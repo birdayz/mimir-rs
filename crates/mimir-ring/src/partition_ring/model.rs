@@ -649,6 +649,10 @@ impl Mergeable for PartitionRingDesc {
         Box::new(self.clone())
     }
 
+    fn eq_mergeable(&self, other: &dyn Mergeable) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
     fn to_go_json(&self) -> GoJson {
         partition_ring_desc_to_go_json(self)
     }

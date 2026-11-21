@@ -143,6 +143,10 @@ impl Mergeable for PropagationDelayTrackerDesc {
         Box::new(self.clone())
     }
 
+    fn eq_mergeable(&self, other: &dyn Mergeable) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
     fn to_go_json(&self) -> GoJson {
         let entries = self
             .beacons
@@ -503,7 +507,15 @@ impl PropagationDelayTracker {
         let now_ms = system_time_to_unix_millis(SystemTime::now());
         let node_name = self.node_name.clone();
 
+        struct PendingBeaconGuard<'a>(&'a AtomicU64);
+        impl Drop for PendingBeaconGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(0, Ordering::Release);
+            }
+        }
+
         self.pending_beacon_id.store(beacon_id, Ordering::Release);
+        let _pending_guard = PendingBeaconGuard(&self.pending_beacon_id);
         self.mark_as_seen(beacon_id);
 
         let res = client
@@ -530,7 +542,7 @@ impl PropagationDelayTracker {
             )
             .await;
 
-        self.pending_beacon_id.store(0, Ordering::Release);
+        drop(_pending_guard);
         if let Err(err) = res {
             warn!(%err, "failed to publish beacon");
             return;

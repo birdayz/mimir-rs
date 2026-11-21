@@ -33,6 +33,9 @@ pub trait Mergeable: Send + Sync {
     /// Deep-clones this value as a boxed [`Mergeable`].
     fn clone_mergeable(&self) -> Box<dyn Mergeable>;
 
+    /// Structural equality check against another [`Mergeable`] value.
+    fn eq_mergeable(&self, other: &dyn Mergeable) -> bool;
+
     /// Go `encoding/json` encoding of the gogo-generated value (`json:"..."` tags), as used by
     /// dskit's `/memberlist` `formatValue` (`format=json` / `json-pretty`).
     fn to_go_json(&self) -> GoJson;

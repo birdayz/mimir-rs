@@ -131,6 +131,10 @@ impl Mergeable for ReplicaDesc {
         Box::new(self.clone())
     }
 
+    fn eq_mergeable(&self, other: &dyn Mergeable) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
     /// Go `encoding/json` of `distributor.ReplicaDesc` (all fields `omitempty`).
     fn to_go_json(&self) -> GoJson {
         let mut f: Vec<(String, GoJson)> = Vec::new();

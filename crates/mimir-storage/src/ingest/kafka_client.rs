@@ -1187,12 +1187,22 @@ impl KafkaClient {
         self
     }
 
+    /// Returns the configured request timeout overhead (`kgo.RequestTimeoutOverhead`).
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     /// Sets the wire `ProduceRequest.timeout_ms` (`kgo.ProduceRequestTimeout`).
     pub fn with_produce_timeout(mut self, timeout: Duration) -> Self {
         if !timeout.is_zero() {
             self.produce_timeout = timeout;
         }
         self
+    }
+
+    /// Returns the configured wire `ProduceRequest` timeout (`kgo.ProduceRequestTimeout`).
+    pub fn produce_timeout(&self) -> Duration {
+        self.produce_timeout
     }
 
     /// Sets the `ListOffsets` retry timeout (`last_produced_offset_retry_timeout`; zero = no limit).
@@ -1249,18 +1259,12 @@ impl KafkaClient {
         } else {
             write_timeout
         };
-        let overhead = Duration::from_nanos(cfg.write_timeout_overhead.as_nanos().max(0) as u64);
-        let overhead = if overhead.is_zero() {
-            kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD
-        } else {
-            overhead
-        };
         let client = Self::new(
             addrs,
             cfg.client_id.clone(),
             cfg.client_rack.clone(),
             Duration::from_nanos(cfg.dial_timeout.as_nanos().max(0) as u64),
-            overhead,
+            kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD,
         )?
         .with_produce_timeout(write_timeout)
         .with_transport(Arc::new(KafkaTransport::from_kafka_config(cfg)?))
@@ -4330,7 +4334,23 @@ mod tests {
             write_timeout_overhead: mimir_config::GoDuration::from_millis(150),
             ..Default::default()
         };
-        let client = super::super::util::IngestKafkaClient::from_config(&cfg, None).unwrap();
+        let reader_kc = KafkaClient::from_config(&cfg).unwrap();
+        assert_eq!(
+            reader_kc.request_timeout(),
+            kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD,
+            "reader KafkaClient::from_config must keep 10s request_timeout"
+        );
+        let reader_ikc = super::super::util::IngestKafkaClient::from_config(&cfg, None).unwrap();
+        assert_eq!(
+            reader_ikc.request_timeout(),
+            kgo_retry::DEFAULT_REQUEST_TIMEOUT_OVERHEAD,
+            "reader IngestKafkaClient::from_config must keep 10s request_timeout"
+        );
+
+        let client =
+            super::super::util::IngestKafkaClient::from_config_for_producer(&cfg, None).unwrap();
+        assert_eq!(client.produce_timeout(), Duration::from_millis(80));
+        assert_eq!(client.request_timeout(), Duration::from_millis(150));
 
         // 120ms server delay > 80ms write_timeout, < 230ms (write_timeout + overhead): MUST succeed
         // and send timeout_ms = 80 on the wire!

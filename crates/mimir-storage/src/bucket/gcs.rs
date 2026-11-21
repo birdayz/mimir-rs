@@ -1806,16 +1806,20 @@ fn new_store_with_env(
             | CredentialSource::ExternalAccountJson(json)
             | CredentialSource::ImpersonatedServiceAccountJson(json) => {
                 let (auth, override_url) = auth_from_json(&json).map_err(wrap)?;
-                if let Some(u) = override_url {
-                    base_url = u;
+                if emulator_url.is_none() {
+                    if let Some(u) = override_url {
+                        base_url = u;
+                    }
                 }
                 auth
             }
             CredentialSource::ApplicationCredentialsFile(path) => {
                 let content = std::fs::read_to_string(&path).map_err(|e| wrap(e.to_string()))?;
                 let (auth, override_url) = auth_from_json(&content).map_err(wrap)?;
-                if let Some(u) = override_url {
-                    base_url = u;
+                if emulator_url.is_none() {
+                    if let Some(u) = override_url {
+                        base_url = u;
+                    }
                 }
                 auth
             }
@@ -3391,6 +3395,25 @@ mod tests {
             (k == "STORAGE_EMULATOR_HOST").then(|| "http://[::1".to_string())
         })
         .is_err());
+
+        // STORAGE_EMULATOR_HOST must NOT be clobbered when service_account JSON provides a base URL / universe override.
+        let cfg_with_sa = GCSConfig {
+            bucket_name: "emu-bkt".into(),
+            service_account: r#"{"type":"service_account","private_key":"unused","private_key_id":"x","client_email":"x@y","gcs_base_url":"https://storage.custom.universe.example","disable_oauth":true}"#.into(),
+            ..Default::default()
+        };
+        let store_with_sa = new_store_with_env(&cfg_with_sa, &|k| {
+            (k == "STORAGE_EMULATOR_HOST").then(|| host_str.clone())
+        })
+        .unwrap();
+        let data2 = store_with_sa
+            .get(&Path::from("k2"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(data2.as_ref(), b"hello");
 
         srv.abort();
     }

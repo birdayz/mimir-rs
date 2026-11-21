@@ -4105,7 +4105,7 @@ impl Head {
             head.min_valid_time.fetch_max(min_valid_time, Ordering::AcqRel);
         }
 
-        let pre_open_chunk_seq = head.replay_on_open(
+        let post_repair_chunk_seq = head.replay_on_open(
             &wal_dir,
             &wbl_dir,
             &chunks_dir,
@@ -4118,7 +4118,7 @@ impl Head {
             opts.max_head_chunk_file_size,
             opts.head_chunks_write_buffer_size,
         )?;
-        chunk_writer.ensure_min_seq(pre_open_chunk_seq);
+        chunk_writer.ensure_min_seq(post_repair_chunk_seq);
         if let Some(m) = head.metrics.chunk_write_queue.clone() {
             chunk_writer.set_queue_metrics(m);
         }
@@ -4143,7 +4143,6 @@ impl Head {
         // `NewChunkDiskMapper` fails `NewHead`); iteration errors are repaired exactly like
         // Go `Head.Init` -> `removeCorruptedMmappedChunks` and the data is recovered from WAL.
         let mut reader = HeadChunksReader::open(chunks_dir)?;
-        let pre_open_chunk_seq = reader.max_seq();
         let MmappedLoad {
             in_order: mut mmapped_map,
             ooo: mut ooo_mmapped_map,
@@ -4158,6 +4157,7 @@ impl Head {
                 self.remove_corrupted_mmapped_chunks(&mut reader, &err)
             }
         };
+        let post_repair_chunk_seq = reader.max_seq();
         *self.chunk_reader.write() = Some(reader);
 
         // 2. Replay WAL checkpoint + segments. Like Go `Head.Init`, the first WAL error
@@ -4193,7 +4193,7 @@ impl Head {
                             chunks_dir,
                             self.opts.max_head_chunk_file_size,
                         )?;
-                        replay_cw.ensure_min_seq(pre_open_chunk_seq);
+                        replay_cw.ensure_min_seq(post_repair_chunk_seq);
                         if let Some(m) = self.metrics.chunk_write_queue.clone() {
                             replay_cw.set_queue_metrics(m);
                         }
@@ -4249,7 +4249,12 @@ impl Head {
             .set(replay_start.elapsed().as_secs_f64());
         self.symbol_arena_baseline_bytes
             .store(self.symbols.read().bytes_len() as u64, Ordering::Release);
-        Ok(pre_open_chunk_seq)
+        let final_chunk_seq = self
+            .chunk_reader
+            .read()
+            .as_ref()
+            .map_or(post_repair_chunk_seq, |r| post_repair_chunk_seq.max(r.max_seq()));
+        Ok(final_chunk_seq)
     }
 
     /// WAL part of Go `Head.Init`: replays the last checkpoint (if any) and then every WAL
@@ -11734,7 +11739,10 @@ impl<'a> HeadAppender<'a> {
             self.head_maxt = self.head.max_time();
         }
         let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
-        if effective_ooo == 0 && t < self.min_valid_time {
+        if effective_ooo == 0
+            && t < self.min_valid_time
+            && !(v.to_bits() == QUIET_ZERO_NAN_BITS && !reject_ooo)
+        {
             self.head
                 .metrics
                 .out_of_bound_samples
@@ -11767,6 +11775,7 @@ impl<'a> HeadAppender<'a> {
                 t,
                 v,
                 effective_ooo,
+                reject_ooo,
             )? {
                 return Ok(ref_id);
             }
@@ -11797,7 +11806,10 @@ impl<'a> HeadAppender<'a> {
             self.head_maxt = self.head.max_time();
         }
         let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
-        if effective_ooo == 0 && t < self.min_valid_time {
+        if effective_ooo == 0
+            && t < self.min_valid_time
+            && !(v.to_bits() == QUIET_ZERO_NAN_BITS && !reject_ooo)
+        {
             self.head
                 .metrics
                 .out_of_bound_samples
@@ -11830,6 +11842,7 @@ impl<'a> HeadAppender<'a> {
                 t,
                 v,
                 effective_ooo,
+                reject_ooo,
             )? {
                 return Ok(ref_id);
             }
@@ -11850,6 +11863,7 @@ impl<'a> HeadAppender<'a> {
         t: i64,
         v: f64,
         effective_ooo: i64,
+        reject_ooo: bool,
     ) -> Result<Option<u64>, HeadError> {
         let ref_id = entry.ref_id;
 
@@ -11929,6 +11943,16 @@ impl<'a> HeadAppender<'a> {
             };
             match res {
                 Ok((is_ooo, is_dup)) => {
+                    if is_ooo && reject_ooo {
+                        entry.pending_commits.fetch_sub(1, Ordering::Release);
+                        if take_entry {
+                            *series_entry = Some(entry);
+                        }
+                        self.head
+                            .metrics
+                            .record_append_err(&HeadError::OutOfOrderSample, "float");
+                        return Err(HeadError::OutOfOrderSample);
+                    }
                     if is_dup {
                         self.head.metrics.exact_duplicate_dropped("float");
                         entry.pending_commits.fetch_sub(1, Ordering::Release);
@@ -11977,6 +12001,16 @@ impl<'a> HeadAppender<'a> {
             };
             match res {
                 Ok((is_ooo, is_dup)) => {
+                    if is_ooo && reject_ooo {
+                        entry.pending_commits.fetch_sub(1, Ordering::Release);
+                        if take_entry {
+                            *series_entry = Some(entry);
+                        }
+                        self.head
+                            .metrics
+                            .record_append_err(&HeadError::OutOfOrderSample, "float");
+                        return Err(HeadError::OutOfOrderSample);
+                    }
                     if is_dup {
                         self.head.metrics.exact_duplicate_dropped("float");
                         entry.pending_commits.fetch_sub(1, Ordering::Release);
@@ -12033,7 +12067,10 @@ impl<'a> HeadAppender<'a> {
             self.min_valid_time = self.head.appendable_min_valid_time();
             self.head_maxt = self.head.max_time();
         }
-        if self.ooo_time_window == 0 && t < self.min_valid_time {
+        if self.ooo_time_window == 0
+            && t < self.min_valid_time
+            && v.to_bits() != QUIET_ZERO_NAN_BITS
+        {
             self.head
                 .metrics
                 .out_of_bound_samples
@@ -12474,38 +12511,31 @@ impl<'a> HeadAppender<'a> {
         if self.closed {
             return Err(HeadError::AppenderClosed);
         }
+        let lookup_by_pairs = || {
+            let mut sorted: SmallVec<[(&str, &str); 16]> = pairs
+                .iter()
+                .copied()
+                .filter(|(_, v)| !v.is_empty())
+                .collect();
+            sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            let hash = hash_sorted_pairs(&sorted);
+            self.head.get_by_sorted_pairs(hash, &sorted)
+        };
+
         if !self.head.opts.enable_exemplar_storage || self.head.exemplars.capacity() == 0 {
             if let Some(r) = series_ref {
                 return Ok(r);
             }
-            let mut sorted: SmallVec<[(&str, &str); 16]> = pairs.iter().copied().collect();
-            sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            let hash = hash_sorted_pairs(&sorted);
-            return Ok(self
-                .head
-                .get_by_sorted_pairs(hash, &sorted)
-                .map_or(0, |e| e.ref_id));
+            return Ok(lookup_by_pairs().map_or(0, |e| e.ref_id));
         }
 
         let entry = if let Some(r) = series_ref {
             match self.head.series.get_by_id(r) {
                 Some(e) => e,
-                None => {
-                    let mut sorted: SmallVec<[(&str, &str); 16]> = pairs.iter().copied().collect();
-                    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
-                    let hash = hash_sorted_pairs(&sorted);
-                    self.head
-                        .get_by_sorted_pairs(hash, &sorted)
-                        .ok_or(HeadError::UnknownSeriesRef(r))?
-                }
+                None => lookup_by_pairs().ok_or(HeadError::UnknownSeriesRef(r))?,
             }
         } else {
-            let mut sorted: SmallVec<[(&str, &str); 16]> = pairs.iter().copied().collect();
-            sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            let hash = hash_sorted_pairs(&sorted);
-            self.head
-                .get_by_sorted_pairs(hash, &sorted)
-                .ok_or(HeadError::UnknownSeriesRef(0))?
+            lookup_by_pairs().ok_or(HeadError::UnknownSeriesRef(0))?
         };
         if entry.is_gced() {
             return Err(HeadError::UnknownSeriesRef(entry.ref_id));
@@ -17433,5 +17463,94 @@ mod tests {
             !shared_cache.has_source_epochs(),
             "Head::drop must prune source_id from shared postings_cache.source_epochs"
         );
+    }
+
+    #[test]
+    fn quiet_zero_nan_reject_ooo_and_min_valid_time_exempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 10_000,
+            ooo_time_window_ms: 0,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let pairs = [("__name__", "qzn_m"), ("job", "t")];
+        let qzn = f64::from_bits(QUIET_ZERO_NAN_BITS);
+
+        // Seed in-order sample at t = 20_000 so min_valid_time = 20_000 - 5_000 = 15_000.
+        let mut app = head.appender();
+        let r = app.append_float(None, &pairs, 20_000, 1.0).unwrap();
+        app.commit().unwrap();
+
+        // 1) append_float_reject_ooo with QUIET_ZERO_NAN_BITS at t < maxt (within min_valid_time)
+        // must return Err(HeadError::OutOfOrderSample) like Go head_append_v2.go:275-279.
+        let mut app = head.appender();
+        let err = app
+            .append_float_reject_ooo(Some(r), &pairs, 18_000, qzn)
+            .unwrap_err();
+        assert!(
+            matches!(err, HeadError::OutOfOrderSample),
+            "expected OutOfOrderSample for reject_ooo + QUIET_ZERO_NAN_BITS at t < maxt, got {err:?}"
+        );
+
+        // Also verify prehashed_encoded reject_ooo path.
+        let lbls = Labels::from_sorted_slice(&pairs);
+        let h = lbls.hash();
+        let mut cached = Some(head.get_entry_by_sorted_pairs(&pairs).unwrap());
+        let err_enc = app
+            .append_float_with_entry_prehashed_encoded(&mut cached, h, lbls.as_bytes(), 0, 18_000, qzn, true)
+            .unwrap_err();
+        assert!(
+            matches!(err_enc, HeadError::OutOfOrderSample),
+            "expected OutOfOrderSample for prehashed_encoded reject_ooo + QUIET_ZERO_NAN_BITS, got {err_enc:?}"
+        );
+        app.rollback().unwrap();
+
+        // 2) Normal append (reject_ooo = false) with QUIET_ZERO_NAN_BITS at t < min_valid_time
+        // must NOT fail with OutOfBounds even when ooo_time_window == 0, and is dropped in commit.
+        let mut app = head.appender();
+        app.append_float(Some(r), &pairs, 10_000, qzn).unwrap();
+        app.append_float_by_ref(r, 10_000, qzn).unwrap();
+        app.append_float_with_entry_prehashed_encoded(&mut cached, h, lbls.as_bytes(), 0, 10_000, qzn, false)
+            .unwrap();
+        app.commit().unwrap();
+
+        // Only the original sample at 20_000 is stored.
+        assert_eq!(read_head_float_samples(&head, r), vec![(20_000, 1.0)]);
+
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn append_exemplar_stale_ref_fallback_filters_empty_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            enable_exemplar_storage: true,
+            max_exemplars: 100,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let pairs_clean = [("__name__", "ex_m"), ("job", "api")];
+
+        let mut app = head.appender();
+        let r = app.append_float(None, &pairs_clean, 10_000, 1.0).unwrap();
+        app.commit().unwrap();
+
+        // Pass a stale series_ref (r + 9999) and pairs containing an empty label value.
+        let pairs_with_empty = [("__name__", "ex_m"), ("empty", ""), ("job", "api")];
+        let ex = Exemplar {
+            labels: Labels::from_pairs([("trace_id", "abc")]),
+            value: 1.0,
+            timestamp_ms: 10_000,
+            has_ts: true,
+        };
+        let mut app = head.appender();
+        let resolved_ref = app
+            .append_exemplar(Some(r + 9999), &pairs_with_empty, ex)
+            .expect("stale ref fallback must strip empty labels to match Go ls.WithoutEmpty()");
+        assert_eq!(resolved_ref, r);
+        app.commit().unwrap();
+
+        head.close().unwrap();
     }
 }

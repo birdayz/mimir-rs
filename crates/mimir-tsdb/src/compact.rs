@@ -2774,8 +2774,7 @@ pub fn compact_blocks_with_float_encoding_and_segment_size_and_metrics(
             } else {
                 let mut all = vec![err.to_string()];
                 all.extend(failed_errs);
-                Err(CompactError::Io(io::Error::other(all.join("
-"))))
+                Err(CompactError::Io(io::Error::other(all.join("\n"))))
             }
         }
     }

@@ -491,11 +491,9 @@ impl MemberlistKv {
                         .into_iter()
                         .map(|c| (c.codec_id().to_string(), c))
                         .collect();
-                    if cfg.propagation_delay_tracker.enabled {
-                        let pt_codec = super::propagation_tracker::propagation_delay_tracker_codec();
-                        map.entry(pt_codec.codec_id().to_string())
-                            .or_insert(pt_codec);
-                    }
+                    let pt_codec = super::propagation_tracker::propagation_delay_tracker_codec();
+                    map.entry(pt_codec.codec_id().to_string())
+                        .or_insert(pt_codec);
                     map
                 }),
                 node_meta,
@@ -2046,9 +2044,25 @@ impl MemberlistKv {
                     if !had_curr {
                         return Ok((None, 0, curr_deleted, curr_update));
                     }
-                    // Persist the merged & tombstone-stripped result without bumping
-                    // curr_version, matching Go's in-place mutation of curr.value while
-                    // returning new_version = 0 (errNoChangeDetected).
+                    let changed_curr = store
+                        .get(key)
+                        .is_none_or(|c| !c.value.eq_mergeable(result.as_ref()));
+                    if changed_curr {
+                        let new_version = curr_version + 1;
+                        store.insert(
+                            key.to_string(),
+                            ValueDesc {
+                                value: result,
+                                version: new_version,
+                                codec_id: codec_id.to_string(),
+                                deleted: new_deleted,
+                                update_time: new_updated,
+                            },
+                        );
+                        return Ok((None, new_version, new_deleted, new_updated));
+                    }
+                    // Result equals curr (no net state change); keep curr_version and
+                    // return new_version = 0 (errNoChangeDetected).
                     store.insert(
                         key.to_string(),
                         ValueDesc {

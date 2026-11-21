@@ -464,10 +464,14 @@ impl hyper::body::Body for ReadTapDropBody {
         };
         if done {
             if let Some(permit) = self.permit.take() {
-                if deadline_exceeded {
-                    permit.deadline_exceeded_flag().store(true, Ordering::Release);
+                if !permit.is_prepared() {
+                    permit.abort();
+                } else {
+                    if deadline_exceeded {
+                        permit.deadline_exceeded_flag().store(true, Ordering::Release);
+                    }
+                    permit.finish(false);
                 }
-                permit.finish(false);
             }
         }
         poll
@@ -485,6 +489,10 @@ impl hyper::body::Body for ReadTapDropBody {
 impl Drop for ReadTapDropBody {
     fn drop(&mut self) {
         if let Some(permit) = self.permit.take() {
+            if !permit.is_prepared() {
+                permit.abort();
+                return;
+            }
             let timed_out = self
                 .deadline_ctx
                 .as_ref()
@@ -3230,6 +3238,27 @@ mod tests {
             1,
             "normal completion on Frame::trailers must call rp.record()"
         );
+
+        // 3) Unprepared permit must call abort() (not finish()) on both poll_frame completion and drop.
+        let tap_unprep1 = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        assert!(!tap_unprep1.is_prepared());
+        let body_unprep_drop = ReadTapDropBody {
+            inner: tonic::body::BoxBody::new(VecFramesBody(VecDeque::new())),
+            permit: Some(tap_unprep1),
+            deadline_ctx: None,
+        };
+        drop(body_unprep_drop);
+
+        let tap_unprep2 = ing.try_start_read_tap(&http::HeaderMap::new()).unwrap();
+        assert!(!tap_unprep2.is_prepared());
+        let mut body_unprep_poll = ReadTapDropBody {
+            inner: tonic::body::BoxBody::new(VecFramesBody(VecDeque::new())),
+            permit: Some(tap_unprep2),
+            deadline_ctx: None,
+        };
+        let end = std::future::poll_fn(|cx| Pin::new(&mut body_unprep_poll).poll_frame(cx)).await;
+        assert!(end.is_none());
+        assert!(body_unprep_poll.permit.is_none());
     }
 
     #[tokio::test]

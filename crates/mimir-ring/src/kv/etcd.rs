@@ -232,12 +232,19 @@ enum AuthError {
     Transport(KvError),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthState {
+    Unknown,
+    Token(String),
+    NotEnabled,
+}
+
 pub struct EtcdKv {
     http: reqwest::Client,
     endpoints: Vec<String>,
     cfg: EtcdConfig,
     codec: Arc<dyn Codec>,
-    auth_token: RwLock<Option<String>>,
+    auth_state: RwLock<AuthState>,
     next_endpoint: AtomicUsize,
 }
 
@@ -295,7 +302,7 @@ impl EtcdKv {
             endpoints,
             cfg,
             codec,
-            auth_token: RwLock::new(None),
+            auth_state: RwLock::new(AuthState::Unknown),
             next_endpoint: AtomicUsize::new(0),
         })
     }
@@ -333,15 +340,17 @@ impl EtcdKv {
     }
 
     async fn invalidate_auth(&self) {
-        *self.auth_token.write().await = None;
+        *self.auth_state.write().await = AuthState::Unknown;
     }
 
     async fn ensure_auth(&self) -> Result<Option<String>, AuthError> {
         if !self.auth_enabled() {
             return Ok(None);
         }
-        if let Some(tok) = self.auth_token.read().await.as_ref() {
-            return Ok(Some(tok.clone()));
+        match &*self.auth_state.read().await {
+            AuthState::Token(tok) => return Ok(Some(tok.clone())),
+            AuthState::NotEnabled => return Ok(None),
+            AuthState::Unknown => {}
         }
         #[derive(Serialize)]
         struct AuthReq<'a> {
@@ -390,16 +399,18 @@ impl EtcdKv {
                             "etcd auth failed: missing token in response".to_string(),
                         )));
                     }
-                    *self.auth_token.write().await = Some(parsed.token.clone());
+                    *self.auth_state.write().await = AuthState::Token(parsed.token.clone());
                     return Ok(Some(parsed.token));
                 }
                 Ok(resp) => {
-                    self.next_endpoint.store(idx, Ordering::Relaxed);
                     let status = resp.status();
+                    if !status.is_server_error() {
+                        self.next_endpoint.store(idx, Ordering::Relaxed);
+                    }
                     if status == StatusCode::BAD_REQUEST {
                         let body = resp.text().await.unwrap_or_default();
                         if body.contains("authentication is not enabled") {
-                            *self.auth_token.write().await = None;
+                            *self.auth_state.write().await = AuthState::NotEnabled;
                             return Ok(None);
                         }
                         return Err(AuthError::Rejected(KvError::Http(format!(
@@ -514,12 +525,12 @@ impl EtcdKv {
                         last_err = Some(KvError::Http(format!("etcd {path} returned {status}")));
                     }
                     Ok(resp) => {
-                        self.next_endpoint.store(idx, Ordering::Relaxed);
+                        let status = resp.status();
+                        if !status.is_server_error() {
+                            self.next_endpoint.store(idx, Ordering::Relaxed);
+                        }
                         responded = true;
-                        last_err = Some(KvError::Http(format!(
-                            "etcd {path} returned {}",
-                            resp.status()
-                        )));
+                        last_err = Some(KvError::Http(format!("etcd {path} returned {status}")));
                     }
                     Err(e) => {
                         last_err = Some(KvError::Http(format_reqwest_error(&e)));
@@ -867,7 +878,7 @@ impl EtcdKv {
         });
 
         let mut start_revision: i64 = 0;
-        let mut ep_idx: usize = 0;
+        let mut ep_idx: usize = self.next_endpoint.load(Ordering::Relaxed) % self.endpoints.len();
         let mut refreshed_auth = false;
 
         while backoff.ongoing() && !cancel.is_canceled() {
@@ -1800,7 +1811,7 @@ mod tests {
         assert!(kv_no_pw.get("k").await.unwrap().is_none());
         assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
 
-        // 2. Non-empty username+password tolerates ErrAuthNotEnabled and proceeds unauthenticated.
+        // 2. Non-empty username+password caches ErrAuthNotEnabled and skips redundant auth POSTs.
         let kv = EtcdKv::new(
             EtcdConfig {
                 endpoints: vec![format!("http://{addr}")],
@@ -1812,6 +1823,13 @@ mod tests {
         )
         .unwrap();
         assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(
+            auth_calls.load(Ordering::SeqCst),
+            1,
+            "subsequent KV RPC must NOT re-post /v3/auth/authenticate once AuthNotEnabled is cached"
+        );
         assert_eq!(saw_auth_header.load(Ordering::SeqCst), 0);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -1902,5 +1920,135 @@ mod tests {
         assert!(kv.get("k").await.unwrap().is_none());
         assert_eq!(hits0.load(Ordering::SeqCst), 1);
         assert_eq!(hits1.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gate_b3_auth_not_enabled_cleared_on_401_and_5xx_does_not_stick_endpoint() {
+        use crate::kv::StringCodec;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Part A: AuthNotEnabled is cleared when a subsequent KV call receives 401.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let auth_enabled = Arc::new(AtomicBool::new(false));
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let ae = Arc::clone(&auth_enabled);
+        let ac = Arc::clone(&auth_calls);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l.accept().await {
+                let ae = Arc::clone(&ae);
+                let ac = Arc::clone(&ac);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let has_auth = req.to_ascii_lowercase().contains("authorization: tok-live");
+                    let (status, body) = if first_line.contains("/v3/auth/authenticate") {
+                        ac.fetch_add(1, Ordering::SeqCst);
+                        if ae.load(Ordering::SeqCst) {
+                            ("200 OK", r#"{"token":"tok-live"}"#)
+                        } else {
+                            ("400 Bad Request", r#"{"error":"etcdserver: authentication is not enabled","code":9}"#)
+                        }
+                    } else if ae.load(Ordering::SeqCst) && !has_auth {
+                        ("401 Unauthorized", r#"{"error":"etcdserver: user name is empty"}"#)
+                    } else {
+                        ("200 OK", r#"{"kvs":[]}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let kv = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{addr}")],
+                username: "root".to_string(),
+                password: "secret".to_string(),
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+
+        // Auth is later enabled on etcd; 401 clears AuthNotEnabled and triggers re-auth.
+        auth_enabled.store(true, Ordering::SeqCst);
+        assert!(kv.get("k").await.unwrap().is_none());
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
+
+        // Part B: 5xx on endpoint 0 must NOT overwrite next_endpoint back to 0.
+        let l503 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a503 = l503.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l503.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"error":"unavailable"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let l200 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a200 = l200.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l200.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"kvs":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let kv_ep = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{a503}"), format!("http://{a200}")],
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+        // Start next_endpoint at 1 (healthy); if we force a 503 on 0 alone, next_endpoint stays at 1.
+        kv_ep.next_endpoint.store(1, Ordering::Relaxed);
+        assert!(kv_ep.get("k").await.unwrap().is_none());
+        assert_eq!(kv_ep.next_endpoint.load(Ordering::Relaxed), 1);
+
+        let kv_503_first = EtcdKv::new(
+            EtcdConfig {
+                endpoints: vec![format!("http://{a503}"), format!("http://{a503}")],
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+        )
+        .unwrap();
+        kv_503_first.next_endpoint.store(1, Ordering::Relaxed);
+        assert!(kv_503_first.get("k").await.is_err());
+        assert_eq!(
+            kv_503_first.next_endpoint.load(Ordering::Relaxed),
+            1,
+            "5xx response must not update next_endpoint"
+        );
     }
 }

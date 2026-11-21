@@ -1794,13 +1794,16 @@ impl SingleClusterPartitionReader {
         let _ = self.stop_tx.send(true);
         self.committer.stop().await;
         self.offset_reader.stop().await;
-        if let Some(r) = self.start_offset_reader.lock().await.take() {
+        let start_offset_reader = self.start_offset_reader.lock().await.take();
+        if let Some(r) = start_offset_reader {
             r.stop().await;
         }
-        if let Some(h) = self.sampler.lock().await.take() {
+        let sampler = self.sampler.lock().await.take();
+        if let Some(h) = sampler {
             let _ = h.await;
         }
-        if let Some(f) = self.fetcher.lock().await.take() {
+        let fetcher = self.fetcher.lock().await.take();
+        if let Some(f) = fetcher {
             f.stop().await;
         }
     }
@@ -2076,13 +2079,16 @@ impl RuntimeFailureCtx {
         let _ = self.stop_tx.send(true);
         self.committer.stop().await;
         self.offset_reader.stop().await;
-        if let Some(r) = self.start_offset_reader.lock().await.take() {
+        let start_offset_reader = self.start_offset_reader.lock().await.take();
+        if let Some(r) = start_offset_reader {
             r.stop().await;
         }
-        if let Some(h) = self.sampler.lock().await.take() {
+        let sampler = self.sampler.lock().await.take();
+        if let Some(h) = sampler {
             let _ = h.await;
         }
-        if let Some(f) = self.fetcher.lock().await.take() {
+        let fetcher = self.fetcher.lock().await.take();
+        if let Some(f) = fetcher {
             f.stop().await;
         } else {
             self.fallback_fetcher.stop().await;

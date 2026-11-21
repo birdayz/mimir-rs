@@ -268,7 +268,6 @@ pub struct KafkaWriterClient {
     compression: KafkaCompression,
     linger: Duration,
     write_timeout: Duration,
-    write_timeout_overhead: Duration,
     buffered_bytes: Arc<AtomicI64>,
     buffered_records: Arc<AtomicI64>,
     queue: Arc<SyncMutex<VecDeque<QueuedItem>>>,
@@ -301,7 +300,10 @@ impl KafkaWriterClient {
         } else {
             None
         };
-        let inner = Arc::new(IngestKafkaClient::from_config(cfg, extended_metrics.clone())?);
+        let inner = Arc::new(IngestKafkaClient::from_config_for_producer(
+            cfg,
+            extended_metrics.clone(),
+        )?);
         let compression =
             kafka_producer_compression_from_config(&cfg.producer_compression)
                 .unwrap_or(KafkaCompression::Snappy);
@@ -312,8 +314,6 @@ impl KafkaWriterClient {
         };
         let write_timeout =
             Duration::from_nanos(cfg.write_timeout.as_nanos().max(0) as u64);
-        let write_timeout_overhead =
-            Duration::from_nanos(cfg.write_timeout_overhead.as_nanos().max(0) as u64);
         let default_topic = if opts.disable_default_topic || cfg.topic.is_empty() {
             None
         } else {
@@ -332,7 +332,6 @@ impl KafkaWriterClient {
             } else {
                 write_timeout
             },
-            write_timeout_overhead,
             buffered_bytes: Arc::new(AtomicI64::new(0)),
             buffered_records: Arc::new(AtomicI64::new(0)),
             queue: Arc::new(SyncMutex::new(VecDeque::new())),
@@ -355,7 +354,7 @@ impl KafkaWriterClient {
     }
 
     pub fn request_timeout_overhead(&self) -> Duration {
-        self.write_timeout_overhead
+        self.inner.request_timeout()
     }
 
     pub fn inner(&self) -> &Arc<IngestKafkaClient> {
