@@ -11739,10 +11739,7 @@ impl<'a> HeadAppender<'a> {
             self.head_maxt = self.head.max_time();
         }
         let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
-        if effective_ooo == 0
-            && t < self.min_valid_time
-            && !(v.to_bits() == QUIET_ZERO_NAN_BITS && !reject_ooo)
-        {
+        if self.ooo_time_window == 0 && t < self.min_valid_time {
             self.head
                 .metrics
                 .out_of_bound_samples
@@ -11806,10 +11803,7 @@ impl<'a> HeadAppender<'a> {
             self.head_maxt = self.head.max_time();
         }
         let effective_ooo = if reject_ooo { 0 } else { self.ooo_time_window };
-        if effective_ooo == 0
-            && t < self.min_valid_time
-            && !(v.to_bits() == QUIET_ZERO_NAN_BITS && !reject_ooo)
-        {
+        if self.ooo_time_window == 0 && t < self.min_valid_time {
             self.head
                 .metrics
                 .out_of_bound_samples
@@ -12067,10 +12061,7 @@ impl<'a> HeadAppender<'a> {
             self.min_valid_time = self.head.appendable_min_valid_time();
             self.head_maxt = self.head.max_time();
         }
-        if self.ooo_time_window == 0
-            && t < self.min_valid_time
-            && v.to_bits() != QUIET_ZERO_NAN_BITS
-        {
+        if self.ooo_time_window == 0 && t < self.min_valid_time {
             self.head
                 .metrics
                 .out_of_bound_samples
@@ -17506,12 +17497,21 @@ mod tests {
         );
         app.rollback().unwrap();
 
-        // 2) Normal append (reject_ooo = false) with QUIET_ZERO_NAN_BITS at t < min_valid_time
-        // must NOT fail with OutOfBounds even when ooo_time_window == 0, and is dropped in commit.
+        // 2) With ooo_time_window == 0 and t < min_valid_time (10_000 < 15_000), Go head_append_v2.go:149
+        // rejects unconditionally with ErrOutOfBounds before getOrCreate (no orphan series created).
         let mut app = head.appender();
-        app.append_float(Some(r), &pairs, 10_000, qzn).unwrap();
-        app.append_float_by_ref(r, 10_000, qzn).unwrap();
-        app.append_float_with_entry_prehashed_encoded(&mut cached, h, lbls.as_bytes(), 0, 10_000, qzn, false)
+        let new_pairs = [("__name__", "qzn_orphan"), ("job", "t")];
+        assert!(matches!(
+            app.append_float(None, &new_pairs, 10_000, qzn),
+            Err(HeadError::OutOfBounds)
+        ));
+        assert!(head.get_entry_by_sorted_pairs(&new_pairs).is_none());
+
+        // Within [min_valid_time, maxt), normal append (reject_ooo = false) accepts QUIET_ZERO_NAN_BITS
+        // via memSeries.appendable() and drops it as a no-op in commit.
+        app.append_float(Some(r), &pairs, 18_000, qzn).unwrap();
+        app.append_float_by_ref(r, 18_000, qzn).unwrap();
+        app.append_float_with_entry_prehashed_encoded(&mut cached, h, lbls.as_bytes(), 0, 18_000, qzn, false)
             .unwrap();
         app.commit().unwrap();
 

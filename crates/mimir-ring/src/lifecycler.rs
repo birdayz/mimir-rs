@@ -851,10 +851,10 @@ impl BasicLifecyclerDelegate for AutoForgetDelegate {
             .iter()
             .filter_map(|(id, inst)| {
                 let elapsed = if inst.timestamp >= 0 {
-                    let hb = UNIX_EPOCH
+                    UNIX_EPOCH
                         .checked_add(Duration::from_secs(inst.timestamp as u64))
-                        .unwrap_or(UNIX_EPOCH);
-                    now.duration_since(hb).unwrap_or(Duration::ZERO)
+                        .and_then(|hb| now.duration_since(hb).ok())
+                        .unwrap_or(Duration::ZERO)
                 } else {
                     let before_epoch = Duration::from_secs(inst.timestamp.unsigned_abs());
                     now.duration_since(UNIX_EPOCH)
