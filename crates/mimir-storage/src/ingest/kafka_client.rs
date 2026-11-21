@@ -286,7 +286,7 @@ struct BrokerConn {
     /// Responses successfully read on this connection after its setup (kgo `cxn.successes`).
     successes: std::sync::atomic::AtomicU64,
     /// kprom `node_id` label value (`kgo.NodeName`) and hooks, when the client has them.
-    node: String,
+    node: Arc<parking_lot::RwLock<String>>,
     kprom: Option<Arc<KpromMetrics>>,
     extended_metrics: Option<KafkaClientExtendedMetrics>,
 }
@@ -391,7 +391,8 @@ impl BrokerConn {
         let alive_r = Arc::clone(&alive);
         let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let disconnected_r = Arc::clone(&disconnected);
-        let disconnect_hook = kprom.clone().map(|k| (k, node.clone()));
+        let node = Arc::new(parking_lot::RwLock::new(node));
+        let disconnect_hook = kprom.clone().map(|k| (k, Arc::clone(&node)));
         let ext_r = extended_metrics.clone();
         let reader_handle = tokio::spawn(async move {
             while let Some((payload, header_at, done_at)) =
@@ -423,7 +424,8 @@ impl BrokerConn {
             pending_drained_r.notify_waiters();
             if let Some((k, node)) = disconnect_hook {
                 if !disconnected_r.swap(true, Ordering::SeqCst) {
-                    k.on_broker_disconnect(&node);
+                    let n = node.read().clone();
+                    k.on_broker_disconnect(&n);
                 }
             }
         });
@@ -473,7 +475,8 @@ impl BrokerConn {
                     return SendOutcome::ReauthFailed(KafkaClientError::RequestTimeout(timeout));
                 }
                 if let Some(ref k) = self.kprom {
-                    k.on_read_error(&self.node, 0);
+                    let n = self.node.read().clone();
+                    k.on_read_error(&n, 0);
                 }
                 return SendOutcome::Err(KafkaClientError::RequestTimeout(timeout));
             }
@@ -555,9 +558,18 @@ impl BrokerConn {
         self.pending_drained.notify_waiters();
         if let Some(ref k) = self.kprom {
             if !self.disconnected.swap(true, Ordering::SeqCst) {
-                k.on_broker_disconnect(&self.node);
+                let n = self.node.read().clone();
+                k.on_broker_disconnect(&n);
             }
         }
+    }
+
+    fn node_name(&self) -> String {
+        self.node.read().clone()
+    }
+
+    fn set_node_name(&self, name: String) {
+        *self.node.write() = name;
     }
 
     fn pick_version(&self, key: ApiKey, our_min: i16, our_max: i16) -> i16 {
@@ -662,7 +674,8 @@ impl BrokerConn {
             Ok(rf) => rf,
             Err(_) => {
                 if let Some(ref k) = self.kprom {
-                    k.on_read_error(&self.node, written);
+                    let n = self.node.read().clone();
+                    k.on_read_error(&n, written);
                 }
                 return Err(KafkaClientError::ConnectionClosed);
             }
@@ -682,7 +695,8 @@ impl BrokerConn {
                 m.kafka_request_duration_e2e_seconds.observe(e2e.as_secs_f64());
             }
             if let Some(ref k) = self.kprom {
-                k.on_e2e(&self.node, written, resp_buf.len() + 4);
+                let n = self.node.read().clone();
+                k.on_e2e(&n, written, resp_buf.len() + 4);
             }
         }
         let resp_header_ver = if api_key == ApiKey::ApiVersions {
@@ -794,7 +808,8 @@ impl BrokerConn {
         };
         if self.write_tx.send(outbound).await.is_err() {
             if let Some(ref k) = self.kprom {
-                k.on_write_error(&self.node);
+                let n = self.node.read().clone();
+                k.on_write_error(&n);
             }
             return Err(KafkaClientError::ConnectionClosed);
         }
@@ -817,13 +832,15 @@ impl BrokerConn {
             Ok(Ok(rf)) => rf,
             Ok(Err(_)) => {
                 if let Some(ref k) = self.kprom {
-                    k.on_read_error(&self.node, written);
+                    let n = self.node.read().clone();
+                    k.on_read_error(&n, written);
                 }
                 return Err(KafkaClientError::ConnectionClosed);
             }
             Err(_) => {
                 if let Some(ref k) = self.kprom {
-                    k.on_read_error(&self.node, written);
+                    let n = self.node.read().clone();
+                    k.on_read_error(&n, written);
                 }
                 return Err(KafkaClientError::RequestTimeout(timeout));
             }
@@ -842,7 +859,8 @@ impl BrokerConn {
             m.kafka_request_duration_e2e_seconds.observe(e2e.as_secs_f64());
         }
         if let Some(ref k) = self.kprom {
-            k.on_e2e(&self.node, written, resp_buf.len() + 4);
+            let n = self.node.read().clone();
+            k.on_e2e(&n, written, resp_buf.len() + 4);
         }
         let resp_header_ver = if api_key == ApiKey::ApiVersions {
             0
@@ -900,6 +918,7 @@ pub struct KafkaClient {
     conns_by_addr: Mutex<HashMap<(String, ConnKind), Arc<BrokerConn>>>,
     connect_locks: ConnectLocks,
     metadata: RwLock<ClusterMetadata>,
+    known_node_ids: RwLock<HashMap<String, i32>>,
     decode_pool: OnceLock<ScopedWorkerPool>,
     /// `-ingest-storage.kafka.last-produced-offset-retry-timeout`: the `ListOffsets` retry timeout
     /// (Mimir's `kgo.RetryTimeoutFn`).
@@ -936,6 +955,7 @@ impl KafkaClient {
             conns_by_addr: Mutex::new(HashMap::new()),
             connect_locks: parking_lot::Mutex::new(HashMap::new()),
             metadata: RwLock::new(ClusterMetadata::default()),
+            known_node_ids: RwLock::new(HashMap::new()),
             decode_pool: OnceLock::new(),
             last_produced_offset_retry_timeout: Duration::from_secs(10),
             controller_id: AtomicI32::new(-1),
@@ -1004,6 +1024,9 @@ impl KafkaClient {
             .iter()
             .find(|(_, b)| b.addr == addr)
         {
+            return id.to_string();
+        }
+        if let Some(id) = self.known_node_ids.read().get(addr) {
             return id.to_string();
         }
         let idx = self.seed_brokers.iter().position(|s| s == addr).unwrap_or(0);
@@ -1287,6 +1310,23 @@ impl KafkaClient {
         self.load_conn_kind(addr, ConnKind::Normal).await
     }
 
+    async fn load_conn_for_node(
+        &self,
+        node_id: i32,
+        addr: &str,
+    ) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        if node_id >= 0 {
+            self.known_node_ids
+                .write()
+                .insert(addr.to_string(), node_id);
+        }
+        let conn = self.load_conn(addr).await?;
+        if node_id >= 0 && conn.node_name().starts_with("seed_") {
+            conn.set_node_name(node_id.to_string());
+        }
+        Ok(conn)
+    }
+
     async fn load_conn_kind(
         &self,
         addr: &str,
@@ -1419,6 +1459,10 @@ impl KafkaClient {
                     )
                 })
                 .collect();
+            let mut known = self.known_node_ids.write();
+            for (id, info) in &md.brokers {
+                known.insert(info.addr.clone(), *id);
+            }
         }
 
         let mut conns = self.conns_by_addr.lock().await;
@@ -2331,7 +2375,11 @@ impl KafkaClient {
             return Err(KafkaClientError::Broker(err));
         }
         let addr = join_host_port(resp.host.as_str(), resp.port);
-        self.load_conn(&addr).await
+        if resp.node_id.0 >= 0 {
+            self.load_conn_for_node(resp.node_id.0, &addr).await
+        } else {
+            self.load_conn(&addr).await
+        }
     }
 
     /// Commits a consumer group offset for `(topic, partition)`.
@@ -3610,7 +3658,7 @@ mod tests {
                 requests_since_auth: std::sync::atomic::AtomicU64::new(0),
                 reauth_lock: tokio::sync::Mutex::new(()),
                 successes: std::sync::atomic::AtomicU64::new(0),
-                node: "99".to_string(),
+                node: Arc::new(parking_lot::RwLock::new("99".to_string())),
                 kprom: None,
                 extended_metrics: None,
             })
@@ -3840,5 +3888,181 @@ mod tests {
         let ctrl_batch = encode_with_non_utf8_header(&[5], true);
         let (ctrl_decoded, _) = decode_single_batch_slice(ctrl_batch, 0).unwrap();
         assert!(ctrl_decoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn w23_csc_12a_find_group_coordinator_attributes_kprom_node_id() {
+        use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+        use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+        use kafka_protocol::messages::ApiVersionsRequest;
+        use kafka_protocol::messages::offset_commit_response::{
+            OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+        };
+        use prometheus::Registry;
+
+        async fn spawn_coord_mock(coord_port_override: Option<i32>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let h = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let coord_port = coord_port_override.unwrap_or(addr.port() as i32);
+                    tokio::spawn(async move {
+                        let (mut rd, mut wr) = stream.into_split();
+                        let mut len_buf = [0u8; 4];
+                        while rd.read_exact(&mut len_buf).await.is_ok() {
+                            let sz = u32::from_be_bytes(len_buf) as usize;
+                            let mut payload = vec![0u8; sz];
+                            if rd.read_exact(&mut payload).await.is_err() {
+                                break;
+                            }
+                            let mut buf = Bytes::from(payload);
+                            let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                            let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                            let Ok(api_key) = ApiKey::try_from(key_i16) else {
+                                break;
+                            };
+                            let hdr_ver = match api_key {
+                                ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                                ApiKey::FindCoordinator => FindCoordinatorRequest::header_version(ver),
+                                ApiKey::OffsetCommit => OffsetCommitRequest::header_version(ver),
+                                _ => break,
+                            };
+                            let Ok(req_hdr) = RequestHeader::decode(&mut buf, hdr_ver) else {
+                                break;
+                            };
+                            let mut out = BytesMut::new();
+                            out.put_u32(0);
+                            let mut resp_hdr = ResponseHeader::default();
+                            resp_hdr.correlation_id = req_hdr.correlation_id;
+                            resp_hdr
+                                .encode(&mut out, api_key.response_header_version(ver))
+                                .unwrap();
+
+                            match api_key {
+                                ApiKey::ApiVersions => {
+                                    let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                    let mut resp = ApiVersionsResponse::default();
+                                    for (k, mn, mx) in [
+                                        (ApiKey::ApiVersions as i16, 0, 3),
+                                        (ApiKey::FindCoordinator as i16, 0, 3),
+                                        (ApiKey::OffsetCommit as i16, 2, 8),
+                                    ] {
+                                        let mut av = ApiVersion::default();
+                                        av.api_key = k;
+                                        av.min_version = mn;
+                                        av.max_version = mx;
+                                        resp.api_keys.push(av);
+                                    }
+                                    resp.encode(&mut out, ver).unwrap();
+                                }
+                                ApiKey::FindCoordinator => {
+                                    let _ = FindCoordinatorRequest::decode(&mut buf, ver);
+                                    let mut resp = FindCoordinatorResponse::default();
+                                    resp.node_id = BrokerId(2);
+                                    resp.host = StrBytes::from_static_str("127.0.0.1");
+                                    resp.port = coord_port;
+                                    resp.encode(&mut out, ver).unwrap();
+                                }
+                                ApiKey::OffsetCommit => {
+                                    let req = OffsetCommitRequest::decode(&mut buf, ver).unwrap();
+                                    let mut resp = OffsetCommitResponse::default();
+                                    for t in &req.topics {
+                                        let mut rt = OffsetCommitResponseTopic::default();
+                                        rt.name = t.name.clone();
+                                        for p in &t.partitions {
+                                            let mut rp = OffsetCommitResponsePartition::default();
+                                            rp.partition_index = p.partition_index;
+                                            rp.error_code = 0;
+                                            rt.partitions.push(rp);
+                                        }
+                                        resp.topics.push(rt);
+                                    }
+                                    resp.encode(&mut out, ver).unwrap();
+                                }
+                                _ => {}
+                            }
+                            let frame_len = (out.len() - 4) as u32;
+                            out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                            if wr.write_all(&out).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            (addr, h)
+        }
+
+        // Case 1: coordinator is a separate broker address from seed_0.
+        let (coord_addr, coord_srv) = spawn_coord_mock(None).await;
+        let (seed_addr, seed_srv) = spawn_coord_mock(Some(coord_addr.port() as i32)).await;
+
+        let reg = Registry::new();
+        let client = KafkaClient::new(
+            vec![seed_addr.to_string()],
+            "test-client",
+            "",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        client.set_kprom(KpromMetrics::new(
+            "cortex_ingest_storage_reader",
+            "partition-reader",
+            Some(&reg),
+        ));
+
+        // commit_offset calls find_group_coordinator BEFORE metadata is ever fetched.
+        client.commit_offset("grp-1", "ingest", 0, 5).await.unwrap();
+
+        let text = prometheus::TextEncoder::new()
+            .encode_to_string(&reg.gather())
+            .unwrap();
+        assert!(
+            text.contains(r#"cortex_ingest_storage_reader_connects_total{component="partition-reader",node_id="2"} 1"#),
+            "expected coordinator node_id=\"2\" in kprom connects_total:\n{text}"
+        );
+        assert!(
+            text.contains(r#"cortex_ingest_storage_reader_write_bytes_total{component="partition-reader",node_id="2"}"#),
+            "expected coordinator node_id=\"2\" write_bytes_total:\n{text}"
+        );
+
+        client.close().await;
+        coord_srv.abort();
+        seed_srv.abort();
+
+        // Case 2: coordinator happens to share the same host:port as seed_0.
+        let (same_addr, same_srv) = spawn_coord_mock(None).await;
+        let reg2 = Registry::new();
+        let client2 = KafkaClient::new(
+            vec![same_addr.to_string()],
+            "test-client",
+            "",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        client2.set_kprom(KpromMetrics::new(
+            "cortex_ingest_storage_reader",
+            "partition-reader",
+            Some(&reg2),
+        ));
+        client2.commit_offset("grp-2", "ingest", 0, 9).await.unwrap();
+        let text2 = prometheus::TextEncoder::new()
+            .encode_to_string(&reg2.gather())
+            .unwrap();
+        assert!(
+            text2.contains(r#"cortex_ingest_storage_reader_write_bytes_total{component="partition-reader",node_id="2"}"#),
+            "expected same-addr coordinator upgraded from seed_0 to node_id=\"2\" write_bytes_total:\n{text2}"
+        );
+        assert!(
+            text2.contains(r#"cortex_ingest_storage_reader_read_bytes_total{component="partition-reader",node_id="2"}"#),
+            "expected same-addr coordinator upgraded from seed_0 to node_id=\"2\" read_bytes_total:\n{text2}"
+        );
+        client2.close().await;
+        same_srv.abort();
     }
 }

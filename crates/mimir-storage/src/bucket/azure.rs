@@ -823,9 +823,22 @@ async fn post_oauth_form(
     Err(last_err)
 }
 
-/// Builds the Azure object store for `cfg` (Go `azure.NewBucketClient` ->
-/// thanos `azure.NewBucketWithConfig`), including the startup container check/creation.
-pub fn new_store(cfg: &AzureConfig) -> Result<Arc<dyn ObjectStore>, BucketError> {
+/// Default timeout applied to the synchronous startup container probe in `new_store`,
+/// matching Mimir's 10s object-storage sanity-check timeout so unreachable endpoints cannot
+/// stall startup across 4x30s retries.
+pub const DEFAULT_CONTAINER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct PreparedAzureStore {
+    conf: ThanosAzureConfig,
+    cc: ContainerClientConfig,
+    retry: RetryConfig,
+    auth: Arc<AzureAuth>,
+    allow_http: bool,
+    container_url: Url,
+    az_client: Arc<AzureHttpClient>,
+}
+
+fn prepare_store(cfg: &AzureConfig) -> Result<PreparedAzureStore, BucketError> {
     let conf = thanos_config(cfg);
     conf.validate().map_err(BucketError::Config)?;
     let env = |k: &str| std::env::var(k).ok();
@@ -846,26 +859,79 @@ pub fn new_store(cfg: &AzureConfig) -> Result<Arc<dyn ObjectStore>, BucketError>
         retry: retry.clone(),
     });
 
-    if conf.storage_create_container {
-        let http = conf.http.clone();
-        let cc2 = cc.clone();
-        let retry2 = retry.clone();
-        let auth2 = Arc::clone(&auth);
+    Ok(PreparedAzureStore {
+        conf,
+        cc,
+        retry,
+        auth,
+        allow_http,
+        container_url,
+        az_client,
+    })
+}
+
+async fn run_container_check(
+    http: &mimir_config::BucketHTTPConfig,
+    cc: &ContainerClientConfig,
+    retry: RetryConfig,
+    auth: Arc<AzureAuth>,
+    container_url: Url,
+    allow_http: bool,
+    timeout: Option<Duration>,
+) -> Result<(), BucketError> {
+    let probe_client = exthttp::reqwest_client(http, timeout, allow_http)?;
+    let probe = AzureHttpClient {
+        container_url,
+        account: cc.account.clone(),
+        client: probe_client,
+        auth,
+        retry,
+    };
+    match timeout {
+        Some(limit) => match tokio::time::timeout(limit, ensure_container(&probe, cc)).await {
+            Ok(res) => res,
+            Err(_) => Err(BucketError::Config(format!(
+                "azure container check failed: context deadline exceeded ({limit:?})"
+            ))),
+        },
+        None => ensure_container(&probe, cc).await,
+    }
+}
+
+/// Builds the Azure object store for `cfg` (Go `azure.NewBucketClient` ->
+/// thanos `azure.NewBucketWithConfig`), bounding the startup container probe to
+/// `DEFAULT_CONTAINER_CHECK_TIMEOUT`.
+pub fn new_store(cfg: &AzureConfig) -> Result<Arc<dyn ObjectStore>, BucketError> {
+    new_store_with_timeout(cfg, Some(DEFAULT_CONTAINER_CHECK_TIMEOUT))
+}
+
+/// Builds the Azure object store with an explicit optional timeout for the initial container probe.
+pub fn new_store_with_timeout(
+    cfg: &AzureConfig,
+    container_check_timeout: Option<Duration>,
+) -> Result<Arc<dyn ObjectStore>, BucketError> {
+    let prep = prepare_store(cfg)?;
+
+    if prep.conf.storage_create_container {
+        let http = prep.conf.http.clone();
+        let cc2 = prep.cc.clone();
+        let retry2 = prep.retry.clone();
+        let auth2 = Arc::clone(&prep.auth);
+        let container_url = prep.container_url.clone();
+        let allow_http = prep.allow_http;
         let res = std::thread::spawn(move || -> Result<(), BucketError> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(async move {
-                let probe_client = exthttp::reqwest_client(&http, None, allow_http)?;
-                let probe = AzureHttpClient {
-                    container_url,
-                    account: cc2.account.clone(),
-                    client: probe_client,
-                    auth: auth2,
-                    retry: retry2,
-                };
-                ensure_container(&probe, &cc2).await
-            })
+            rt.block_on(run_container_check(
+                &http,
+                &cc2,
+                retry2,
+                auth2,
+                container_url,
+                allow_http,
+                container_check_timeout,
+            ))
         })
         .join()
         .map_err(|_| BucketError::Config("azure container check panicked".to_string()))?;
@@ -873,8 +939,35 @@ pub fn new_store(cfg: &AzureConfig) -> Result<Arc<dyn ObjectStore>, BucketError>
     }
 
     Ok(Arc::new(AzureStore {
-        inner: az_client,
-        container: cc.container,
+        inner: prep.az_client,
+        container: prep.cc.container,
+    }))
+}
+
+/// Non-blocking async variant of `new_store_with_timeout` that runs the initial container check
+/// directly on the caller's Tokio task without blocking a worker thread.
+pub async fn new_store_async(
+    cfg: &AzureConfig,
+    container_check_timeout: Option<Duration>,
+) -> Result<Arc<dyn ObjectStore>, BucketError> {
+    let prep = prepare_store(cfg)?;
+
+    if prep.conf.storage_create_container {
+        run_container_check(
+            &prep.conf.http,
+            &prep.cc,
+            prep.retry,
+            prep.auth,
+            prep.container_url,
+            prep.allow_http,
+            container_check_timeout,
+        )
+        .await?;
+    }
+
+    Ok(Arc::new(AzureStore {
+        inner: prep.az_client,
+        container: prep.cc.container,
     }))
 }
 
@@ -2336,5 +2429,51 @@ mod tests {
     fn w20_sdw_11_percent_decode_rejects_plus_and_minus_signs() {
         assert_eq!(percent_decode("a%20b%2Fc"), "a b/c");
         assert_eq!(percent_decode("%+a%-1%zz%2"), "%+a%-1%zz%2");
+    }
+
+    #[tokio::test]
+    async fn w23_csc_06a_new_store_container_check_respects_timeout_on_stalled_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                // Accept TCP connection and hold open without replying to stall HTTP.
+                held.push(sock);
+            }
+        });
+
+        let cfg = AzureConfig {
+            account_name: "devstoreaccount1".into(),
+            container_name: "blocks".into(),
+            connection_string: format!(
+                "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://{addr}/devstoreaccount1;"
+            ),
+            ..Default::default()
+        };
+
+        // 1. Async variant bounds stalled endpoint promptly.
+        let t0 = std::time::Instant::now();
+        let err = new_store_async(&cfg, Some(Duration::from_millis(150)))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("context deadline exceeded"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(2), "elapsed={:?}", t0.elapsed());
+
+        // 2. Sync bounded variant also bounds stalled endpoint promptly.
+        let cfg2 = cfg.clone();
+        let t1 = std::time::Instant::now();
+        let err2 = tokio::task::spawn_blocking(move || {
+            new_store_with_timeout(&cfg2, Some(Duration::from_millis(150)))
+        })
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+        assert!(err2.contains("context deadline exceeded"), "{err2}");
+        assert!(t1.elapsed() < Duration::from_secs(2), "elapsed={:?}", t1.elapsed());
+
+        srv.abort();
     }
 }

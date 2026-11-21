@@ -277,11 +277,18 @@ impl BucketClient {
                 b.gcs.bucket_name.clone(),
                 "GCS",
             ),
-            "azure" => Self::from_backend(
-                Backend::Store(azure::new_store(&b.azure)?),
-                b.azure.container_name.clone(),
-                "AZURE",
-            ),
+            "azure" => {
+                let timeout = if component == "sanity-check" {
+                    Some(std::time::Duration::from_secs(10))
+                } else {
+                    Some(azure::DEFAULT_CONTAINER_CHECK_TIMEOUT)
+                };
+                Self::from_backend(
+                    Backend::Store(azure::new_store_with_timeout(&b.azure, timeout)?),
+                    b.azure.container_name.clone(),
+                    "AZURE",
+                )
+            }
             other => {
                 return Err(BucketError::UnsupportedBackend(other.to_string()));
             }
