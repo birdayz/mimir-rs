@@ -387,7 +387,10 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
     let md = MetadataMap::new();
     let m_eq = vec![proto_matcher(ingesterpb::MatchType::Equal, "__name__", "wll01_m")];
 
-    let qs = ing
+    // Matches Go Prometheus TSDB (head_read.go:513 "can't read from a closed head" /
+    // block.go:479 "block is closing"): TSDB querier-backed RPCs fail with an error while a
+    // closing/closed UserTsdb is still in ing.tsdbs so Querier fails over to healthy replicas.
+    assert!(ing
         .handle_query_stream(
             &md,
             user,
@@ -399,10 +402,9 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
             },
         )
         .await
-        .unwrap();
-    assert_eq!(qs.iter().map(|r| r.streaming_series.len()).sum::<usize>(), 0);
+        .is_err());
 
-    let lv = ing
+    assert!(ing
         .handle_label_values(
             &md,
             user,
@@ -415,10 +417,9 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
             },
         )
         .await
-        .unwrap();
-    assert!(lv.label_values.is_empty());
+        .is_err());
 
-    let ln = ing
+    assert!(ing
         .handle_label_names(
             &md,
             user,
@@ -430,8 +431,7 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
             },
         )
         .await
-        .unwrap();
-    assert!(ln.label_names.is_empty());
+        .is_err());
 
     let us = ing
         .handle_user_stats(&md, user, ingesterpb::UserStatsRequest::default())
@@ -439,7 +439,7 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
         .unwrap();
     assert_eq!(us.num_series, 1);
 
-    let mf = ing
+    assert!(ing
         .handle_metrics_for_label_matchers(
             &md,
             user,
@@ -453,8 +453,7 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
             },
         )
         .await
-        .unwrap();
-    assert!(mf.metric.is_empty());
+        .is_err());
 
     let mm = ing
         .handle_metrics_metadata(&md, user, ingesterpb::MetricsMetadataRequest::default())
@@ -502,7 +501,7 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
         .unwrap();
     let _ = active;
 
-    let sln = ing
+    assert!(ing
         .handle_search_label_names(
             &md,
             user,
@@ -514,10 +513,9 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
             },
         )
         .await
-        .unwrap();
-    assert!(sln.is_empty());
+        .is_err());
 
-    let slv = ing
+    assert!(ing
         .handle_search_label_values(
             &md,
             user,
@@ -530,8 +528,7 @@ async fn wll_01_closed_user_tsdb_returns_empty_ok_on_all_read_rpcs() {
             },
         )
         .await
-        .unwrap();
-    assert!(slv.is_empty());
+        .is_err());
 
     let _ = ing.stop().await;
 }

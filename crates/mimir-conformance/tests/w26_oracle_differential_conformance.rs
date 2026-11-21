@@ -117,7 +117,7 @@ struct VerifyIndexFileResp {
     error: String,
     version: u8,
     #[serde(default)]
-    label_names: Vec<String>,
+    label_names: Option<Vec<String>>,
     series_count: usize,
     #[serde(default)]
     query_error: Option<String>,
@@ -1502,7 +1502,7 @@ fn w26_oracle_tsdb_index_v1_v2_differential() {
                 panic!("iter {iter}: Go opened & queried cleanly but Rust failed open: {e}")
             });
             assert_eq!(r.version(), go_chk.version);
-            assert_eq!(r.label_names(), go_chk.label_names);
+            assert_eq!(r.label_names(), go_chk.label_names.unwrap_or_default());
             let all = r.all_postings().expect("rust all_postings");
             assert_eq!(all.len(), go_chk.series_count);
             for id in all {

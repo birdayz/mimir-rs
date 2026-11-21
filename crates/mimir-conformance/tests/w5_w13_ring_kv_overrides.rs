@@ -561,7 +561,7 @@ fn runtime_config_cost_attribution_trackers_and_otel_override_inheritance() {
     defaults.name_validation_scheme = NameValidationScheme::Utf8;
     defaults.otel_metric_suffixes_enabled = Some(true);
     defaults.otel_translation_strategy =
-        OTelTranslationStrategy("NoUTF8EscapingWithSuffixes".to_string());
+        OTelTranslationStrategy("UnderscoreEscapingWithoutSuffixes".to_string());
 
     let rt_yaml = br#"
 overrides:
@@ -598,7 +598,7 @@ overrides:
     assert_eq!(ov.name_validation_scheme("tenant_a"), NameValidationScheme::Utf8);
     assert_eq!(
         ov.otel_translation_strategy("tenant_a").0,
-        "NoUTF8EscapingWithSuffixes"
+        "UnderscoreEscapingWithoutSuffixes"
     );
 
     // 2. Twin-process Go vs Rust /runtime_config parity with cost_attribution_trackers overlay
