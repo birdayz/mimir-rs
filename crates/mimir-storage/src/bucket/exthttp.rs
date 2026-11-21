@@ -22,8 +22,10 @@
 //!   `min(per_host, max_idle)`.
 //! - `InsecureSkipVerify` -> accept invalid certificates (rustls: any certificate and hostname,
 //!   like Go).
-//! - `TLSConfig.CAFile` -> additional trusted root certificates. NOTE: Go replaces the system
-//!   roots with the CA file; `object_store` 0.11 can only add roots (documented divergence).
+//! - `TLSConfig.CAFile` -> replaces the system root certificates via `reqwest_client`
+//!   (`.tls_built_in_root_certs(false)`, used by both GCS and Azure bucket clients, matching Go
+//!   `exthttp.updateRootCA`). `client_options` is retained only for legacy `object_store` 0.11
+//!   helpers where `ClientOptions::with_root_certificate` appends rather than replaces.
 //! - `ForceAttemptHTTP2` -> HTTP/2 via ALPN. Go disables HTTP/2 when a custom `TLSClientConfig`
 //!   is set (always the case here) unless `ForceAttemptHTTP2` is true, so the default is HTTP/1.1.
 //! - `ExpectContinueTimeout` only applies to requests carrying `Expect: 100-continue`; neither the
@@ -526,11 +528,24 @@ mod tests {
                 let acc = acceptor.clone();
                 tokio::spawn(async move {
                     if let Ok(mut tls) = acc.accept(sock).await {
-                        let mut buf = [0u8; 1024];
-                        let _ = tls.read(&mut buf).await;
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 1024];
+                        while let Ok(n) = tls.read(&mut tmp).await {
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
                         let _ = tls
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
+                            )
                             .await;
+                        let _ = tls.flush().await;
+                        let _ = tls.shutdown().await;
                     }
                 });
             }
@@ -560,6 +575,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_connect() || err.is_request(), "expected TLS verify error, got {err:?}");
+
+        // Verify GCS and Azure builders propagate http.tls_ca_path via reqwest_client
+        // (replacing OS roots rather than appending).
+        let conn_str = format!(
+            "DefaultEndpointsProtocol=https;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=https://localhost:{};",
+            addr.port()
+        );
+        let az_wrong_cfg = mimir_config::AzureConfig {
+            account_name: "devstoreaccount1".into(),
+            connection_string: conn_str.clone(),
+            container_name: "mimir".into(),
+            max_retries: 0,
+            http: wrong_cfg.clone(),
+            ..Default::default()
+        };
+        let az_err = crate::bucket::azure::new_store_async(
+            &az_wrong_cfg,
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            az_err.contains("azure") && !az_err.contains("storage_account_name"),
+            "expected TLS failure with wrong tls_ca_path on Azure store, got {az_err}"
+        );
+
+        let az_ok_cfg = mimir_config::AzureConfig {
+            http: ok_cfg.clone(),
+            ..az_wrong_cfg
+        };
+        crate::bucket::azure::new_store_async(&az_ok_cfg, Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+
+        let gcs_cfg = mimir_config::GCSConfig {
+            bucket_name: "mimir".into(),
+            service_account: r#"{"type":"authorized_user","client_id":"cid","client_secret":"sec","refresh_token":"rt","token_uri":"https://localhost/token"}"#.into(),
+            http: wrong_cfg,
+            ..Default::default()
+        };
+        assert!(crate::bucket::gcs::new_store(&gcs_cfg).is_ok());
 
         srv.abort();
     }

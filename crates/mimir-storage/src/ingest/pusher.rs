@@ -305,11 +305,7 @@ pub struct PusherError {
 
 impl fmt::Display for PusherError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ref code) = self.grpc_code {
-            write!(f, "rpc error: code = {code} desc = {}", self.message)
-        } else {
-            f.write_str(&self.message)
-        }
+        f.write_str(&self.message)
     }
 }
 
@@ -334,6 +330,15 @@ impl PusherError {
 
     pub fn with_do_not_log(mut self) -> Self {
         self.log_policy = Some(LogPolicy::DoNotLog);
+        self
+    }
+
+    /// Prepends gRPC's `rpc error: code = <Code> desc = ` prefix (matching `status.Status.Err()`
+    /// used by Go `pusher_test.go` mocks, unlike real `globalerror.ErrorWithStatus.Error()`).
+    pub fn with_grpc_status_prefix(mut self) -> Self {
+        if let Some(ref code) = self.grpc_code {
+            self.message = format!("rpc error: code = {code} desc = {}", self.message);
+        }
         self
     }
 

@@ -137,14 +137,14 @@ impl IngestReaderHandle {
 pub struct IngesterStorageAdapter(pub Arc<Ingester>);
 
 pub fn ingester_err_to_pusher_err(err: IngesterError) -> PusherError {
-    let cause = err.error_cause();
+    let cause = err.has_ingester_error_details().then(|| err.error_cause());
     let grpc_code = match cause {
-        ErrorCause::BadData => "InvalidArgument",
-        ErrorCause::TenantLimit => "FailedPrecondition",
-        ErrorCause::ServiceUnavailable
-        | ErrorCause::InstanceLimit
-        | ErrorCause::CircuitBreakerOpen => "Unavailable",
-        ErrorCause::MethodNotAllowed => "Unimplemented",
+        Some(ErrorCause::BadData) => "InvalidArgument",
+        Some(ErrorCause::TenantLimit) => "FailedPrecondition",
+        Some(ErrorCause::ServiceUnavailable)
+        | Some(ErrorCause::InstanceLimit)
+        | Some(ErrorCause::CircuitBreakerOpen) => "Unavailable",
+        Some(ErrorCause::MethodNotAllowed) => "Unimplemented",
         _ => "Internal",
     };
     let log_policy = if err.is_do_not_log() {
@@ -159,7 +159,7 @@ pub fn ingester_err_to_pusher_err(err: IngesterError) -> PusherError {
     };
     PusherError {
         message: err.to_string(),
-        cause: Some(cause),
+        cause,
         grpc_code: Some(grpc_code.to_string()),
         log_policy,
     }

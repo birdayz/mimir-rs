@@ -290,3 +290,32 @@ async fn w19_rkn_09_kafka_transport_dial_allows_non_dns_server_name_when_insecur
 
     srv.abort();
 }
+
+#[tokio::test]
+async fn d_tls_03_s3_bucket_accepts_non_rfc_server_name_when_insecure_skip_verify() {
+    let s3_cfg = S3Config {
+        endpoint: "127.0.0.1:9000".to_string(),
+        bucket_name: "test-bkt".to_string(),
+        region: "us-east-1".to_string(),
+        access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+        secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        insecure: true,
+        http: BucketHTTPConfig {
+            tls_server_name: "bad_host:9092".to_string(),
+            insecure_skip_verify: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(S3Bucket::new(&s3_cfg, "ingester").is_ok());
+
+    let strict_cfg = S3Config {
+        http: BucketHTTPConfig {
+            tls_server_name: "bad_host:9092".to_string(),
+            insecure_skip_verify: false,
+            ..Default::default()
+        },
+        ..s3_cfg
+    };
+    assert!(S3Bucket::new(&strict_cfg, "ingester").is_err());
+}

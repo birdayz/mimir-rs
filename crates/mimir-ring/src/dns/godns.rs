@@ -340,33 +340,70 @@ impl Resolver {
         } else {
             format!("_{service}._{proto}.{name}")
         };
-        let (resolver, _) = self.current();
-        match resolver.srv_lookup(target.as_str()).await {
-            Ok(lookup) => {
-                let cname = lookup.query().name().to_ascii();
-                let mut srvs: Vec<Srv> = lookup
-                    .iter()
-                    .map(|s| Srv {
-                        target: s.target().to_ascii(),
-                        port: s.port(),
-                        priority: s.priority(),
-                        weight: s.weight(),
-                    })
-                    .collect();
-                if srvs.is_empty() {
-                    return Err(Box::new(GoDnsError {
-                        err: ERR_NO_SUCH_HOST.to_string(),
-                        name: target,
-                        server: String::new(),
-                        is_timeout: false,
-                        is_not_found: true,
-                    }));
-                }
-                sort_by_priority_weight(&mut srvs, &mut rand::thread_rng());
-                Ok((cname, srvs))
-            }
-            Err(e) => Err(Box::new(GoDnsError::from_resolve_error(&target, &e))),
+        // Go net.DefaultResolver.LookupSRV rejects empty target (isDomainName("") == false)
+        // locally with IsNotFound without issuing a root-zone "." query.
+        if target.is_empty() {
+            return Err(Box::new(GoDnsError {
+                err: ERR_NO_SUCH_HOST.to_string(),
+                name: target,
+                server: String::new(),
+                is_timeout: false,
+                is_not_found: true,
+            }));
         }
+        let parsed_name = match target.as_str().into_name() {
+            Ok(n) => n,
+            Err(e) => {
+                let re = ResolveError::from(e);
+                return Err(Box::new(GoDnsError::from_resolve_error(&target, &re)));
+            }
+        };
+        let (resolver, _) = self.current();
+        let candidates =
+            build_go_search_candidates(&target, &parsed_name, resolver.config(), resolver.options());
+        let mut first_non_not_found: Option<ResolveError> = None;
+        let mut first_not_found: Option<ResolveError> = None;
+
+        for cand in candidates {
+            match resolver.srv_lookup(cand).await {
+                Ok(lookup) => {
+                    let cname = lookup.query().name().to_ascii();
+                    let mut srvs: Vec<Srv> = lookup
+                        .iter()
+                        .map(|s| Srv {
+                            target: s.target().to_ascii(),
+                            port: s.port(),
+                            priority: s.priority(),
+                            weight: s.weight(),
+                        })
+                        .collect();
+                    if !srvs.is_empty() {
+                        sort_by_priority_weight(&mut srvs, &mut rand::thread_rng());
+                        return Ok((cname, srvs));
+                    }
+                }
+                Err(e) => {
+                    if !is_not_found_resolve_error(&e) {
+                        if first_non_not_found.is_none() {
+                            first_non_not_found = Some(e);
+                        }
+                    } else if first_not_found.is_none() {
+                        first_not_found = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_non_not_found.as_ref().or(first_not_found.as_ref()) {
+            return Err(Box::new(GoDnsError::from_resolve_error(&target, err)));
+        }
+        Err(Box::new(GoDnsError {
+            err: ERR_NO_SUCH_HOST.to_string(),
+            name: target,
+            server: String::new(),
+            is_timeout: false,
+            is_not_found: true,
+        }))
     }
 }
 
@@ -780,5 +817,126 @@ mod tests {
             "candidate 2 must never be queried once candidate 1 returned an A record"
         );
         srv_search.abort();
+    }
+
+    fn build_mock_srv_reply(req: &[u8], q_end: usize, rcode: u8, target: Option<(&[&str], u16)>) -> Vec<u8> {
+        let mut resp = Vec::with_capacity(q_end + 64);
+        resp.extend_from_slice(&req[..q_end]);
+        let rd = req[2] & 0x01;
+        resp[2] = 0x80 | rd;
+        resp[3] = 0x80 | rcode;
+        resp[4] = 0;
+        resp[5] = 1;
+        let ancount: u16 = if target.is_some() { 1 } else { 0 };
+        resp[6..8].copy_from_slice(&ancount.to_be_bytes());
+        resp[8..12].fill(0);
+        if let Some((labels, port)) = target {
+            let mut target_wire = Vec::new();
+            for l in labels {
+                target_wire.push(l.len() as u8);
+                target_wire.extend_from_slice(l.as_bytes());
+            }
+            target_wire.push(0);
+            let rdlength = 6 + target_wire.len();
+            resp.extend_from_slice(&[0xc0, 0x0c]);
+            resp.extend_from_slice(&33u16.to_be_bytes()); // SRV
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&30u32.to_be_bytes());
+            resp.extend_from_slice(&(rdlength as u16).to_be_bytes());
+            resp.extend_from_slice(&10u16.to_be_bytes()); // priority
+            resp.extend_from_slice(&1u16.to_be_bytes()); // weight
+            resp.extend_from_slice(&port.to_be_bytes());
+            resp.extend_from_slice(&target_wire);
+        }
+        resp
+    }
+
+    #[tokio::test]
+    async fn d_dns_01_empty_srv_target_is_not_found_and_sends_zero_packets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::UdpSocket;
+
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let port = sock.local_addr().unwrap().port();
+        let packets = Arc::new(AtomicUsize::new(0));
+        let packets_srv = Arc::clone(&packets);
+        let sock_srv = Arc::clone(&sock);
+        let srv = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while sock_srv.recv_from(&mut buf).await.is_ok() {
+                packets_srv.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let ns = NameServerConfigGroup::from_ips_clear(&[IpAddr::V4(Ipv4Addr::LOCALHOST)], port, true);
+        let mut builder = TokioResolver::builder_with_config(
+            ResolverConfig::from_parts(None, vec![], ns),
+            TokioConnectionProvider::default(),
+        );
+        builder.options_mut().timeout = Duration::from_secs(5);
+        builder.options_mut().attempts = 1;
+        let r = Resolver::with_resolver(builder.build());
+
+        let err = tokio::time::timeout(Duration::from_millis(200), r.lookup_srv("", "", ""))
+            .await
+            .expect("empty SRV lookup must fail locally without network I/O")
+            .unwrap_err();
+        assert!(r.is_not_found(err.as_ref()), "{err}");
+        assert_eq!(packets.load(Ordering::SeqCst), 0);
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn d_dns_01_srv_lookup_follows_go_name_list_search_before_domain() {
+        use tokio::net::UdpSocket;
+
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let port = sock.local_addr().unwrap().port();
+        let seen_qnames = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen_srv = Arc::clone(&seen_qnames);
+        let sock_srv = Arc::clone(&sock);
+        let srv = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = sock_srv.recv_from(&mut buf).await {
+                let Some((qname, qtype, q_end)) = parse_qname_and_qtype(&buf[..n]) else {
+                    continue;
+                };
+                seen_srv.lock().push(format!("{qname}:{qtype}"));
+                let resp = if qname == "_gossip._tcp.svc.search1.local." && qtype == 33 {
+                    build_mock_srv_reply(
+                        &buf[..n],
+                        q_end,
+                        0,
+                        Some((&["pod-0", "search1", "local"], 7946)),
+                    )
+                } else {
+                    build_mock_srv_reply(&buf[..n], q_end, 3, None)
+                };
+                let _ = sock_srv.send_to(&resp, peer).await;
+            }
+        });
+
+        let ns = NameServerConfigGroup::from_ips_clear(&[IpAddr::V4(Ipv4Addr::LOCALHOST)], port, true);
+        let domain = Some(Name::from_ascii("domain.local.").unwrap());
+        let search = vec![Name::from_ascii("search1.local.").unwrap()];
+        let mut builder = TokioResolver::builder_with_config(
+            ResolverConfig::from_parts(domain, search, ns),
+            TokioConnectionProvider::default(),
+        );
+        builder.options_mut().cache_size = 0;
+        builder.options_mut().attempts = 1;
+        builder.options_mut().ndots = 5;
+
+        let r = Resolver::with_resolver(builder.build());
+        let (_cname, srvs) = r.lookup_srv("", "", "_gossip._tcp.svc").await.unwrap();
+        assert_eq!(srvs.len(), 1);
+        assert_eq!(srvs[0].target, "pod-0.search1.local.");
+        assert_eq!(srvs[0].port, 7946);
+        assert_eq!(
+            *seen_qnames.lock(),
+            vec!["_gossip._tcp.svc.search1.local.:33".to_string()],
+            "Go nameList must try search before domain"
+        );
+        srv.abort();
     }
 }

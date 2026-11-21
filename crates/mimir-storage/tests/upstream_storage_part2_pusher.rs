@@ -206,8 +206,8 @@ async fn test_pusher_consumer() {
                 (1, TENANT_ID, wr_bytes[2].clone()),
             ],
             responses: vec![
-                Err(PusherError::ingester(ErrorCause::BadData, "InvalidArgument", "ingester test error")),
-                Err(PusherError::ingester(ErrorCause::BadData, "Unknown", "ingester test error")),
+                Err(PusherError::ingester(ErrorCause::BadData, "InvalidArgument", "ingester test error").with_grpc_status_prefix()),
+                Err(PusherError::ingester(ErrorCause::BadData, "Unknown", "ingester test error").with_grpc_status_prefix()),
                 Ok(()),
             ],
             expected_wrs: write_reqs[0..3].to_vec(),
@@ -227,8 +227,8 @@ async fn test_pusher_consumer() {
                 (1, TENANT_ID, wr_bytes[4].clone()),
             ],
             responses: vec![
-                Err(PusherError::ingester(ErrorCause::BadData, "InvalidArgument", "ingester test error")),
-                Err(PusherError::ingester(ErrorCause::TsdbUnavailable, "Unavailable", "ingester internal error")),
+                Err(PusherError::ingester(ErrorCause::BadData, "InvalidArgument", "ingester test error").with_grpc_status_prefix()),
+                Err(PusherError::ingester(ErrorCause::TsdbUnavailable, "Unavailable", "ingester internal error").with_grpc_status_prefix()),
             ],
             expected_wrs: write_reqs[0..2].to_vec(),
             exp_err: Some("ingester internal error"),
@@ -1291,4 +1291,69 @@ async fn test_batching_queue_error_handling() {
         let batch = rx.recv().await.unwrap();
         assert_eq!(batch.write_request.timeseries, vec![s1]);
     }
+}
+
+#[tokio::test]
+async fn w27_a_03_pusher_error_formats_bare_message_without_grpc_prefix() {
+    let client_err = PusherError::ingester(
+        ErrorCause::BadData,
+        "InvalidArgument",
+        "user=t1: sample out of bounds",
+    );
+    assert_eq!(client_err.to_string(), "user=t1: sample out of bounds");
+
+    let server_err = PusherError::ingester(
+        ErrorCause::TsdbUnavailable,
+        "Unavailable",
+        "tsdb closing",
+    );
+    assert_eq!(server_err.to_string(), "tsdb closing");
+
+    let req = cortexpb::WriteRequest {
+        timeseries: vec![mock_timeseries("s_w27_a_03")],
+        ..Default::default()
+    };
+    let mut wr_bytes = Vec::new();
+    req.encode(&mut wr_bytes).unwrap();
+
+    // Client error log must contain bare message without "rpc error: code = ... desc = ".
+    let log_sink = Arc::new(SyncMutex::new(Vec::<String>::new()));
+    let c_err = client_err.clone();
+    let pusher_client = Arc::new(FnPusher(move |_, _| {
+        let e = c_err.clone();
+        async move { Err(e) }
+    }));
+    let mut cfg = create_test_kafka_config("", "test");
+    cfg.ingestion_concurrency_max = 0;
+    let consumer = PusherConsumer::new(
+        pusher_client,
+        cfg.clone(),
+        PusherConsumerMetrics::new(Some(&Registry::new())),
+    )
+    .with_log_sink(Arc::clone(&log_sink));
+    consumer
+        .consume(make_fetched_records(vec![(1, "t1", wr_bytes.clone())]))
+        .await
+        .unwrap();
+    let logs = log_sink.lock().clone();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].contains("err=\"user=t1: sample out of bounds\""), "logs: {logs:?}");
+    assert!(!logs[0].contains("rpc error: code ="), "logs: {logs:?}");
+
+    // Server error return must wrap bare message without "rpc error: code = ... desc = ".
+    let s_err = server_err.clone();
+    let pusher_server = Arc::new(FnPusher(move |_, _| {
+        let e = s_err.clone();
+        async move { Err(e) }
+    }));
+    let consumer_srv = PusherConsumer::new(
+        pusher_server,
+        cfg,
+        PusherConsumerMetrics::new(Some(&Registry::new())),
+    );
+    let err = consumer_srv
+        .consume(make_fetched_records(vec![(1, "t1", wr_bytes)]))
+        .await
+        .unwrap_err();
+    assert_eq!(err, "consuming record at offset 0 for tenant t1: tsdb closing");
 }
