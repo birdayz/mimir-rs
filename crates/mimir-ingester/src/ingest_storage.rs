@@ -892,11 +892,6 @@ impl IngesterShardedBatchConsumer {
                     }
                 }
 
-                let max_exemplars = self
-                    .ingester
-                    .limiter
-                    .max_exemplars_per_user(&tenant_ids[tenant_idx as usize]);
-
                 if version == 2 {
                     let label_bytes_base = label_bytes_arena.len();
                     let samples_base = samples_arena.len();
@@ -910,9 +905,9 @@ impl IngesterShardedBatchConsumer {
                     let mut rec_metadata: Vec<BorrowedMetadata<'_>> = Vec::new();
                     let mut rec_first_shard: Option<usize> = None;
                     let mut rec_series_count = 0usize;
-                    // Exemplars are always unmarshalled (and so validated on the wire), like Go:
-                    // only the distributor sets `SkipUnmarshalingExemplars`. With exemplars
-                    // disabled for the tenant they are just not converted below.
+                    // Exemplars are always unmarshalled and retained during decode, matching Go:
+                    // only the distributor sets `SkipUnmarshalingExemplars`, and
+                    // `max_global_exemplars_per_user > 0` is checked at exemplar append time.
                     let stream_res = decode_rw2_stream(
                         &rec.value,
                         DecodeOptions::kafka_v2(),
@@ -954,7 +949,7 @@ impl IngesterShardedBatchConsumer {
 
                             let ex_start = exemplars_arena.len();
                             let mut ex_len = 0usize;
-                            if max_exemplars > 0 && ts.exemplars_len() > 0 {
+                            if ts.exemplars_len() > 0 {
                                 tmp_ex.clear();
                                 for ex in ts.exemplars() {
                                     let res = convert_borrowed_exemplar(&ex);
@@ -1249,7 +1244,7 @@ impl IngesterShardedBatchConsumer {
 
                     let ex_start = exemplars_arena.len();
                     let mut ex_len = 0usize;
-                    if max_exemplars > 0 && ts.exemplars().len() > 0 {
+                    if ts.exemplars().len() > 0 {
                         tmp_ex.clear();
                         for ex in ts.exemplars() {
                             let res = convert_borrowed_exemplar(&ex);
@@ -2292,5 +2287,129 @@ mod consumer_tests {
         assert!(err.contains("consuming record at offset 7 for tenant tenant-a"), "{err}");
         assert_eq!(c.metrics.storage_pusher_metrics.server_err_requests.get(), 1.0);
         assert!(ing.get_user_metadata("tenant-a").is_none());
+    }
+
+    #[test]
+    fn f4_w24_b01_kafka_v1_and_v2_preserve_wire_exemplars_when_max_exemplars_is_zero() {
+        for version in [RecordVersion::V1, RecordVersion::V2] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ing = running_ingester(tmp.path());
+            let reg = prometheus::Registry::new();
+            let c = consumer(&ing, &reg);
+
+            // Seed tenant-a so head is initialized and min_append_time_available is true.
+            let t0 = now_ms();
+            let seed = cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![cortexpb::LabelPair {
+                        name: "__name__".into(),
+                        value: "kafka_f4_seed".into(),
+                    }],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: t0,
+                        value: 1.0,
+                    }],
+                    exemplars: vec![cortexpb::Exemplar {
+                        labels: vec![cortexpb::LabelPair {
+                            name: "trace_id".into(),
+                            value: "t0".into(),
+                        }],
+                        value: 1.0,
+                        timestamp_ms: t0,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            c.consume_records_sync(&records(version, "tenant-a", &seed, 1))
+                .unwrap();
+
+            // Sample commits, exemplar is not stored when max_global_exemplars_per_user == 0.
+            let db = ing.get_tsdb("tenant-a").unwrap();
+            let mut ex_count = 0usize;
+            db.db.head().exemplars().iterate_exemplars(|_, _| ex_count += 1);
+            assert_eq!(ex_count, 0);
+
+            // Exemplar-only series with invalid UTF-8 labels must be treated as a 4xx client error
+            // and increment ingested_exemplars_fail (NOT silently accepted!).
+            let fail_before = ing.metrics.ingested_exemplars_fail.get();
+            let bad_ex_only = cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![cortexpb::LabelPair {
+                        name: "__name__".into(),
+                        value: if version == RecordVersion::V2 {
+                            bytes::Bytes::from_static(b"BAD_MARKER_UTF8")
+                        } else {
+                            bytes::Bytes::from_static(&[0xff, 0xfe])
+                        },
+                    }],
+                    exemplars: vec![cortexpb::Exemplar {
+                        labels: vec![cortexpb::LabelPair {
+                            name: "trace_id".into(),
+                            value: "t_bad".into(),
+                        }],
+                        value: 1.0,
+                        timestamp_ms: t0,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut recs_bad = records(version, "tenant-a", &bad_ex_only, 2);
+            if version == RecordVersion::V2 {
+                // Replace the valid ASCII marker inside the V2 symbol table with invalid UTF-8
+                // while keeping the snappy/raw frame length identical.
+                let needle = b"BAD_MARKER_UTF8";
+                let mut patched = false;
+                for r in &mut recs_bad {
+                    let mut buf = r.value.to_vec();
+                    if let Some(pos) = buf.windows(needle.len()).position(|w| w == needle) {
+                        buf[pos] = 0xff;
+                        buf[pos + 1] = 0xfe;
+                        r.value = bytes::Bytes::from(buf);
+                        patched = true;
+                    }
+                }
+                assert!(patched, "expected V2 symbol marker in serialized record");
+            }
+            let client_before = c.metrics.storage_pusher_metrics.client_err_requests.get();
+            c.consume_records_sync(&recs_bad).unwrap();
+            assert_eq!(
+                c.metrics.storage_pusher_metrics.client_err_requests.get(),
+                client_before + 1.0,
+                "version={version:?}: exemplar-only invalid UTF-8 must count as client error"
+            );
+            assert_eq!(ing.metrics.ingested_exemplars_fail.get(), fail_before + 1.0);
+
+            // OOB sample + missing __name__ + wire exemplar must trigger server error (500),
+            // not OOB fast-path 400!
+            let ooo_missing_name = cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![cortexpb::LabelPair {
+                        name: "job".into(),
+                        value: "missing_name".into(),
+                    }],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: t0 - 3_600_000,
+                        value: 1.0,
+                    }],
+                    exemplars: vec![cortexpb::Exemplar {
+                        labels: vec![cortexpb::LabelPair {
+                            name: "trace_id".into(),
+                            value: "t_oob".into(),
+                        }],
+                        value: 1.0,
+                        timestamp_ms: t0,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let res = c.consume_records_sync(&records(version, "tenant-a", &ooo_missing_name, 3));
+            assert!(
+                res.is_err(),
+                "version={version:?}: OOB sample + missing __name__ + exemplar must hard-fail as server error"
+            );
+        }
     }
 }

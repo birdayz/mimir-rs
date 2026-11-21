@@ -614,7 +614,7 @@ impl Ingester {
                     continue;
                 }
             }
-            if db.db.head().num_series() < series_before {
+            if db.db.head().num_series() != series_before {
                 db.trigger_recompute_owned_series(RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION);
                 self.metrics
                     .early_compaction_non_owned_series_triggered
@@ -1698,5 +1698,115 @@ mod tests {
         let _ = loop_handle.await;
         ring_svc.stop_async();
         let _ = ring_svc.await_terminated().await;
+    }
+
+    #[tokio::test]
+    async fn f6_compact_non_owned_series_triggers_recompute_when_series_after_gt_series_before() {
+        use crate::ingester::Ingester;
+        use mimir_config::limits::LimitsConfig;
+        use mimir_config::{
+            BlocksStorageConfig, GoDuration, IngestStorageConfig, IngesterConfig, Overrides,
+        };
+        use mimir_proto::cortexpb::{LabelPair, Sample, TimeSeries, WriteRequest};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = IngesterConfig::default();
+        cfg.ring.instance_id = "ing-self".to_string();
+        cfg.early_compaction_non_owned_series_enabled = true;
+        cfg.early_compaction_non_owned_series_min_grace_period = GoDuration::ZERO;
+        cfg.early_compaction_non_owned_series_max_grace_period = GoDuration::ZERO;
+        let mut bcfg = BlocksStorageConfig::default();
+        bcfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        bcfg.tsdb.ship_interval = GoDuration::ZERO;
+
+        let limits = LimitsConfig {
+            early_head_compaction_owned_series_threshold: 1,
+            ..Default::default()
+        };
+        let ing = Ingester::new(
+            cfg,
+            bcfg,
+            IngestStorageConfig::default(),
+            Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        // Push 1000 series so selected-series compaction takes long enough for a concurrent push
+        // to add more new series while compact_selected_series is running (making series_after > series_before).
+        let now_ms = 1_700_000_000_000i64;
+        let ts_vec: Vec<TimeSeries> = (0..1000)
+            .map(|k| TimeSeries {
+                labels: vec![
+                    LabelPair {
+                        name: bytes::Bytes::from_static(b"__name__"),
+                        value: bytes::Bytes::from(format!("non_owned_{k}")),
+                    },
+                ],
+                samples: vec![Sample {
+                    timestamp_ms: now_ms,
+                    value: k as f64,
+                }],
+                ..Default::default()
+            })
+            .collect();
+        ing.push_grpc("user-f6", &WriteRequest {
+            timeseries: ts_vec,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Mark 2 series as aged non-owned so compact_blocks_due_to_non_owned_series compacts them.
+        let db = ing.get_tsdb("user-f6").unwrap();
+        let mut non_owned = std::collections::HashSet::new();
+        non_owned.insert(1);
+        non_owned.insert(2);
+        db.add_pending_non_owned_refs(&non_owned);
+        db.backdate_pending_non_owned_refs(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        );
+
+        // Hold compaction_mtx briefly via a spawned task? No: instead test both:
+        // (1) when num_series is bumped concurrently during compact_blocks_due_to_non_owned_series,
+        // and (2) directly verify that num_series() > series_before triggers the metric & recompute.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_c = Arc::clone(&done);
+        let db_push = Arc::clone(&db);
+        let push_task = tokio::spawn(async move {
+            let mut j = 0usize;
+            while !done_c.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut app = db_push.db.appender();
+                for _ in 0..10 {
+                    let name = format!("concurrent_new_{j}");
+                    j += 1;
+                    app.append_float(None, &[("__name__", &name)], now_ms + 1000, 1.0)
+                        .unwrap();
+                }
+                app.commit().unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        ing.compact_blocks_due_to_non_owned_series(Duration::ZERO)
+            .await;
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        push_task.await.unwrap();
+
+        assert_eq!(
+            ing.metrics
+                .early_compaction_non_owned_series_triggered
+                .with_label_values(&["user-f6"])
+                .get(),
+            1.0,
+            "!= series_before check must trigger even when concurrent pushes raise num_series above series_before"
+        );
     }
 }

@@ -1294,7 +1294,6 @@ impl Ingester {
             let mut min_ts = i64::MAX;
             let mut all_sorted_unique = true;
             let mut all_sorted_have_metric_name = true;
-            let max_exemplars = self.limiter.max_exemplars_per_user(user_id);
 
             let ClassicPushScratch {
                 ref mut wr_scratch,
@@ -1305,9 +1304,9 @@ impl Ingester {
                 ref mut series_metas,
             } = *s;
 
-            // Exemplars are always unmarshalled (and so validated on the wire), like Go: only the
-            // distributor sets `SkipUnmarshalingExemplars`. With exemplars disabled for the tenant
-            // they are just not converted below.
+            // Exemplars are always unmarshalled and retained during decode, matching Go: only the
+            // distributor sets `SkipUnmarshalingExemplars`, and `max_global_exemplars_per_user > 0`
+            // is checked at exemplar append time (after MinTimestamp, OOB fast-path, and label checks).
             let stream_res = mimir_proto::zerocopy::decode_classic_stream(
                 raw_bytes,
                 mimir_proto::zerocopy::DecodeOptions::classic(),
@@ -1334,15 +1333,13 @@ impl Ingester {
 
                     let ex_start = exemplars_arena.len();
                     let mut ex_len = 0usize;
-                    if max_exemplars > 0 {
-                        for ex in series.exemplars() {
-                            let res = convert_borrowed_exemplar(&ex);
-                            if let Ok(ref conv) = res {
-                                min_ts = min_ts.min(conv.0);
-                            }
-                            exemplars_arena.push(res);
-                            ex_len += 1;
+                    for ex in series.exemplars() {
+                        let res = convert_borrowed_exemplar(&ex);
+                        if let Ok(ref conv) = res {
+                            min_ts = min_ts.min(conv.0);
                         }
+                        exemplars_arena.push(res);
+                        ex_len += 1;
                     }
 
                     let (raw_label_start, raw_label_len) = match series.raw_label_bytes_range {
@@ -5336,5 +5333,341 @@ mod wave3_tests {
         let mut ex_count = 0usize;
         db.db.head().exemplars().iterate_exemplars(|_, _| ex_count += 1);
         assert_eq!(ex_count, 2);
+    }
+
+    #[test]
+    fn f4_w24_b01_raw_grpc_push_preserves_wire_exemplars_when_max_exemplars_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "test-f4".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().to_string();
+        // Default max_global_exemplars_per_user == 0, with out_of_order_time_window == 0
+        // and past_grace_period > 0 so all OOB/grace/exemplar-timestamp interactions are exercised.
+        let mut limits = mimir_config::LimitsConfig::default();
+        assert_eq!(limits.max_global_exemplars_per_user, 0);
+        limits.out_of_order_time_window = mimir_config::ModelDuration(0);
+        limits.past_grace_period = mimir_config::ModelDuration(2 * 3_600 * 1_000_000_000); // 2h
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let encode = |req: &cortexpb::WriteRequest| mimir_proto::prost::Message::encode_to_vec(req);
+
+        // (e) Normal sample + exemplar with max_global_exemplars_per_user == 0:
+        // sample commits, exemplar is NOT stored in TSDB.
+        let seed_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("__name__", "f4_seed")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now - 5_000,
+                    value: 1.0,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![lp("trace_id", "t0")],
+                    value: 1.0,
+                    timestamp_ms: now - 5_000,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ing.push_grpc_raw_sync("t-f4", &encode(&seed_req)).unwrap();
+        let db = ing.get_tsdb("t-f4").unwrap();
+        assert_eq!(db.db.head().num_series(), 1);
+        let mut stored_ex = 0usize;
+        db.db.head().exemplars().iterate_exemplars(|_, _| stored_ex += 1);
+        assert_eq!(stored_ex, 0);
+
+        // Advance head min/max time so min_append_time_available is true and min_timestamp_ms > now - 3h:
+        let advance_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("__name__", "f4_seed")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now,
+                    value: 2.0,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ing.push_grpc_raw_sync("t-f4", &encode(&advance_req)).unwrap();
+
+        // (a) Early-compaction acquire_append_lock must see the exemplar timestamp even when
+        // the sample timestamp is newer than forced_compaction_max_time!
+        let (ok, _) = db.change_state_to_forced_compaction(
+            crate::user_tsdb::TsdbState::Active,
+            now - 10_000,
+        );
+        assert!(ok);
+        let early_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("__name__", "f4_early")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: now,
+                    value: 1.0,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![lp("trace_id", "old_ex")],
+                    value: 1.0,
+                    timestamp_ms: now - 20_000,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let early_err = ing
+            .push_grpc_raw_sync("t-f4", &encode(&early_req))
+            .unwrap_err();
+        assert!(
+            early_err.to_string().contains("compaction")
+                || early_err.error_cause() == cortexpb::ErrorCause::Unknown,
+            "expected early-compaction rejection due to exemplar timestamp, got: {early_err}"
+        );
+        assert!(
+            db.change_state(
+                crate::user_tsdb::TsdbState::ForceCompacting,
+                crate::user_tsdb::TsdbState::Active,
+            )
+            .0
+        );
+
+        let oob_ts = now - 4_000_000;
+        assert!(oob_ts < db.db.head().appendable_min_valid_time());
+
+        // (b1) OOB sample + unsorted labels + exemplar must NOT enter OOB fast-path:
+        // returns SeriesLabelsNotSorted and increments ingested_exemplars_fail!
+        let fail_before = ing.metrics.ingested_exemplars_fail.get();
+        let unsorted_oob_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("z", "1"), lp("__name__", "f4_unsorted")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: oob_ts,
+                    value: 1.0,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![lp("trace_id", "u1")],
+                    value: 1.0,
+                    timestamp_ms: now,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let unsorted_err = ing
+            .push_grpc_raw_sync("t-f4", &encode(&unsorted_oob_req))
+            .unwrap_err();
+        assert!(
+            unsorted_err.to_string().contains("err-mimir-labels-not-sorted"),
+            "expected SeriesLabelsNotSorted instead of SampleTimestampTooOld, got: {unsorted_err}"
+        );
+        assert_eq!(ing.metrics.ingested_exemplars_fail.get(), fail_before + 1.0);
+
+        // (b2) OOB sample older than min_timestamp_ms (past_grace_period) + exemplar skips OOB
+        // fast-path and is silently dropped by s.timestamp_ms < min_timestamp_ms (returns Ok).
+        let very_old_ts = now - 24 * 3_600 * 1000;
+        let past_grace_req = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![lp("__name__", "f4_past_grace")],
+                samples: vec![cortexpb::Sample {
+                    timestamp_ms: very_old_ts,
+                    value: 1.0,
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![lp("trace_id", "g1")],
+                    value: 1.0,
+                    timestamp_ms: now,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ing.push_grpc_raw_sync("t-f4", &encode(&past_grace_req))
+            .expect("past_grace_period sample with wire exemplar must silently drop, not SampleTimestampTooOld");
+
+        // (b3) OOB sample + exemplar with verify_ring_ownership=true on an unowned series
+        // skips OOB fast-path and triggers 500 hard error rollback, so an earlier valid series
+        // in the same WriteRequest is rolled back.
+        let kv: Arc<dyn mimir_ring::kv::KvClient> =
+            Arc::new(mimir_ring::kv::inmemory::InMemoryKv::new(
+                mimir_ring::ring::model::ring_desc_codec(),
+            ));
+        let remote_tokens: Vec<u32> = (0..128u32)
+            .map(|i| i.wrapping_mul(u32::MAX / 128))
+            .collect();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            kv.cas(
+                "ring",
+                Box::new(move |cur| {
+                    let mut desc = cur
+                        .and_then(|a| a.downcast_ref::<mimir_proto::ringpb::Desc>().cloned())
+                        .unwrap_or_default();
+                    use mimir_ring::ring::model::DescExt;
+                    desc.add_ingester(
+                        "other-ingester",
+                        "127.0.0.1:9095",
+                        "",
+                        remote_tokens.clone(),
+                        mimir_proto::ringpb::InstanceState::Active,
+                        Some(SystemTime::now()),
+                        false,
+                        None,
+                        std::collections::HashMap::new(),
+                    );
+                    Ok(mimir_ring::kv::CasOutcome::Update(Box::new(desc)))
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let mut owned_ing_cfg = mimir_config::IngesterConfig::default();
+        owned_ing_cfg.ring.instance_id = "local-ingester".to_string();
+        owned_ing_cfg.ring.replication_factor = 1;
+        let mut owned_blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        let tmp_ring = tempfile::tempdir().unwrap();
+        owned_blocks_cfg.tsdb.dir = tmp_ring.path().to_string_lossy().to_string();
+        let owned_limits = mimir_config::LimitsConfig {
+            out_of_order_time_window: mimir_config::ModelDuration(0),
+            ..Default::default()
+        };
+        let ring = mimir_ring::ring::Ring::with_store_and_strategy(
+            mimir_ring::ring::RingSettings::from(&owned_ing_cfg.ring),
+            "ingester",
+            "ring",
+            Arc::clone(&kv),
+            Arc::new(mimir_ring::ring::replication_strategy::DefaultReplicationStrategy),
+            None,
+        )
+        .unwrap();
+        use mimir_common::services::{Service, ServiceContext};
+        let _guard = rt.enter();
+        let ring_svc = Arc::clone(&ring).into_service();
+        rt.block_on(ring_svc.start_async(ServiceContext::background()))
+            .unwrap();
+        rt.block_on(ring_svc.await_running()).unwrap();
+        let owned_ing = Ingester::new(
+            owned_ing_cfg,
+            owned_blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(owned_limits),
+            Some(Arc::clone(&ring)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        owned_ing.set_state_for_test(mimir_common::services::State::Running);
+        owned_ing.verify_ring_ownership.store(true, Ordering::Relaxed);
+        // Seed local-ingester TSDB while verify_ownership is temporarily off so head is initialized.
+        owned_ing.verify_ring_ownership.store(false, Ordering::Relaxed);
+        owned_ing
+            .push_grpc_raw_sync(
+                "t-f4-own",
+                &encode(&cortexpb::WriteRequest {
+                    timeseries: vec![cortexpb::TimeSeries {
+                        labels: vec![lp("__name__", "f4_own_seed")],
+                        samples: vec![cortexpb::Sample {
+                            timestamp_ms: now,
+                            value: 1.0,
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        owned_ing.verify_ring_ownership.store(true, Ordering::Relaxed);
+        let owned_db = owned_ing.get_tsdb("t-f4-own").unwrap();
+        let series_before = owned_db.db.head().num_series();
+        let hard_rollback_req = cortexpb::WriteRequest {
+            timeseries: vec![
+                cortexpb::TimeSeries {
+                    labels: vec![lp("__name__", "f4_should_rollback")],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: now,
+                        value: 1.0,
+                    }],
+                    ..Default::default()
+                },
+                cortexpb::TimeSeries {
+                    labels: vec![lp("__name__", "f4_unowned_oob")],
+                    samples: vec![cortexpb::Sample {
+                        timestamp_ms: oob_ts,
+                        value: 1.0,
+                    }],
+                    exemplars: vec![cortexpb::Exemplar {
+                        labels: vec![lp("trace_id", "r1")],
+                        value: 1.0,
+                        timestamp_ms: now,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let hard_err = owned_ing
+            .push_grpc_raw_sync("t-f4-own", &encode(&hard_rollback_req))
+            .unwrap_err();
+        assert_eq!(
+            hard_err.http_status_code(),
+            500,
+            "unowned series with OOB sample + exemplar must hard-fail 500, got: {hard_err}"
+        );
+        assert_eq!(
+            owned_db.db.head().num_series(),
+            series_before,
+            "hard error must roll back earlier series in batch"
+        );
+        ring_svc.stop_async();
+        rt.block_on(ring_svc.await_terminated()).unwrap();
+
+        // (c) Exemplar-only series with invalid UTF-8 labels must return 400 Bad Request
+        // and count the wire exemplar in ingested_exemplars_fail!
+        let fail_before_utf8 = ing.metrics.ingested_exemplars_fail.get();
+        let ex_only_bad_utf8 = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair {
+                    name: bytes::Bytes::from_static(b"__name__"),
+                    value: bytes::Bytes::from_static(&[0xff, 0xfe]),
+                }],
+                exemplars: vec![cortexpb::Exemplar {
+                    labels: vec![lp("trace_id", "bad")],
+                    value: 1.0,
+                    timestamp_ms: now,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let utf8_err = ing
+            .push_grpc_raw_sync("t-f4", &encode(&ex_only_bad_utf8))
+            .unwrap_err();
+        assert_eq!(utf8_err.http_status_code(), 400);
+        assert!(
+            utf8_err.to_string().contains("err-mimir-label-invalid"),
+            "expected SERIES_INVALID_LABEL, got: {utf8_err}"
+        );
+        assert_eq!(ing.metrics.ingested_exemplars_fail.get(), fail_before_utf8 + 1.0);
     }
 }

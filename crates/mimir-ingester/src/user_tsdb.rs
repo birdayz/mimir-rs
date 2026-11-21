@@ -10,7 +10,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimir_config::{BlocksStorageConfig, IngesterConfig, Overrides};
@@ -23,7 +23,9 @@ use mimir_tsdb::db::{BlocksReloadedFn, BlocksToDeleteFn, Tsdb, TsdbError, TsdbOp
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::metadata::MetadataLimits;
-use mimir_tsdb::postings_cache::{PostingsForMatchersCacheConfig, PostingsForMatchersCacheMetrics};
+use mimir_tsdb::postings_cache::{
+    PostingsForMatchersCache, PostingsForMatchersCacheConfig, PostingsForMatchersCacheMetrics,
+};
 use mimir_tsdb::wlog::CompressionType;
 use parking_lot::{Mutex, RwLock};
 use prometheus::{CounterVec, Registry};
@@ -544,6 +546,10 @@ impl UserTsdb {
             timely_compaction: blocks_cfg.tsdb.timely_head_compaction_enabled,
             // Go `headPostingsForMatchersCacheFactory` (MaxItems: math.MaxInt).
             postings_cache: head_postings_for_matchers_cache_config(blocks_cfg, shared_metrics),
+            shared_postings_cache: blocks_cfg
+                .tsdb
+                .shared_postings_for_matchers_cache
+                .then(|| shared_metrics.get_or_init_shared_head_cache(blocks_cfg)),
             metadata_limits: initial_metadata_limits,
             series_lifecycle_callback: Some(lifecycle_adapter.clone()),
             registry: tsdb_prom_reg.clone(),
@@ -609,18 +615,11 @@ impl UserTsdb {
                 .tsdb
                 .bigger_out_of_order_blocks_for_old_samples,
             // Go `blockPostingsForMatchersCacheFactory` (no invalidation, MaxItems: math.MaxInt).
-            block_postings_cache: PostingsForMatchersCacheConfig {
-                ttl: Duration::from_nanos(
-                    blocks_cfg.tsdb.block_postings_for_matchers_cache_ttl.as_nanos().max(0) as u64,
-                ),
-                max_items: usize::MAX,
-                max_bytes: blocks_cfg.tsdb.block_postings_for_matchers_cache_max_bytes.max(0)
-                    as usize,
-                enable_invalidation: false,
-                num_metric_versions: 0,
-                metrics: shared_metrics.block_postings_cache.clone(),
-                report_invalidations: false,
-            },
+            block_postings_cache: block_postings_for_matchers_cache_config(blocks_cfg, shared_metrics),
+            shared_block_postings_cache: blocks_cfg
+                .tsdb
+                .shared_postings_for_matchers_cache
+                .then(|| shared_metrics.get_or_init_shared_block_cache(blocks_cfg)),
         };
 
         if let Some(ref reg) = tsdb_prom_reg {
@@ -1410,6 +1409,8 @@ pub struct SharedTsdbMetrics {
     pub head_postings_cache: Option<PostingsForMatchersCacheMetrics>,
     pub block_postings_cache: Option<PostingsForMatchersCacheMetrics>,
     pub offset_catalogue: OffsetCatalogueMetrics,
+    shared_head_postings_cache: Arc<OnceLock<Arc<PostingsForMatchersCache>>>,
+    shared_block_postings_cache: Arc<OnceLock<Arc<PostingsForMatchersCache>>>,
 }
 
 impl SharedTsdbMetrics {
@@ -1424,7 +1425,50 @@ impl SharedTsdbMetrics {
                 reg,
             )),
             offset_catalogue: OffsetCatalogueMetrics::new(reg),
+            shared_head_postings_cache: Arc::new(OnceLock::new()),
+            shared_block_postings_cache: Arc::new(OnceLock::new()),
         }
+    }
+
+    pub fn new_with_blocks_cfg(reg: Option<&Registry>, blocks_cfg: &BlocksStorageConfig) -> Self {
+        let this = Self::new(reg);
+        if blocks_cfg.tsdb.shared_postings_for_matchers_cache {
+            let _ = this.get_or_init_shared_head_cache(blocks_cfg);
+            let _ = this.get_or_init_shared_block_cache(blocks_cfg);
+        }
+        this
+    }
+
+    pub fn get_or_init_shared_head_cache(
+        &self,
+        blocks_cfg: &BlocksStorageConfig,
+    ) -> Arc<PostingsForMatchersCache> {
+        Arc::clone(self.shared_head_postings_cache.get_or_init(|| {
+            let cache = Arc::new(PostingsForMatchersCache::new(
+                head_postings_for_matchers_cache_config(blocks_cfg, self),
+            ));
+            cache.set_eligibility(
+                blocks_cfg.tsdb.head_postings_for_matchers_cache_force,
+                true,
+            );
+            cache
+        }))
+    }
+
+    pub fn get_or_init_shared_block_cache(
+        &self,
+        blocks_cfg: &BlocksStorageConfig,
+    ) -> Arc<PostingsForMatchersCache> {
+        Arc::clone(self.shared_block_postings_cache.get_or_init(|| {
+            let cache = Arc::new(PostingsForMatchersCache::new(
+                block_postings_for_matchers_cache_config(blocks_cfg, self),
+            ));
+            cache.set_eligibility(
+                blocks_cfg.tsdb.block_postings_for_matchers_cache_force,
+                true,
+            );
+            cache
+        }))
     }
 }
 
@@ -1726,7 +1770,9 @@ pub(crate) fn head_postings_for_matchers_cache_config(
             .tsdb
             .head_postings_for_matchers_cache_max_bytes
             .max(0) as usize,
-        enable_invalidation: invalidation,
+        // Go postings_for_matchers_cache.go:146-151: invalidation is only enabled when
+        // both Shared and Invalidation are true.
+        enable_invalidation: shared_invalidation,
         num_metric_versions: if shared_invalidation {
             blocks_cfg
                 .tsdb
@@ -1736,6 +1782,30 @@ pub(crate) fn head_postings_for_matchers_cache_config(
             0
         },
         metrics: shared_metrics.head_postings_cache.clone(),
+        report_invalidations: false,
+    }
+}
+
+pub(crate) fn block_postings_for_matchers_cache_config(
+    blocks_cfg: &BlocksStorageConfig,
+    shared_metrics: &SharedTsdbMetrics,
+) -> PostingsForMatchersCacheConfig {
+    PostingsForMatchersCacheConfig {
+        ttl: Duration::from_nanos(
+            blocks_cfg
+                .tsdb
+                .block_postings_for_matchers_cache_ttl
+                .as_nanos()
+                .max(0) as u64,
+        ),
+        max_items: usize::MAX,
+        max_bytes: blocks_cfg
+            .tsdb
+            .block_postings_for_matchers_cache_max_bytes
+            .max(0) as usize,
+        enable_invalidation: false,
+        num_metric_versions: 0,
+        metrics: shared_metrics.block_postings_cache.clone(),
         report_invalidations: false,
     }
 }
@@ -1945,7 +2015,7 @@ mod tests {
         let mut inv_only_cfg = mimir_config::BlocksStorageConfig::default();
         inv_only_cfg.tsdb.head_postings_for_matchers_cache_invalidation = true;
         let pc_inv = head_postings_for_matchers_cache_config(&inv_only_cfg, &shared);
-        assert!(pc_inv.enable_invalidation);
+        assert!(!pc_inv.enable_invalidation);
         assert_eq!(pc_inv.num_metric_versions, 0);
         assert!(!pc_inv.report_invalidations);
 
@@ -2134,5 +2204,90 @@ mod tests {
             assert_eq!(samples[0].t, i64::MAX);
             assert_eq!(samples[0].value, SampleValue::Float(9.5));
         }
+    }
+
+    #[tokio::test]
+    async fn f2_shared_postings_cache_uses_one_instance_across_tenants_and_blocks_without_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+        blocks_cfg.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+        blocks_cfg.tsdb.shared_postings_for_matchers_cache = true;
+        blocks_cfg.tsdb.head_postings_for_matchers_cache_invalidation = true;
+        blocks_cfg.tsdb.head_postings_for_matchers_cache_versions = 1024;
+        blocks_cfg.tsdb.head_postings_for_matchers_cache_force = true;
+        blocks_cfg.tsdb.block_postings_for_matchers_cache_force = true;
+
+        let reg = Registry::new();
+        let shared = SharedTsdbMetrics::new_with_blocks_cfg(Some(&reg), &blocks_cfg);
+
+        let open_tenant = |uid: &str| {
+            let overrides = Overrides::new(mimir_config::LimitsConfig::default());
+            let limiter = Arc::new(Limiter::new(
+                overrides.clone(),
+                Arc::new(crate::limiter::NoopRingLimiterStrategy),
+            ));
+            let shipper = ShipperMetrics::new(None);
+            let rej = CounterVec::new(prometheus::Opts::new(format!("rej_{uid}"), "h"), &["reason"]).unwrap();
+            UserTsdb::open(
+                uid.to_string(),
+                &mimir_config::IngesterConfig::default(),
+                &blocks_cfg,
+                overrides,
+                limiter,
+                None,
+                shipper,
+                &shared,
+                None,
+                1,
+                Arc::new(AtomicI64::new(0)),
+                Arc::new(|| 0),
+                rej,
+                HashSet::new(),
+                0,
+                0,
+                None,
+            )
+            .unwrap()
+        };
+
+        let db_a = open_tenant("tenant_a");
+        let db_b = open_tenant("tenant_b");
+
+        // Both tenant Heads must point to the exact same shared PostingsForMatchersCache instance.
+        assert!(std::ptr::eq(db_a.db.head().postings_cache(), db_b.db.head().postings_cache()));
+
+        // Append 1 series for "up" in tenant-a and 2 series for "up" in tenant-b.
+        {
+            let mut app = db_a.db.appender();
+            app.append_float(None, &[("__name__", "up"), ("i", "1")], 1_000, 1.0).unwrap();
+            app.commit().unwrap();
+        }
+        {
+            let mut app = db_b.db.appender();
+            app.append_float(None, &[("__name__", "up"), ("i", "1")], 1_000, 1.0).unwrap();
+            app.append_float(None, &[("__name__", "up"), ("i", "2")], 2_000, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+
+        let m_up = [mimir_tsdb::matcher::LabelMatcher::new(
+            mimir_tsdb::matcher::MatchType::Equal,
+            "__name__",
+            "up",
+        )
+        .unwrap()];
+        assert_eq!(db_a.db.head().postings_for_matchers_arc(&m_up).unwrap().len(), 1);
+        assert_eq!(db_b.db.head().postings_for_matchers_arc(&m_up).unwrap().len(), 2);
+
+        // Compact both into Blocks and verify both Blocks share the ONE shared block postings cache
+        // and still never collide on identical matchers.
+        db_a.compact_head(1_000).await.unwrap();
+        db_b.compact_head(2_000).await.unwrap();
+        let ba = &db_a.db.blocks()[0];
+        let bb = &db_b.db.blocks()[0];
+        assert!(std::ptr::eq(ba.postings_cache(), bb.postings_cache()));
+        assert!(!std::ptr::eq(ba.postings_cache(), db_a.db.head().postings_cache()));
+        assert_eq!(ba.postings_for_matchers(&m_up).unwrap().len(), 1);
+        assert_eq!(bb.postings_for_matchers(&m_up).unwrap().len(), 2);
     }
 }

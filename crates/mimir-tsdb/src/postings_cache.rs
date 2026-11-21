@@ -157,8 +157,18 @@ impl PostingsForMatchersCacheMetrics {
     }
 }
 
+static NEXT_POSTINGS_CACHE_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a globally unique monotonic source ID for a `Head` or `Block` instance so
+/// entries in a shared `PostingsForMatchersCache` never collide across tenants or blocks.
+#[inline]
+pub fn next_postings_cache_source_id() -> u64 {
+    NEXT_POSTINGS_CACHE_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct InFlightKey {
+    source_id: u64,
     version: u64,
     is_per_metric: bool,
     key_bytes: Box<[u8]>,
@@ -220,6 +230,7 @@ impl Drop for InFlightGuard<'_> {
 struct CacheEntry {
     id: u64,
     hash: u64,
+    source_id: u64,
     version: u64,
     is_per_metric: bool,
     key_bytes: Box<[u8]>,
@@ -291,9 +302,15 @@ impl PagedMetricVersions {
     }
 
     #[inline]
-    fn slot_coords(&self, metric_name: &str) -> (usize, usize) {
-        // FNV-1a matching Prometheus metricVersions.getIndex.
+    fn slot_coords(&self, source_id: u64, metric_name: &str) -> (usize, usize) {
+        // FNV-1a matching Prometheus metricVersions.getIndex(key, metricName).
         let mut h: u64 = 14695981039346656037;
+        if source_id != 0 {
+            for b in source_id.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(1099511628211);
+            }
+        }
         for &b in metric_name.as_bytes() {
             h ^= b as u64;
             h = h.wrapping_mul(1099511628211);
@@ -306,8 +323,8 @@ impl PagedMetricVersions {
     }
 
     #[inline]
-    fn load(&self, metric_name: &str) -> u64 {
-        let (page_idx, off) = self.slot_coords(metric_name);
+    fn load(&self, source_id: u64, metric_name: &str) -> u64 {
+        let (page_idx, off) = self.slot_coords(source_id, metric_name);
         let ptr = self.pages[page_idx].load(Ordering::Acquire);
         if ptr.is_null() {
             return 0;
@@ -318,8 +335,8 @@ impl PagedMetricVersions {
     }
 
     #[inline]
-    fn fetch_add(&self, metric_name: &str) {
-        let (page_idx, off) = self.slot_coords(metric_name);
+    fn fetch_add(&self, source_id: u64, metric_name: &str) {
+        let (page_idx, off) = self.slot_coords(source_id, metric_name);
         let ptr = self.get_or_alloc_page(page_idx);
         // SAFETY: `ptr` is non-null and points to `page_len` `AtomicU64` elements where
         // `off < page_len`.
@@ -373,10 +390,12 @@ pub struct PostingsForMatchersCache {
     force: AtomicBool,
     shared: AtomicBool,
     global_epoch: AtomicU64,
-    postings_generation: AtomicU64,
+    has_source_epochs: AtomicBool,
+    source_epochs: RwLock<HashMap<u64, u64>>,
     metric_versions: OnceLock<PagedMetricVersions>,
     inner: RwLock<CacheInner>,
     in_flight: Mutex<HashMap<InFlightKey, Arc<InFlightCall>>>,
+    expire_in_progress: AtomicBool,
     metrics: Option<PostingsForMatchersCacheMetrics>,
 }
 
@@ -413,10 +432,12 @@ impl PostingsForMatchersCache {
             force: AtomicBool::new(false),
             shared: AtomicBool::new(false),
             global_epoch: AtomicU64::new(0),
-            postings_generation: AtomicU64::new(0),
+            has_source_epochs: AtomicBool::new(false),
+            source_epochs: RwLock::new(HashMap::new()),
             metric_versions: OnceLock::new(),
             inner: RwLock::new(CacheInner::default()),
             in_flight: Mutex::new(HashMap::new()),
+            expire_in_progress: AtomicBool::new(false),
             metrics,
         }
     }
@@ -438,22 +459,39 @@ impl PostingsForMatchersCache {
         self.shared.load(Ordering::Acquire)
     }
 
-    /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`
-    /// without incrementing `invalidations_total` (used internally during WAL replay and Head GC).
+    /// Returns true only when both `shared` and `enable_invalidation` are enabled, matching
+    /// Go `postings_for_matchers_cache.go:146-151` (`config.Shared && config.Invalidation`).
     #[inline]
-    pub fn invalidate_metric_silent(&self, metric_name: &str) {
-        self.postings_generation.fetch_add(1, Ordering::Release);
-        if self.config.enable_invalidation && !metric_name.is_empty() {
-            if let Some(mv) = self.metric_versions.get() {
-                mv.fetch_add(metric_name);
-            }
+    pub fn invalidation_active(&self) -> bool {
+        self.shared() && self.config.enable_invalidation
+    }
+
+    /// Invalidates cached Head postings for `source_id` and `metric_name` without incrementing
+    /// `invalidations_total` (used internally during WAL replay and Head GC).
+    #[inline]
+    pub fn invalidate_metric_silent_for_source(&self, source_id: u64, metric_name: &str) {
+        if !self.invalidation_active() {
+            return;
+        }
+        if let Some(mv) = self.metric_versions.get() {
+            mv.fetch_add(source_id, metric_name);
         }
     }
 
-    /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`.
+    /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`
+    /// without incrementing `invalidations_total`.
     #[inline]
-    pub fn invalidate_metric(&self, metric_name: &str) {
-        self.invalidate_metric_silent(metric_name);
+    pub fn invalidate_metric_silent(&self, metric_name: &str) {
+        self.invalidate_metric_silent_for_source(0, metric_name);
+    }
+
+    /// Invalidates cached Head postings for `source_id` and `metric_name`.
+    #[inline]
+    pub fn invalidate_metric_for_source(&self, source_id: u64, metric_name: &str) {
+        if !self.invalidation_active() {
+            return;
+        }
+        self.invalidate_metric_silent_for_source(source_id, metric_name);
         if self.config.report_invalidations && !metric_name.is_empty() {
             if let Some(ref m) = self.metrics {
                 m.invalidations.inc();
@@ -461,12 +499,54 @@ impl PostingsForMatchersCache {
         }
     }
 
+    /// Invalidates cached Head postings affected by creating or deleting a series with `metric_name`.
+    #[inline]
+    pub fn invalidate_metric(&self, metric_name: &str) {
+        self.invalidate_metric_for_source(0, metric_name);
+    }
+
+    /// Invalidates all cached entries belonging to `source_id` (without disturbing other
+    /// sources in a shared cache).
+    pub fn invalidate_source(&self, source_id: u64) {
+        if !self.shared() {
+            self.invalidate_all();
+            return;
+        }
+        if !self.config.enable_invalidation {
+            return;
+        }
+        {
+            let mut epochs = self.source_epochs.write();
+            let entry = epochs.entry(source_id).or_insert(0);
+            *entry = entry.wrapping_add(1);
+            self.has_source_epochs.store(true, Ordering::Release);
+        }
+        let mut inner = self.inner.write();
+        let mut removed_entries = 0usize;
+        let mut removed_bytes = 0usize;
+        inner.table.retain(|e| {
+            if e.source_id == source_id {
+                removed_entries += 1;
+                removed_bytes += e.size_bytes;
+                false
+            } else {
+                true
+            }
+        });
+        inner.total_bytes = inner.total_bytes.saturating_sub(removed_bytes);
+        if removed_entries > 0 {
+            if let Some(ref m) = self.metrics {
+                m.entries.sub(removed_entries as f64);
+                m.bytes.sub(removed_bytes as f64);
+            }
+        }
+    }
+
     /// Invalidates all cached entries (e.g., after bulk postings rebuild/truncation).
     pub fn invalidate_all(&self) {
         self.global_epoch.fetch_add(1, Ordering::Release);
-        self.postings_generation.fetch_add(1, Ordering::Release);
         let mut inner = self.inner.write();
-        // The gauges are shared with other tenants' caches: subtract only this cache's share.
+        // The gauges may be shared across caches: subtract only this cache's entries.
         if let Some(ref m) = self.metrics {
             m.entries.sub(inner.table.len() as f64);
             m.bytes.sub(inner.total_bytes as f64);
@@ -477,30 +557,53 @@ impl PostingsForMatchersCache {
     }
 
     #[inline]
-    fn version_for_matchers(&self, matchers: &[LabelMatcher]) -> (u64, bool) {
-        if !self.config.enable_invalidation {
+    fn version_for_matchers(&self, source_id: u64, matchers: &[LabelMatcher]) -> (u64, bool) {
+        if !self.invalidation_active() {
             return (0, false);
         }
         let mv = self
             .metric_versions
             .get_or_init(|| PagedMetricVersions::new(self.config.num_metric_versions));
-        let epoch = self.global_epoch.load(Ordering::Acquire);
-        if let Some(metric_name) = exact_metric_name_from_matchers(matchers) {
-            let ver = mv.load(metric_name);
-            ((epoch << 32) ^ ver, true)
+        let source_epoch = if self.has_source_epochs.load(Ordering::Acquire) {
+            self.source_epochs
+                .read()
+                .get(&source_id)
+                .copied()
+                .unwrap_or(0)
         } else {
-            let gen = self.postings_generation.load(Ordering::Acquire);
-            ((epoch << 32) ^ gen, false)
+            0
+        };
+        let epoch = self.global_epoch.load(Ordering::Acquire) ^ source_epoch;
+        if let Some(metric_name) = exact_metric_name_from_matchers(matchers) {
+            let ver = mv.load(source_id, metric_name);
+            ((epoch << 32) ^ (ver & 0xFFFF_FFFF), true)
+        } else {
+            (epoch << 32, false)
         }
     }
 
-    /// Evaluates `matchers` using the cache, returning an `Arc<[u64]>` of matching series refs.
+    /// Evaluates `matchers` using the cache (with default `source_id = 0`).
+    pub fn get_or_compute<F, E>(
+        &self,
+        matchers: &[LabelMatcher],
+        concurrent: bool,
+        compute: F,
+    ) -> Result<Arc<[u64]>, E>
+    where
+        F: FnOnce() -> Result<Vec<u64>, E>,
+    {
+        self.get_or_compute_for_source(0, matchers, concurrent, compute)
+    }
+
+    /// Evaluates `matchers` for `source_id` using the cache, returning an `Arc<[u64]>` of
+    /// matching series refs.
     ///
     /// Matches Go `PostingsForMatchersCache.PostingsForMatchers` (`postings_for_matchers_cache.go:239-280`):
     /// skips the cache (incrementing `skips_total{reason="ineligible"}`) when
-    /// `(!concurrent && !self.force()) || (self.shared() && self.config.enable_invalidation && exact_metric_name_from_matchers(matchers).is_none())`.
-    pub fn get_or_compute<F, E>(
+    /// `(!concurrent && !self.force()) || (self.invalidation_active() && exact_metric_name_from_matchers(matchers).is_none())`.
+    pub fn get_or_compute_for_source<F, E>(
         &self,
+        source_id: u64,
         matchers: &[LabelMatcher],
         concurrent: bool,
         compute: F,
@@ -513,8 +616,7 @@ impl PostingsForMatchersCache {
         }
 
         let skip_ineligible = (!concurrent && !self.force())
-            || (self.shared()
-                && self.config.enable_invalidation
+            || (self.invalidation_active()
                 && exact_metric_name_from_matchers(matchers).is_none());
         if skip_ineligible {
             if let Some(ref m) = self.metrics {
@@ -523,29 +625,20 @@ impl PostingsForMatchersCache {
             return compute().map(Arc::from);
         }
 
-        if matchers.is_empty()
-            || self.config.ttl.is_zero()
-            || self.config.max_items == 0
-            || self.config.max_bytes == 0
-        {
-            // Go still runs these through the cache (a miss whose result is not kept).
-            if let Some(ref m) = self.metrics {
-                m.misses.inc();
-            }
-            return compute().map(Arc::from);
-        }
+        self.expire();
 
         let mut key_buf = SmallVec::<[u8; 256]>::new();
         encode_canonical_matchers_key(matchers, &mut key_buf);
 
-        let (ver_before, is_per_metric) = self.version_for_matchers(matchers);
-        let hash = cache_entry_hash(ver_before, is_per_metric, &key_buf);
+        let (ver_before, is_per_metric) = self.version_for_matchers(source_id, matchers);
+        let hash = cache_entry_hash(source_id, ver_before, is_per_metric, &key_buf);
         let now = Instant::now();
 
-        {
+        if !self.config.ttl.is_zero() {
             let inner = self.inner.read();
             if let Some(entry) = inner.table.find(hash, |e| {
-                e.version == ver_before
+                e.source_id == source_id
+                    && e.version == ver_before
                     && e.is_per_metric == is_per_metric
                     && e.key_bytes.as_ref() == key_buf.as_slice()
             }) {
@@ -555,11 +648,17 @@ impl PostingsForMatchersCache {
                     }
                     return Ok(Arc::clone(&entry.postings));
                 }
+                drop(inner);
+                if let Some(ref m) = self.metrics {
+                    m.skips_stale.inc();
+                }
+                return compute().map(Arc::from);
             }
         }
 
-        // Coalesce concurrent identical cache misses.
+        // Coalesce concurrent identical cache misses (including ttl == 0 and empty matchers).
         let flight_key = InFlightKey {
+            source_id,
             version: ver_before,
             is_per_metric,
             key_bytes: key_buf.as_slice().into(),
@@ -586,16 +685,19 @@ impl PostingsForMatchersCache {
 
                 let vec = compute()?;
                 let arc: Arc<[u64]> = Arc::from(vec);
-                let (ver_after, _) = self.version_for_matchers(matchers);
+                let (ver_after, _) = self.version_for_matchers(source_id, matchers);
 
                 if ver_after == ver_before {
-                    self.insert_entry(
-                        hash,
-                        ver_before,
-                        is_per_metric,
-                        guard.key.key_bytes.clone(),
-                        Arc::clone(&arc),
-                    );
+                    if !self.config.ttl.is_zero() {
+                        self.insert_entry(
+                            source_id,
+                            hash,
+                            ver_before,
+                            is_per_metric,
+                            guard.key.key_bytes.clone(),
+                            Arc::clone(&arc),
+                        );
+                    }
                     guard.map.lock().remove(&guard.key);
                     guard.call.complete(Some(Arc::clone(&arc)));
                     guard.completed = true;
@@ -625,8 +727,51 @@ impl PostingsForMatchersCache {
         compute().map(Arc::from)
     }
 
+    /// Bounded read-side TTL & size expiration matching Go `PostingsForMatchersCache.expire()`.
+    pub fn expire(&self) {
+        if self.config.ttl.is_zero() {
+            return;
+        }
+        if self
+            .expire_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        struct ExpireReset<'a>(&'a AtomicBool);
+        impl Drop for ExpireReset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _reset = ExpireReset(&self.expire_in_progress);
+        let now = Instant::now();
+        {
+            let inner = self.inner.read();
+            if !self.should_evict_head(&inner, now) {
+                return;
+            }
+        }
+        let mut inner = self.inner.write();
+        self.evict_locked(&mut inner, now);
+    }
+
+    #[inline]
+    fn should_evict_head(&self, inner: &CacheInner, now: Instant) -> bool {
+        if inner.table.len() > self.config.max_items || inner.total_bytes > self.config.max_bytes {
+            return true;
+        }
+        inner
+            .fifo
+            .front()
+            .is_some_and(|front| now.duration_since(front.inserted_at) >= self.config.ttl)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn insert_entry(
         &self,
+        source_id: u64,
         hash: u64,
         version: u64,
         is_per_metric: bool,
@@ -635,7 +780,7 @@ impl PostingsForMatchersCache {
     ) {
         let size_bytes =
             key_bytes.len() + postings.len() * std::mem::size_of::<u64>() + std::mem::size_of::<CacheEntry>();
-        if size_bytes > self.config.max_bytes {
+        if self.config.max_items == 0 || size_bytes > self.config.max_bytes {
             return;
         }
 
@@ -645,7 +790,8 @@ impl PostingsForMatchersCache {
 
         // If an expired entry with the exact same key is still in table, replace/remove it first.
         if let Ok(occ) = inner.table.find_entry(hash, |e| {
-            e.version == version
+            e.source_id == source_id
+                && e.version == version
                 && e.is_per_metric == is_per_metric
                 && e.key_bytes.as_ref() == key_bytes.as_ref()
         }) {
@@ -675,6 +821,7 @@ impl PostingsForMatchersCache {
             CacheEntry {
                 id,
                 hash,
+                source_id,
                 version,
                 is_per_metric,
                 key_bytes,
@@ -692,7 +839,6 @@ impl PostingsForMatchersCache {
 
         self.evict_locked(&mut inner, now);
     }
-
     fn evict_locked(&self, inner: &mut CacheInner, now: Instant) {
         while let Some(front) = inner.fifo.front() {
             let expired = now.duration_since(front.inserted_at) >= self.config.ttl;
@@ -723,21 +869,15 @@ impl PostingsForMatchersCache {
     }
 }
 
+/// Returns the value of the first `__name__=...` equality matcher (even if empty or followed by
+/// another `__name__=` matcher), matching Go `metricNameFromMatchers`.
 #[inline]
-fn exact_metric_name_from_matchers(matchers: &[LabelMatcher]) -> Option<&str> {
-    let mut found: Option<&str> = None;
-    for m in matchers {
-        if m.name == METRIC_NAME && m.match_type == MatchType::Equal && !m.value.is_empty() {
-            match found {
-                None => found = Some(m.value.as_str()),
-                Some(prev) if prev != m.value => return None,
-                Some(_) => {}
-            }
-        }
-    }
-    found
+pub fn exact_metric_name_from_matchers(matchers: &[LabelMatcher]) -> Option<&str> {
+    matchers
+        .iter()
+        .find(|m| m.name == METRIC_NAME && m.match_type == MatchType::Equal)
+        .map(|m| m.value.as_str())
 }
-
 #[inline]
 fn match_type_code(mt: MatchType) -> u8 {
     match mt {
@@ -780,15 +920,17 @@ fn encode_canonical_matchers_key(matchers: &[LabelMatcher], buf: &mut SmallVec<[
 }
 
 #[inline]
-fn cache_entry_hash(version: u64, is_per_metric: bool, key_bytes: &[u8]) -> u64 {
+fn cache_entry_hash(source_id: u64, version: u64, is_per_metric: bool, key_bytes: &[u8]) -> u64 {
     let h = xxh3_64(key_bytes);
-    h ^ version.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (is_per_metric as u64)
+    h ^ source_id.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ version.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (is_per_metric as u64)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
 
     #[test]
     fn postings_cache_hit_and_per_metric_invalidation() {
@@ -798,6 +940,7 @@ mod tests {
             metrics: Some(PostingsForMatchersCacheMetrics::new("test_", Some(&reg))),
             ..Default::default()
         });
+        cache.set_eligibility(true, true);
 
         let m_a = vec![
             LabelMatcher::new(MatchType::Equal, "__name__", "metric_a").unwrap(),
@@ -830,7 +973,7 @@ mod tests {
         assert_eq!(&*r2, &[1, 2, 3]);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        // Query without exact __name__
+        // With shared + invalidation active, query without exact __name__ skips cache as ineligible
         let r_no_name = cache
             .get_or_compute::<_, ()>(&m_no_name, true, || {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -839,6 +982,7 @@ mod tests {
             .unwrap();
         assert_eq!(&*r_no_name, &[1, 2, 3, 4]);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(sample(&reg, "test_postings_for_matchers_cache_skips_total", Some("ineligible")), 1.0);
 
         // Creating a series in metric_b does NOT invalidate metric_a!
         cache.invalidate_metric("metric_b");
@@ -852,16 +996,6 @@ mod tests {
         assert_eq!(&*r3, &[1, 2, 3]);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
 
-        // However, query without __name__ IS invalidated by metric_b creation
-        let r_no_name_2 = cache
-            .get_or_compute::<_, ()>(&m_no_name, true, || {
-                calls.fetch_add(1, Ordering::Relaxed);
-                Ok(vec![1, 2, 3, 4, 5])
-            })
-            .unwrap();
-        assert_eq!(&*r_no_name_2, &[1, 2, 3, 4, 5]);
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
-
         // Creating a series in metric_a invalidates metric_a
         cache.invalidate_metric("metric_a");
         let r4 = cache
@@ -871,7 +1005,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(&*r4, &[1, 2, 3, 6]);
-        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -978,8 +1112,10 @@ mod tests {
             report_invalidations: true,
             ..cfg
         });
-        let m1 = [LabelMatcher::new(MatchType::Equal, "a", "1").unwrap()];
-        let m2 = [LabelMatcher::new(MatchType::Equal, "a", "2").unwrap()];
+        a.set_eligibility(true, true);
+        b.set_eligibility(true, true);
+        let m1 = [LabelMatcher::new(MatchType::Equal, "__name__", "x").unwrap()];
+        let m2 = [LabelMatcher::new(MatchType::Equal, "__name__", "y").unwrap()];
         let ok = |v: Vec<u64>| move || Ok::<_, ()>(v);
         a.get_or_compute(&m1, true, ok(vec![1])).unwrap();
         a.get_or_compute(&m1, true, ok(vec![1])).unwrap();
@@ -1006,10 +1142,10 @@ mod tests {
         assert_eq!(sample(&reg, &format!("{p}entries_total"), None), 1.0);
         assert_eq!(sample(&reg, &format!("{p}bytes_total"), None), bytes / 2.0);
 
-        // Calls that bypass the cache are still requests (and misses, as in Go).
+        // Calls that skip the cache are still counted as requests.
         a.get_or_compute(&[], true, ok(vec![])).unwrap();
         assert_eq!(sample(&reg, &format!("{p}requests_total"), None), 5.0);
-        assert_eq!(sample(&reg, &format!("{p}misses_total"), None), 4.0);
+        assert_eq!(sample(&reg, &format!("{p}skips_total"), Some("ineligible")), 1.0);
 
         // Dropping `b` subtracts its remaining entries & bytes from shared gauges.
         drop(b);
@@ -1024,6 +1160,7 @@ mod tests {
             num_metric_versions: 2_097_152,
             ..Default::default()
         });
+        cache.set_eligibility(true, true);
 
         // Write-only / unqueried tenant: 0 bytes & 0 pages allocated even across many invalidations.
         for i in 0..1000 {
@@ -1120,5 +1257,229 @@ mod tests {
             sample(&reg, "sq01_postings_for_matchers_cache_skips_total", Some("ineligible")),
             4.0
         );
+    }
+
+    #[test]
+    fn f2_shared_cache_disambiguates_sources_and_isolates_invalidations() {
+        let reg = Registry::new();
+        let metrics = PostingsForMatchersCacheMetrics::new("f2_", Some(&reg));
+        // Budget allows ~1 entry (CacheEntry + 8B postings + key ~= 120B).
+        let cache = Arc::new(PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            ttl: Duration::from_secs(60),
+            max_items: usize::MAX,
+            max_bytes: 180,
+            enable_invalidation: true,
+            num_metric_versions: 1024,
+            metrics: Some(metrics),
+            report_invalidations: true,
+        }));
+        cache.set_eligibility(true, true);
+
+        let s1 = next_postings_cache_source_id();
+        let s2 = next_postings_cache_source_id();
+        let m_up = [LabelMatcher::new(MatchType::Equal, "__name__", "up").unwrap()];
+
+        let r1 = cache.get_or_compute_for_source::<_, ()>(s1, &m_up, true, || Ok(vec![101])).unwrap();
+        let r2 = cache.get_or_compute_for_source::<_, ()>(s2, &m_up, true, || Ok(vec![202])).unwrap();
+        assert_eq!(&*r1, &[101]);
+        assert_eq!(&*r2, &[202]);
+        // Shared max_bytes (180B) only fits one entry, so inserting s2 evicted s1.
+        assert_eq!(sample(&reg, "f2_postings_for_matchers_cache_entries_total", None), 1.0);
+        assert_eq!(sample(&reg, "f2_postings_for_matchers_cache_evictions_total", Some("max-bytes-reached")), 1.0);
+
+        // With larger budget, both coexist without collision and invalidate independently.
+        let cache2 = Arc::new(PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            ttl: Duration::from_secs(60),
+            max_items: usize::MAX,
+            max_bytes: 1024 * 1024,
+            enable_invalidation: true,
+            num_metric_versions: 1024,
+            metrics: None,
+            report_invalidations: false,
+        }));
+        cache2.set_eligibility(true, true);
+        let c1 = AtomicUsize::new(0);
+        let c2 = AtomicUsize::new(0);
+        let a1 = cache2.get_or_compute_for_source::<_, ()>(s1, &m_up, true, || {
+            c1.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1])
+        }).unwrap();
+        let b1 = cache2.get_or_compute_for_source::<_, ()>(s2, &m_up, true, || {
+            c2.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![2])
+        }).unwrap();
+        assert_eq!(&*a1, &[1]);
+        assert_eq!(&*b1, &[2]);
+
+        // Invalidating s1 "up" does NOT invalidate s2 "up".
+        cache2.invalidate_metric_for_source(s1, "up");
+        let a2 = cache2.get_or_compute_for_source::<_, ()>(s1, &m_up, true, || {
+            c1.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1, 11])
+        }).unwrap();
+        let b2 = cache2.get_or_compute_for_source::<_, ()>(s2, &m_up, true, || {
+            c2.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![999])
+        }).unwrap();
+        assert_eq!(&*a2, &[1, 11]);
+        assert_eq!(&*b2, &[2]);
+        assert_eq!(c1.load(Ordering::Relaxed), 2);
+        assert_eq!(c2.load(Ordering::Relaxed), 1);
+
+        // invalidate_source(s1) leaves s2 cached.
+        cache2.invalidate_source(s1);
+        let b3 = cache2.get_or_compute_for_source::<_, ()>(s2, &m_up, true, || {
+            c2.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![999])
+        }).unwrap();
+        assert_eq!(&*b3, &[2]);
+        assert_eq!(c2.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn f3a_non_shared_cache_is_purely_ttl_based() {
+        let cache = PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            ttl: Duration::from_secs(60),
+            enable_invalidation: true,
+            num_metric_versions: 64,
+            ..Default::default()
+        });
+        cache.set_eligibility(true, false);
+        assert!(!cache.invalidation_active());
+        let m_up = [LabelMatcher::new(MatchType::Equal, "__name__", "up").unwrap()];
+        let m_job = [LabelMatcher::new(MatchType::Equal, "job", "api").unwrap()];
+        let calls = AtomicUsize::new(0);
+        cache.get_or_compute::<_, ()>(&m_up, true, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1])
+        }).unwrap();
+        cache.get_or_compute::<_, ()>(&m_job, true, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![2])
+        }).unwrap();
+        cache.invalidate_metric("up");
+        cache.invalidate_metric("other");
+        assert_eq!(&*cache.get_or_compute::<_, ()>(&m_up, true, || { calls.fetch_add(1, Ordering::Relaxed); Ok(vec![9]) }).unwrap(), &[1]);
+        assert_eq!(&*cache.get_or_compute::<_, ()>(&m_job, true, || { calls.fetch_add(1, Ordering::Relaxed); Ok(vec![9]) }).unwrap(), &[2]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn f3b_ttl_zero_and_empty_matchers_coalesce_in_flight() {
+        let reg = Registry::new();
+        let metrics = PostingsForMatchersCacheMetrics::new("f3b_", Some(&reg));
+        let cache = Arc::new(PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            ttl: Duration::ZERO,
+            max_items: usize::MAX,
+            max_bytes: 1024 * 1024,
+            enable_invalidation: false,
+            metrics: Some(metrics),
+            ..Default::default()
+        }));
+        cache.set_eligibility(true, false);
+
+        let leader_entered = Arc::new(Barrier::new(2));
+        let release_leader = Arc::new(Barrier::new(2));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let c1 = Arc::clone(&cache);
+        let le1 = Arc::clone(&leader_entered);
+        let rl1 = Arc::clone(&release_leader);
+        let calls1 = Arc::clone(&calls);
+        let h1 = std::thread::spawn(move || {
+            c1.get_or_compute::<_, ()>(&[], true, || {
+                calls1.fetch_add(1, Ordering::Relaxed);
+                le1.wait();
+                rl1.wait();
+                Ok(vec![7, 8])
+            }).unwrap()
+        });
+
+        leader_entered.wait();
+        let c2 = Arc::clone(&cache);
+        let calls2 = Arc::clone(&calls);
+        let h2 = std::thread::spawn(move || {
+            c2.get_or_compute::<_, ()>(&[], true, || {
+                calls2.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![999])
+            }).unwrap()
+        });
+        // Give waiter a moment to register on in_flight before releasing leader.
+        std::thread::sleep(Duration::from_millis(25));
+        release_leader.wait();
+
+        assert_eq!(&*h1.join().unwrap(), &[7, 8]);
+        assert_eq!(&*h2.join().unwrap(), &[7, 8]);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(sample(&reg, "f3b_postings_for_matchers_cache_misses_total", None), 1.0);
+        assert_eq!(sample(&reg, "f3b_postings_for_matchers_cache_hits_total", None), 1.0);
+        assert_eq!(sample(&reg, "f3b_postings_for_matchers_cache_entries_total", None), 0.0);
+
+        // Because ttl == 0, completed entry was deleted from in_flight, so next call misses again.
+        let r3 = cache.get_or_compute::<_, ()>(&[], true, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![9])
+        }).unwrap();
+        assert_eq!(&*r3, &[9]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(sample(&reg, "f3b_postings_for_matchers_cache_misses_total", None), 2.0);
+    }
+
+    #[test]
+    fn f3c_exact_metric_name_matches_go_first_equal_matcher() {
+        let empty_name = [LabelMatcher::new(MatchType::Equal, "__name__", "").unwrap()];
+        assert_eq!(exact_metric_name_from_matchers(&empty_name), Some(""));
+
+        let dup_names = [
+            LabelMatcher::new(MatchType::Equal, "__name__", "first").unwrap(),
+            LabelMatcher::new(MatchType::Equal, "__name__", "second").unwrap(),
+        ];
+        assert_eq!(exact_metric_name_from_matchers(&dup_names), Some("first"));
+
+        let empty_then_named = [
+            LabelMatcher::new(MatchType::Equal, "__name__", "").unwrap(),
+            LabelMatcher::new(MatchType::Equal, "__name__", "second").unwrap(),
+        ];
+        assert_eq!(exact_metric_name_from_matchers(&empty_then_named), Some(""));
+
+        let regex_only = [LabelMatcher::new(MatchType::RegexMatch, "__name__", "up.*").unwrap()];
+        assert_eq!(exact_metric_name_from_matchers(&regex_only), None);
+    }
+
+    #[test]
+    fn f3d_read_side_expire_and_stale_cached_entry_skip() {
+        let reg = Registry::new();
+        let metrics = PostingsForMatchersCacheMetrics::new("f3d_", Some(&reg));
+        let cache = PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            ttl: Duration::from_millis(30),
+            max_items: 100,
+            max_bytes: 1024 * 1024,
+            enable_invalidation: false,
+            metrics: Some(metrics),
+            ..Default::default()
+        });
+        cache.set_eligibility(true, false);
+
+        let m1 = [LabelMatcher::new(MatchType::Equal, "__name__", "m1").unwrap()];
+        let m2 = [LabelMatcher::new(MatchType::Equal, "__name__", "m2").unwrap()];
+        cache.get_or_compute::<_, ()>(&m1, true, || Ok(vec![1])).unwrap();
+        assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_entries_total", None), 1.0);
+
+        std::thread::sleep(Duration::from_millis(45));
+        // Even an ineligible read does not expire, whereas an eligible read for m2 runs expire()
+        // and evicts expired m1 first, or if expire_in_progress is contended, hitting expired m1
+        // increments skips_total{reason="stale-cached-entry"}.
+        cache.expire_in_progress.store(true, Ordering::Release);
+        let res = cache.get_or_compute::<_, ()>(&m1, true, || Ok(vec![2])).unwrap();
+        assert_eq!(&*res, &[2]);
+        assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_skips_total", Some("stale-cached-entry")), 1.0);
+        cache.expire_in_progress.store(false, Ordering::Release);
+
+        // Now expire() runs on eligible read and evicts m1.
+        cache.get_or_compute::<_, ()>(&m2, false, || Ok(vec![3])).unwrap(); // skipped ineligible -> no expire
+        assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_entries_total", None), 1.0);
+        cache.get_or_compute::<_, ()>(&m2, true, || Ok(vec![3])).unwrap(); // runs expire(), evicts m1, inserts m2
+        assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_evictions_total", Some("ttl-expired")), 1.0);
+        assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_entries_total", None), 1.0);
     }
 }
