@@ -80,6 +80,34 @@ pub trait IpLookupResolver: Send + Sync {
         proto: &'a str,
         name: &'a str,
     ) -> BoxFuture<'a, Result<(String, Vec<Srv>), LookupError>>;
+    /// Go `LookupIPAddr(ctx, host)` formatted like `net.IPAddr.String()`, preserving any
+    /// IPv6 link-local `%zone` scope suffix.
+    fn lookup_ip_addr_strings<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, LookupError>> {
+        async move {
+            let ips = self.lookup_ip_addr(host).await?;
+            let zone = host.split_once('%').and_then(|(ip_part, z)| {
+                if !z.is_empty() && ip_part.parse::<std::net::Ipv6Addr>().is_ok() {
+                    Some(z)
+                } else {
+                    None
+                }
+            });
+            Ok(ips
+                .iter()
+                .map(|ip| {
+                    let s = go_ip_string(ip);
+                    match (ip, zone) {
+                        (IpAddr::V6(_), Some(z)) => format!("{s}%{z}"),
+                        _ => s,
+                    }
+                })
+                .collect())
+        }
+        .boxed()
+    }
     /// Go `IsNotFound(err error) bool`.
     fn is_not_found(&self, err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool;
 }
@@ -123,7 +151,7 @@ impl DnsSd {
                         name: name.to_string(),
                     });
                 }
-                let ips = match self.resolver.lookup_ip_addr(host).await {
+                let ips = match self.resolver.lookup_ip_addr_strings(host).await {
                     Ok(ips) => ips,
                     Err(err) => {
                         // We exclude error from std Golang resolver for the case of the domain
@@ -141,10 +169,7 @@ impl DnsSd {
                     }
                 };
                 for ip in &ips {
-                    res.push(append_scheme(
-                        scheme,
-                        &join_host_port(&go_ip_string(ip), port),
-                    ));
+                    res.push(append_scheme(scheme, &join_host_port(ip, port)));
                 }
             }
             "dnssrv" | "dnssrvnoa" => {
@@ -180,7 +205,7 @@ impl DnsSd {
                         continue;
                     }
                     // Do A lookup for the domain in SRV answer.
-                    let res_ips = match self.resolver.lookup_ip_addr(&rec.target).await {
+                    let res_ips = match self.resolver.lookup_ip_addr_strings(&rec.target).await {
                         Ok(ips) => ips,
                         Err(err) => {
                             if !self.resolver.is_not_found(err.as_ref()) {
@@ -194,10 +219,7 @@ impl DnsSd {
                         }
                     };
                     for ip in &res_ips {
-                        res.push(append_scheme(
-                            scheme,
-                            &join_host_port(&go_ip_string(ip), res_port),
-                        ));
+                        res.push(append_scheme(scheme, &join_host_port(ip, res_port)));
                     }
                 }
             }
@@ -233,5 +255,31 @@ fn append_scheme(scheme: &str, host: &str) -> String {
         host.to_string()
     } else {
         format!("{scheme}//{host}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns::godns;
+
+    #[tokio::test]
+    async fn d_dns_02_preserves_ipv6_zone_id_on_dns_resolve() {
+        let sd = DnsSd::new(Arc::new(godns::Resolver::new()));
+        assert_eq!(
+            sd.resolve("[fe80::1%eth0]:7946", &A).await.unwrap(),
+            vec!["[fe80::1%eth0]:7946"]
+        );
+        assert_eq!(
+            sd.resolve("http://[fe80::1%eth0]:7946", &A).await.unwrap(),
+            vec!["http://[fe80::1%eth0]:7946"]
+        );
+    }
+
+    #[tokio::test]
+    async fn d_dns_01_empty_dnssrv_resolves_to_empty_without_error() {
+        let sd = DnsSd::new(Arc::new(godns::Resolver::new()));
+        assert_eq!(sd.resolve("", &SRV).await.unwrap(), Vec::<String>::new());
+        assert_eq!(sd.resolve("", &SRV_NO_A).await.unwrap(), Vec::<String>::new());
     }
 }
