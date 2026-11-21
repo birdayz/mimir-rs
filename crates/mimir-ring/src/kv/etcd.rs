@@ -353,7 +353,6 @@ impl EtcdKv {
                         Ok(b) => b,
                         Err(e) => {
                             // Mid-body read / timeout / connection reset is a transport failure.
-                            let _ = e.is_timeout() || e.is_connect() || e.is_body() || e.is_request();
                             last_err = Some(KvError::Http(format_reqwest_error(&e)));
                             continue;
                         }

@@ -8,7 +8,85 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hashbrown::{HashMap, HashTable};
-use parking_lot::{Condvar, Mutex, RwLock};
+#[cfg(not(miri))]
+mod sync_impl {
+    pub use parking_lot::{Condvar, Mutex, RwLock};
+
+    #[inline]
+    pub fn cvar_wait<'a, T>(
+        cvar: &Condvar,
+        mut g: parking_lot::MutexGuard<'a, T>,
+    ) -> parking_lot::MutexGuard<'a, T> {
+        cvar.wait(&mut g);
+        g
+    }
+}
+
+#[cfg(miri)]
+#[allow(dead_code)]
+mod sync_impl {
+    pub struct Mutex<T>(std::sync::Mutex<T>);
+
+    impl<T> Mutex<T> {
+        #[inline]
+        pub fn new(val: T) -> Self {
+            Self(std::sync::Mutex::new(val))
+        }
+
+        #[inline]
+        pub fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    pub struct RwLock<T>(std::sync::RwLock<T>);
+
+    impl<T> RwLock<T> {
+        #[inline]
+        pub fn new(val: T) -> Self {
+            Self(std::sync::RwLock::new(val))
+        }
+
+        #[inline]
+        pub fn read(&self) -> std::sync::RwLockReadGuard<'_, T> {
+            self.0.read().unwrap_or_else(|e| e.into_inner())
+        }
+
+        #[inline]
+        pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+            self.0.write().unwrap_or_else(|e| e.into_inner())
+        }
+
+        #[inline]
+        pub fn get_mut(&mut self) -> &mut T {
+            self.0.get_mut().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    pub struct Condvar(std::sync::Condvar);
+
+    impl Condvar {
+        #[inline]
+        pub fn new() -> Self {
+            Self(std::sync::Condvar::new())
+        }
+
+        #[inline]
+        pub fn notify_all(&self) {
+            self.0.notify_all();
+        }
+    }
+
+    #[inline]
+    pub fn cvar_wait<'a, T>(
+        cvar: &Condvar,
+        g: std::sync::MutexGuard<'a, T>,
+    ) -> std::sync::MutexGuard<'a, T> {
+        cvar.0.wait(g).unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+use sync_impl::{cvar_wait, Condvar, Mutex, RwLock};
 use prometheus::{Counter, CounterVec, Gauge, Opts, Registry};
 use smallvec::SmallVec;
 use xxhash_rust::xxh3::xxh3_64;
@@ -205,7 +283,7 @@ impl InFlightCall {
     fn wait(&self) -> Option<Arc<[u64]>> {
         let mut g = self.state.lock();
         while !g.done {
-            self.cvar.wait(&mut g);
+            g = cvar_wait(&self.cvar, g);
         }
         g.result.clone()
     }
@@ -1443,8 +1521,17 @@ mod tests {
                 Ok(vec![999])
             }).unwrap()
         });
-        // Give waiter a moment to register on in_flight before releasing leader.
-        std::thread::sleep(Duration::from_millis(25));
+        // Wait deterministically until the waiter has cloned the Arc<InFlightCall> from in_flight.
+        while !cache
+            .in_flight
+            .lock()
+            .values()
+            .next()
+            .is_some_and(|c| Arc::strong_count(c) >= 3)
+        {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(5));
         release_leader.wait();
 
         assert_eq!(&*h1.join().unwrap(), &[7, 8]);
@@ -1489,8 +1576,18 @@ mod tests {
     fn f3d_read_side_expire_and_stale_cached_entry_skip() {
         let reg = Registry::new();
         let metrics = PostingsForMatchersCacheMetrics::new("f3d_", Some(&reg));
+        let ttl = if cfg!(miri) {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(30)
+        };
+        let sleep = if cfg!(miri) {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_millis(45)
+        };
         let cache = PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
-            ttl: Duration::from_millis(30),
+            ttl,
             max_items: 100,
             max_bytes: 1024 * 1024,
             enable_invalidation: false,
@@ -1504,7 +1601,7 @@ mod tests {
         cache.get_or_compute::<_, ()>(&m1, true, || Ok(vec![1])).unwrap();
         assert_eq!(sample(&reg, "f3d_postings_for_matchers_cache_entries_total", None), 1.0);
 
-        std::thread::sleep(Duration::from_millis(45));
+        std::thread::sleep(sleep);
         // Even an ineligible read does not expire, whereas an eligible read for m2 runs expire()
         // and evicts expired m1 first, or if expire_in_progress is contended, hitting expired m1
         // increments skips_total{reason="stale-cached-entry"}.
