@@ -45,6 +45,8 @@ pub enum ProducerError {
     RecordTimeout,
     #[error("message too large")]
     MessageTooLarge,
+    #[error("client closed")]
+    Closed,
     #[error("kafka error: {0}")]
     Other(String),
 }
@@ -265,14 +267,15 @@ pub struct KafkaWriterClient {
     default_topic: Option<String>,
     compression: KafkaCompression,
     linger: Duration,
-    max_inflight: usize,
     write_timeout: Duration,
     write_timeout_overhead: Duration,
     buffered_bytes: Arc<AtomicI64>,
     buffered_records: Arc<AtomicI64>,
     queue: Arc<SyncMutex<VecDeque<QueuedItem>>>,
+    inflight_sem: Arc<Semaphore>,
     notify: Arc<Notify>,
     closed: Arc<AtomicBool>,
+    close_tx: watch::Sender<bool>,
     extended_metrics: Option<KafkaClientExtendedMetrics>,
 }
 
@@ -317,12 +320,13 @@ impl KafkaWriterClient {
             Some(cfg.topic.clone())
         };
 
+        let max_inflight = max_inflight_produce_requests.max(1);
+        let (close_tx, close_rx) = watch::channel(false);
         let client = Arc::new(Self {
             inner,
             default_topic,
             compression,
             linger,
-            max_inflight: max_inflight_produce_requests.max(1),
             write_timeout: if write_timeout.is_zero() {
                 Duration::from_secs(10)
             } else {
@@ -332,17 +336,19 @@ impl KafkaWriterClient {
             buffered_bytes: Arc::new(AtomicI64::new(0)),
             buffered_records: Arc::new(AtomicI64::new(0)),
             queue: Arc::new(SyncMutex::new(VecDeque::new())),
+            inflight_sem: Arc::new(Semaphore::new(max_inflight)),
             notify: Arc::new(Notify::new()),
             closed: Arc::new(AtomicBool::new(false)),
+            close_tx,
             extended_metrics,
         });
 
         let c_bg = Arc::downgrade(&client);
+        let inflight_sem = Arc::clone(&client.inflight_sem);
         let notify = Arc::clone(&client.notify);
         let closed = Arc::clone(&client.closed);
-        let max_inflight = client.max_inflight;
         tokio::spawn(async move {
-            Self::dispatch_loop(c_bg, max_inflight, notify, closed).await;
+            Self::dispatch_loop(c_bg, inflight_sem, notify, closed, close_rx).await;
         });
 
         Ok(client)
@@ -381,26 +387,39 @@ impl KafkaWriterClient {
         (r.key.len() + r.value.len()) as i64
     }
 
+    fn fail_items_with_err(&self, items: Vec<QueuedItem>, err: ProducerError) {
+        for item in items {
+            let bytes = Self::record_buf_bytes(&item.record);
+            self.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            self.buffered_records.fetch_sub(1, Ordering::SeqCst);
+            self.update_buffered_gauges();
+            (item.on_done)(item.record, Err(err.clone()));
+        }
+    }
+
+    fn drain_closed(&self) {
+        let drained: Vec<QueuedItem> = {
+            let mut q = self.queue.lock();
+            self.closed.store(true, Ordering::SeqCst);
+            q.drain(..).collect()
+        };
+        let _ = self.close_tx.send(true);
+        self.inflight_sem.close();
+        self.notify.notify_waiters();
+        self.fail_items_with_err(drained, ProducerError::Closed);
+    }
+
     async fn dispatch_loop(
         weak: Weak<Self>,
-        max_inflight: usize,
+        inflight_sem: Arc<Semaphore>,
         notify: Arc<Notify>,
         closed: Arc<AtomicBool>,
+        mut close_rx: watch::Receiver<bool>,
     ) {
-        let inflight_sem = Arc::new(Semaphore::new(max_inflight));
         loop {
-            if closed.load(Ordering::SeqCst) {
+            if closed.load(Ordering::SeqCst) || *close_rx.borrow_and_update() {
                 if let Some(this) = weak.upgrade() {
-                    let drained: Vec<QueuedItem> = this.queue.lock().drain(..).collect();
-                    for item in drained {
-                        let bytes = Self::record_buf_bytes(&item.record);
-                        this.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                        this.buffered_records.fetch_sub(1, Ordering::SeqCst);
-                        (item.on_done)(
-                            item.record,
-                            Err(ProducerError::Other("client closed".to_string())),
-                        );
-                    }
+                    this.drain_closed();
                 }
                 break;
             }
@@ -416,32 +435,51 @@ impl KafkaWriterClient {
             if !has_items {
                 tokio::select! {
                     _ = notify.notified() => {},
+                    _ = close_rx.changed() => {},
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {},
                 }
                 continue;
             }
 
-            let Ok(permit) = Arc::clone(&inflight_sem).acquire_owned().await else {
+            // Acquire at most one permit before lingering/draining so subsequent items stay
+            // buffered in self.queue while all max_inflight slots are busy. Additional
+            // permits for multi-partition batches are acquired INSIDE each spawned task,
+            // never on dispatch_loop's own stack.
+            let Ok(first_permit) = Arc::clone(&inflight_sem).acquire_owned().await else {
+                if let Some(this) = weak.upgrade() {
+                    this.drain_closed();
+                }
                 break;
             };
 
             if !linger.is_zero() {
-                tokio::time::sleep(linger).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(linger) => {},
+                    _ = close_rx.changed() => {},
+                }
+                if closed.load(Ordering::SeqCst) || *close_rx.borrow_and_update() {
+                    drop(first_permit);
+                    if let Some(this) = weak.upgrade() {
+                        this.drain_closed();
+                    }
+                    break;
+                }
             }
 
             // Drain all queued items and group by (topic, partition)
-            let (groups, extra_permits_needed) = {
+            let groups = {
                 let Some(this) = weak.upgrade() else {
-                    drop(permit);
+                    drop(first_permit);
                     break;
                 };
-                if closed.load(Ordering::SeqCst) {
-                    drop(permit);
-                    continue;
+                if closed.load(Ordering::SeqCst) || *close_rx.borrow_and_update() {
+                    drop(first_permit);
+                    this.drain_closed();
+                    break;
                 }
                 let batch_items: Vec<QueuedItem> = this.queue.lock().drain(..).collect();
                 if batch_items.is_empty() {
-                    drop(permit);
+                    drop(first_permit);
                     continue;
                 }
 
@@ -457,39 +495,103 @@ impl KafkaWriterClient {
                         .or_default()
                         .push(item);
                 }
-                let extra = groups.len().saturating_sub(1);
-                (groups, extra)
+                groups
             };
 
-            let mut extra_permits = Vec::with_capacity(extra_permits_needed);
-            for _ in 0..extra_permits_needed {
-                if let Ok(p) = Arc::clone(&inflight_sem).acquire_owned().await {
-                    extra_permits.push(p);
+            if closed.load(Ordering::SeqCst) || *close_rx.borrow_and_update() {
+                drop(first_permit);
+                if let Some(this) = weak.upgrade() {
+                    for (_, items) in groups {
+                        this.fail_items_with_err(items, ProducerError::Closed);
+                    }
+                    this.drain_closed();
+                } else {
+                    for (_, items) in groups {
+                        for item in items {
+                            (item.on_done)(item.record, Err(ProducerError::Closed));
+                        }
+                    }
                 }
+                break;
             }
+
             let Some(this_strong) = weak.upgrade() else {
-                drop(permit);
+                drop(first_permit);
+                for (_, items) in groups {
+                    for item in items {
+                        (item.on_done)(item.record, Err(ProducerError::Closed));
+                    }
+                }
                 break;
             };
-            let mut permit_opt = Some(permit);
 
+            let mut first_permit_opt = Some(first_permit);
             for ((topic, partition), items) in groups {
-                let p = if permit_opt.is_some() {
-                    permit_opt.take()
-                } else {
-                    extra_permits.pop()
-                };
+                let pre_permit = first_permit_opt.take();
+                let sem = Arc::clone(&inflight_sem);
                 let weak_this = Arc::downgrade(&this_strong);
                 tokio::spawn(async move {
-                    let _permit = p;
+                    let _permit = match pre_permit {
+                        Some(p) => p,
+                        None => {
+                            let earliest_enqueue = items
+                                .iter()
+                                .map(|i| i.enqueued_at)
+                                .min()
+                                .unwrap_or_else(Instant::now);
+                            let Some(write_timeout) = weak_this.upgrade().map(|t| t.write_timeout)
+                            else {
+                                for item in items {
+                                    (item.on_done)(item.record, Err(ProducerError::Closed));
+                                }
+                                return;
+                            };
+                            let deadline = earliest_enqueue + write_timeout;
+                            tokio::select! {
+                                res = sem.acquire_owned() => match res {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        if let Some(this) = weak_this.upgrade() {
+                                            this.fail_items_with_err(items, ProducerError::Closed);
+                                        } else {
+                                            for item in items {
+                                                (item.on_done)(
+                                                    item.record,
+                                                    Err(ProducerError::Closed),
+                                                );
+                                            }
+                                        }
+                                        return;
+                                    }
+                                },
+                                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                                    if let Some(this) = weak_this.upgrade() {
+                                        this.fail_items_with_err(
+                                            items,
+                                            ProducerError::RecordTimeout,
+                                        );
+                                    } else {
+                                        for item in items {
+                                            (item.on_done)(
+                                                item.record,
+                                                Err(ProducerError::RecordTimeout),
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    };
                     if let Some(this) = weak_this.upgrade() {
-                        this.send_partition_batch(topic, partition, items).await;
+                        if this.closed.load(Ordering::SeqCst) {
+                            this.fail_items_with_err(items, ProducerError::Closed);
+                        } else {
+                            this.send_partition_batch(topic, partition, items).await;
+                        }
                     } else {
                         for item in items {
-                            (item.on_done)(
-                                item.record,
-                                Err(ProducerError::Other("client closed".to_string())),
-                            );
+                            (item.on_done)(item.record, Err(ProducerError::Closed));
                         }
                     }
                 });
@@ -670,15 +772,22 @@ impl KafkaWriterClient {
                 }
                 Err(_) => {
                     last_err = Some(ProducerError::RecordTimeout);
-                    // Fail all currently buffered records in the queue (matching franz-go cascading timeout behavior).
-                    let drained: Vec<QueuedItem> = self.queue.lock().drain(..).collect();
-                    for item in drained {
-                        let bytes = Self::record_buf_bytes(&item.record);
-                        self.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                        self.buffered_records.fetch_sub(1, Ordering::SeqCst);
-                        self.update_buffered_gauges();
-                        (item.on_done)(item.record, Err(ProducerError::RecordTimeout));
+                    // Fail only queued records belonging to this (topic, partition), matching
+                    // franz-go per-partition recBuf isolation.
+                    let mut same_partition_items = Vec::new();
+                    {
+                        let mut q = self.queue.lock();
+                        let mut remaining = VecDeque::with_capacity(q.len());
+                        for item in q.drain(..) {
+                            if item.record.topic == topic && item.record.partition == partition {
+                                same_partition_items.push(item);
+                            } else {
+                                remaining.push_back(item);
+                            }
+                        }
+                        *q = remaining;
                     }
+                    self.fail_items_with_err(same_partition_items, ProducerError::RecordTimeout);
                     break;
                 }
             }
@@ -734,15 +843,22 @@ impl KafkaProducerClient for KafkaWriterClient {
                 record.topic = t.clone();
             }
         }
+        let mut q = self.queue.lock();
+        if self.closed.load(Ordering::SeqCst) {
+            drop(q);
+            (on_done)(record, Err(ProducerError::Closed));
+            return;
+        }
         let bytes = Self::record_buf_bytes(&record);
         self.buffered_bytes.fetch_add(bytes, Ordering::SeqCst);
         self.buffered_records.fetch_add(1, Ordering::SeqCst);
         self.update_buffered_gauges();
-        self.queue.lock().push_back(QueuedItem {
+        q.push_back(QueuedItem {
             record,
             enqueued_at: Instant::now(),
             on_done,
         });
+        drop(q);
         self.notify.notify_one();
     }
 
@@ -755,15 +871,13 @@ impl KafkaProducerClient for KafkaWriterClient {
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.drain_closed();
     }
 }
 
 impl Drop for KafkaWriterClient {
     fn drop(&mut self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.drain_closed();
     }
 }
 
@@ -996,6 +1110,11 @@ impl KafkaProducer {
         registry: Option<&Registry>,
         opts: KafkaWriterClientOptions,
     ) -> Result<Arc<Self>, KafkaClientError> {
+        if cfg.backend.eq_ignore_ascii_case("warpstream") {
+            return Err(KafkaClientError::Config(
+                "kafka backend \"warpstream\" is not supported by mimir-rs".to_string(),
+            ));
+        }
         let client = KafkaWriterClient::new_with_prefix(
             cfg,
             max_inflight,
@@ -1396,6 +1515,391 @@ mod tests {
 
         client.close();
         srv.abort();
+    }
+
+    async fn spawn_multi_partition_mock_kafka(
+        num_partitions: i32,
+        stall_partition_0_forever: Arc<AtomicBool>,
+        produced_partitions: Arc<SyncMutex<Vec<i32>>>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let stall_p0 = Arc::clone(&stall_partition_0_forever);
+                let produced = Arc::clone(&produced_partitions);
+                let port = addr.port() as i32;
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    let mut len_buf = [0u8; 4];
+                    while rd.read_exact(&mut len_buf).await.is_ok() {
+                        let sz = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; sz];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = Bytes::from(payload);
+                        let key_i16 = i16::from_be_bytes([buf[0], buf[1]]);
+                        let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                        let Ok(api_key) = ApiKey::try_from(key_i16) else {
+                            break;
+                        };
+                        let hdr_ver = match api_key {
+                            ApiKey::ApiVersions => ApiVersionsRequest::header_version(ver),
+                            ApiKey::Metadata => MetadataRequest::header_version(ver),
+                            ApiKey::Produce => ProduceRequest::header_version(ver),
+                            _ => break,
+                        };
+                        let Ok(req_hdr) = RequestHeader::decode(&mut buf, hdr_ver) else {
+                            break;
+                        };
+                        let mut out = BytesMut::new();
+                        out.put_u32(0);
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr
+                            .encode(&mut out, api_key.response_header_version(ver))
+                            .unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 1, 12),
+                                    (ApiKey::Produce as i16, 3, 9),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = port;
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+
+                                let mut mt = MetadataResponseTopic::default();
+                                mt.name = Some(TopicName(StrBytes::from_static_str("ingest")));
+                                for pid in 0..num_partitions {
+                                    let mut mp = MetadataResponsePartition::default();
+                                    mp.partition_index = pid;
+                                    mp.leader_id = BrokerId(0);
+                                    mt.partitions.push(mp);
+                                }
+                                resp.topics.push(mt);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Produce => {
+                                let req = ProduceRequest::decode(&mut buf, ver).unwrap();
+                                let mut should_stall = false;
+                                let mut resp = ProduceResponse::default();
+                                for rt in &req.topic_data {
+                                    let mut tr = TopicProduceResponse::default();
+                                    tr.name = rt.name.clone();
+                                    for rp in &rt.partition_data {
+                                        if rp.index == 0 && stall_p0.load(Ordering::SeqCst) {
+                                            should_stall = true;
+                                        }
+                                        produced.lock().push(rp.index);
+                                        let mut pr = PartitionProduceResponse::default();
+                                        pr.index = rp.index;
+                                        pr.error_code = 0;
+                                        pr.base_offset = 100 + rp.index as i64;
+                                        tr.partition_responses.push(pr);
+                                    }
+                                    resp.responses.push(tr);
+                                }
+                                if should_stall {
+                                    // Stall only this partition's Produce response without blocking
+                                    // subsequent requests for healthy partitions on the same socket.
+                                    continue;
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, srv)
+    }
+
+    #[tokio::test]
+    async fn w23_csc_01_dispatch_loop_does_not_deadlock_when_batch_spans_more_partitions_than_max_inflight() {
+        let stall = Arc::new(AtomicBool::new(false));
+        let produced = Arc::new(SyncMutex::new(Vec::new()));
+        let (addr, srv) = spawn_multi_partition_mock_kafka(8, stall, Arc::clone(&produced)).await;
+
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "ingest".to_string(),
+            write_timeout: GoDuration::from_secs(3),
+            ..Default::default()
+        };
+        cfg.dial_timeout = GoDuration::from_secs(2);
+
+        // max_inflight = 2 while a single 50ms linger batch spans 8 partitions.
+        let client = KafkaWriterClient::new(
+            &cfg,
+            2,
+            None,
+            KafkaWriterClientOptions {
+                disable_default_topic: false,
+                disable_linger: false,
+            },
+        )
+        .unwrap();
+
+        let mut futs = Vec::new();
+        for p in 0..8 {
+            let c = Arc::clone(&client);
+            futs.push(tokio::spawn(async move {
+                c.produce_sync(WriterRecord {
+                    topic: "ingest".to_string(),
+                    partition: p,
+                    key: Bytes::from(format!("k-{p}")),
+                    value: Bytes::from(format!("v-{p}")),
+                    ..Default::default()
+                })
+                .await
+                .map(|off| (p, off))
+            }));
+        }
+
+        let results = tokio::time::timeout(Duration::from_secs(3), futures::future::join_all(futs))
+            .await
+            .expect("8-partition linger batch with max_inflight=2 must not deadlock");
+        for r in results {
+            let (p, off) = r.unwrap().expect("produce must succeed");
+            assert_eq!(off, 100 + p as i64);
+        }
+        assert_eq!(client.buffered_produce_bytes(), 0);
+        assert_eq!(client.buffered_produce_records(), 0);
+
+        client.close();
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn w23_csc_01_single_partition_timeout_only_drains_timed_out_partition() {
+        let stall_p0 = Arc::new(AtomicBool::new(true));
+        let produced = Arc::new(SyncMutex::new(Vec::new()));
+        let (addr, srv) =
+            spawn_multi_partition_mock_kafka(2, Arc::clone(&stall_p0), Arc::clone(&produced)).await;
+
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "ingest".to_string(),
+            write_timeout: GoDuration::from_millis(160),
+            write_timeout_overhead: GoDuration::from_millis(40),
+            ..Default::default()
+        };
+        cfg.dial_timeout = GoDuration::from_secs(2);
+
+        let client = KafkaWriterClient::new(
+            &cfg,
+            2,
+            None,
+            KafkaWriterClientOptions {
+                disable_default_topic: false,
+                disable_linger: false,
+            },
+        )
+        .unwrap();
+
+        // Batch 1: partition 0 stalls and will hit tokio::time::timeout at ~200ms after linger (50ms).
+        let (tx0_a, rx0_a) = tokio::sync::oneshot::channel();
+        client.produce(
+            WriterRecord {
+                topic: "ingest".to_string(),
+                partition: 0,
+                key: Bytes::from_static(b"k0a"),
+                value: Bytes::from_static(b"v0a"),
+                ..Default::default()
+            },
+            Box::new(move |_rec, res| {
+                let _ = tx0_a.send(res);
+            }),
+        );
+
+        // Wait until batch 1 is in-flight on partition 0 (past the 50ms linger, before its 200ms timeout).
+        while !produced.lock().contains(&0) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Sleep until just before the first batch times out (~155ms elapsed vs ~200ms timeout),
+        // then enqueue a second p0 record AND a healthy p1 record so both sit in self.queue
+        // during the 50ms linger while p0 times out.
+        tokio::time::sleep(Duration::from_millis(105)).await;
+
+        let (tx0_b, rx0_b) = tokio::sync::oneshot::channel();
+        client.produce(
+            WriterRecord {
+                topic: "ingest".to_string(),
+                partition: 0,
+                key: Bytes::from_static(b"k0b"),
+                value: Bytes::from_static(b"v0b"),
+                ..Default::default()
+            },
+            Box::new(move |_rec, res| {
+                let _ = tx0_b.send(res);
+            }),
+        );
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        client.produce(
+            WriterRecord {
+                topic: "ingest".to_string(),
+                partition: 1,
+                key: Bytes::from_static(b"k1"),
+                value: Bytes::from_static(b"v1"),
+                ..Default::default()
+            },
+            Box::new(move |_rec, res| {
+                let _ = tx1.send(res);
+            }),
+        );
+
+        assert_eq!(rx0_a.await.unwrap(), Err(ProducerError::RecordTimeout));
+        assert_eq!(rx0_b.await.unwrap(), Err(ProducerError::RecordTimeout));
+        assert_eq!(rx1.await.unwrap(), Ok(101));
+        assert_eq!(client.buffered_produce_bytes(), 0);
+
+        client.close();
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn w23_csc_01_drop_and_close_release_queued_items_and_buffered_bytes() {
+        let stall = Arc::new(AtomicBool::new(true));
+        let produced = Arc::new(SyncMutex::new(Vec::new()));
+        let (addr, srv) = spawn_multi_partition_mock_kafka(1, stall, produced).await;
+
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "ingest".to_string(),
+            write_timeout: GoDuration::from_secs(5),
+            ..Default::default()
+        };
+        cfg.dial_timeout = GoDuration::from_secs(2);
+
+        // Case A: close() while items are queued in linger releases KafkaProducer.buffered_bytes.
+        let producer = KafkaProducer::from_config_with_prefix(
+            &cfg,
+            2,
+            "",
+            None,
+            KafkaWriterClientOptions {
+                disable_default_topic: false,
+                disable_linger: false,
+            },
+        )
+        .unwrap();
+
+        let p_c = Arc::clone(&producer);
+        let h = tokio::spawn(async move {
+            p_c.produce_sync(
+                &ProduceContext::background(),
+                vec![WriterRecord {
+                    topic: "ingest".to_string(),
+                    partition: 0,
+                    key: Bytes::from_static(b"k"),
+                    value: Bytes::from_static(b"payload-1234"),
+                    ..Default::default()
+                }],
+            )
+            .await
+        });
+
+        while producer.buffered_bytes_counter() == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        producer.close();
+
+        let res = tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("produce_sync must complete promptly on close")
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].err, Some(ProducerError::Closed));
+        assert_eq!(producer.buffered_bytes_counter(), 0);
+
+        // Case B: dropping KafkaWriterClient while queued items exist invokes callbacks and clears bytes.
+        let client = KafkaWriterClient::new(
+            &cfg,
+            2,
+            None,
+            KafkaWriterClientOptions {
+                disable_default_topic: false,
+                disable_linger: false,
+            },
+        )
+        .unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let sim_buffered = Arc::new(AtomicI64::new(12));
+        let sim_ctr = Arc::clone(&sim_buffered);
+        client.produce(
+            WriterRecord {
+                topic: "ingest".to_string(),
+                partition: 0,
+                key: Bytes::from_static(b"k2"),
+                value: Bytes::from_static(b"payload-5678"),
+                ..Default::default()
+            },
+            Box::new(move |rec, res| {
+                sim_ctr.fetch_sub(rec.value.len() as i64, Ordering::SeqCst);
+                let _ = done_tx.send(res);
+            }),
+        );
+        assert_eq!(client.buffered_produce_records(), 1);
+        drop(client);
+        let res2 = tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("drop must resolve queued callbacks without hanging")
+            .unwrap();
+        assert_eq!(res2, Err(ProducerError::Closed));
+        assert_eq!(sim_buffered.load(Ordering::SeqCst), 0);
+
+        srv.abort();
+    }
+
+    #[test]
+    fn w23_csc_12a_rejects_warpstream_backend() {
+        let cfg = KafkaConfig {
+            backend: "warpstream".to_string(),
+            address: StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "ingest".to_string(),
+            ..Default::default()
+        };
+        let err = match KafkaProducer::from_config_with_prefix(
+            &cfg,
+            1,
+            "",
+            None,
+            KafkaWriterClientOptions::default(),
+        ) {
+            Ok(_) => panic!("expected warpstream backend to be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("warpstream"), "unexpected error: {err}");
     }
 }
 

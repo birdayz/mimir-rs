@@ -1802,13 +1802,19 @@ pub fn new_store(cfg: &GCSConfig) -> Result<Arc<dyn ObjectStore>, BucketError> {
     let idempotent: Arc<dyn ObjectStore> = Arc::new(GcsStore {
         client: Arc::clone(&inner),
         retry: retry_config(cfg.max_retries, true),
+        retry_always: false,
     });
     let non_idempotent: Arc<dyn ObjectStore> = Arc::new(GcsStore {
         client: Arc::clone(&inner),
         retry: retry_config(cfg.max_retries, false),
+        retry_always: false,
     });
     let upload: Arc<dyn ObjectStore> = if cfg.enable_upload_retries {
-        Arc::clone(&idempotent)
+        Arc::new(GcsStore {
+            client: Arc::clone(&inner),
+            retry: retry_config(cfg.max_retries, true),
+            retry_always: true,
+        })
     } else {
         Arc::clone(&non_idempotent)
     };
@@ -1977,6 +1983,7 @@ impl GcsClient {
 struct GcsStore {
     client: Arc<GcsClient>,
     retry: RetryConfig,
+    retry_always: bool,
 }
 
 impl fmt::Display for GcsStore {
@@ -2312,7 +2319,7 @@ impl ObjectStore for GcsStore {
     ) -> object_store::Result<PutResult> {
         let url = self.client.object_url(location);
         let len = payload.content_length();
-        let idempotent = matches!(opts.mode, PutMode::Overwrite);
+        let idempotent = self.retry_always || matches!(opts.mode, PutMode::Overwrite);
         let res = self
             .client
             .send_with_retry(&self.retry, location.as_ref(), idempotent, |c| {
@@ -2358,9 +2365,10 @@ impl ObjectStore for GcsStore {
         opts: PutMultipartOpts,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let url = self.client.object_url(location);
+        let idempotent = self.retry_always;
         let resp = self
             .client
-            .send_with_retry(&self.retry, location.as_ref(), false, |c| {
+            .send_with_retry(&self.retry, location.as_ref(), idempotent, |c| {
                 let rb = c
                     .post(&url)
                     .header(CONTENT_LENGTH, "0")
@@ -2569,6 +2577,7 @@ impl GcsStore {
                 let tmp = GcsStore {
                     client: Arc::clone(&client),
                     retry: retry.clone(),
+                    retry_always: false,
                 };
                 let (res, next) = tmp
                     .list_page(
@@ -3067,5 +3076,117 @@ mod tests {
         );
         assert!(first_line.contains("devstorage.full_control"), "{first_line}");
         assert!(!first_line.contains("audience="), "{first_line}");
+    }
+
+    #[tokio::test]
+    async fn w23_csc_10_multipart_and_create_upload_retry_transport_eof_when_enabled() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_srv = Arc::clone(&attempts);
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log_srv = Arc::clone(&log);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let attempts_c = Arc::clone(&attempts_srv);
+                let log_c = Arc::clone(&log_srv);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut len = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let lower = h.trim().to_ascii_lowercase();
+                        if lower.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = lower.strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; len];
+                    let _ = reader.read_exact(&mut body);
+                    log_c.lock().unwrap().push(line.trim().to_string());
+
+                    let n = attempts_c.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // Drop socket without response -> post-connect transport EOF error.
+                        drop(reader);
+                        drop(stream);
+                        return;
+                    }
+                    if line.starts_with("POST ") && line.contains("uploads=") {
+                        let xml = "<InitiateMultipartUploadResult><UploadId>up-123</UploadId></InitiateMultipartUploadResult>";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{xml}",
+                            xml.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else {
+                        let resp = "HTTP/1.1 200 OK\r\netag: \"e1\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                });
+            }
+        });
+
+        let sa = format!(
+            r#"{{"type":"service_account","private_key":"unused","private_key_id":"x","client_email":"x@y","gcs_base_url":"http://{addr}","disable_oauth":true}}"#
+        );
+
+        // 1. enable_upload_retries = true: put_multipart_opts retries post-connect EOF and succeeds.
+        let store_retry = new_store(&GCSConfig {
+            bucket_name: "bkt".into(),
+            service_account: sa.clone(),
+            max_retries: 2,
+            enable_upload_retries: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mp = store_retry
+            .put_multipart(&Path::from("big/chunks/000001"))
+            .await
+            .expect("put_multipart must retry post-connect EOF when enable_upload_retries=true");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        drop(mp);
+
+        // 2. enable_upload_retries = true: PutMode::Create also retries post-connect EOF.
+        attempts.store(0, Ordering::SeqCst);
+        store_retry
+            .put_opts(
+                &Path::from("create/obj"),
+                PutPayload::from_static(b"hello"),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("PutMode::Create must retry post-connect EOF when enable_upload_retries=true");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        // 3. enable_upload_retries = false: put_multipart fails on attempt 1 with 0 retries.
+        attempts.store(0, Ordering::SeqCst);
+        let store_no_retry = new_store(&GCSConfig {
+            bucket_name: "bkt".into(),
+            service_account: sa,
+            max_retries: 2,
+            enable_upload_retries: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let res = store_no_retry
+            .put_multipart(&Path::from("big/chunks/000002"))
+            .await;
+        assert!(res.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }
