@@ -17742,4 +17742,161 @@ mod tests {
         app.rollback().unwrap();
         head.close().unwrap();
     }
+
+    #[test]
+    fn gate_a1_t_eq_maxt_duplicate_and_quiet_zero_nan_reject_ooo_parity() {
+        use prometheus::core::Collector as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 10_000,
+            ooo_time_window_ms: 50_000,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        let qzn = f64::from_bits(QUIET_ZERO_NAN_BITS);
+
+        let make_hist = |v: u64| Histogram {
+            schema: 0,
+            count: v,
+            sum: v as f64,
+            positive_spans: vec![crate::chunkenc::HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![v as i64],
+            ..Histogram::default()
+        };
+        let make_fhist = |v: f64| FloatHistogram {
+            schema: 0,
+            count: v,
+            sum: v,
+            positive_spans: vec![crate::chunkenc::HistogramSpan { offset: 0, length: 1 }],
+            positive_buckets: vec![v],
+            ..FloatHistogram::default()
+        };
+
+        let fp = [("__name__", "ga1_float"), ("job", "t")];
+        let fp_zero = [("__name__", "ga1_float_zero"), ("job", "t")];
+        let hp = [("__name__", "ga1_hist"), ("job", "t")];
+        let fhp = [("__name__", "ga1_fhist"), ("job", "t")];
+
+        // Seed in-order maxt = 200_000 and an OOO sample at t = 180_000 on each series.
+        let mut app = head.appender();
+        let fr = app.append_float(None, &fp, 200_000, 1.0).unwrap();
+        let fzr = app.append_float(None, &fp_zero, 200_000, 0.0).unwrap();
+        let hr = app.append_histogram(None, &hp, 0, 200_000, make_hist(1)).unwrap();
+        let fhr = app.append_float_histogram(None, &fhp, 0, 200_000, make_fhist(1.0)).unwrap();
+        app.commit().unwrap();
+
+        let mut app = head.appender();
+        app.append_float(Some(fr), &fp, 180_000, 7.0).unwrap();
+        app.append_histogram(Some(hr), &hp, 0, 180_000, make_hist(7)).unwrap();
+        app.append_float_histogram(Some(fhr), &fhp, 0, 180_000, make_fhist(7.0)).unwrap();
+        app.commit().unwrap();
+
+        let ooo_hist_count = || -> u64 {
+            head.metrics
+                .ooo_histogram
+                .collect()
+                .first()
+                .and_then(|mf| mf.get_metric().first())
+                .map(|m| m.get_histogram().get_sample_count())
+                .unwrap_or(0)
+        };
+        let dup_f = || head.metrics.duplicate_samples.with_label_values(&["float"]).get();
+        let dup_h = || head.metrics.duplicate_samples.with_label_values(&["histogram"]).get();
+        let ooo_f = || head.metrics.out_of_order_samples.with_label_values(&["float"]).get();
+        let ooo_h = || head.metrics.out_of_order_samples.with_label_values(&["histogram"]).get();
+
+        let mut app = head.appender();
+
+        // 1) Equal-value duplicate at t == st.max_time() (including QuietZeroNaN when prev_v == 0.0)
+        // must succeed silently under reject_ooo == true without incrementing out_of_order_samples.
+        let ooo_hist_0 = ooo_hist_count();
+        let ooo_f_0 = ooo_f();
+        let ooo_h_0 = ooo_h();
+        let dup_f_0 = dup_f();
+        let dup_h_0 = dup_h();
+
+        assert_eq!(app.append_float_reject_ooo(Some(fr), &fp, 200_000, 1.0).unwrap(), fr);
+        assert_eq!(app.append_float_reject_ooo(Some(fzr), &fp_zero, 200_000, qzn).unwrap(), fzr);
+        let lbls = Labels::from_sorted_slice(&fp_zero);
+        let h = lbls.hash();
+        let mut cached_zero = Some(head.get_entry_by_sorted_pairs(&fp_zero).unwrap());
+        assert_eq!(
+            app.append_float_with_entry_prehashed_encoded(
+                &mut cached_zero,
+                h,
+                lbls.as_bytes(),
+                0,
+                200_000,
+                qzn,
+                true,
+            )
+            .unwrap(),
+            fzr
+        );
+        assert_eq!(app.append_histogram_reject_ooo(Some(hr), &hp, 200_000, make_hist(1)).unwrap(), hr);
+        assert_eq!(
+            app.append_float_histogram_reject_ooo(Some(fhr), &fhp, 200_000, make_fhist(1.0))
+                .unwrap(),
+            fhr
+        );
+        assert_eq!(ooo_f(), ooo_f_0);
+        assert_eq!(ooo_h(), ooo_h_0);
+        assert_eq!(ooo_hist_count(), ooo_hist_0);
+        assert_eq!(dup_f(), dup_f_0 + 3.0);
+        assert_eq!(dup_h(), dup_h_0 + 2.0);
+
+        // 2) Override duplicate at t == st.max_time() under reject_ooo == true returns DuplicateSample*
+        // and increments duplicate_samples, NOT out_of_order_samples or ooo_histogram.
+        assert!(matches!(
+            app.append_float_reject_ooo(Some(fr), &fp, 200_000, 2.0),
+            Err(HeadError::DuplicateSampleWithDetails(_))
+        ));
+        assert!(matches!(
+            app.append_histogram_reject_ooo(Some(hr), &hp, 200_000, make_hist(2)),
+            Err(HeadError::DuplicateSampleForTimestamp)
+        ));
+        assert!(matches!(
+            app.append_float_histogram_reject_ooo(Some(fhr), &fhp, 200_000, make_fhist(2.0)),
+            Err(HeadError::DuplicateSampleForTimestamp)
+        ));
+        assert_eq!(ooo_f(), ooo_f_0);
+        assert_eq!(ooo_h(), ooo_h_0);
+        assert_eq!(ooo_hist_count(), ooo_hist_0);
+        assert_eq!(dup_f(), dup_f_0 + 4.0);
+        assert_eq!(dup_h(), dup_h_0 + 4.0);
+
+        // 3) OOO duplicate at t < st.max_time() (180_000, already stored in OOO chunk) under
+        // reject_ooo == true must return OutOfOrderSample (before OOO dup check), incrementing
+        // out_of_order_samples and NOT duplicate_samples or ooo_histogram.
+        assert!(matches!(
+            app.append_float_reject_ooo(Some(fr), &fp, 180_000, 7.0),
+            Err(HeadError::OutOfOrderSample)
+        ));
+        assert!(matches!(
+            app.append_histogram_reject_ooo(Some(hr), &hp, 180_000, make_hist(7)),
+            Err(HeadError::OutOfOrderSample)
+        ));
+        assert!(matches!(
+            app.append_float_histogram_reject_ooo(Some(fhr), &fhp, 180_000, make_fhist(7.0)),
+            Err(HeadError::OutOfOrderSample)
+        ));
+        assert_eq!(ooo_f(), ooo_f_0 + 1.0);
+        assert_eq!(ooo_h(), ooo_h_0 + 2.0);
+        assert_eq!(ooo_hist_count(), ooo_hist_0);
+        assert_eq!(dup_f(), dup_f_0 + 4.0);
+        assert_eq!(dup_h(), dup_h_0 + 4.0);
+
+        // 4) QuietZeroNaN at t < st.max_time() under reject_ooo == true returns OutOfOrderSample.
+        assert!(matches!(
+            app.append_float_reject_ooo(Some(fzr), &fp_zero, 180_000, qzn),
+            Err(HeadError::OutOfOrderSample)
+        ));
+        assert_eq!(ooo_f(), ooo_f_0 + 2.0);
+        assert_eq!(ooo_hist_count(), ooo_hist_0);
+        assert_eq!(dup_f(), dup_f_0 + 4.0);
+
+        app.rollback().unwrap();
+        head.close().unwrap();
+    }
 }

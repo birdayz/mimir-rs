@@ -108,7 +108,8 @@ impl FloatHistogramStChunk {
                 min: HISTOGRAM_HEADER_SIZE,
             });
         }
-        if self.b.bytes().len() == HISTOGRAM_HEADER_SIZE {
+        if self.num_samples() == 0 {
+            self.b.truncate_and_set_count(HISTOGRAM_HEADER_SIZE, 0);
             return Ok(FloatHistogramStAppender {
                 chunk: self,
                 state: FloatHistogramAppenderState::empty(),
@@ -620,6 +621,20 @@ mod tests {
         assert_eq!(it.at_st(), 100);
         assert_eq!(it.next_float_histogram().unwrap().unwrap().1.count, 5.0);
         assert_eq!(it.at_st(), 200);
+        assert!(it.next_float_histogram().unwrap().is_none());
+
+        // GateA-2: 0-sample chunk with trailing padding bytes truncates to header before sample 0.
+        let mut zero_padded = FloatHistogramStChunk::from_bytes(vec![0, 0, 0, 0xff, 0xaa]);
+        {
+            let _ = zero_padded.appender().unwrap();
+            assert_eq!(zero_padded.as_bytes(), &[0, 0, 0]);
+            let mut app = zero_padded.appender().unwrap();
+            app.append_float_histogram(None, 123, 1_000, &fh1, false)
+                .unwrap();
+        }
+        let mut it = zero_padded.iter();
+        assert_eq!(it.next_float_histogram().unwrap().unwrap().1.count, 2.0);
+        assert_eq!(it.at_st(), 123);
         assert!(it.next_float_histogram().unwrap().is_none());
     }
 }

@@ -530,7 +530,9 @@ impl Http for HttpGrpcBridge {
             if non_utf8_body {
                 // Go grpc-go: proto.Marshal(google.rpc.Status) fails with errInvalidUTF8 when
                 // Status.Message is invalid UTF-8, omitting grpc-status-details-bin while still
-                // sending grpc-status = http_resp.code and grpc-message = encodeGrpcMessage(body).
+                // sending grpc-status = http_resp.code and grpc-message = encodeGrpcMessage(body)
+                // (google.golang.org/grpc/internal/transport/http_util.go:227-265).
+                let encoded_msg = encode_grpc_message_like_go(&msg);
                 let mut st = Status::new(
                     mimir_proto::grpcutilpb::http_code_to_grpc_code(http_resp.code),
                     msg,
@@ -538,6 +540,9 @@ impl Http for HttpGrpcBridge {
                 if let Ok(val) = tonic::metadata::MetadataValue::try_from(http_resp.code.to_string())
                 {
                     st.metadata_mut().insert("x-mimir-httpgrpc-raw-code", val);
+                }
+                if let Ok(val) = tonic::metadata::MetadataValue::try_from(encoded_msg) {
+                    st.metadata_mut().insert("x-mimir-httpgrpc-raw-msg", val);
                 }
                 return Err(st);
             }
@@ -1571,10 +1576,34 @@ fn header_map_to_httpgrpc(headers: &HeaderMap) -> Vec<httpgrpcpb::Header> {
     out
 }
 
+/// Go `google.golang.org/grpc/internal/transport/http_util.go:227-265` (`encodeGrpcMessage` /
+/// `encodeGrpcMessageUnchecked`): leaves printable ASCII `' '..='~'` except `'%'` unencoded and
+/// percent-encodes all other UTF-8 bytes (including `U+FFFD` replacement bytes `%EF%BF%BD`
+/// produced by `utf8.DecodeRuneInString` on invalid UTF-8) as uppercase `%XX`.
+fn encode_grpc_message_like_go(msg_lossy: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(msg_lossy.len());
+    for &b in msg_lossy.as_bytes() {
+        if (b' '..=b'~').contains(&b) && b != b'%' {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 fn rewrite_httpgrpc_status_header(headers: &mut HeaderMap) {
+    let raw_msg = headers.remove("x-mimir-httpgrpc-raw-msg");
     if let Some(raw_code) = headers.remove("x-mimir-httpgrpc-raw-code") {
         headers.insert(Status::GRPC_STATUS, raw_code);
+        if let Some(msg) = raw_msg {
+            headers.insert(Status::GRPC_MESSAGE, msg);
+        }
         return;
+    }
+    if let Some(msg) = raw_msg {
+        headers.insert(Status::GRPC_MESSAGE, msg);
     }
     if !headers.contains_key("grpc-status-details-bin") {
         return;
@@ -2379,6 +2408,15 @@ mod tests {
                 }),
             )
             .route(
+                "/bin-err-pct",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Bytes::from_static(b"100% err:\xff\x80"),
+                    )
+                }),
+            )
+            .route(
                 "/bin-err-override",
                 get(|| async {
                     (
@@ -2439,9 +2477,44 @@ mod tests {
             "grpc-status-details-bin must be omitted on non-UTF-8 Status.Message"
         );
         assert!(!merged_headers.contains_key("x-mimir-httpgrpc-raw-code"));
+        assert!(!merged_headers.contains_key("x-mimir-httpgrpc-raw-msg"));
         assert_eq!(
             merged_headers.get("grpc-message").unwrap(),
             "%1F%EF%BF%BD%08bad"
+        );
+
+        // Verify Go grpc-go encodeGrpcMessage parity on '%', ' ', and invalid UTF-8 bytes:
+        // b"100% err:\xff\x80" -> "100%25 err:%EF%BF%BD%EF%BF%BD" (grpc-go v1.85.0 http_util.go:241-265).
+        let pct_req = httpgrpcpb::HttpRequest {
+            method: "GET".to_string(),
+            url: "/bin-err-pct".to_string(),
+            headers: vec![],
+            body: Bytes::new(),
+        };
+        let pct_payload = pct_req.encode_to_vec();
+        let mut pct_frame = Vec::with_capacity(5 + pct_payload.len());
+        pct_frame.push(0);
+        pct_frame.extend_from_slice(&(pct_payload.len() as u32).to_be_bytes());
+        pct_frame.extend_from_slice(&pct_payload);
+        let pct_http_req = http::Request::builder()
+            .method("POST")
+            .uri("/httpgrpc.HTTP/Handle")
+            .header("content-type", "application/grpc")
+            .body(tonic::body::BoxBody::new(SingleChunkBody(Some(Bytes::from(pct_frame)))))
+            .unwrap();
+        let pct_resp = svc.clone().oneshot(pct_http_req).await.unwrap();
+        let mut pct_headers = pct_resp.headers().clone();
+        let pct_collected = pct_resp.into_body().collect().await.unwrap();
+        if let Some(trailers) = pct_collected.trailers() {
+            pct_headers.extend(trailers.clone());
+        }
+        assert_eq!(pct_headers.get("grpc-status").unwrap(), "500");
+        assert!(!pct_headers.contains_key("grpc-status-details-bin"));
+        assert!(!pct_headers.contains_key("x-mimir-httpgrpc-raw-code"));
+        assert!(!pct_headers.contains_key("x-mimir-httpgrpc-raw-msg"));
+        assert_eq!(
+            pct_headers.get("grpc-message").unwrap(),
+            "100%25 err:%EF%BF%BD%EF%BF%BD"
         );
 
         // When X-ErrorMessage IS set (valid UTF-8), grpc-status-details-bin MUST still be emitted.

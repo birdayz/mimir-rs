@@ -116,7 +116,8 @@ impl HistogramChunk {
                 min: HISTOGRAM_HEADER_SIZE,
             });
         }
-        if self.b.bytes().len() == HISTOGRAM_HEADER_SIZE {
+        if self.num_samples() == 0 {
+            self.b.truncate_and_set_count(HISTOGRAM_HEADER_SIZE, 0);
             return Ok(HistogramAppender {
                 chunk: self,
                 state: HistogramAppenderState::empty(),
@@ -1500,5 +1501,17 @@ mod tests {
         let spans = [HistogramSpan { offset: 0, length: 2 }];
         let expanded = expand_int_spans_and_buckets(&spans, &spans, &[i64::MAX, 1], &[i64::MAX, 1]);
         assert!(expanded.is_some());
+
+        // GateA-2: 0-sample chunk with trailing padding bytes truncates to header before sample 0.
+        let mut zero_padded = HistogramChunk::from_bytes(vec![0, 0, 0, 0xff, 0xaa]);
+        {
+            let _ = zero_padded.appender().unwrap();
+            assert_eq!(zero_padded.as_bytes(), &[0, 0, 0]);
+            let mut app = zero_padded.appender().unwrap();
+            app.append_histogram(None, 0, 1_000, &h1, false).unwrap();
+        }
+        let mut it = zero_padded.iter();
+        assert_eq!(it.next_histogram().unwrap().unwrap().1.count, 2);
+        assert!(it.next_histogram().unwrap().is_none());
     }
 }

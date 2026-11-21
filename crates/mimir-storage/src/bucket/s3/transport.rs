@@ -42,6 +42,16 @@ use tokio::sync::Semaphore;
 /// Go `net.Dialer.Timeout` / `KeepAlive` used by `exthttp.DefaultTransport`.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAL_KEEP_ALIVE: Duration = Duration::from_secs(30);
+/// Maximum number of per-target-host `reqwest::Client` instances retained in `SniClientPool`.
+const MAX_SNI_CLIENTS: usize = 64;
+
+#[inline]
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 /// Immutable per-target-host DNS resolver override so reqwest dials `target_host` while
 /// sending `sni_host` in TLS `ClientHello` SNI. Each distinct target host gets its own
 /// `reqwest::Client` (and thus its own keep-alive pool and resolver), eliminating both
@@ -60,13 +70,14 @@ impl reqwest::dns::Resolve for SniResolver {
             name.as_str().to_string()
         };
         Box::pin(async move {
-            if let Ok(ip) = lookup_host.parse::<std::net::IpAddr>() {
+            let bare_host = strip_ipv6_brackets(&lookup_host);
+            if let Ok(ip) = bare_host.parse::<std::net::IpAddr>() {
                 let addrs: reqwest::dns::Addrs =
                     Box::new(std::iter::once(std::net::SocketAddr::new(ip, 0)));
                 return Ok(addrs);
             }
             let resolved: Vec<std::net::SocketAddr> =
-                tokio::net::lookup_host((lookup_host.as_str(), 0))
+                tokio::net::lookup_host((bare_host, 0))
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
                     .collect();
@@ -89,9 +100,10 @@ pub(crate) struct SniClientPool {
 
 impl SniClientPool {
     fn build_client(&self, target_host: &str) -> Result<reqwest::Client, String> {
+        let bare_target = strip_ipv6_brackets(target_host);
         let resolver = Arc::new(SniResolver {
             sni_host: self.sni_host.clone(),
-            target_host: target_host.to_string(),
+            target_host: bare_target.to_string(),
         });
         let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(self.tls.clone())
@@ -110,15 +122,19 @@ impl SniClientPool {
     }
 
     pub fn client_for_host(&self, target_host: &str) -> Result<reqwest::Client, String> {
-        let key = target_host.to_ascii_lowercase();
+        let bare_target = strip_ipv6_brackets(target_host);
+        let key = bare_target.to_ascii_lowercase();
         if let Some(c) = self.clients.read().get(&key) {
             return Ok(c.clone());
         }
+        let client = self.build_client(bare_target)?;
         let mut guard = self.clients.write();
         if let Some(c) = guard.get(&key) {
             return Ok(c.clone());
         }
-        let client = self.build_client(target_host)?;
+        if guard.len() >= MAX_SNI_CLIENTS {
+            guard.clear();
+        }
         guard.insert(key, client.clone());
         Ok(client)
     }
@@ -528,5 +544,37 @@ mod tests {
         };
         assert!(new_tls_config(&insecure_cfg).is_ok());
         assert!(HttpTransport::new(&insecure_cfg).is_ok());
+    }
+
+    #[tokio::test]
+    async fn gate_b1_sni_pool_strips_ipv6_brackets_and_caps_entries() {
+        use reqwest::dns::Resolve;
+
+        let tr = HttpTransport::new(&BucketHTTPConfig {
+            tls_ca_path: fixture("ca.crt"),
+            tls_server_name: "kafka.mimir-rs.test".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let pool = tr.sni.expect("expected SniClientPool");
+
+        // "[::1]" and "::1" normalize to the same pooled key and resolve to ::1.
+        let _c1 = pool.client_for_host("[::1]").unwrap();
+        let _c2 = pool.client_for_host("::1").unwrap();
+        assert_eq!(pool.clients.read().len(), 1);
+
+        let resolver = SniResolver {
+            sni_host: "kafka.mimir-rs.test".to_string(),
+            target_host: "[::1]".to_string(),
+        };
+        let name: reqwest::dns::Name = "kafka.mimir-rs.test".parse().unwrap();
+        let addrs: Vec<_> = resolver.resolve(name).await.unwrap().collect();
+        assert_eq!(addrs, vec![std::net::SocketAddr::new("::1".parse().unwrap(), 0)]);
+
+        // Inserting more than MAX_SNI_CLIENTS clears and keeps map bounded.
+        for i in 0..(MAX_SNI_CLIENTS + 10) {
+            pool.client_for_host(&format!("127.0.1.{i}")).unwrap();
+        }
+        assert!(pool.clients.read().len() <= MAX_SNI_CLIENTS);
     }
 }

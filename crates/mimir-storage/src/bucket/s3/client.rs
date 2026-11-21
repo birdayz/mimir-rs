@@ -859,7 +859,11 @@ impl Client {
         }
         let (client, dial_url) = if self.endpoint.scheme == "https" {
             if let Some(sni) = &self.http.sni {
-                let (target_host, target_port) = split_authority_host_port(&req.host);
+                let (raw_target_host, target_port) = split_authority_host_port(&req.host);
+                let target_host = raw_target_host
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(raw_target_host);
                 let client = sni
                     .client_for_host(target_host)
                     .map_err(|message| SendError {

@@ -697,7 +697,8 @@ limits:
   metric_relabel_configs:
     - source_labels: [__name__]
       regex: null
-    - target_label: bar
+    - source_labels: [__name__, job]
+      target_label: bar
       action: KEEP
 "#;
     let mut cfg2 = MimirConfig::default();
@@ -719,6 +720,8 @@ limits:
     let mut val = serde_yaml::to_value(&cfg2.limits).unwrap();
     yaml_v3::order_like_go_type("validation.Limits", &mut val).unwrap();
     let rendered = yaml_v3_emit::marshal_struct(&val).unwrap();
+    assert!(rendered.contains("source_labels: [__name__]"), "rendered:\n{rendered}");
+    assert!(rendered.contains("source_labels: [__name__, job]"), "rendered:\n{rendered}");
     assert!(rendered.contains("separator: ;"), "rendered:\n{rendered}");
     assert!(rendered.contains("replacement: $1"), "rendered:\n{rendered}");
     assert!(rendered.contains("action: replace"), "rendered:\n{rendered}");
