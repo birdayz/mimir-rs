@@ -6602,7 +6602,13 @@ impl Head {
                 Ordering::Acquire,
             );
         } else {
-            while self.min_time.load(Ordering::Acquire) == i64::MAX {
+            let start = Instant::now();
+            while self.min_time.load(Ordering::Acquire) == i64::MAX
+                && self.max_time.load(Ordering::Acquire) != i64::MAX
+            {
+                if start.elapsed() >= std::time::Duration::from_millis(100) {
+                    break;
+                }
                 std::hint::spin_loop();
             }
         }
@@ -7165,16 +7171,17 @@ impl Head {
             }
             {
                 let mut st = e.inner.lock();
-                chunks_removed += (st.mmapped().len() + st.head_chunks_len()) as u64;
-                st.mmapped_chunks = Vec::new();
-                st.clear_head_chunks();
-                st.set_gced(true);
                 if let Some(keep_until) = {
                     let mt = st.max_time();
                     (mt != i64::MIN).then_some(mt)
                 } {
                     self.update_wal_expiry(e.ref_id, keep_until);
                 }
+                self.update_metrics_on_series_delete(&st);
+                chunks_removed += (st.mmapped().len() + st.head_chunks_len()) as u64;
+                st.mmapped_chunks = Vec::new();
+                st.clear_head_chunks();
+                st.set_gced(true);
             }
             // Drop `e: Arc<SeriesEntry>` immediately to release SeriesState + chunk buffers before
             // postings deletion and lifecycle callbacks.
@@ -12658,6 +12665,9 @@ impl<'a> HeadAppender<'a> {
                     for app in &mut apps[idx..] {
                         app.rollback_series_refs_after_wal_err(&err);
                     }
+                    for app in &mut apps[..idx] {
+                        let _ = app.apply_in_memory_inner();
+                    }
                     let notifiers: SmallVec<[(&Head, &dyn CompactNotifier); 8]> = apps
                         .iter()
                         .filter_map(|a| a.compact_notifier.map(|n| (a.head, n)))
@@ -17064,5 +17074,221 @@ mod tests {
             );
         }
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn head_open_and_wlog_checkpoint_replay_non_utf8_metadata_without_repair() {
+        use crate::encoding::Encbuf;
+        use crate::record::{MetricType, RecordEncoder, RecordType, RefSample, RefSeries};
+        use crate::wlog::{create_checkpoint, last_checkpoint, segments_range, CompressionType, WlogReader, WlogWriter};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let enc = RecordEncoder::new(false);
+        let mut w = WlogWriter::open(&wal_dir, CompressionType::Snappy).unwrap();
+
+        // Segment 0: Series(ref=1), Metadata with raw non-UTF-8 unit/help bytes, Sample(ref=1).
+        let s0 = enc.series(
+            &[RefSeries {
+                ref_id: 1,
+                labels: Labels::from_pairs([("__name__", "seg0_metric"), ("job", "api")]),
+            }],
+            Vec::new(),
+        );
+        let mut meta_raw = Encbuf::new();
+        meta_raw.put_byte(RecordType::Metadata as u8);
+        meta_raw.put_uvarint64(1);
+        meta_raw.put_byte(MetricType::Counter as u8);
+        meta_raw.put_uvarint(2);
+        meta_raw.put_uvarint_str("UNIT");
+        meta_raw.put_uvarint_bytes(&[0xff, 0xfe]);
+        meta_raw.put_uvarint_str("HELP");
+        meta_raw.put_uvarint_bytes(b"bad\xffhelp");
+        let samp0 = enc.samples(
+            &[RefSample { ref_id: 1, st: 0, t: 1_000, v: 11.0 }],
+            Vec::new(),
+        );
+        w.log(&[&s0, meta_raw.as_slice(), &samp0]).unwrap();
+        w.next_segment().unwrap();
+
+        // Segment 1: Series(ref=2) + Sample(ref=2) that would be wiped if repair_write_log ran.
+        let s1 = enc.series(
+            &[RefSeries {
+                ref_id: 2,
+                labels: Labels::from_pairs([("__name__", "seg1_metric"), ("job", "api")]),
+            }],
+            Vec::new(),
+        );
+        let samp1 = enc.samples(
+            &[RefSample { ref_id: 2, st: 0, t: 2_000, v: 22.0 }],
+            Vec::new(),
+        );
+        w.log(&[&s1, &samp1]).unwrap();
+        w.close().unwrap();
+
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        assert_eq!(head.num_series(), 2);
+        let e1 = head
+            .get_entry_by_sorted_pairs(&[("__name__", "seg0_metric"), ("job", "api")])
+            .expect("seg0_metric must replay");
+        let e2 = head
+            .get_entry_by_sorted_pairs(&[("__name__", "seg1_metric"), ("job", "api")])
+            .expect("seg1_metric in subsequent segment must not be truncated by repair_write_log");
+        assert_eq!(read_head_float_samples(&head, e1.ref_id), vec![(1_000, 11.0)]);
+        assert_eq!(read_head_float_samples(&head, e2.ref_id), vec![(2_000, 22.0)]);
+        let meta = e1.inner.lock().metadata().expect("metadata replayed");
+        let syms = head.symbols.read();
+        assert_eq!(syms.resolve(meta.unit), "\u{FFFD}\u{FFFD}");
+        assert_eq!(syms.resolve(meta.help), "bad\u{FFFD}help");
+        drop(syms);
+        head.close().unwrap();
+
+        // Both original segments must still be intact, and checkpointing must succeed.
+        assert_eq!(segments_range(&wal_dir).unwrap(), Some((0, 2)));
+        let cp_stats = create_checkpoint(
+            &wal_dir,
+            0,
+            0,
+            |id| id == 1 || id == 2,
+            500,
+            false,
+            CompressionType::Snappy,
+        )
+        .unwrap();
+        assert_eq!(cp_stats.total_metadata, 1);
+        let (cp_dir, _) = last_checkpoint(&wal_dir).unwrap().unwrap();
+        let mut r = WlogReader::open_dir(&cp_dir).unwrap();
+        let dec = RecordDecoder::new();
+        let mut saw_meta = false;
+        while let Some(rec) = r.next_record().unwrap() {
+            if let DecodedRecord::Metadata(ms) = dec.decode_record(rec).unwrap() {
+                assert_eq!(ms[0].unit, "\u{FFFD}\u{FFFD}");
+                assert_eq!(ms[0].help, "bad\u{FFFD}help");
+                saw_meta = true;
+            }
+        }
+        assert!(saw_meta);
+    }
+
+    #[test]
+    fn head_open_replay_full_tombstone_updates_wal_expiry_and_head_gauges() {
+        use crate::chunkenc::histogram_model::{Histogram, HistogramSpan};
+        use crate::record::{RecordEncoder, RefHistogramSample, RefSample, RefSeries, Tombstone};
+        use crate::wlog::{CompressionType, WlogWriter};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let enc = RecordEncoder::new(false);
+        let mut w = WlogWriter::open(&wal_dir, CompressionType::Snappy).unwrap();
+
+        let s_stale = enc.series(
+            &[
+                RefSeries {
+                    ref_id: 10,
+                    labels: Labels::from_pairs([("__name__", "stale_s")]),
+                },
+                RefSeries {
+                    ref_id: 11,
+                    labels: Labels::from_pairs([("__name__", "hist_s")]),
+                },
+            ],
+            Vec::new(),
+        );
+        let float_rec = enc.samples(
+            &[
+                RefSample { ref_id: 10, st: 0, t: 1_000, v: 1.0 },
+                RefSample { ref_id: 10, st: 0, t: 2_000, v: stale_nan() },
+            ],
+            Vec::new(),
+        );
+        let hist = Histogram {
+            schema: 0,
+            count: 3,
+            sum: 10.0,
+            zero_threshold: 0.001,
+            zero_count: 1,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 2 }],
+            positive_buckets: vec![1, 1],
+            ..Default::default()
+        };
+        let (hist_rec, _) = enc.histogram_samples(
+            &[RefHistogramSample { ref_id: 11, st: 0, t: 3_000, h: hist }],
+            Vec::new(),
+        );
+        let tomb_rec = enc.tombstones(
+            &[
+                Tombstone { ref_id: 10, mint: i64::MIN, maxt: i64::MAX },
+                Tombstone { ref_id: 11, mint: i64::MIN, maxt: i64::MAX },
+            ],
+            Vec::new(),
+        );
+        w.log(&[&s_stale, &float_rec, &hist_rec, &tomb_rec]).unwrap();
+        w.close().unwrap();
+
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        assert_eq!(head.num_series(), 0);
+        assert_eq!(head.num_stale_series(), 0);
+        assert_eq!(head.num_native_histogram_series(), 0);
+        assert_eq!(head.num_native_histogram_buckets(), 0);
+        {
+            let exp = head.wal_expiries.lock();
+            assert_eq!(exp.get(&10).copied(), Some(2_000));
+            assert_eq!(exp.get(&11).copied(), Some(3_000));
+        }
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn commit_batch_multi_head_wal_partial_failure_applies_committed_heads_in_memory() {
+        let dir0 = tempfile::tempdir().unwrap();
+        let dir1 = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            ooo_time_window_ms: 10_000,
+            ..HeadOptions::default()
+        };
+        let head0 = Head::open(dir0.path(), opts.clone(), i64::MIN).unwrap();
+        let head1 = Head::open(dir1.path(), opts, i64::MIN).unwrap();
+
+        // Seed an in-order anchor in head0 so we can test both in-order and OOO commit on head0.
+        let p0_ooo = [("__name__", "h0_ooo"), ("job", "api")];
+        {
+            let mut app = head0.appender();
+            app.append_float(None, &p0_ooo, 10_000, 1.0).unwrap();
+            app.commit().unwrap();
+        }
+
+        // Inject WAL failure on head1.
+        {
+            let mut wal1 = head1.wal.lock();
+            wal1.as_mut().unwrap().set_write_fault_hook(Some(Arc::new(|_| {
+                crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::StorageFull)
+            })));
+        }
+
+        let p0_in = [("__name__", "h0_in"), ("job", "api")];
+        let mut app0 = head0.appender();
+        let r0_in = app0.append_float(None, &p0_in, 10_000, 42.0).unwrap();
+        let r0_ooo = app0.append_float(None, &p0_ooo, 5_000, 99.0).unwrap();
+
+        let p1 = [("__name__", "h1_fail"), ("job", "api")];
+        let mut app1 = head1.appender();
+        let r1 = app1.append_float(None, &p1, 10_000, 7.0).unwrap();
+
+        let err = HeadAppender::commit_batch(vec![app0, app1]).unwrap_err();
+        assert!(matches!(err, HeadError::Wlog(_)));
+
+        // head0 already committed durably to its WAL, so both in-order and OOO samples must be visible.
+        let e0_in = head0.get_entry_by_sorted_pairs(&p0_in).unwrap();
+        assert_eq!(e0_in.pending_commits_count(), 0);
+        assert_eq!(read_head_float_samples(&head0, r0_in), vec![(10_000, 42.0)]);
+        assert_eq!(read_head_float_samples(&head0, r0_ooo), vec![(5_000, 99.0), (10_000, 1.0)]);
+
+        // head1 failed WAL write, so its sample must NOT be visible in memory.
+        let e1 = head1.get_entry_by_sorted_pairs(&p1).unwrap();
+        assert_eq!(e1.pending_commits_count(), 0);
+        assert!(head1.series_chunks(r1, i64::MIN, i64::MAX).unwrap().is_none());
+
+        head0.close().unwrap();
+        head1.close().unwrap();
     }
 }

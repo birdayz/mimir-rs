@@ -31,7 +31,7 @@ use mimir_tsdb::chunkenc::Encoding;
 use mimir_tsdb::chunks_block::ChunkMeta;
 use mimir_tsdb::compact::{
     compact_chunk_series_merge, merge_chunks_with_tombstones_and_float_encoding,
-    merge_head_chunks_with_tombstones_and_float_encoding, reencode_chunk_without_tombstones,
+    merge_head_chunks_with_tombstones, reencode_chunk_without_tombstones,
 };
 use mimir_tsdb::db::Tsdb;
 use mimir_tsdb::head::{HeadReadGuard, HeadReadIsolation};
@@ -4410,7 +4410,6 @@ impl PlannedTsdbChunkQuerier {
                 });
             }
         };
-        let float_enc = head.float_chunk_encoding();
         let mut raw_items: Vec<TsdbChunkSeriesItem> = Vec::with_capacity(refs.len());
         let mut chks_buf = Vec::new();
         let mut tombs_buf = Vec::new();
@@ -4449,10 +4448,11 @@ impl PlannedTsdbChunkQuerier {
             if chks_buf.is_empty() {
                 continue;
             }
-            let final_chunks = match merge_head_chunks_with_tombstones_and_float_encoding(
+            // Go `populateChunksFromIterable` (`tsdb/querier.go:1271`) uses `EncXOR` for
+            // intra-head merges when `st == 0`, regardless of `float_chunk_encoding`.
+            let final_chunks = match merge_head_chunks_with_tombstones(
                 std::mem::take(&mut chks_buf),
                 &tombs_buf,
-                float_enc,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -6363,6 +6363,136 @@ mod tests {
         assert_eq!(
             merged_dup[0].chunks[0].chunk.as_ref().unwrap().encoding(),
             Encoding::Xor2
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_head_overlapping_xor2_chunks_merge_to_enc_xor() {
+        use mimir_tsdb::chunkenc::Xor2Chunk;
+
+        // 1) Verify directly that merge_head_chunks_with_tombstones (used by
+        // PlannedTsdbChunkQuerier::select_head_in_order) emits EncXOR (1) on overlapping
+        // Xor2 chunks with st==0.
+        let mut c0 = Xor2Chunk::new();
+        {
+            let mut app = c0.appender().unwrap();
+            app.append(0, 1_000, 1.0).unwrap();
+            app.append(0, 3_000, 3.0).unwrap();
+        }
+        let mut c1 = Xor2Chunk::new();
+        {
+            let mut app = c1.appender().unwrap();
+            app.append(0, 2_000, 2.0).unwrap();
+            app.append(0, 4_000, 4.0).unwrap();
+        }
+        let merged = merge_head_chunks_with_tombstones(
+            vec![
+                ChunkMeta {
+                    ref_id: 1,
+                    min_time: 1_000,
+                    max_time: 3_000,
+                    chunk: Some(mimir_tsdb::chunkenc::EncodedChunk::Xor2(c0)),
+                },
+                ChunkMeta {
+                    ref_id: 2,
+                    min_time: 2_000,
+                    max_time: 4_000,
+                    chunk: Some(mimir_tsdb::chunkenc::EncodedChunk::Xor2(c1)),
+                },
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].chunk.as_ref().unwrap().encoding(), Encoding::Xor);
+
+        // 2) End-to-end QueryStream with float_chunk_encoding=xor2, enable_st_storage=false,
+        // index_lookup_planning_enabled=true, and overlapping Head+OOO float chunks emits EncXOR (1).
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "planned-xor2-head".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+        blocks_cfg.tsdb.index_lookup_planning.index_lookup_planning_enabled = true;
+        let limits = mimir_config::LimitsConfig {
+            float_chunk_encoding: "xor2".to_string(),
+            out_of_order_time_window: mimir_config::ModelDuration::from_mins(30),
+            ..Default::default()
+        };
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(limits),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
+
+        let now = 1_700_000_000_000i64;
+        let user = "t-planned-xor2";
+        ing.push_to_storage(
+            user,
+            &cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_strs("__name__", "planned_overlap_xor2"),
+                        cortexpb::LabelPair::from_strs("job", "api"),
+                    ],
+                    samples: vec![
+                        cortexpb::Sample { value: 1.0, timestamp_ms: now },
+                        cortexpb::Sample { value: 3.0, timestamp_ms: now + 2_000 },
+                    ],
+                    ..Default::default()
+                }],
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ing.push_to_storage(
+            user,
+            &cortexpb::WriteRequest {
+                timeseries: vec![cortexpb::TimeSeries {
+                    labels: vec![
+                        cortexpb::LabelPair::from_strs("__name__", "planned_overlap_xor2"),
+                        cortexpb::LabelPair::from_strs("job", "api"),
+                    ],
+                    samples: vec![cortexpb::Sample { value: 2.0, timestamp_ms: now + 1_000 }],
+                    ..Default::default()
+                }],
+                source: cortexpb::write_request::SourceEnum::Api as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let md = MetadataMap::new();
+        let req = ingesterpb::QueryRequest {
+            start_timestamp_ms: now - 1_000,
+            end_timestamp_ms: now + 5_000,
+            matchers: vec![ingesterpb::LabelMatcher {
+                r#type: ingesterpb::MatchType::Equal as i32,
+                name: "__name__".into(),
+                value: "planned_overlap_xor2".into(),
+            }],
+            ..Default::default()
+        };
+        let res = ing.handle_query_stream(&md, user, req).await.unwrap();
+        let chunks: Vec<_> = res
+            .iter()
+            .flat_map(|r| r.streaming_series_chunks.iter().flat_map(|sc| sc.chunks.iter()))
+            .collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].encoding,
+            tsdb_encoding_to_wire(Encoding::Xor),
+            "planned Head merge with st==0 must emit wire PrometheusXorChunk (4), not PrometheusXor2Chunk (7)"
         );
     }
 }

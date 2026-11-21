@@ -1481,4 +1481,66 @@ overrides:
             started2.elapsed()
         );
     }
+
+    #[test]
+    fn w23_csc_08_null_scalar_fields_preserve_defaults_in_runtime_config() {
+        let defaults = LimitsConfig {
+            max_global_series_per_user: 777,
+            ..Default::default()
+        };
+        let ing_defaults = InstanceLimits {
+            max_inflight_push_requests: 888,
+            ..Default::default()
+        };
+        let dist_defaults = DistributorInstanceLimits {
+            max_inflight_push_requests: 999,
+            ..Default::default()
+        };
+
+        let yaml = br#"
+overrides:
+  t_null: null
+  tenant-a:
+    max_global_series_per_user: null
+    max_label_name_length: 123
+    blocked_label_names_for_label_value_bytes: null
+    otel_metric_suffixes_enabled: null
+ingester_limits:
+  max_inflight_push_requests: null
+  max_tenants: 50
+distributor_limits:
+  max_inflight_push_requests: null
+  max_ingestion_rate: 1234
+multi_kv_config:
+  primary: null
+  mirror_enabled: null
+"#;
+        let root: serde_yaml::Value = serde_yaml::from_slice(yaml).unwrap();
+        let out = parse_runtime_config_value(
+            root,
+            &defaults,
+            &ing_defaults,
+            &dist_defaults,
+            GoDuration::ZERO,
+        )
+        .expect("null scalar fields in runtime_config must preserve defaults like Go yaml.v3");
+
+        assert!(out.overrides["t_null"].is_none());
+        let ta = out.overrides["tenant-a"].as_ref().unwrap();
+        assert_eq!(ta.max_global_series_per_user, 777);
+        assert_eq!(ta.max_label_name_length, 123);
+        assert!(ta.blocked_label_names_for_label_value_bytes.0.is_empty());
+        assert_eq!(ta.otel_metric_suffixes_enabled, None);
+
+        let il = out.ingester_limits.as_ref().unwrap();
+        assert_eq!(il.max_inflight_push_requests, 888);
+        assert_eq!(il.max_tenants, 50);
+
+        let dl = out.distributor_limits.as_ref().unwrap();
+        assert_eq!(dl.max_inflight_push_requests, 999);
+        assert_eq!(dl.max_ingestion_rate, 1234.0);
+
+        assert_eq!(out.multi_kv_config.primary, "");
+        assert_eq!(out.multi_kv_config.mirror_enabled, None);
+    }
 }

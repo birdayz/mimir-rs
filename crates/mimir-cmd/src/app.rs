@@ -685,38 +685,12 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             )
             .context("creating KV store for ingester partition ring")?;
 
-            let plc_cfg = PartitionInstanceLifecyclerConfig {
+            let plc_cfg = PartitionInstanceLifecyclerConfig::from_partition_ring_config(
+                &cfg.ingester.partition_ring,
                 partition_id,
-                create_partitions_with_derived_tokens: cfg
-                    .ingester
-                    .partition_ring
-                    .create_partitions_with_derived_tokens,
-                max_derived_token_partitions: cfg
-                    .ingester
-                    .partition_ring
-                    .max_derived_token_partitions
-                    as i32,
-                instance_id: cfg.ingester.ring.instance_id.clone(),
-                multi_partition_ownership: false,
-                wait_owners_count_on_pending: cfg
-                    .ingester
-                    .partition_ring
-                    .min_partition_owners_count
-                    .max(0) as usize,
-                wait_owners_duration_on_pending: cfg
-                    .ingester
-                    .partition_ring
-                    .min_partition_owners_duration
-                    .as_std()
-                    .unwrap_or(Duration::from_secs(10)),
-                delete_inactive_partition_after: cfg
-                    .ingester
-                    .partition_ring
-                    .delete_inactive_partition_after
-                    .as_std()
-                    .unwrap_or(Duration::from_secs(13 * 3600)),
-                polling_interval: Duration::from_secs(5),
-            };
+                &cfg.ingester.ring.instance_id,
+                Duration::from_secs(5),
+            );
             // With compartments enabled the ingester registers its partition into the partition
             // ring of its own read compartment (Go `ingester.New`).
             let (plc_ring_name, plc_ring_key) = if cfg.compartments.enabled {
@@ -736,6 +710,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 Some(&cortex_registerer),
             )
             .context("creating ingester partition lifecycler")?;
+            plc.apply_min_partition_owners_duration(
+                cfg.ingester.partition_ring.min_partition_owners_duration,
+            );
 
             // The partition instance lifecycler is a subservice of the ingester: it is started
             // only once the ingester is ACTIVE in the ring (after WAL replay, partition catch-up
@@ -812,6 +789,10 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     let config_arc = Arc::new(cfg.clone());
     let default_config_arc = Arc::new(MimirConfig::default());
+
+    if let Some((ref ca_path, _)) = cost_attribution_registry {
+        server.set_cost_attribution_path(ca_path);
+    }
 
     let http_router = build_http_router(AppHttpState {
         config: Arc::clone(&config_arc),

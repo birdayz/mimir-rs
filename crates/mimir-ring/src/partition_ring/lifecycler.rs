@@ -5,7 +5,7 @@
 //! - github.com/grafana/dskit/ring/partition_ring_editor.go
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -160,6 +160,9 @@ pub struct PartitionInstanceLifecycler {
     remove_owner_on_shutdown: AtomicBool,
     started: AtomicBool,
     running: AtomicBool,
+    /// Magnitude (in nanoseconds) of a negative min_partition_owners_duration, preserving Go signed
+    /// now.Add(-WaitOwnersDurationOnPending) semantics (before = now + neg).
+    wait_owners_negative_duration_nanos: AtomicU64,
     op_lock: tokio::sync::Mutex<()>,
     metrics: LifecyclerMetrics,
 }
@@ -200,9 +203,28 @@ impl PartitionInstanceLifecycler {
             remove_owner_on_shutdown: AtomicBool::new(false),
             started: AtomicBool::new(false),
             running: AtomicBool::new(false),
+            wait_owners_negative_duration_nanos: AtomicU64::new(0),
             op_lock: tokio::sync::Mutex::new(()),
             metrics: LifecyclerMetrics::new(ring_name, reg.as_ref()),
         }))
+    }
+
+    /// Sets the negative-duration offset for WaitOwnersDurationOnPending when configured with a
+    /// negative Go duration (e.g. -1s => before = now + 1s).
+    pub fn set_wait_owners_negative_duration(&self, neg: Duration) {
+        let nanos = neg.as_nanos().min(u64::MAX as u128) as u64;
+        self.wait_owners_negative_duration_nanos
+            .store(nanos, Ordering::Release);
+    }
+
+    /// Applies the signed min_partition_owners_duration from PartitionRingConfig.
+    pub fn apply_min_partition_owners_duration(&self, d: mimir_config::GoDuration) {
+        if d.0 < 0 {
+            self.set_wait_owners_negative_duration(Duration::from_nanos(d.0.unsigned_abs()));
+        } else {
+            self.wait_owners_negative_duration_nanos
+                .store(0, Ordering::Release);
+        }
     }
 
     pub fn partition_id(&self) -> i32 {
@@ -393,6 +415,9 @@ impl PartitionInstanceLifecycler {
         let pid = self.cfg.partition_id;
         let wait_count = self.cfg.wait_owners_count_on_pending;
         let wait_dur = self.cfg.wait_owners_duration_on_pending;
+        let wait_neg_nanos = self
+            .wait_owners_negative_duration_nanos
+            .load(Ordering::Acquire);
 
         let res = self
             .update_ring(move |ring| {
@@ -400,7 +425,12 @@ impl PartitionInstanceLifecycler {
                     .partitions
                     .get(&pid)
                     .ok_or(PartitionRingError::PartitionDoesNotExist)?;
-                let before = now.checked_sub(wait_dur).unwrap_or(SystemTime::UNIX_EPOCH);
+                let before = if wait_neg_nanos > 0 {
+                    now.checked_add(Duration::from_nanos(wait_neg_nanos))
+                        .unwrap_or(now)
+                } else {
+                    now.checked_sub(wait_dur).unwrap_or(SystemTime::UNIX_EPOCH)
+                };
                 if part.is_pending()
                     && ring.partition_owners_count_updated_before(pid, before) >= wait_count
                 {
@@ -677,5 +707,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("lifecycler not running"));
+    }
+
+    #[tokio::test]
+    async fn w23_csc_04_negative_partition_ring_durations_match_go_signed_semantics() {
+        let cfg = PartitionRingConfig {
+            min_partition_owners_count: 1,
+            min_partition_owners_duration: mimir_config::GoDuration::from_secs(-1),
+            delete_inactive_partition_after: mimir_config::GoDuration::from_secs(-1),
+            ..Default::default()
+        };
+        let plc_cfg = PartitionInstanceLifecyclerConfig::from_partition_ring_config(
+            &cfg,
+            0,
+            "ing-0",
+            Duration::from_secs(5),
+        );
+        assert_eq!(plc_cfg.wait_owners_duration_on_pending, Duration::ZERO);
+        assert_eq!(plc_cfg.delete_inactive_partition_after, Duration::ZERO);
+
+        let kv: Arc<dyn KvClient> = Arc::new(InMemoryKv::new(partition_ring_desc_codec()));
+        let plc = PartitionInstanceLifecycler::new(
+            plc_cfg,
+            "ingester-partitions",
+            "ingester-partitions",
+            kv.clone(),
+            None,
+        )
+        .unwrap();
+        plc.apply_min_partition_owners_duration(cfg.min_partition_owners_duration);
+
+        let now = SystemTime::now();
+        kv.cas(
+            "ingester-partitions",
+            Box::new(move |in_val| {
+                let mut desc = in_val
+                    .and_then(|a| a.downcast_ref::<PartitionRingDesc>())
+                    .cloned()
+                    .unwrap_or_default();
+                desc.add_partition(0, PartitionState::PartitionPending, now);
+                desc.add_or_update_owner("ing-0", OwnerState::OwnerActive, 0, now);
+                let old_ts = now - Duration::from_secs(24 * 3600);
+                desc.add_partition(1, PartitionState::PartitionInactive, old_ts);
+                Ok(CasOutcome::Update(Box::new(desc)))
+            }),
+        )
+        .await
+        .unwrap();
+
+        plc.reconcile_owned_partition(now).await;
+        plc.reconcile_other_partitions(now).await;
+
+        let desc = plc.get_ring().await.unwrap();
+        assert_eq!(
+            desc.partitions.get(&0).unwrap().partition_state(),
+            PartitionState::PartitionActive
+        );
+        assert!(
+            desc.partitions.contains_key(&1),
+            "negative delete_inactive_partition_after must disable deletion"
+        );
     }
 }

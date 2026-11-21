@@ -27,32 +27,111 @@ pub type FetchOffsetsFn<O> =
 pub type GetPartitionIDsFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<i32>, String>> + Send>> + Send + Sync>;
 
-type NextWaiterTx<O> = Arc<Mutex<watch::Sender<Option<(u64, Result<O, String>)>>>>;
+const STOPPED_ERR: &str = "partition offset reader is stopped";
+
+struct OffsetPollPromise<O> {
+    once: std::sync::OnceLock<Result<O, String>>,
+    tx: watch::Sender<Option<Result<O, String>>>,
+}
+
+impl<O: Clone + Send + Sync + 'static> OffsetPollPromise<O> {
+    fn new() -> Arc<Self> {
+        let (tx, _) = watch::channel(None);
+        Arc::new(Self {
+            once: std::sync::OnceLock::new(),
+            tx,
+        })
+    }
+
+    fn notify(&self, res: Result<O, String>) {
+        if self.once.set(res.clone()).is_ok() {
+            let _ = self.tx.send(Some(res));
+        }
+    }
+
+    async fn wait(&self) -> Result<O, String> {
+        if let Some(res) = self.once.get() {
+            return res.clone();
+        }
+        let mut rx = self.tx.subscribe();
+        loop {
+            if let Some(res) = self.once.get() {
+                return res.clone();
+            }
+            if let Some(ref res) = *rx.borrow_and_update() {
+                return res.clone();
+            }
+            if rx.changed().await.is_err() {
+                return Err(STOPPED_ERR.to_string());
+            }
+        }
+    }
+}
+
+async fn wait_stopped(stop_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop_rx.borrow_and_update() {
+            return;
+        }
+        if stop_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
 
 /// Generic periodic offset poller supporting `wait_next_fetch_last_produced_offset` and `cached_offset`.
 pub struct GenericOffsetReader<O: Clone + Send + Sync + 'static> {
     fetch_fn: FetchOffsetsFn<O>,
     poll_interval: Duration,
     last_result: Arc<RwLock<Option<Result<O, String>>>>,
-    next_waiter_tx: NextWaiterTx<O>,
-    issued_seq: Arc<std::sync::atomic::AtomicU64>,
+    next_result_promise: Arc<parking_lot::Mutex<Arc<OffsetPollPromise<O>>>>,
     stop_tx: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
     pub fn new(fetch_fn: FetchOffsetsFn<O>, poll_interval: Duration) -> Self {
-        let (next_waiter_tx, _) = watch::channel(None);
         let (stop_tx, _) = watch::channel(false);
         Self {
             fetch_fn,
             poll_interval: poll_interval.max(Duration::from_millis(10)),
             last_result: Arc::new(RwLock::new(None)),
-            next_waiter_tx: Arc::new(Mutex::new(next_waiter_tx)),
-            issued_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            next_result_promise: Arc::new(parking_lot::Mutex::new(OffsetPollPromise::new())),
             stop_tx,
             task: Mutex::new(None),
         }
+    }
+
+    async fn poll_and_notify(
+        fetch_fn: &FetchOffsetsFn<O>,
+        last_result: &Arc<RwLock<Option<Result<O, String>>>>,
+        next_result_promise: &Arc<parking_lot::Mutex<Arc<OffsetPollPromise<O>>>>,
+        stop_rx: &mut watch::Receiver<bool>,
+    ) -> bool {
+        let promise = {
+            let mut guard = next_result_promise.lock();
+            if *stop_rx.borrow() {
+                guard.notify(Err(STOPPED_ERR.to_string()));
+                return false;
+            }
+            std::mem::replace(&mut *guard, OffsetPollPromise::new())
+        };
+
+        let res = tokio::select! {
+            biased;
+            _ = wait_stopped(stop_rx) => {
+                promise.notify(Err(STOPPED_ERR.to_string()));
+                return false;
+            }
+            r = (fetch_fn)() => r,
+        };
+
+        if let Err(ref e) = res {
+            warn!(err = %e, "failed to fetch the last produced offset");
+        }
+        *last_result.write() = Some(res.clone());
+        promise.notify(res);
+        true
     }
 
     pub async fn start(&self) {
@@ -60,15 +139,26 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
         if guard.is_some() {
             return;
         }
+        let mut stop_rx = self.stop_tx.subscribe();
+        if *stop_rx.borrow() {
+            return;
+        }
         // Perform initial poll synchronously at startup to populate cached_offset.
-        self.poll_once().await;
+        if !Self::poll_and_notify(
+            &self.fetch_fn,
+            &self.last_result,
+            &self.next_result_promise,
+            &mut stop_rx,
+        )
+        .await
+        {
+            return;
+        }
 
         let fetch_fn = Arc::clone(&self.fetch_fn);
         let poll_interval = self.poll_interval;
         let last_result = Arc::clone(&self.last_result);
-        let next_waiter_tx = Arc::clone(&self.next_waiter_tx);
-        let issued_seq = Arc::clone(&self.issued_seq);
-        let mut stop_rx = self.stop_tx.subscribe();
+        let next_result_promise = Arc::clone(&self.next_result_promise);
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(poll_interval);
@@ -76,20 +166,21 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
             interval.tick().await; // skip immediate first tick since we already polled above
             loop {
                 tokio::select! {
-                    res = stop_rx.changed() => {
-                        if res.is_err() || *stop_rx.borrow() {
-                            break;
-                        }
+                    biased;
+                    _ = wait_stopped(&mut stop_rx) => {
+                        break;
                     }
                     _ = interval.tick() => {
-                        let req_seq = issued_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        let res = (fetch_fn)().await;
-                        if let Err(ref e) = res {
-                            warn!(err = %e, "failed to fetch the last produced offset");
+                        if !Self::poll_and_notify(
+                            &fetch_fn,
+                            &last_result,
+                            &next_result_promise,
+                            &mut stop_rx,
+                        )
+                        .await
+                        {
+                            break;
                         }
-                        *last_result.write() = Some(res.clone());
-                        let tx = next_waiter_tx.lock().await;
-                        let _ = tx.send(Some((req_seq, res)));
                     }
                 }
             }
@@ -97,19 +188,11 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
         *guard = Some(handle);
     }
 
-    async fn poll_once(&self) {
-        let req_seq = self.issued_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let res = (self.fetch_fn)().await;
-        if let Err(ref e) = res {
-            warn!(err = %e, "failed to fetch the last produced offset");
-        }
-        *self.last_result.write() = Some(res.clone());
-        let tx = self.next_waiter_tx.lock().await;
-        let _ = tx.send(Some((req_seq, res)));
-    }
-
     pub async fn stop(&self) {
         let _ = self.stop_tx.send(true);
+        self.next_result_promise
+            .lock()
+            .notify(Err(STOPPED_ERR.to_string()));
         if let Some(handle) = self.task.lock().await.take() {
             let _ = handle.await;
         }
@@ -117,31 +200,15 @@ impl<O: Clone + Send + Sync + 'static> GenericOffsetReader<O> {
 
     /// Waits for the *next* poll cycle to be issued and complete, and returns its result.
     pub async fn wait_next_fetch_last_produced_offset(&self) -> Result<O, String> {
-        let target_seq = self.issued_seq.load(std::sync::atomic::Ordering::SeqCst) + 1;
-        let mut rx = self.next_waiter_tx.lock().await.subscribe();
         let mut stop_rx = self.stop_tx.subscribe();
-
-        loop {
-            if let Some((s, ref res)) = *rx.borrow() {
-                if s >= target_seq {
-                    return res.clone();
-                }
-            }
-            if stop_rx.has_changed().is_err() || *stop_rx.borrow() {
-                return Err("partition offset reader is stopped".to_string());
-            }
-            tokio::select! {
-                changed = rx.changed() => {
-                    if changed.is_err() {
-                        return Err("partition offset reader is stopped".to_string());
-                    }
-                }
-                res = stop_rx.changed() => {
-                    if res.is_err() || *stop_rx.borrow() {
-                        return Err("partition offset reader is stopped".to_string());
-                    }
-                }
-            }
+        if *stop_rx.borrow() {
+            return Err(STOPPED_ERR.to_string());
+        }
+        let promise = Arc::clone(&*self.next_result_promise.lock());
+        tokio::select! {
+            biased;
+            _ = wait_stopped(&mut stop_rx) => Err(STOPPED_ERR.to_string()),
+            res = promise.wait() => res,
         }
     }
 
@@ -412,5 +479,101 @@ impl MultiClusterOffsetsReader {
         &self,
     ) -> Result<TopicsPartitionsOffsets, String> {
         self.generic.wait_next_fetch_last_produced_offset().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn w23_csc_09_per_poll_promise_isolates_ok_from_subsequent_err() {
+        let poll_num = Arc::new(AtomicUsize::new(0));
+        let poll1_done = Arc::new(Notify::new());
+        let poll2_done = Arc::new(Notify::new());
+
+        let pn = Arc::clone(&poll_num);
+        let p1d = Arc::clone(&poll1_done);
+        let p2d = Arc::clone(&poll2_done);
+
+        let fetch_fn: FetchOffsetsFn<i64> = Arc::new(move || {
+            let n = pn.fetch_add(1, Ordering::SeqCst);
+            let p1d = Arc::clone(&p1d);
+            let p2d = Arc::clone(&p2d);
+            Box::pin(async move {
+                match n {
+                    0 => Ok(10),
+                    1 => {
+                        p1d.notify_waiters();
+                        Ok(42)
+                    }
+                    _ => {
+                        p2d.notify_waiters();
+                        Err("transient broker error".to_string())
+                    }
+                }
+            })
+        });
+
+        let reader = Arc::new(GenericOffsetReader::new(
+            fetch_fn,
+            Duration::from_millis(20),
+        ));
+        reader.start().await;
+        assert_eq!(reader.cached_offset(), Some(Ok(10)));
+
+        // Subscribe to poll 1's promise before poll 1 runs.
+        let promise_1 = Arc::clone(&*reader.next_result_promise.lock());
+
+        // Wait for poll 1 (Ok(42)) AND poll 2 (Err("transient broker error")) to BOTH complete
+        // before awaiting promise_1.
+        poll1_done.notified().await;
+        poll2_done.notified().await;
+        while !matches!(reader.cached_offset(), Some(Err(_))) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Poll 1's promise must still yield Ok(42), never overwritten by poll 2's Err.
+        assert_eq!(promise_1.wait().await, Ok(42));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn w23_csc_09_stop_cancels_hanging_fetch_immediately() {
+        let poll_num = Arc::new(AtomicUsize::new(0));
+        let entered_poll_1 = Arc::new(Notify::new());
+
+        let pn = Arc::clone(&poll_num);
+        let ep1 = Arc::clone(&entered_poll_1);
+        let fetch_fn: FetchOffsetsFn<i64> = Arc::new(move || {
+            let n = pn.fetch_add(1, Ordering::SeqCst);
+            let ep1 = Arc::clone(&ep1);
+            Box::pin(async move {
+                if n == 0 {
+                    Ok(7)
+                } else {
+                    ep1.notify_waiters();
+                    std::future::pending::<Result<i64, String>>().await
+                }
+            })
+        });
+
+        let reader = Arc::new(GenericOffsetReader::new(
+            fetch_fn,
+            Duration::from_millis(10),
+        ));
+        reader.start().await;
+        entered_poll_1.notified().await;
+
+        let r_wait = Arc::clone(&reader);
+        let waiter = tokio::spawn(async move { r_wait.wait_next_fetch_last_produced_offset().await });
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(Duration::from_millis(50), reader.stop())
+            .await
+            .expect("stop() must cancel hanging fetch_fn in <50ms");
+        assert!(waiter.await.unwrap().is_err());
     }
 }

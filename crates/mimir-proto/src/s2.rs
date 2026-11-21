@@ -236,6 +236,19 @@ pub fn decompress_framed_into(
     max_out_len: usize,
 ) -> io::Result<()> {
     let start_len = out.len();
+    let res = decompress_framed_into_inner(input, out, start_len, max_out_len);
+    if res.is_err() {
+        out.truncate(start_len);
+    }
+    res
+}
+
+fn decompress_framed_into_inner(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    start_len: usize,
+    max_out_len: usize,
+) -> io::Result<()> {
     let mut pos = 0usize;
     let mut read_header = false;
     let mut snappy_frame = false;
@@ -430,5 +443,79 @@ mod tests {
         let mut out = Vec::new();
         decompress_framed_into(&s2_stream, &mut out, 1024).unwrap();
         assert_eq!(&out, expected);
+    }
+
+    #[test]
+    fn decompress_framed_into_truncates_out_to_start_len_on_every_error() {
+        let prefix = b"keep-prefix-";
+
+        // 1) Valid chunk followed by corrupt CRC in second uncompressed chunk.
+        let mut s2_bad_crc = Vec::new();
+        s2_bad_crc.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+        let chunk1 = b"first-chunk";
+        let c1_len = 4 + chunk1.len();
+        s2_bad_crc.push(CHUNK_TYPE_UNCOMPRESSED);
+        s2_bad_crc.push((c1_len & 0xff) as u8);
+        s2_bad_crc.push(((c1_len >> 8) & 0xff) as u8);
+        s2_bad_crc.push(((c1_len >> 16) & 0xff) as u8);
+        s2_bad_crc.extend_from_slice(&masked_crc32c(chunk1).to_le_bytes());
+        s2_bad_crc.extend_from_slice(chunk1);
+
+        let chunk2 = b"second-chunk";
+        let c2_len = 4 + chunk2.len();
+        s2_bad_crc.push(CHUNK_TYPE_UNCOMPRESSED);
+        s2_bad_crc.push((c2_len & 0xff) as u8);
+        s2_bad_crc.push(((c2_len >> 8) & 0xff) as u8);
+        s2_bad_crc.push(((c2_len >> 16) & 0xff) as u8);
+        s2_bad_crc.extend_from_slice(&(masked_crc32c(chunk2) ^ 0xDEAD_BEEF).to_le_bytes());
+        s2_bad_crc.extend_from_slice(chunk2);
+
+        let mut out = prefix.to_vec();
+        let err = decompress_framed_into(&s2_bad_crc, &mut out, 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(out, prefix);
+
+        // 2) Compressed chunk with valid varint length (resizes out), invalid s2 payload.
+        let mut s2_bad_comp = Vec::new();
+        s2_bad_comp.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+        let bad_block = [32u8, 0x01, 0xff];
+        let bc_len = 4 + bad_block.len();
+        s2_bad_comp.push(CHUNK_TYPE_COMPRESSED);
+        s2_bad_comp.push((bc_len & 0xff) as u8);
+        s2_bad_comp.push(((bc_len >> 8) & 0xff) as u8);
+        s2_bad_comp.push(((bc_len >> 16) & 0xff) as u8);
+        s2_bad_comp.extend_from_slice(&0u32.to_le_bytes());
+        s2_bad_comp.extend_from_slice(&bad_block);
+
+        let mut out2 = prefix.to_vec();
+        assert!(decompress_framed_into(&s2_bad_comp, &mut out2, 1024).is_err());
+        assert_eq!(out2, prefix);
+
+        // 3) Compressed chunk with valid s2 payload but bad CRC.
+        let mut s2_comp_crc = Vec::new();
+        s2_comp_crc.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+        let valid_block = [4u8, 0x0c, b'A', b'B', b'C', b'D'];
+        let vc_len = 4 + valid_block.len();
+        s2_comp_crc.push(CHUNK_TYPE_COMPRESSED);
+        s2_comp_crc.push((vc_len & 0xff) as u8);
+        s2_comp_crc.push(((vc_len >> 8) & 0xff) as u8);
+        s2_comp_crc.push(((vc_len >> 16) & 0xff) as u8);
+        s2_comp_crc.extend_from_slice(&(masked_crc32c(b"ABCD") ^ 1).to_le_bytes());
+        s2_comp_crc.extend_from_slice(&valid_block);
+
+        let mut out3 = prefix.to_vec();
+        assert!(decompress_framed_into(&s2_comp_crc, &mut out3, 1024).is_err());
+        assert_eq!(out3, prefix);
+
+        // 4) Truncated header, missing stream identifier, unsupported unskippable chunk.
+        for bad_input in [
+            &b"\xff\x06"[..],
+            &b"\x01\x04\x00\x00\x00\x00\x00\x00"[..],
+            &b"\xff\x06\x00\x00S2sTwO\x02\x00\x00\x00"[..],
+        ] {
+            let mut out_err = prefix.to_vec();
+            assert!(decompress_framed_into(bad_input, &mut out_err, 1024).is_err());
+            assert_eq!(out_err, prefix);
+        }
     }
 }

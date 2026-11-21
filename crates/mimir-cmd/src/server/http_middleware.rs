@@ -211,6 +211,68 @@ pub struct HttpMiddlewareConfig {
     pub trace_exclude_headers: Vec<String>,
     pub create_new_traces: bool,
     pub cluster_validation: Option<HttpClusterValidation>,
+    pub http_path_prefix: String,
+    pub cost_attribution_path: Option<String>,
+}
+
+/// Checks BEFORE `inflight`, `check_cluster`, and OTel span creation whether the matched Axum
+/// route rejects `req.method()` with a `gorilla/mux` `ErrMethodMismatch`, matching dskit's
+/// `RouteInjector` (`routeName = ""`, `other` / `<unknown-route>`).
+fn is_method_mismatch_before_run(req: &Request, cfg: &HttpMiddlewareConfig) -> bool {
+    let Some(matched_raw) = req.extensions().get::<MatchedPath>().map(|m| m.as_str()) else {
+        return false;
+    };
+    let path = if !cfg.http_path_prefix.is_empty() {
+        matched_raw
+            .strip_prefix(&cfg.http_path_prefix)
+            .unwrap_or(matched_raw)
+    } else {
+        matched_raw
+    };
+    let m = req.method();
+    match path {
+        "/ready"
+        | "/metrics"
+        | "/debug/pprof/cmdline"
+        | "/debug/pprof"
+        | "/debug/pprof/"
+        | "/debug/pprof/*name"
+        | "/debug/pprof/profile"
+        | "/debug/pprof/symbol" => false,
+        "/ingester/flush" | "/ingester/ring" | "/ingester/partition-ring" => {
+            !matches!(*m, http::Method::GET | http::Method::POST)
+        }
+        p if p.starts_with("/ingester/partition-ring/compartment-") => {
+            !matches!(*m, http::Method::GET | http::Method::POST)
+        }
+        "/ingester/prepare-shutdown"
+        | "/ingester/prepare-partition-downscale"
+        | "/ingester/prepare-instance-ring-downscale" => {
+            !matches!(*m, http::Method::GET | http::Method::POST | http::Method::DELETE)
+        }
+        "/ingester/unregister-on-shutdown" => {
+            !matches!(*m, http::Method::GET | http::Method::PUT | http::Method::DELETE)
+        }
+        "/ingester/shutdown" => *m != http::Method::POST,
+        "/services"
+        | "/config"
+        | "/api/v1/status/buildinfo"
+        | "/api/v1/status/config"
+        | "/api/v1/status/flags"
+        | "/debug/fgprof"
+        | "/static/"
+        | "/static/*path"
+        | "/runtime_config"
+        | "/api/v1/user_limits"
+        | "/"
+        | "/memberlist"
+        | "/ingester/tsdb_metrics"
+        | "/ingester/tenants"
+        | "/ingester/tsdb/:tenant"
+        | "/ingester/label_churn/:tenant" => *m != http::Method::GET,
+        p if cfg.cost_attribution_path.as_deref() == Some(p) => *m != http::Method::GET,
+        _ => false,
+    }
 }
 
 /// Route name for metrics: the matched route template through `MakeLabelValue`; prefix routes
@@ -313,7 +375,12 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
     let begin = Instant::now();
     let start_unix_nano = now_unix_nanos();
     let method = req.method().as_str().to_string();
-    let matched_route = route_name(&req);
+    let method_mismatch = is_method_mismatch_before_run(&req, &cfg);
+    let matched_route = if method_mismatch {
+        None
+    } else {
+        route_name(&req)
+    };
     let route = matched_route.clone().unwrap_or_else(|| "other".to_string());
     let uri = req
         .uri()
@@ -574,5 +641,138 @@ mod tests {
         let all = SourceIps::new("", "", true).unwrap();
         assert_eq!(all.get(&h, "1.2.3.4:5678"), "10.0.0.1, 10.0.0.2, 1.2.3.4");
         assert!(SourceIps::new("X", "", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn w23_csc_11_method_mismatch_resolves_other_before_inflight_cluster_and_otel() {
+        use axum::routing::{on, MethodFilter};
+        use axum::Router;
+        use http_body_util::BodyExt as _;
+        use prometheus::Registry;
+        use tower::ServiceExt as _;
+
+        #[derive(Default)]
+        struct NoopLogger;
+        impl Logger for NoopLogger {
+            fn log(&self, _level: LogLevel, _fields: &[(&str, &str)]) {}
+        }
+
+        static SPANS: std::sync::OnceLock<Arc<Mutex<Vec<ExportedSpan>>>> = std::sync::OnceLock::new();
+        let spans = SPANS.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
+        let prev_exp = std::env::var("OTEL_TRACES_EXPORTER").ok();
+        std::env::set_var("OTEL_TRACES_EXPORTER", "otlp");
+        let sink = Arc::clone(spans);
+        let _ = mimir_common::tracing::init_otel_or_jaeger_from_env(
+            "mimir-test",
+            &NoopLogger,
+            Some(Arc::new(move |s: ExportedSpan| {
+                sink.lock().push(s);
+            })),
+        );
+        match prev_exp {
+            Some(v) => std::env::set_var("OTEL_TRACES_EXPORTER", v),
+            None => std::env::remove_var("OTEL_TRACES_EXPORTER"),
+        }
+        spans.lock().clear();
+
+        let reg = Registry::new();
+        let metrics = ServerMetrics::new(&reg, false, false).unwrap();
+        let cv = HttpClusterValidation::new(vec!["prod".to_string()], false, &[], &[]).unwrap();
+        let cfg = Arc::new(HttpMiddlewareConfig {
+            metrics,
+            logger: Arc::new(NoopLogger),
+            log_request_headers: false,
+            log_request_at_info_level: false,
+            log_source_ips: None,
+            trace_source_ips: None,
+            exclude_headers: Vec::new(),
+            trace_request_headers: false,
+            trace_exclude_headers: Vec::new(),
+            create_new_traces: true,
+            cluster_validation: Some(cv),
+            http_path_prefix: String::new(),
+            cost_attribution_path: None,
+        });
+
+        let inflight_seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let inflight_seen_cb = Arc::clone(&inflight_seen);
+        let reg_cb = reg.clone();
+
+        let app = Router::new()
+            .route("/config", on(MethodFilter::GET, || async { "ok" }))
+            .route("/ingester/tenants", {
+                let reg_cb = reg_cb.clone();
+                let inflight_seen_cb = Arc::clone(&inflight_seen_cb);
+                on(MethodFilter::GET, || async { "ok" }).head(move || {
+                    let reg_cb = reg_cb.clone();
+                    let inflight_seen_cb = Arc::clone(&inflight_seen_cb);
+                    async move {
+                        for mf in reg_cb.gather() {
+                            if mf.get_name() == "cortex_inflight_requests" {
+                                for m in mf.get_metric() {
+                                    if m.get_gauge().get_value() > 0.0 {
+                                        let method = m.get_label().iter().find(|l| l.get_name() == "method").map(|l| l.get_value().to_string()).unwrap_or_default();
+                                        let route = m.get_label().iter().find(|l| l.get_name() == "route").map(|l| l.get_value().to_string()).unwrap_or_default();
+                                        inflight_seen_cb.lock().push((method, route));
+                                    }
+                                }
+                            }
+                        }
+                        method_not_allowed().await
+                    }
+                })
+            })
+            .method_not_allowed_fallback(method_not_allowed)
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&cfg),
+                dskit_http_middleware,
+            ));
+
+        let mut req1 = Request::builder()
+            .method(http::Method::HEAD)
+            .uri("/ingester/tenants")
+            .header("X-Cluster", "prod")
+            .header("traceparent", "00-11111111111111111111111111111111-2222222222222222-01")
+            .body(Body::empty())
+            .unwrap();
+        req1.extensions_mut().insert(ServedOverHttp {
+            remote_addr: "127.0.0.1:12345".parse().unwrap(),
+        });
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let _ = resp1.into_body().collect().await.unwrap();
+        assert_eq!(*inflight_seen.lock(), vec![("HEAD".to_string(), "other".to_string())]);
+
+        let mut req2 = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("/config")
+            .header("traceparent", "00-33333333333333333333333333333333-4444444444444444-01")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ServedOverHttp {
+            remote_addr: "127.0.0.1:12345".parse().unwrap(),
+        });
+        let resp2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::NETWORK_AUTHENTICATION_REQUIRED);
+        let body2 = String::from_utf8(resp2.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        let json2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(json2["route"], "<unknown-route>");
+
+        for mf in reg.gather() {
+            for m in mf.get_metric() {
+                for lp in m.get_label() {
+                    if lp.get_name() == "route" {
+                        assert!(
+                            lp.get_value() == "other" || lp.get_value() == "<unknown-route>",
+                            "unexpected route label {} in {}",
+                            lp.get_value(),
+                            mf.get_name()
+                        );
+                    }
+                }
+            }
+        }
+
+
     }
 }

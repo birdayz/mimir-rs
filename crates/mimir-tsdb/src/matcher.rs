@@ -914,5 +914,16 @@ mod tests {
         assert!(!FastRegexMatcher::new(r"\p{Cs}").unwrap().is_match("a"));
         assert!(FastRegexMatcher::new(r"\P{Cs}").unwrap().is_match("a"));
         assert!(!FastRegexMatcher::new(r"\x{D800}").unwrap().is_match("a"));
+
+        // Go Perl \s excludes vertical tab 0x0B (\v), so \S and [\S] must match "\x0b"
+        // and [^\S] must NOT match "\x0b".
+        assert!(FastRegexMatcher::new(r"\S").unwrap().is_match("\x0b"));
+        assert!(FastRegexMatcher::new(r"[\S]").unwrap().is_match("\x0b"));
+        assert!(!FastRegexMatcher::new(r"[^\S]").unwrap().is_match("\x0b"));
+        assert!(!FastRegexMatcher::new(r"\s").unwrap().is_match("\x0b"));
+        assert!(!FastRegexMatcher::new(r"[\s]").unwrap().is_match("\x0b"));
+        assert!(FastRegexMatcher::new(r"[^\s]").unwrap().is_match("\x0b"));
+        assert!(FastRegexMatcher::new(r"[[:space:]]").unwrap().is_match("\x0b"));
+        assert!(!FastRegexMatcher::new(r"[[:^space:]]").unwrap().is_match("\x0b"));
     }
 }

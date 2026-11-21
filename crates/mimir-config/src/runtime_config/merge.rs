@@ -157,13 +157,23 @@ pub(crate) fn decoded_as_json(name: &str, data: &[u8]) -> bool {
         )
 }
 
+/// Maximum runtime config payload size (64 MiB), bounding both HTTP bodies and gzip expansion.
+pub(crate) const MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES: usize = 64 * 1024 * 1024;
+
 /// `unmarshalMaybeGzipped`.
 pub(crate) fn unmarshal_maybe_gzipped(name: &str, data: &[u8]) -> Result<Mapping, String> {
     if name.ends_with(".gz") {
-        let mut dec = flate2::read::MultiGzDecoder::new(data);
+        let dec = flate2::read::MultiGzDecoder::new(data);
+        let mut limited = dec.take((MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES + 1) as u64);
         let mut out = Vec::new();
-        dec.read_to_end(&mut out)
+        limited
+            .read_to_end(&mut out)
             .map_err(|e| format!("read gzipped file: {e}"))?;
+        if out.len() > MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES {
+            return Err(format!(
+                "uncompress/unmarshal gzipped file: decompressed runtime config exceeds maximum size of {MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES} bytes"
+            ));
+        }
         return unmarshal_yaml_map(&out).map_err(|e| format!("uncompress/unmarshal gzipped file: {e}"));
     }
     unmarshal_json_or_yaml(data).map_err(|e| {
@@ -298,6 +308,22 @@ mod tests {
         assert_eq!(
             err,
             r#"conflicting types for ".overrides": map[string]interface {} != map[interface {}]interface {}"#
+        );
+    }
+
+    #[test]
+    fn w23_csc_07_gzip_bomb_is_rejected_without_unbounded_allocation() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let chunk = vec![b' '; 1024 * 1024];
+        for _ in 0..65 {
+            enc.write_all(&chunk).unwrap();
+        }
+        let gz = enc.finish().unwrap();
+        let err = unmarshal_maybe_gzipped("bomb.yaml.gz", &gz).unwrap_err();
+        assert!(
+            err.contains("exceeds maximum size"),
+            "expected size limit error, got: {err}"
         );
     }
 }
