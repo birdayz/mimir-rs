@@ -979,7 +979,6 @@ pub fn decode_write_request<'a, 's>(
     let mut skip_label_validation = false;
     let mut skip_label_count_validation = false;
     let mut seen_first_symbol = false;
-    let mut prescanned_symbols = false;
     let mut all_symbols_utf8 = true;
 
     let mut pos = 0usize;
@@ -1040,23 +1039,21 @@ pub fn decode_write_request<'a, 's>(
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                if !prescanned_symbols {
-                    if !seen_first_symbol && !sub.is_empty() {
-                        return Err(DecodeError::InvalidFirstSymbol);
-                    }
-                    seen_first_symbol = true;
-                    if std::str::from_utf8(&input[sub.clone()]).is_err() {
-                        all_symbols_utf8 = false;
-                    }
-                    scratch.rw2_symbols.push(if sub.is_empty() {
-                        SliceRef::Empty
-                    } else {
-                        SliceRef::Input {
-                            start: sub.start as u32,
-                            len: sub.len() as u32,
-                        }
-                    });
+                if !seen_first_symbol && !sub.is_empty() {
+                    return Err(DecodeError::InvalidFirstSymbol);
                 }
+                seen_first_symbol = true;
+                if std::str::from_utf8(&input[sub.clone()]).is_err() {
+                    all_symbols_utf8 = false;
+                }
+                scratch.rw2_symbols.push(if sub.is_empty() {
+                    SliceRef::Empty
+                } else {
+                    SliceRef::Input {
+                        start: sub.start as u32,
+                        len: sub.len() as u32,
+                    }
+                });
             }
             5 => {
                 if !is_rw2 {
@@ -1069,41 +1066,6 @@ pub fn decode_write_request<'a, 's>(
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                if !seen_first_symbol && !prescanned_symbols {
-                    // Handle rare out-of-order protobuf fields where field 5 appears before field 4.
-                    prescanned_symbols = true;
-                    let mut scan_pos = pos;
-                    while scan_pos < len {
-                        let (sf, sw) = read_key_bounded(input, &mut scan_pos, len)?;
-                        if sf == 4 {
-                            if sw != 2 {
-                                return Err(DecodeError::InvalidWireType {
-                                    field: 4,
-                                    wire_type: sw,
-                                });
-                            }
-                            let sym_range =
-                                read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
-                            if !seen_first_symbol && !sym_range.is_empty() {
-                                return Err(DecodeError::InvalidFirstSymbol);
-                            }
-                            seen_first_symbol = true;
-                            if std::str::from_utf8(&input[sym_range.clone()]).is_err() {
-                                all_symbols_utf8 = false;
-                            }
-                            scratch.rw2_symbols.push(if sym_range.is_empty() {
-                                SliceRef::Empty
-                            } else {
-                                SliceRef::Input {
-                                    start: sym_range.start as u32,
-                                    len: sym_range.len() as u32,
-                                }
-                            });
-                        } else {
-                            skip_field_bounded(input, &mut scan_pos, len, sw)?;
-                        }
-                    }
-                }
                 let ts_meta = decode_timeseries_rw2(
                     input,
                     sub,
@@ -1237,20 +1199,18 @@ fn append_raw_rw2_labels(
             while p < packed.end {
                 let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
                 let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                let &(k_bytes, _) = resolved
-                    .get(name_idx as usize)
-                    .and_then(|o| o.as_ref())
-                    .ok_or(DecodeError::InvalidLabelRef {
+                let (k_bytes, _) = lookup_resolved(resolved, name_idx).ok_or(
+                    DecodeError::InvalidLabelRef {
                         index: name_idx,
                         offset: symbol_offset,
-                    })?;
-                let &(v_bytes, _) = resolved
-                    .get(val_idx as usize)
-                    .and_then(|o| o.as_ref())
-                    .ok_or(DecodeError::InvalidLabelRef {
+                    },
+                )?;
+                let (v_bytes, _) = lookup_resolved(resolved, val_idx).ok_or(
+                    DecodeError::InvalidLabelRef {
                         index: val_idx,
                         offset: symbol_offset,
-                    })?;
+                    },
+                )?;
                 append_stringlabel_pair_proto_bounded(
                     label_bytes_arena,
                     k_bytes,
@@ -1764,7 +1724,6 @@ where
     let mut skip_label_validation = false;
     let mut skip_label_count_validation = false;
     let mut seen_first_symbol = false;
-    let mut prescanned_symbols = false;
     let mut emitted_any_series = false;
     let mut header_changed_after_series = false;
 
@@ -1797,15 +1756,13 @@ where
                         });
                     }
                     let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                    if !prescanned_symbols {
-                        let sym_bytes = &input[sub];
-                        if !seen_first_symbol && !sym_bytes.is_empty() {
-                            return Err(DecodeError::InvalidFirstSymbol);
-                        }
-                        seen_first_symbol = true;
-                        let valid_utf8 = is_valid_utf8_fast(sym_bytes);
-                        resolved.push(Some((sym_bytes, valid_utf8)));
+                    let sym_bytes = &input[sub];
+                    if !seen_first_symbol && !sym_bytes.is_empty() {
+                        return Err(DecodeError::InvalidFirstSymbol);
                     }
+                    seen_first_symbol = true;
+                    let valid_utf8 = is_valid_utf8_fast(sym_bytes);
+                    resolved.push(Some((sym_bytes, valid_utf8)));
                 }
                 5 => {
                     if wire_type != 2 {
@@ -1815,35 +1772,6 @@ where
                         });
                     }
                     let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                    if !seen_first_symbol && !prescanned_symbols {
-                        prescanned_symbols = true;
-                        let mut scan_pos = pos;
-                        while scan_pos < len {
-                            let (sf, sw) = read_key_bounded(input, &mut scan_pos, len)?;
-                            if sf == 4 {
-                                if sw != 2 {
-                                    return Err(DecodeError::InvalidWireType {
-                                        field: 4,
-                                        wire_type: sw,
-                                    });
-                                }
-                                let sym_range =
-                                    read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
-                                let sym_bytes = &input[sym_range];
-                                if !seen_first_symbol && !sym_bytes.is_empty() {
-                                    return Err(DecodeError::InvalidFirstSymbol);
-                                }
-                                seen_first_symbol = true;
-                                let valid_utf8 = is_valid_utf8_fast(sym_bytes);
-                                resolved.push(Some((sym_bytes, valid_utf8)));
-                            } else {
-                                skip_field_bounded(input, &mut scan_pos, len, sw)?;
-                            }
-                        }
-                        if resolved.is_empty() && rw2_offset == 0 {
-                            resolved.push(Some((b"", true)));
-                        }
-                    }
                     let series = decode_timeseries_rw2_stream(
                         input,
                         sub,
@@ -1953,10 +1881,13 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
         match field_num {
             1 => {
                 if wire_type == 0 {
-                    let _ = read_varint_bounded(input, &mut pos, end)?;
                     return Err(DecodeError::OddNumberOfLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let element_count = input[packed.clone()].iter().filter(|&&b| b < 128).count();
+                    if !element_count.is_multiple_of(2) {
+                        return Err(DecodeError::OddNumberOfLabelRefs);
+                    }
                     let mut p = packed.start;
                     label_bytes_arena
                         .reserve((packed.end - p).saturating_mul(16).clamp(64, 65536));
@@ -1966,20 +1897,18 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                             return Err(DecodeError::OddNumberOfLabelRefs);
                         }
                         let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        let &(k_bytes, k_utf8) = resolved
-                            .get(name_idx as usize)
-                            .and_then(|o| o.as_ref())
-                            .ok_or(DecodeError::InvalidLabelRef {
+                        let (k_bytes, k_utf8) = lookup_resolved(resolved, name_idx).ok_or(
+                            DecodeError::InvalidLabelRef {
                                 index: name_idx,
                                 offset: symbol_offset,
-                            })?;
-                        let &(v_bytes, v_utf8) = resolved
-                            .get(val_idx as usize)
-                            .and_then(|o| o.as_ref())
-                            .ok_or(DecodeError::InvalidLabelRef {
+                            },
+                        )?;
+                        let (v_bytes, v_utf8) = lookup_resolved(resolved, val_idx).ok_or(
+                            DecodeError::InvalidLabelRef {
                                 index: val_idx,
                                 offset: symbol_offset,
-                            })?;
+                            },
+                        )?;
                         if k_bytes == b"__name__" {
                             metric_name_bytes = v_bytes;
                             metric_name_utf8 = v_utf8;
@@ -2216,10 +2145,13 @@ fn decode_exemplar_rw2_resolved<'a>(
         match field_num {
             1 => {
                 if wire_type == 0 {
-                    let _ = read_varint_bounded(input, &mut pos, end)?;
                     return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let element_count = input[packed.clone()].iter().filter(|&&b| b < 128).count();
+                    if !element_count.is_multiple_of(2) {
+                        return Err(DecodeError::OddNumberOfExemplarLabelRefs);
+                    }
                     let mut p = packed.start;
                     while p < packed.end {
                         let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
@@ -2227,20 +2159,18 @@ fn decode_exemplar_rw2_resolved<'a>(
                             return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                         }
                         let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        let &(k_bytes, _) = resolved
-                            .get(name_idx as usize)
-                            .and_then(|o| o.as_ref())
-                            .ok_or(DecodeError::InvalidExemplarLabelRef {
+                        let (k_bytes, _) = lookup_resolved(resolved, name_idx).ok_or(
+                            DecodeError::InvalidExemplarLabelRef {
                                 index: name_idx,
                                 offset: symbol_offset,
-                            })?;
-                        let &(v_bytes, _) = resolved
-                            .get(val_idx as usize)
-                            .and_then(|o| o.as_ref())
-                            .ok_or(DecodeError::InvalidExemplarLabelRef {
+                            },
+                        )?;
+                        let (v_bytes, _) = lookup_resolved(resolved, val_idx).ok_or(
+                            DecodeError::InvalidExemplarLabelRef {
                                 index: val_idx,
                                 offset: symbol_offset,
-                            })?;
+                            },
+                        )?;
                         let name_ref = bytes_to_slice_ref(
                             k_bytes,
                             name_idx as usize,
@@ -2336,13 +2266,12 @@ fn decode_metadata_rw2_stream<'r>(
                     });
                 }
                 let help_ref = read_varint_bounded(input, &mut pos, end)? as u32;
-                let &(bytes, ok) = resolved
-                    .get(help_ref as usize)
-                    .and_then(|o| o.as_ref())
-                    .ok_or(DecodeError::InvalidHelpRef {
+                let (bytes, ok) = lookup_resolved(resolved, help_ref).ok_or(
+                    DecodeError::InvalidHelpRef {
                         index: help_ref,
                         offset: symbol_offset,
-                    })?;
+                    },
+                )?;
                 help_bytes = bytes;
                 help_utf8 = ok;
             }
@@ -2354,13 +2283,12 @@ fn decode_metadata_rw2_stream<'r>(
                     });
                 }
                 let unit_ref = read_varint_bounded(input, &mut pos, end)? as u32;
-                let &(bytes, ok) = resolved
-                    .get(unit_ref as usize)
-                    .and_then(|o| o.as_ref())
-                    .ok_or(DecodeError::InvalidUnitRef {
+                let (bytes, ok) = lookup_resolved(resolved, unit_ref).ok_or(
+                    DecodeError::InvalidUnitRef {
                         index: unit_ref,
                         offset: symbol_offset,
-                    })?;
+                    },
+                )?;
                 unit_bytes = bytes;
                 unit_utf8 = ok;
             }
@@ -2518,10 +2446,13 @@ fn decode_timeseries_rw2(
                 scratch.rw2_label_refs.clear();
                 if wire_type == 0 {
                     // Single unpacked varint means odd number of refs (matching Mimir compat_rw2.go).
-                    let _ = read_varint_bounded(input, &mut pos, end)?;
                     return Err(DecodeError::OddNumberOfLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let element_count = input[packed.clone()].iter().filter(|&&b| b < 128).count();
+                    if !element_count.is_multiple_of(2) {
+                        return Err(DecodeError::OddNumberOfLabelRefs);
+                    }
                     let mut p = packed.start;
                     scratch.labels.reserve(((packed.end - p) / 2).min(4096));
                     while p < packed.end {
@@ -2815,10 +2746,13 @@ fn decode_exemplar_rw2(
             1 => {
                 scratch.rw2_label_refs.clear();
                 if wire_type == 0 {
-                    let _ = read_varint_bounded(input, &mut pos, end)?;
                     return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let element_count = input[packed.clone()].iter().filter(|&&b| b < 128).count();
+                    if !element_count.is_multiple_of(2) {
+                        return Err(DecodeError::OddNumberOfExemplarLabelRefs);
+                    }
                     let mut p = packed.start;
                     while p < packed.end {
                         let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
@@ -3433,6 +3367,17 @@ pub fn normalize_metric_name(series_name: &str, metric_type: i32) -> &str {
             .unwrap_or(series_name),
         _ => series_name,
     }
+}
+
+#[inline(always)]
+fn lookup_resolved<'r>(
+    resolved: &[Option<(&'r [u8], bool)>],
+    idx: u32,
+) -> Option<(&'r [u8], bool)> {
+    if idx == 0 {
+        return Some((b"", true));
+    }
+    resolved.get(idx as usize).and_then(|o| *o)
 }
 
 #[inline]
@@ -4529,7 +4474,8 @@ mod tests {
             assert_eq!(owned.timeseries[0].histograms, rw1.timeseries[0].histograms);
         }
 
-        // Test out-of-order RW2 fields: field 5 encoded BEFORE field 4.
+        // Test out-of-order RW2 fields: field 5 encoded BEFORE field 4 MUST fail with InvalidLabelRef
+        // in single-pass Go WriteRequest.Unmarshal parity.
         let rw2 = from_write_request_to_rw2(&rw1, 0, None).unwrap();
         let part_ts = cortexpb::WriteRequest {
             timeseries_rw2: rw2.timeseries_rw2.clone(),
@@ -4544,14 +4490,311 @@ mod tests {
         let mut out_of_order = Vec::new();
         out_of_order.extend_from_slice(&part_ts);
         out_of_order.extend_from_slice(&part_syms);
-        let decoded_ooo =
-            decode_write_request(&out_of_order, DecodeOptions::rw2(), &mut scratch).unwrap();
-        assert_eq!(decoded_ooo.timeseries_len(), 1);
-        assert_eq!(decoded_ooo.metadata().len(), 1);
+        assert!(matches!(
+            decode_write_request(&out_of_order, DecodeOptions::rw2(), &mut scratch),
+            Err(DecodeError::InvalidLabelRef { .. })
+        ));
+        let mut resolved_ooo = Rw2ResolvedScratch::new();
+        let mut label_bytes_ooo = Vec::new();
+        let mut samples_ooo = Vec::new();
+        let mut meta_ooo = Vec::new();
+        assert!(matches!(
+            decode_rw2_stream(
+                &out_of_order,
+                DecodeOptions::rw2(),
+                &mut scratch,
+                &mut resolved_ooo,
+                &mut label_bytes_ooo,
+                &mut samples_ooo,
+                &mut meta_ooo,
+                |_| {},
+            ),
+            Err(DecodeError::InvalidLabelRef { .. })
+        ));
+    }
+
+    #[test]
+    fn test_rw2_single_pass_interleaved_and_kafka_v2_common_refs() {
+        let mut scratch = WriteRequestScratch::new();
+        let mut resolved = Rw2ResolvedScratch::new();
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+
+        let push_sym = |buf: &mut Vec<u8>, s: &str| {
+            buf.push(0x22); // field 4, wire_type 2
+            prost::encoding::encode_varint(s.len() as u64, buf);
+            buf.extend_from_slice(s.as_bytes());
+        };
+        let push_ts = |buf: &mut Vec<u8>, refs: &[u32], val: f64, ts: i64, help_ref: u32, unit_ref: u32| {
+            let mut inner = Vec::new();
+            if !refs.is_empty() {
+                let mut packed = Vec::new();
+                for &r in refs {
+                    prost::encoding::encode_varint(r as u64, &mut packed);
+                }
+                inner.push(0x0a); // field 1, wire_type 2
+                prost::encoding::encode_varint(packed.len() as u64, &mut inner);
+                inner.extend_from_slice(&packed);
+            }
+            let samp = cortexpb::Sample {
+                value: val,
+                timestamp_ms: ts,
+            }
+            .encode_to_vec();
+            inner.push(0x12);
+            prost::encoding::encode_varint(samp.len() as u64, &mut inner);
+            inner.extend_from_slice(&samp);
+            if help_ref != 0 || unit_ref != 0 {
+                let meta = cortexpb::MetadataRw2 {
+                    r#type: cortexpb::metadata_rw2::MetricType::Counter as i32,
+                    help_ref,
+                    unit_ref,
+                }
+                .encode_to_vec();
+                inner.push(0x2a);
+                prost::encoding::encode_varint(meta.len() as u64, &mut inner);
+                inner.extend_from_slice(&meta);
+            }
+            buf.push(0x2a); // field 5, wire_type 2
+            prost::encoding::encode_varint(inner.len() as u64, buf);
+            buf.extend_from_slice(&inner);
+        };
+
+        // 1. Interleaved field 4 -> field 5 -> field 4 -> field 5 in RW2 mode.
+        let mut interleaved = Vec::new();
+        push_sym(&mut interleaved, "");
+        push_sym(&mut interleaved, "__name__");
+        push_sym(&mut interleaved, "m1");
+        push_ts(&mut interleaved, &[1, 2], 1.0, 100, 0, 0);
+        push_sym(&mut interleaved, "m2");
+        push_ts(&mut interleaved, &[1, 3], 2.0, 200, 0, 0);
+
+        let dec = decode_write_request(&interleaved, DecodeOptions::rw2(), &mut scratch).unwrap();
+        let owned = dec.to_owned_write_request();
+        assert_eq!(owned.timeseries.len(), 2);
+        assert_eq!(owned.timeseries[0].labels[0].value.as_ref(), b"m1");
+        assert_eq!(owned.timeseries[1].labels[0].value.as_ref(), b"m2");
+
+        let mut streamed_labels = Vec::new();
+        {
+            let mut m = Vec::new();
+            decode_rw2_stream(
+                &interleaved,
+                DecodeOptions::rw2(),
+                &mut scratch,
+                &mut resolved,
+                &mut label_bytes,
+                &mut samples,
+                &mut m,
+                |s| {
+                    streamed_labels.push(s.encoded_labels.to_vec());
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(streamed_labels.len(), 2);
+        assert!(streamed_labels[0].windows(2).any(|w| w == b"m1"));
+        assert!(streamed_labels[1].windows(2).any(|w| w == b"m2"));
+
+        // 2. Kafka v2: field 5 before field 4 referencing local symbol >= 64 fails,
+        //    while referencing only common symbols (< 64) succeeds.
+        let mut kv2_local_before_sym = Vec::new();
+        push_ts(&mut kv2_local_before_sym, &[1, 65], 1.0, 100, 0, 0);
+        push_sym(&mut kv2_local_before_sym, "");
+        push_sym(&mut kv2_local_before_sym, "custom_metric");
         assert_eq!(
-            decoded_ooo.metadata().next().unwrap().metric_family_name,
-            "req_latency"
+            decode_write_request(&kv2_local_before_sym, DecodeOptions::kafka_v2(), &mut scratch)
+                .err(),
+            Some(DecodeError::InvalidLabelRef {
+                index: 65,
+                offset: V2_RECORD_SYMBOL_OFFSET
+            })
         );
+        {
+            let mut m = Vec::new();
+            assert_eq!(
+                decode_rw2_stream(
+                    &kv2_local_before_sym,
+                    DecodeOptions::kafka_v2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut label_bytes,
+                    &mut samples,
+                    &mut m,
+                    |_| {},
+                )
+                .err(),
+                Some(DecodeError::InvalidLabelRef {
+                    index: 65,
+                    offset: V2_RECORD_SYMBOL_OFFSET
+                })
+            );
+        }
+
+        let mut kv2_common_before_sym = Vec::new();
+        push_ts(&mut kv2_common_before_sym, &[1, 6], 1.0, 100, 0, 0);
+        push_sym(&mut kv2_common_before_sym, "");
+        push_sym(&mut kv2_common_before_sym, "unused");
+        let dec_common =
+            decode_write_request(&kv2_common_before_sym, DecodeOptions::kafka_v2(), &mut scratch)
+                .unwrap();
+        assert_eq!(dec_common.timeseries_len(), 1);
+        {
+            let mut m = Vec::new();
+            decode_rw2_stream(
+                &kv2_common_before_sym,
+                DecodeOptions::kafka_v2(),
+                &mut scratch,
+                &mut resolved,
+                &mut label_bytes,
+                &mut samples,
+                &mut m,
+                |_| {},
+            )
+            .unwrap();
+        }
+
+        // 3. RW2: field 5 before field 4 with ref == 0 resolves to "" cleanly.
+        let mut rw2_ref0 = Vec::new();
+        push_ts(&mut rw2_ref0, &[0, 0], 1.0, 100, 0, 0);
+        push_sym(&mut rw2_ref0, "");
+        decode_write_request(&rw2_ref0, DecodeOptions::rw2(), &mut scratch).unwrap();
+        {
+            let mut m = Vec::new();
+            decode_rw2_stream(
+                &rw2_ref0,
+                DecodeOptions::rw2(),
+                &mut scratch,
+                &mut resolved,
+                &mut label_bytes,
+                &mut samples,
+                &mut m,
+                |_| {},
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_rw2_label_refs_error_precedence_s4_11() {
+        let mut scratch = WriteRequestScratch::new();
+        let mut resolved = Rw2ResolvedScratch::new();
+        let mut label_bytes = Vec::new();
+        let mut samples = Vec::new();
+
+        // (a) Unpacked wire_type=0 with truncated EOF (tag 0x08 only) -> OddNumberOfLabelRefs
+        let ts_wire_wt0 = vec![0x08];
+        let mut wr_wt0 = vec![0x2a, ts_wire_wt0.len() as u8];
+        wr_wt0.extend_from_slice(&ts_wire_wt0);
+        assert_eq!(
+            decode_write_request(&wr_wt0, DecodeOptions::rw2(), &mut scratch).err(),
+            Some(DecodeError::OddNumberOfLabelRefs)
+        );
+        {
+            let mut m = Vec::new();
+            assert_eq!(
+                decode_rw2_stream(
+                    &wr_wt0,
+                    DecodeOptions::rw2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut label_bytes,
+                    &mut samples,
+                    &mut m,
+                    |_| {},
+                )
+                .err(),
+                Some(DecodeError::OddNumberOfLabelRefs)
+            );
+        }
+
+        // (b) Exemplar unpacked wire_type=0 with truncated EOF (tag 0x08 only) -> OddNumberOfExemplarLabelRefs
+        let ex_wire_wt0 = vec![0x08];
+        let mut ts_ex_wt0 = vec![0x22, ex_wire_wt0.len() as u8];
+        ts_ex_wt0.extend_from_slice(&ex_wire_wt0);
+        let mut wr_ex_wt0 = vec![0x2a, ts_ex_wt0.len() as u8];
+        wr_ex_wt0.extend_from_slice(&ts_ex_wt0);
+        assert_eq!(
+            decode_write_request(&wr_ex_wt0, DecodeOptions::rw2(), &mut scratch).err(),
+            Some(DecodeError::OddNumberOfExemplarLabelRefs)
+        );
+        {
+            let mut m = Vec::new();
+            assert_eq!(
+                decode_rw2_stream(
+                    &wr_ex_wt0,
+                    DecodeOptions::rw2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut label_bytes,
+                    &mut samples,
+                    &mut m,
+                    |_| {},
+                )
+                .err(),
+                Some(DecodeError::OddNumberOfExemplarLabelRefs)
+            );
+        }
+
+        // (c) Packed [999, 1, 2] -> OddNumberOfLabelRefs BEFORE resolving 999
+        let mut packed = Vec::new();
+        for v in [999u64, 1, 2] {
+            prost::encoding::encode_varint(v, &mut packed);
+        }
+        let mut ts_odd_invalid = vec![0x0a, packed.len() as u8];
+        ts_odd_invalid.extend_from_slice(&packed);
+        let mut wr_odd_invalid = vec![0x2a, ts_odd_invalid.len() as u8];
+        wr_odd_invalid.extend_from_slice(&ts_odd_invalid);
+        assert_eq!(
+            decode_write_request(&wr_odd_invalid, DecodeOptions::rw2(), &mut scratch).err(),
+            Some(DecodeError::OddNumberOfLabelRefs)
+        );
+        {
+            let mut m = Vec::new();
+            assert_eq!(
+                decode_rw2_stream(
+                    &wr_odd_invalid,
+                    DecodeOptions::rw2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut label_bytes,
+                    &mut samples,
+                    &mut m,
+                    |_| {},
+                )
+                .err(),
+                Some(DecodeError::OddNumberOfLabelRefs)
+            );
+        }
+
+        // (d) Exemplar packed [999, 1, 2] -> OddNumberOfExemplarLabelRefs BEFORE resolving 999
+        let mut ex_odd_invalid = vec![0x0a, packed.len() as u8];
+        ex_odd_invalid.extend_from_slice(&packed);
+        let mut ts_ex_odd = vec![0x22, ex_odd_invalid.len() as u8];
+        ts_ex_odd.extend_from_slice(&ex_odd_invalid);
+        let mut wr_ex_odd = vec![0x2a, ts_ex_odd.len() as u8];
+        wr_ex_odd.extend_from_slice(&ts_ex_odd);
+        assert_eq!(
+            decode_write_request(&wr_ex_odd, DecodeOptions::rw2(), &mut scratch).err(),
+            Some(DecodeError::OddNumberOfExemplarLabelRefs)
+        );
+        {
+            let mut m = Vec::new();
+            assert_eq!(
+                decode_rw2_stream(
+                    &wr_ex_odd,
+                    DecodeOptions::rw2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut label_bytes,
+                    &mut samples,
+                    &mut m,
+                    |_| {},
+                )
+                .err(),
+                Some(DecodeError::OddNumberOfExemplarLabelRefs)
+            );
+        }
     }
 
     #[test]

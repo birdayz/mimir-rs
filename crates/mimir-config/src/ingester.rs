@@ -364,11 +364,6 @@ impl RingConfig {
                     "\"spread-minimizing\" token generation strategy is misconfigured: strategy requires \"tokens-file-path\" to be empty".to_string(),
                 ));
             }
-            if self.instance_id.is_empty() {
-                return Err(ConfigError::Validation(
-                    "\"spread-minimizing\" token generation strategy is misconfigured: instance id cannot be empty".to_string(),
-                ));
-            }
             if self.spread_minimizing_zones.0.is_empty() || self.spread_minimizing_zones.0.len() > 8
             {
                 return Err(ConfigError::Validation(format!(
@@ -386,15 +381,25 @@ impl RingConfig {
                     self.instance_availability_zone
                 )));
             }
-            let valid_suffix = self
-                .instance_id
-                .rfind('-')
-                .map(|pos| &self.instance_id[pos + 1..])
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
-            if !valid_suffix {
+            let Some((prefix, suffix)) = self.instance_id.rsplit_once('-') else {
                 return Err(ConfigError::Validation(format!(
                     "\"spread-minimizing\" token generation strategy is misconfigured: unable to extract instance id from {:?}",
                     self.instance_id
+                )));
+            };
+            if prefix.contains('\n')
+                || suffix.is_empty()
+                || !suffix.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "\"spread-minimizing\" token generation strategy is misconfigured: unable to extract instance id from {:?}",
+                    self.instance_id
+                )));
+            }
+            if suffix.parse::<i64>().is_err() {
+                return Err(ConfigError::Validation(format!(
+                    "\"spread-minimizing\" token generation strategy is misconfigured: strconv.Atoi: parsing {:?}: value out of range",
+                    suffix
                 )));
             }
             return Ok(());
@@ -1044,5 +1049,48 @@ impl IngesterClientConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.grpc_client_config.validate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w26_s4_07_spread_minimizing_instance_id_and_zone_order() {
+        let mut ring = RingConfig {
+            token_generation_strategy: "spread-minimizing".to_string(),
+            spread_minimizing_zones: StringSliceCSV(vec!["zone-a".to_string()]),
+            instance_availability_zone: "zone-a".to_string(),
+            instance_id: "ingester-0".to_string(),
+            ..Default::default()
+        };
+        ring.validate().unwrap();
+
+        // Zone count & membership checked before instance_id (matching Go NewSpreadMinimizingTokenGenerator).
+        let mut bad_zone = ring.clone();
+        bad_zone.instance_id = "".to_string();
+        bad_zone.spread_minimizing_zones = StringSliceCSV(vec![]);
+        assert!(bad_zone
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("number of zones 0 is not correct"));
+
+        // Newline before '-' rejected (Go regexp `.` does not match '\n').
+        ring.instance_id = "bad\ningester-0".to_string();
+        assert!(ring
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unable to extract instance id"));
+
+        // i64 overflow rejected (Go strconv.Atoi).
+        ring.instance_id = "ingester-99999999999999999999".to_string();
+        assert!(ring
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("value out of range"));
     }
 }

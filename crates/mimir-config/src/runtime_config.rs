@@ -472,18 +472,10 @@ fn parse_runtime_config_value(
                     )));
                 }
 
-                let tenant_set_otel_strategy = tenant_v.as_mapping().is_some_and(|m| {
-                    m.contains_key(Value::String("otel_translation_strategy".to_string()))
-                });
                 let mut limits: LimitsConfig = serde_yaml::from_value(merged).map_err(|e| {
                     ConfigError::RuntimeConfig(format!("tenant {tenant_id:?}: {e}"))
                 })?;
-                let validation_res = if tenant_set_otel_strategy {
-                    limits.validate()
-                } else {
-                    limits.validate_with_defaults(Some(default_limits))
-                };
-                validation_res.map_err(|e| {
+                limits.validate().map_err(|e| {
                     ConfigError::RuntimeConfig(format!("tenant {tenant_id:?}: {e}"))
                 })?;
                 if limits.query_ingesters_within.0 != 0
@@ -1370,8 +1362,10 @@ mod null_override_tests {
         );
         defaults.name_validation_scheme = NameValidationScheme::Utf8;
         defaults.otel_metric_suffixes_enabled = Some(true);
-        defaults.otel_translation_strategy =
-            OTelTranslationStrategy("NoUTF8EscapingWithSuffixes".to_string());
+        // When global otel_translation_strategy is unset (""), tenant overrides that omit
+        // name_validation_scheme / otel_metric_suffixes_enabled validate cleanly and inherit
+        // the derived strategy at lookup time.
+        defaults.otel_translation_strategy = OTelTranslationStrategy::default();
 
         let out = parse_runtime_config_yaml(
             br#"
@@ -1414,7 +1408,7 @@ overrides:
 
         let mgr = RuntimeConfigManager::new(
             RuntimeConfigConfig::default(),
-            defaults,
+            defaults.clone(),
             InstanceLimits::default(),
         )
         .unwrap();
@@ -1436,6 +1430,62 @@ overrides:
             ov.otel_translation_strategy("t_null_ca").0,
             "UnderscoreEscapingWithoutSuffixes"
         );
+
+        // S4-04: When global defaults explicitly set otel_translation_strategy to a strategy
+        // requiring utf8 or suffixes=true, Go resets OTelMetricSuffixesEnabled=nil and
+        // NameValidationScheme=Unset before decoding per-tenant overrides and running Validate().
+        let mut strict_defaults = defaults;
+        strict_defaults.otel_translation_strategy =
+            OTelTranslationStrategy("NoUTF8EscapingWithSuffixes".to_string());
+        let err = parse_runtime_config_yaml(
+            b"overrides:
+  t1:
+    max_global_series_per_user: 100
+",
+            &strict_defaults,
+            &InstanceLimits::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("OTLP translation strategy NoUTF8EscapingWithSuffixes is not allowed unless validation scheme is utf8"),
+            "unexpected err: {err}"
+        );
+
+        // Also for UnderscoreEscapingWithSuffixes when tenant omits otel_metric_suffixes_enabled.
+        let suffix_defaults = LimitsConfig {
+            otel_metric_suffixes_enabled: Some(true),
+            otel_translation_strategy: OTelTranslationStrategy(
+                "UnderscoreEscapingWithSuffixes".to_string(),
+            ),
+            ..Default::default()
+        };
+        let err2 = parse_runtime_config_yaml(
+            b"overrides:
+  t1:
+    max_global_series_per_user: 100
+",
+            &suffix_defaults,
+            &InstanceLimits::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err2.contains("OTLP translation strategy UnderscoreEscapingWithSuffixes is not allowed unless metric suffixes are enabled"),
+            "unexpected err2: {err2}"
+        );
+
+        // Providing the matching scheme/suffixes on the tenant override succeeds.
+        parse_runtime_config_yaml(
+            b"overrides:
+  t1:
+    name_validation_scheme: utf8
+    otel_metric_suffixes_enabled: true
+",
+            &strict_defaults,
+            &InstanceLimits::default(),
+        )
+        .unwrap();
     }
 
     #[test]

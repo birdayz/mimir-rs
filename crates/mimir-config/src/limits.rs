@@ -674,9 +674,8 @@ impl LimitsConfig {
                     }
                     source.insert(name.to_string(), matcher.to_string());
                 }
-                if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
-                    v(&source).map_err(ConfigError::Flag)?;
-                }
+                let validator = active_custom_trackers_validator();
+                validator(&source).map_err(ConfigError::Flag)?;
                 let map = &mut get_mut(t).active_series_custom_trackers;
                 for (name, matcher) in source {
                     if map.contains_key(&name) {
@@ -836,30 +835,14 @@ impl LimitsConfig {
 
     /// Validates limits matching `pkg/util/validation/limits.go:Limits.Validate()`.
     pub fn validate(&mut self) -> Result<(), ConfigError> {
-        self.validate_with_defaults(None)
-    }
-
-    /// Validates limits, falling back `name_validation_scheme` and
-    /// `otel_metric_suffixes_enabled` to `defaults` when unset on a per-tenant override
-    /// (without mutating `self` so `/runtime_config` preserves unset fields like Go).
-    pub fn validate_with_defaults(&mut self, defaults: Option<&LimitsConfig>) -> Result<(), ConfigError> {
-        let effective_scheme = match self.name_validation_scheme {
-            NameValidationScheme::Unset => defaults
-                .map(|d| d.name_validation_scheme)
-                .unwrap_or(NameValidationScheme::Unset),
-            other => other,
-        };
-        let validation_scheme = match effective_scheme {
+        let validation_scheme = match self.name_validation_scheme {
             NameValidationScheme::Unset | NameValidationScheme::Legacy => {
                 NameValidationScheme::Legacy
             }
             NameValidationScheme::Utf8 => NameValidationScheme::Utf8,
         };
 
-        let otel_suffixes = self
-            .otel_metric_suffixes_enabled
-            .or_else(|| defaults.and_then(|d| d.otel_metric_suffixes_enabled))
-            .unwrap_or(false);
+        let otel_suffixes = self.otel_metric_suffixes_enabled.unwrap_or(false);
         match self.otel_translation_strategy.0.as_str() {
             "UnderscoreEscapingWithoutSuffixes" => {
                 if validation_scheme != NameValidationScheme::Legacy {
@@ -1012,10 +995,9 @@ impl LimitsConfig {
         for (k, v) in &self.alertmanager_notification_rate_limit_per_integration {
             validate_integration_limit(k, v)?;
         }
-        if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
-            v(&self.active_series_custom_trackers).map_err(ConfigError::Validation)?;
-            v(&self.active_series_additional_custom_trackers).map_err(ConfigError::Validation)?;
-        }
+        let validator = active_custom_trackers_validator();
+        validator(&self.active_series_custom_trackers).map_err(ConfigError::Validation)?;
+        validator(&self.active_series_additional_custom_trackers).map_err(ConfigError::Validation)?;
         validate_cost_attribution_trackers(&self.cost_attribution_trackers)?;
         validate_cost_attribution_trackers(&self.additional_cost_attribution_trackers)?;
         for cfg in self.cost_attribution_trackers.values_mut() {
@@ -1045,7 +1027,7 @@ impl LimitsConfig {
                 > self.max_active_series_additional_custom_trackers as usize
         {
             return Err(ConfigError::Validation(format!(
-                "active_series_additional_custom_trackers validation failed: number of additional custom trackers ({}) exceeds limit ({})",
+                "active_series_additional_custom_trackers validation failed: the number of custom trackers [{}] exceeds the configured limit [{}]",
                 self.active_series_additional_custom_trackers.len(),
                 self.max_active_series_additional_custom_trackers
             )));
@@ -1166,12 +1148,163 @@ pub fn set_active_series_custom_trackers_validator(f: CustomTrackersValidator) {
     let _ = CUSTOM_TRACKERS_VALIDATOR.set(f);
 }
 
+fn active_custom_trackers_validator() -> CustomTrackersValidator {
+    CUSTOM_TRACKERS_VALIDATOR
+        .get()
+        .copied()
+        .unwrap_or(default_validate_custom_trackers)
+}
+
+/// Built-in fallback matcher validator (matching Alertmanager `labels.ParseMatchers` and
+/// `CustomTrackersConfig.NewCustomTrackersConfig`) used when `mimir-cmd` has not installed the
+/// `mimir-ingester` hook.
+fn default_validate_custom_trackers(m: &BTreeMap<String, String>) -> Result<(), String> {
+    const MAX_NUMBER_OF_TRACKERS: usize = u16::MAX as usize;
+    if m.len() > MAX_NUMBER_OF_TRACKERS {
+        return Err(format!(
+            "the number of trackers set [{}] exceeds the maximum number of trackers [{MAX_NUMBER_OF_TRACKERS}]",
+            m.len()
+        ));
+    }
+    for (name, matcher) in m {
+        validate_am_matchers(matcher)
+            .map_err(|e| format!("can't build active series matcher {name}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn validate_am_matchers(s: &str) -> Result<(), String> {
+    let s = s.strip_prefix('{').unwrap_or(s);
+    let s = s.strip_suffix('}').unwrap_or(s);
+
+    let mut inside_quotes = false;
+    let mut escaped = false;
+    let mut token = String::new();
+    let mut tokens = Vec::new();
+
+    for ch in s.chars() {
+        match ch {
+            ',' if !inside_quotes => {
+                tokens.push(std::mem::take(&mut token));
+                continue;
+            }
+            '"' => {
+                if !escaped {
+                    inside_quotes = !inside_quotes;
+                } else {
+                    escaped = false;
+                }
+            }
+            '\\' => {
+                escaped = !escaped;
+            }
+            _ => {
+                escaped = false;
+            }
+        }
+        token.push(ch);
+    }
+
+    let rem = token.trim();
+    if !rem.is_empty() {
+        tokens.push(rem.to_string());
+    }
+
+    for tok in tokens {
+        validate_am_matcher(&tok)?;
+    }
+    Ok(())
+}
+
+fn validate_am_matcher(s: &str) -> Result<(), String> {
+    let trimmed = s.trim_start();
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() || !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_' || bytes[0] == b':')
+    {
+        return Err(format!("bad matcher format: {s}"));
+    }
+    let mut i = 1;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b':')
+    {
+        i += 1;
+    }
+    let rest = trimmed[i..].trim_start();
+
+    let (is_regex, after_op) = if let Some(r) = rest.strip_prefix("=~") {
+        (true, r)
+    } else if let Some(r) = rest.strip_prefix("!~") {
+        (true, r)
+    } else if let Some(r) = rest.strip_prefix("!=") {
+        (false, r)
+    } else if let Some(r) = rest.strip_prefix('=') {
+        (false, r)
+    } else {
+        return Err(format!("bad matcher format: {s}"));
+    };
+
+    let raw_trimmed = after_op.trim();
+    let mut raw_value = raw_trimmed;
+    let mut expect_trailing_quote = false;
+    if let Some(after) = raw_value.strip_prefix('"') {
+        raw_value = after;
+        expect_trailing_quote = true;
+    }
+
+    let mut value = String::with_capacity(raw_value.len());
+    let mut escaped = false;
+    let mut chars = raw_value.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        let is_last = chars.peek().is_none();
+        if escaped {
+            escaped = false;
+            match ch {
+                'n' => value.push('\n'),
+                '"' | '\\' => value.push(ch),
+                _ => {
+                    value.push('\\');
+                    value.push(ch);
+                }
+            }
+            continue;
+        }
+        match ch {
+            '\\' => {
+                if !is_last {
+                    escaped = true;
+                    continue;
+                }
+                value.push('\\');
+            }
+            '"' => {
+                if !expect_trailing_quote || idx + ch.len_utf8() < raw_value.len() {
+                    return Err(format!(
+                        "matcher value contains unescaped double quote: {raw_trimmed}"
+                    ));
+                }
+                expect_trailing_quote = false;
+            }
+            _ => value.push(ch),
+        }
+    }
+
+    if expect_trailing_quote {
+        return Err(format!(
+            "matcher value contains unescaped double quote: {raw_trimmed}"
+        ));
+    }
+
+    if is_regex {
+        regex::Regex::new(&value).map_err(|e| format!("invalid regex: {e}"))?;
+    }
+    Ok(())
+}
+
 /// YAML-decode-time custom trackers validation (Go: `CustomTrackersConfig.UnmarshalYAML`).
 pub(crate) fn validate_custom_trackers_yaml(l: &LimitsConfig) -> Result<(), ConfigError> {
-    if let Some(v) = CUSTOM_TRACKERS_VALIDATOR.get() {
-        v(&l.active_series_custom_trackers).map_err(ConfigError::Yaml)?;
-        v(&l.active_series_additional_custom_trackers).map_err(ConfigError::Yaml)?;
-    }
+    let validator = active_custom_trackers_validator();
+    validator(&l.active_series_custom_trackers).map_err(ConfigError::Yaml)?;
+    validator(&l.active_series_additional_custom_trackers).map_err(ConfigError::Yaml)?;
     Ok(())
 }
 
@@ -1268,5 +1401,43 @@ mod tests {
                 other => panic!("expected ConfigError::Validation for {strategy:?}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn w26_s2_07_and_s4_10_custom_trackers_error_wording_and_builtin_validator() {
+        let mut limits = LimitsConfig {
+            max_active_series_additional_custom_trackers: 1,
+            ..Default::default()
+        };
+        limits
+            .active_series_additional_custom_trackers
+            .insert("t1".to_string(), r#"{job="a"}"#.to_string());
+        limits
+            .active_series_additional_custom_trackers
+            .insert("t2".to_string(), r#"{job="b"}"#.to_string());
+        assert_eq!(
+            limits.validate().unwrap_err().to_string(),
+            "error validating config: active_series_additional_custom_trackers validation failed: the number of custom trackers [2] exceeds the configured limit [1]"
+        );
+
+        let mut bad_matcher = LimitsConfig::default();
+        bad_matcher
+            .active_series_custom_trackers
+            .insert("bad".to_string(), "not a valid matcher".to_string());
+        let err = bad_matcher.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("can't build active series matcher bad"),
+            "unexpected err: {err}"
+        );
+
+        let mut bad_regex = LimitsConfig::default();
+        bad_regex
+            .active_series_additional_custom_trackers
+            .insert("bad_re".to_string(), r#"{job=~"[unclosed"}"#.to_string());
+        let err_re = bad_regex.validate().unwrap_err().to_string();
+        assert!(
+            err_re.contains("can't build active series matcher bad_re"),
+            "unexpected err: {err_re}"
+        );
     }
 }
