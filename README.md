@@ -18,7 +18,7 @@ Go Mimir spends a large share of its CPU and resident memory in runtime overhead
 - **Two-level paged tables with OS page reclamation:** `PagedById` (series lookup by ID) and lock-free `NanosSlab` (active-series timestamps) index up to `256 * 256 * 4096` slots via two pointer indirections. Empty pages are returned to the kernel via `madvise(MADV_DONTNEED)`.
 - **Single-pass zero-copy wire decoders:** `decode_classic_stream` and `decode_rw2_stream` validate UTF-8, resolve `V2CommonSymbols`, encode `stringlabels` directly into reusable per-worker arenas, and compute `xxhash64` in one pass without intermediate `LabelPair` structs.
 - **Direct-to-`BytesMut` gRPC encoders:** `QueryStream` (`QueryStreamBatchBuilder`) and `MetricsForLabelMatchers` (`encode_metric_stringlabels`) serialize protobuf wire frames straight from `stringlabels` and raw chunk bytes into `BytesMut`, avoiding `prost` message trees and `Bytes::slice` refcount operations.
-- **Lockless WAL pre-compression and `jemalloc`:** WAL records are Snappy/Zstd-compressed on background worker threads before taking the WAL writer lock (`WlogWriter::log_precompressed`). Linux builds link `tikv-jemallocator` (`background_thread:true,dirty_decay_ms:250,muzzy_decay_ms:0,narenas:8`) to return freed pages promptly.
+- **Lockless WAL pre-compression and `jemalloc`:** WAL records are Snappy/Zstd-compressed on background worker threads before taking the WAL writer lock (`WlogWriter::log_precompressed`). Linux builds link `tikv-jemallocator` (`background_thread:true,dirty_decay_ms:250,muzzy_decay_ms:0,narenas:8`) to return freed pages promptly (see [docs/allocator-benchmark.md](docs/allocator-benchmark.md) for the ABBA comparison against `glibc` and stock `jemalloc`).
 
 ## Compatibility and Current Scope
 
