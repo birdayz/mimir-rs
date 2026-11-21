@@ -55,7 +55,9 @@ use crate::metrics::{native_histogram, FnGaugeCollector};
 use crate::postings::{
     postings_for_matchers, MemPostings, PostingsBatchScratch, PostingsError,
 };
-use crate::postings_cache::{PostingsForMatchersCache, PostingsForMatchersCacheConfig};
+use crate::postings_cache::{
+    next_postings_cache_source_id, PostingsForMatchersCache, PostingsForMatchersCacheConfig,
+};
 use crate::matcher::LabelMatcher;
 use crate::record::{
     DecodedRecord, MetricType, RecordDecoder, RecordEncoder, RecordError, RefExemplar,
@@ -222,6 +224,9 @@ pub struct HeadOptions {
     pub timely_compaction: bool,
     /// Mimir `head_postings_for_matchers_cache_{ttl,max_bytes,versions}`.
     pub postings_cache: PostingsForMatchersCacheConfig,
+    /// Optional shared `PostingsForMatchersCache` across all tenant Heads when
+    /// `shared_postings_for_matchers_cache: true`.
+    pub shared_postings_cache: Option<Arc<PostingsForMatchersCache>>,
     pub metadata_limits: MetadataLimits,
     pub series_lifecycle_callback: Option<Arc<dyn SeriesLifecycleCallback>>,
     pub registry: Option<Arc<prometheus::Registry>>,
@@ -257,6 +262,10 @@ impl std::fmt::Debug for HeadOptions {
             )
             .field("timely_compaction", &self.timely_compaction)
             .field("postings_cache", &self.postings_cache)
+            .field(
+                "shared_postings_cache",
+                &self.shared_postings_cache.as_ref().map(|_| "..."),
+            )
             .field("metadata_limits", &self.metadata_limits)
             .field(
                 "series_lifecycle_callback",
@@ -314,10 +323,8 @@ impl Default for HeadOptions {
             head_chunks_write_queue_size: 0,
             head_chunks_write_buffer_size: crate::head_chunks::DEFAULT_WRITE_BUFFER_SIZE,
             timely_compaction: false,
-            postings_cache: PostingsForMatchersCacheConfig {
-                enable_invalidation: true,
-                ..Default::default()
-            },
+            postings_cache: PostingsForMatchersCacheConfig::default(),
+            shared_postings_cache: None,
             metadata_limits: MetadataLimits::default(),
             series_lifecycle_callback: None,
             registry: None,
@@ -3699,7 +3706,8 @@ pub struct Head {
     series: StripeSeries,
     series_creation_mtx: Mutex<()>,
     postings: MemPostings,
-    postings_cache: PostingsForMatchersCache,
+    postings_cache: Arc<PostingsForMatchersCache>,
+    postings_cache_source_id: u64,
     tombstones: MemTombstones,
     exemplars: CircularExemplarStorage,
     metadata: UserMetricsMetadata,
@@ -3998,7 +4006,11 @@ impl Head {
             series: StripeSeries::new(opts.stripe_size),
             series_creation_mtx: Mutex::new(()),
             postings: MemPostings::new_unordered(),
-            postings_cache: PostingsForMatchersCache::new(opts.postings_cache.clone()),
+            postings_cache: opts
+                .shared_postings_cache
+                .clone()
+                .unwrap_or_else(|| Arc::new(PostingsForMatchersCache::new(opts.postings_cache.clone()))),
+            postings_cache_source_id: next_postings_cache_source_id(),
             tombstones: MemTombstones::new(),
             exemplars: CircularExemplarStorage::new_with_registry(
                 if opts.enable_exemplar_storage {
@@ -4194,7 +4206,6 @@ impl Head {
         }
 
         self.postings.ensure_order_parallel();
-        self.postings_cache.invalidate_all();
 
         // Go `Head.Init` deferred order (LIFO): clamp `min_time` to `min_valid_time` BEFORE `gc`,
         // then run `gc(self.min_time())` so sample-less series replayed when uninitialized
@@ -6766,7 +6777,8 @@ impl Head {
         let entry = Arc::new(SeriesEntry::new(ref_id, hash, labels, init_pending));
         self.series.insert(Arc::clone(&entry));
         self.postings.add(ref_id, &symbol_labels);
-        self.postings_cache.invalidate_metric(metric_name);
+        self.postings_cache
+            .invalidate_metric_for_source(self.postings_cache_source_id, metric_name);
         self.num_series.fetch_add(1, Ordering::Relaxed);
         if let Some(ref g) = self.series_gauge {
             g.inc();
@@ -6837,7 +6849,7 @@ impl Head {
         self.series.insert(Arc::clone(&entry));
         self.postings.add(ref_id, &symbol_labels);
         self.postings_cache
-            .invalidate_metric(entry.labels.get(METRIC_NAME));
+            .invalidate_metric_for_source(self.postings_cache_source_id, entry.labels.get(METRIC_NAME));
         self.num_series.fetch_add(1, Ordering::Relaxed);
         if let Some(ref g) = self.series_gauge {
             g.inc();
@@ -7106,7 +7118,8 @@ impl Head {
         let entry = Arc::new(SeriesEntry::new(ref_id, hash, labels.clone(), 0));
         self.series.insert(Arc::clone(&entry));
         self.postings.add(ref_id, &symbol_labels);
-        self.postings_cache.invalidate_metric_silent(metric_name);
+        self.postings_cache
+            .invalidate_metric_silent_for_source(self.postings_cache_source_id, metric_name);
         self.num_series.fetch_add(1, Ordering::Relaxed);
         if let Some(ref g) = self.series_gauge {
             g.inc();
@@ -7203,10 +7216,12 @@ impl Head {
         drop(syms_guard);
         drop(affected);
         if entries_len > 64 {
-            self.postings_cache.invalidate_all();
+            self.postings_cache
+                .invalidate_source(self.postings_cache_source_id);
         } else {
             for m in &small_metric_names {
-                self.postings_cache.invalidate_metric_silent(m);
+                self.postings_cache
+                    .invalidate_metric_silent_for_source(self.postings_cache_source_id, m);
             }
         }
         self.tombstones.delete_tombstones(&deleted);
@@ -7275,10 +7290,12 @@ impl Head {
         drop(syms_guard);
         drop(affected);
         if entries_len > 64 {
-            self.postings_cache.invalidate_all();
+            self.postings_cache
+                .invalidate_source(self.postings_cache_source_id);
         } else {
             for m in &small_metric_names {
-                self.postings_cache.invalidate_metric_silent(m);
+                self.postings_cache
+                    .invalidate_metric_silent_for_source(self.postings_cache_source_id, m);
             }
         }
         self.tombstones.delete_tombstones(&deleted);
@@ -9434,11 +9451,16 @@ impl Head {
         matchers: &[LabelMatcher],
         concurrent: bool,
     ) -> Result<Arc<[u64]>, HeadError> {
-        self.postings_cache.get_or_compute(matchers, concurrent || self.postings_cache.force(), || {
-            let syms = self.symbols.read();
-            let view = self.postings.as_source(&syms);
-            Ok(postings_for_matchers(&view, matchers)?)
-        })
+        self.postings_cache.get_or_compute_for_source(
+            self.postings_cache_source_id,
+            matchers,
+            concurrent || self.postings_cache.force(),
+            || {
+                let syms = self.symbols.read();
+                let view = self.postings.as_source(&syms);
+                Ok(postings_for_matchers(&view, matchers)?)
+            },
+        )
     }
 
     /// Evaluates label matchers against `MemPostings` directly, bypassing `PostingsForMatchersCache`
@@ -10455,6 +10477,8 @@ impl Head {
 impl Drop for Head {
     fn drop(&mut self) {
         let _ = self.close();
+        self.postings_cache
+            .remove_source(self.postings_cache_source_id);
     }
 }
 
@@ -13787,6 +13811,7 @@ mod tests {
         let opts = HeadOptions {
             registry: Some(Arc::clone(&reg)),
             postings_cache: PostingsForMatchersCacheConfig {
+                enable_invalidation: true,
                 metrics: Some(crate::postings_cache::PostingsForMatchersCacheMetrics::new(
                     "prometheus_tsdb_",
                     Some(&reg),
@@ -13796,7 +13821,7 @@ mod tests {
             ..defaults
         };
         let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
-        head.set_postings_cache_eligibility(true, false);
+        head.set_postings_cache_eligibility(true, true);
 
         {
             let mut app = head.appender();
@@ -16522,7 +16547,11 @@ mod tests {
                 series: StripeSeries::new(opts.stripe_size),
                 series_creation_mtx: Mutex::new(()),
                 postings: MemPostings::new_unordered(),
-                postings_cache: PostingsForMatchersCache::new(opts.postings_cache.clone()),
+                postings_cache: opts
+                    .shared_postings_cache
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(PostingsForMatchersCache::new(opts.postings_cache.clone()))),
+                postings_cache_source_id: next_postings_cache_source_id(),
                 tombstones: MemTombstones::new(),
                 exemplars: CircularExemplarStorage::new_with_registry(0, 0, None),
                 metadata: UserMetricsMetadata::new(),
@@ -17290,5 +17319,36 @@ mod tests {
 
         head0.close().unwrap();
         head1.close().unwrap();
+    }
+
+    #[test]
+    fn shared_postings_cache_skips_source_epochs_on_fresh_head_open_and_prunes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_cache = Arc::new(PostingsForMatchersCache::new(PostingsForMatchersCacheConfig {
+            enable_invalidation: true,
+            num_metric_versions: 64,
+            ..Default::default()
+        }));
+        shared_cache.set_eligibility(true, true);
+
+        let opts = HeadOptions {
+            shared_postings_cache: Some(Arc::clone(&shared_cache)),
+            ..HeadOptions::default()
+        };
+        let head = Head::open(dir.path(), opts, i64::MIN).unwrap();
+        assert!(
+            !shared_cache.has_source_epochs(),
+            "fresh Head::open must not populate source_epochs on shared postings_cache"
+        );
+
+        let source_id = head.postings_cache_source_id;
+        shared_cache.invalidate_source(source_id);
+        assert!(shared_cache.has_source_epochs());
+
+        drop(head);
+        assert!(
+            !shared_cache.has_source_epochs(),
+            "Head::drop must prune source_id from shared postings_cache.source_epochs"
+        );
     }
 }

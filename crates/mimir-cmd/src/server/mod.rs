@@ -233,6 +233,7 @@ impl Server {
                 }
             },
             cost_attribution_path: None,
+            compartments_enabled: false,
         });
 
         let http_cfg = HttpServerConfig {
@@ -328,6 +329,12 @@ impl Server {
             format!("/{path}")
         };
         Arc::make_mut(&mut self.middleware).cost_attribution_path = Some(normalized);
+    }
+
+    /// Configures whether compartments are enabled so `/ingester/partition-ring` is treated as
+    /// GET-only in method-mismatch detection (matching `pkg/api/api.go:RegisterIngesterPartitionRings`).
+    pub fn set_compartments_enabled(&mut self, enabled: bool) {
+        Arc::make_mut(&mut self.middleware).compartments_enabled = enabled;
     }
 
     /// Go `Server.Run`: serves `router` (wrapped in the dskit HTTP middleware) and the gRPC

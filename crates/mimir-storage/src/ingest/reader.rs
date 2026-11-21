@@ -596,7 +596,7 @@ pub struct PartitionCommitter {
     to_commit: Arc<AtomicI64>,
     last_committed_offset: Arc<AtomicI64>,
     adm_client: Arc<dyn AdmClient>,
-    notifier: Arc<dyn PreCommitNotifier>,
+    notifier: SyncMutex<Arc<dyn PreCommitNotifier>>,
     offset_file: Option<Arc<OffsetFile>>,
     commit_requests_total: Counter,
     commit_failures_total: Counter,
@@ -670,7 +670,7 @@ impl PartitionCommitter {
             to_commit: Arc::new(AtomicI64::new(-1)),
             last_committed_offset,
             adm_client,
-            notifier,
+            notifier: SyncMutex::new(notifier),
             offset_file,
             commit_requests_total,
             commit_failures_total,
@@ -678,6 +678,10 @@ impl PartitionCommitter {
             stop_tx,
             task: Mutex::new(None),
         }
+    }
+
+    pub fn set_pre_commit_notifier(&self, notifier: Arc<dyn PreCommitNotifier>) {
+        *self.notifier.lock() = notifier;
     }
 
     pub fn enqueue_offset(&self, offset: i64) {
@@ -754,7 +758,8 @@ impl PartitionCommitter {
         let start = Instant::now();
         self.commit_requests_total.inc();
 
-        if let Err(e) = self.notifier.notify_pre_commit().await {
+        let notifier = Arc::clone(&self.notifier.lock());
+        if let Err(e) = notifier.notify_pre_commit().await {
             warn!(
                 partition = self.partition_id,
                 offset,
@@ -1027,17 +1032,7 @@ impl SingleClusterPartitionReader {
     }
 
     pub fn with_pre_commit_notifier(mut self, notifier: Arc<dyn PreCommitNotifier>) -> Self {
-        let adm: Arc<dyn AdmClient> = Arc::new(KafkaAdmClient::new(Arc::clone(&self.client)));
-        // Rebuild committer without re-registering duplicate metrics if registry wasn't passed
-        self.committer = Arc::new(PartitionCommitter::new(
-            self.kafka_cfg.clone(),
-            adm,
-            self.partition_id,
-            self.consumer_group.clone(),
-            Arc::clone(&notifier),
-            self.offset_file.clone(),
-            None,
-        ));
+        self.committer.set_pre_commit_notifier(Arc::clone(&notifier));
         self.notifier = notifier;
         self
     }
@@ -1517,13 +1512,16 @@ impl SingleClusterPartitionReader {
         } else {
             // The Kafka client consumes the partition (it sends the client rack and honours
             // the broker's preferred read replica).
-            ReaderFetcher::Client(ClientPartitionConsumer::new(
-                Arc::clone(&self.client),
-                self.kafka_cfg.topic.clone(),
-                self.partition_id,
-                start_offset,
-                go_duration(self.kafka_cfg.fetch_max_wait.as_nanos()),
-            ))
+            ReaderFetcher::Client(
+                ClientPartitionConsumer::new(
+                    Arc::clone(&self.client),
+                    self.kafka_cfg.topic.clone(),
+                    self.partition_id,
+                    start_offset,
+                    go_duration(self.kafka_cfg.fetch_max_wait.as_nanos()),
+                )
+                .with_fetch_wait_duration(self.metrics.fetcher.fetch_wait_duration.clone()),
+            )
         };
         let fetcher = Arc::new(fetcher);
         fetcher.start().await;
@@ -3389,5 +3387,86 @@ mod tests {
         assert!(matches!(err, ReaderError::Canceled), "got {err:?}");
 
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn w24_b05_with_pre_commit_notifier_preserves_registered_committer_metrics() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct NoOpConsumer;
+        impl RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        struct CountingNotifier(AtomicUsize);
+        impl PreCommitNotifier for CountingNotifier {
+            fn notify_pre_commit(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let reg = Registry::new();
+        let cfg = KafkaConfig {
+            address: mimir_config::StringSliceCSV(vec!["127.0.0.1:9092".to_string()]),
+            topic: "w24-b05".to_string(),
+            // Empty instance_id -> consumer_group is empty, so commit() skips broker RPC.
+            ..Default::default()
+        };
+        let client = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let notifier = Arc::new(CountingNotifier(AtomicUsize::new(0)));
+        let reader = SingleClusterPartitionReader::with_client(
+            cfg,
+            3,
+            "",
+            None,
+            client,
+            Arc::new(NoOpConsumer),
+            Some(&reg),
+        )
+        .unwrap()
+        .with_pre_commit_notifier(Arc::clone(&notifier) as Arc<dyn PreCommitNotifier>);
+
+        reader.committer().commit(42).await.unwrap();
+        assert_eq!(notifier.0.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.committer().last_committed_offset(), 42);
+
+        let mfs = reg.gather();
+        let find_metric = |name: &str| {
+            mfs.iter()
+                .find(|mf| mf.get_name() == name)
+                .unwrap_or_else(|| panic!("missing metric {name}"))
+                .get_metric()[0]
+                .clone()
+        };
+        assert_eq!(
+            find_metric("cortex_ingest_storage_reader_offset_commit_requests_total")
+                .get_counter()
+                .get_value(),
+            1.0
+        );
+        assert_eq!(
+            find_metric("cortex_ingest_storage_reader_offset_commit_failures_total")
+                .get_counter()
+                .get_value(),
+            0.0
+        );
+        assert_eq!(
+            find_metric("cortex_ingest_storage_reader_offset_commit_request_duration_seconds")
+                .get_histogram()
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(
+            find_metric("cortex_ingest_storage_reader_last_committed_offset")
+                .get_gauge()
+                .get_value(),
+            42.0
+        );
     }
 }

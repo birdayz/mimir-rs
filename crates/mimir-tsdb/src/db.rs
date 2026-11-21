@@ -32,7 +32,7 @@ use crate::head::{
 };
 use crate::matcher::LabelMatcher;
 use crate::metrics::{counter, gauge, native_histogram, FnGaugeCollector};
-use crate::postings_cache::PostingsForMatchersCacheConfig;
+use crate::postings_cache::{PostingsForMatchersCache, PostingsForMatchersCacheConfig};
 use crate::querier::{
     snapshot_head_query_source, snapshot_query_sources_with_lock, HeadQuerySnapshot,
     HeadSnapshotMode, QuerySourceSnapshot, TsdbChunkQuerier, TsdbQuerier,
@@ -93,6 +93,9 @@ pub struct TsdbOptions {
     pub enable_bigger_ooo_block_for_old_samples: bool,
     /// Per-block `PostingsForMatchersCache` (Mimir `block_postings_for_matchers_cache_*`).
     pub block_postings_cache: PostingsForMatchersCacheConfig,
+    /// Optional shared `PostingsForMatchersCache` across all tenant Blocks when
+    /// `shared_postings_for_matchers_cache: true`.
+    pub shared_block_postings_cache: Option<Arc<PostingsForMatchersCache>>,
 }
 
 impl std::fmt::Debug for TsdbOptions {
@@ -114,6 +117,10 @@ impl std::fmt::Debug for TsdbOptions {
                 &self.enable_bigger_ooo_block_for_old_samples,
             )
             .field("block_postings_cache", &self.block_postings_cache)
+            .field(
+                "shared_block_postings_cache",
+                &self.shared_block_postings_cache.as_ref().map(|_| "..."),
+            )
             .finish()
     }
 }
@@ -129,6 +136,7 @@ impl Default for TsdbOptions {
             on_blocks_reload: None,
             enable_bigger_ooo_block_for_old_samples: false,
             block_postings_cache: PostingsForMatchersCacheConfig::default(),
+            shared_block_postings_cache: None,
         }
     }
 }
@@ -843,7 +851,12 @@ impl TsdbInner {
         metrics: &DbMetrics,
         loaded: &[Arc<Block>],
     ) -> Result<(Vec<Arc<Block>>, HashSet<Ulid>), TsdbError> {
-        let (loadable, mut corrupted) = Self::open_blocks(dir, loaded, &opts.block_postings_cache)?;
+        let (loadable, mut corrupted) = Self::open_blocks(
+            dir,
+            loaded,
+            &opts.block_postings_cache,
+            opts.shared_block_postings_cache.as_ref(),
+        )?;
 
         let default_fn =
             |blocks: &[Arc<Block>]| Self::default_blocks_to_delete(opts, metrics, blocks);
@@ -904,6 +917,7 @@ impl TsdbInner {
         dir: &Path,
         loaded: &[Arc<Block>],
         postings_cache: &PostingsForMatchersCacheConfig,
+        shared_postings_cache: Option<&Arc<PostingsForMatchersCache>>,
     ) -> Result<(Vec<Arc<Block>>, HashMap<Ulid, BlockError>), TsdbError> {
         let mut bdirs: Vec<PathBuf> = Vec::new();
         for entry in fs::read_dir(dir)? {
@@ -941,7 +955,11 @@ impl TsdbInner {
         let mut corrupted = HashMap::new();
         if to_open.len() <= 1 {
             for (uid, bdir) in to_open {
-                match Block::open_with_postings_cache(&bdir, postings_cache.clone()) {
+                let opened = match shared_postings_cache {
+                    Some(shared) => Block::open_with_shared_postings_cache(&bdir, Arc::clone(shared)),
+                    None => Block::open_with_postings_cache(&bdir, postings_cache.clone()),
+                };
+                match opened {
                     Ok(b) => blocks.push(Arc::new(b)),
                     Err(e) => {
                         corrupted.insert(uid, e);
@@ -966,8 +984,11 @@ impl TsdbInner {
                     let Some((uid, ref bdir)) = to_open.get(idx) else {
                         break;
                     };
-                    let res = Block::open_with_postings_cache(bdir, postings_cache.clone())
-                        .map(Arc::new);
+                    let res = match shared_postings_cache {
+                        Some(shared) => Block::open_with_shared_postings_cache(bdir, Arc::clone(shared)),
+                        None => Block::open_with_postings_cache(bdir, postings_cache.clone()),
+                    }
+                    .map(Arc::new);
                     results.lock().push((*uid, res));
                 });
             }
@@ -1484,20 +1505,44 @@ impl TsdbInner {
                         continue;
                     }
                 }
-                plan_blocks.push(Arc::new(Block::open_with_postings_cache(
-                    dir,
-                    self.opts.block_postings_cache.clone(),
-                )?));
+                let blk = match self.opts.shared_block_postings_cache.as_ref() {
+                    Some(shared) => Block::open_with_shared_postings_cache(dir, Arc::clone(shared))?,
+                    None => Block::open_with_postings_cache(
+                        dir,
+                        self.opts.block_postings_cache.clone(),
+                    )?,
+                };
+                plan_blocks.push(Arc::new(blk));
             }
             let block_refs: Vec<&Block> = plan_blocks.iter().map(|b| b.as_ref()).collect();
-            let meta_opt = self.timed_write(|| {
+            let compact_res = self.timed_write(|| {
                 compact_blocks_with_float_encoding_and_metrics(
                     &self.dir,
                     &block_refs,
                     self.head.float_chunk_encoding(),
                     Some(&self.metrics.compactor),
                 )
-            })?;
+            });
+            let meta_opt = match compact_res {
+                Ok(v) => v,
+                Err(err) => {
+                    // Go LeveledCompactor.CompactWithBlockPopulator (compact.go:730-740):
+                    // mark every input block compaction.failed = true on disk and refresh blocks.
+                    let mut errs = vec![err.to_string()];
+                    for b in &plan_blocks {
+                        if let Err(set_err) = b.set_compaction_failed() {
+                            errs.push(format!(
+                                "setting compaction failed for block: {}: {set_err}",
+                                b.dir().display()
+                            ));
+                        }
+                    }
+                    drop(plan_blocks);
+                    drop(loaded_blocks);
+                    let _ = self.reload_blocks_locked();
+                    return Err(TsdbError::Other(errs.join("\n")));
+                }
+            };
             match meta_opt {
                 Some(meta) => {
                     drop(plan_blocks);
@@ -2205,6 +2250,63 @@ mod tests {
             assert_eq!(samples[0].t, i64::MAX);
             assert_eq!(samples[0].value, SampleValue::Float(123.5));
         }
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn f5_corrupt_block_compaction_persists_failed_true_and_skips_range_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Tsdb::open_with_reload_interval(
+            dir.path(),
+            TsdbOptions::default(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let range = 7_200_000i64;
+        db.set_block_ranges(vec![range, range * 3]);
+
+        // Create 3 level-1 blocks in the first 3x range [0, 3*range) + 1 trailing block so
+        // plan_block_compactions selects the first range, then 3 healthy blocks in the second
+        // 3x range [3*range, 6*range) + a trailing block.
+        for i in 0..7i64 {
+            let t = i * range + 1_000;
+            let mut app = db.appender();
+            app.append_float(None, &[("__name__", "m_f5"), ("i", &i.to_string())], t, i as f64)
+                .unwrap();
+            app.commit().unwrap();
+            db.compact_head_range(i * range, (i + 1) * range)
+                .unwrap()
+                .unwrap();
+        }
+
+        let blocks = db.blocks();
+        assert_eq!(blocks.len(), 7);
+        // Corrupt chunks/000001 of the second block (in the first 3x range [0, 3*range))
+        // by truncating it to its 8-byte header so Block::open still succeeds while reading
+        // chunk bytes fails during compaction.
+        let corrupt_dir = blocks[1].dir().to_path_buf();
+        let chunk_seg = corrupt_dir.join("chunks").join("000001");
+        let f = std::fs::OpenOptions::new().write(true).open(&chunk_seg).unwrap();
+        f.set_len(8).unwrap();
+        drop(f);
+        drop(blocks);
+
+        // First compact_blocks() selects [0, 3*range), fails on the corrupted chunk,
+        // marks those 3 blocks failed = true in meta.json & in memory, and returns Err.
+        let err = db.compact_blocks().unwrap_err();
+        let _ = err;
+
+        for b in &db.blocks()[..3] {
+            assert!(b.meta().compaction.failed, "in-memory block must reflect failed=true");
+            let on_disk = crate::block::read_meta_file(b.dir()).unwrap();
+            assert!(on_disk.compaction.failed, "on-disk meta.json must persist failed=true");
+        }
+
+        // Next compact_blocks() skips the failed [0, 3*range) range and succeeds on
+        // the healthy [3*range, 6*range) range!
+        let created = db.compact_blocks().unwrap();
+        assert_eq!(created.len(), 1, "healthy range must compact after broken range marked failed");
 
         db.close().unwrap();
     }

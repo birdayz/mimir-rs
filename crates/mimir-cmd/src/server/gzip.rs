@@ -166,6 +166,13 @@ pub async fn gzip_handler(State(cfg): State<GzipConfig>, req: Request, next: Nex
     }
     let (accepts_gzip, rejects_identity) = request_acceptance(req.headers());
     let mut resp = next.run(req).await;
+    if resp
+        .extensions()
+        .get::<crate::server::http_middleware::MethodMismatch>()
+        .is_some()
+    {
+        return resp;
+    }
     // Go adds `Vary: Accept-Encoding` before running the wrapped handler. The only gzipped handler
     // that sets `Vary` itself is `/ingester/tsdb_metrics`: `promhttp.HandlerFor` with
     // `HandlerOpts.Timeout` runs inside `http.TimeoutHandler`, which replaces the response's

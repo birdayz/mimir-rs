@@ -123,25 +123,19 @@ impl UserMetricsMetadata {
         {
             let inner = self.inner.read();
             if let Some(table) = inner.metrics.get(metric_name) {
-                if let Some(entry) =
-                    table.find(hash, |s| s.matches(metric_type, metric_name, help, unit))
+                if (limits.max_metadata_per_metric == 0
+                    || table.len() < limits.max_metadata_per_metric)
+                    && table
+                        .find(hash, |s| s.matches(metric_type, metric_name, help, unit))
+                        .map(|entry| entry.last_seen_nanos.store(now, Ordering::Relaxed))
+                        .is_some()
                 {
-                    entry.last_seen_nanos.store(now, Ordering::Relaxed);
                     return Ok(false);
                 }
             }
         }
 
         let mut inner = self.inner.write();
-        if let Some(table) = inner.metrics.get(metric_name) {
-            if let Some(entry) =
-                table.find(hash, |s| s.matches(metric_type, metric_name, help, unit))
-            {
-                entry.last_seen_nanos.store(now, Ordering::Relaxed);
-                return Ok(false);
-            }
-        }
-
         if !inner.metrics.contains_key(metric_name)
             && limits.max_metrics_with_metadata_per_user > 0
             && inner.metrics.len() >= limits.max_metrics_with_metadata_per_user
@@ -157,6 +151,15 @@ impl UserMetricsMetadata {
                 limit: limits.max_metadata_per_metric,
                 metric: metric_name.to_string(),
             });
+        }
+
+        if let Some(table) = inner.metrics.get(metric_name) {
+            if let Some(entry) =
+                table.find(hash, |s| s.matches(metric_type, metric_name, help, unit))
+            {
+                entry.last_seen_nanos.store(now, Ordering::Relaxed);
+                return Ok(false);
+            }
         }
 
         let table = inner.metrics.entry(metric_name.to_string()).or_default();
@@ -206,21 +209,19 @@ impl UserMetricsMetadata {
         {
             let inner = self.inner.read();
             if let Some(table) = inner.metrics.get(metric_name) {
-                if let Some(entry) = table.find(hash, |s| s.meta == metadata) {
-                    entry.last_seen_nanos.store(now, Ordering::Relaxed);
+                if (limits.max_metadata_per_metric == 0
+                    || table.len() < limits.max_metadata_per_metric)
+                    && table
+                        .find(hash, |s| s.meta == metadata)
+                        .map(|entry| entry.last_seen_nanos.store(now, Ordering::Relaxed))
+                        .is_some()
+                {
                     return Ok(false);
                 }
             }
         }
 
         let mut inner = self.inner.write();
-        if let Some(table) = inner.metrics.get(metric_name) {
-            if let Some(entry) = table.find(hash, |s| s.meta == metadata) {
-                entry.last_seen_nanos.store(now, Ordering::Relaxed);
-                return Ok(false);
-            }
-        }
-
         if !inner.metrics.contains_key(metric_name)
             && limits.max_metrics_with_metadata_per_user > 0
             && inner.metrics.len() >= limits.max_metrics_with_metadata_per_user
@@ -236,6 +237,13 @@ impl UserMetricsMetadata {
                 limit: limits.max_metadata_per_metric,
                 metric: metric_name.to_string(),
             });
+        }
+
+        if let Some(table) = inner.metrics.get(metric_name) {
+            if let Some(entry) = table.find(hash, |s| s.meta == metadata) {
+                entry.last_seen_nanos.store(now, Ordering::Relaxed);
+                return Ok(false);
+            }
         }
 
         let table = inner.metrics.entry(metric_name.to_string()).or_default();
@@ -357,8 +365,18 @@ mod tests {
             unit: "".into(),
         };
         assert_eq!(store.add("req_total", m1.clone(), limits), Ok(true));
-        // Duplicate refresh succeeds even at limit=1
-        assert_eq!(store.add("req_total", m1.clone(), limits), Ok(false));
+        // Go userMetricsMetadata.add checks IsWithinMaxMetadataPerMetric(len(set)) before
+        // checking membership, so refreshing at limit=1 is rejected.
+        assert!(matches!(
+            store.add("req_total", m1.clone(), limits),
+            Err(MetadataError::MaxMetadataPerMetricReached { .. })
+        ));
+        // When limit allows (limit=2 > len=1), refreshing existing entry returns Ok(false).
+        let limits_room = MetadataLimits {
+            max_metrics_with_metadata_per_user: 2,
+            max_metadata_per_metric: 2,
+        };
+        assert_eq!(store.add("req_total", m1.clone(), limits_room), Ok(false));
 
         let m1_alt = MetricMetadata {
             help: "Different help".into(),
@@ -428,5 +446,54 @@ mod tests {
         assert_eq!(store.purge(Some(future)), 1);
         assert_eq!(store.num_entries(), 0);
         assert_eq!(store.num_metrics(), 0);
+    }
+
+    #[test]
+    fn metadata_max_per_metric_checked_on_refresh_for_add_and_add_str() {
+        let store = UserMetricsMetadata::new();
+        let cap1 = MetadataLimits {
+            max_metrics_with_metadata_per_user: 10,
+            max_metadata_per_metric: 1,
+        };
+        let cap2 = MetadataLimits {
+            max_metrics_with_metadata_per_user: 10,
+            max_metadata_per_metric: 2,
+        };
+
+        let meta = MetricMetadata {
+            metric_type: MetricType::Counter,
+            metric_family_name: "req_total".into(),
+            help: "Total requests".into(),
+            unit: "".into(),
+        };
+        assert_eq!(store.add("req_total", meta.clone(), cap1), Ok(true));
+        // Refreshing via add() and add_str() when len == limit (1) must return MaxMetadataPerMetricReached.
+        assert!(matches!(
+            store.add("req_total", meta.clone(), cap1),
+            Err(MetadataError::MaxMetadataPerMetricReached { limit: 1, .. })
+        ));
+        assert!(matches!(
+            store.add_str("req_total", MetricType::Counter, "Total requests", "", cap1),
+            Err(MetadataError::MaxMetadataPerMetricReached { limit: 1, .. })
+        ));
+
+        // With limit=2, refresh succeeds and a second distinct entry can be added.
+        assert_eq!(
+            store.add_str("req_total", MetricType::Counter, "Total requests", "", cap2),
+            Ok(false)
+        );
+        assert_eq!(
+            store.add_str("req_total", MetricType::Counter, "Alt help", "", cap2),
+            Ok(true)
+        );
+        // Now len=2 == limit=2: refresh of either entry must fail even on fast-path.
+        assert!(matches!(
+            store.add_str("req_total", MetricType::Counter, "Total requests", "", cap2),
+            Err(MetadataError::MaxMetadataPerMetricReached { limit: 2, .. })
+        ));
+        assert!(matches!(
+            store.add("req_total", meta, cap2),
+            Err(MetadataError::MaxMetadataPerMetricReached { limit: 2, .. })
+        ));
     }
 }
