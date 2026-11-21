@@ -93,7 +93,7 @@ fn test_config_validate() {
                 cfg.kafka.backend = "warpstream".to_string();
                 cfg.kafka.write_timeout = GoDuration::from_millis(3999);
             },
-            expected_err: Some("write-timeout must be greater than or equal to twice write-timeout-overhead"),
+            expected_err: Some("ingest-storage.kafka.write-timeout must be greater than or equal to twice ingest-storage.kafka.write-timeout-overhead"),
         },
         Case {
             name: "should pass if backend is warpstream and write timeout == 2 * overhead",
@@ -127,7 +127,7 @@ fn test_config_validate() {
                 cfg.kafka.write_timeout_overhead = GoDuration::from_millis(500);
                 cfg.kafka.write_timeout = GoDuration::from_millis(999);
             },
-            expected_err: Some("write-timeout must be greater than or equal to twice write-timeout-overhead"),
+            expected_err: Some("ingest-storage.kafka.write-timeout must be greater than or equal to twice ingest-storage.kafka.write-timeout-overhead"),
         },
         Case {
             name: "should fail if write timeout overhead is below minimum",
@@ -523,7 +523,7 @@ fn test_config_validate() {
                 cfg.kafka.ingestion_concurrency_max = 5;
                 cfg.kafka.ingestion_concurrency_batch_size = -1;
             },
-            expected_err: Some("ingestion-concurrency-* params"),
+            expected_err: Some("ingest-storage.kafka.ingestion-concurrency-queue-capacity, ingest-storage.kafka.ingestion-concurrency-estimated-bytes-per-sample, ingest-storage.kafka.ingestion-concurrency-batch-size and ingest-storage.kafka.ingestion-concurrency-target-flushes-per-shard must be greater than 0"),
         },
         Case {
             name: "should fail if ingestion concurrency queue capacity < 0",
@@ -534,7 +534,7 @@ fn test_config_validate() {
                 cfg.kafka.ingestion_concurrency_max = 5;
                 cfg.kafka.ingestion_concurrency_queue_capacity = -1;
             },
-            expected_err: Some("ingestion-concurrency-* params"),
+            expected_err: Some("ingest-storage.kafka.ingestion-concurrency-queue-capacity, ingest-storage.kafka.ingestion-concurrency-estimated-bytes-per-sample, ingest-storage.kafka.ingestion-concurrency-batch-size and ingest-storage.kafka.ingestion-concurrency-target-flushes-per-shard must be greater than 0"),
         },
         Case {
             name: "should fail if ingestion concurrency estimated bytes per sample < 0",
@@ -545,7 +545,7 @@ fn test_config_validate() {
                 cfg.kafka.ingestion_concurrency_max = 5;
                 cfg.kafka.ingestion_concurrency_estimated_bytes_per_sample = -1;
             },
-            expected_err: Some("ingestion-concurrency-* params"),
+            expected_err: Some("ingest-storage.kafka.ingestion-concurrency-queue-capacity, ingest-storage.kafka.ingestion-concurrency-estimated-bytes-per-sample, ingest-storage.kafka.ingestion-concurrency-batch-size and ingest-storage.kafka.ingestion-concurrency-target-flushes-per-shard must be greater than 0"),
         },
         Case {
             name: "should fail if ingestion concurrency target flushes per shard < 0",
@@ -556,7 +556,7 @@ fn test_config_validate() {
                 cfg.kafka.ingestion_concurrency_max = 5;
                 cfg.kafka.ingestion_concurrency_target_flushes_per_shard = -1;
             },
-            expected_err: Some("ingestion-concurrency-* params"),
+            expected_err: Some("ingest-storage.kafka.ingestion-concurrency-queue-capacity, ingest-storage.kafka.ingestion-concurrency-estimated-bytes-per-sample, ingest-storage.kafka.ingestion-concurrency-batch-size and ingest-storage.kafka.ingestion-concurrency-target-flushes-per-shard must be greater than 0"),
         },
         Case {
             name: "should fail when auto create topic default partitions < 1 (and != -1)",
