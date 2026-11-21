@@ -85,9 +85,6 @@ pub fn block_chunk_file_path(dir: &Path, seq: usize) -> PathBuf {
 }
 
 fn list_segment_files(dir: &Path) -> Result<Vec<(usize, PathBuf)>, BlockChunksError> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
     let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -423,5 +420,13 @@ mod tests {
             reader.chunk(metas[1].ref_id).unwrap(),
             EncodedChunk::Xor(c2)
         );
+    }
+
+    #[test]
+    fn open_missing_chunks_dir_returns_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("chunks");
+        let err = BlockChunksReader::open(&missing).expect_err("missing chunks dir must fail");
+        assert!(matches!(err, BlockChunksError::Io(ref io_err) if io_err.kind() == io::ErrorKind::NotFound));
     }
 }

@@ -18,11 +18,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::block::{
-    parse_block_dir_name, read_meta_file, write_meta_file, Block, BlockDesc, BlockError,
-    BlockMetaCompaction,
+    parse_block_dir_name, read_meta_file, Block, BlockDesc, BlockError, BlockMetaCompaction,
 };
+use crate::chunkenc::Encoding;
 use crate::compact::{
-    compact_blocks_with_float_encoding_and_metrics, plan_block_compactions,
+    compact_blocks_with_float_encoding_and_segment_size_and_metrics, plan_block_compactions,
     write_head_block_streaming_with_options, CompactError, CompactorMetrics,
 };
 use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
@@ -160,6 +160,7 @@ struct DbMetrics {
     selected_series_compactions_triggered: prometheus::Counter,
     selected_series_compactions_failed: prometheus::Counter,
     selected_series_compaction_duration: SingleHistogram,
+    clean_start: prometheus::Gauge,
     compactor: CompactorMetrics,
 }
 
@@ -210,14 +211,12 @@ impl DbMetrics {
             Some(exponential_buckets(1.0, 2.0, 14)),
         );
         let compactor = CompactorMetrics::new(reg);
-        // Go `tsdbutil.NewDirLocker(dir, "tsdb", ...)`: the lock file is never taken (Mimir opens
-        // every TSDB with `NoLockfile`), which Go reports as `lockfileDisabled`.
-        gauge(
+        let clean_start = gauge(
             reg,
             "prometheus_tsdb_clean_start",
             "-1: lockfile is disabled. 0: a lockfile from a previous execution was replaced. 1: lockfile creation was clean",
-        )
-        .set(-1.0);
+        );
+        clean_start.set(-1.0);
         Self {
             compactions_total: counter(
                 reg,
@@ -292,6 +291,7 @@ impl DbMetrics {
                 "Total number of compactions triggered for an explicit caller-provided list of series references that failed.",
             ),
             selected_series_compaction_duration,
+            clean_start,
             compactor,
         }
     }
@@ -347,9 +347,66 @@ fn remove_tmp_dirs(dir: &Path) -> Result<(), TsdbError> {
     Ok(())
 }
 
+/// Go `tsdbutil.DirLocker`: holds an exclusive non-blocking `flock` on `<dir>/lock`.
+struct DirLocker {
+    path: PathBuf,
+    file: Option<fs::File>,
+}
+
+impl DirLocker {
+    fn acquire(dir: &Path, clean_start: &prometheus::Gauge) -> Result<Self, TsdbError> {
+        let abs_dir = std::path::absolute(dir)?;
+        let lock_path = abs_dir.join("lock");
+        if fs::metadata(&lock_path).is_ok() {
+            tracing::warn!(
+                file = %lock_path.display(),
+                "A lockfile from a previous execution already existed. It was replaced"
+            );
+            clean_start.set(0.0);
+        } else {
+            clean_start.set(1.0);
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        if let Err(e) = file.try_lock() {
+            return Err(TsdbError::Other(format!("lock DB directory: {e}")));
+        }
+        Ok(Self {
+            path: lock_path,
+            file: Some(file),
+        })
+    }
+
+    fn release(&mut self) -> Result<(), TsdbError> {
+        let Some(file) = self.file.take() else {
+            return Ok(());
+        };
+        let unlock_res = file.unlock();
+        drop(file);
+        let remove_res = fs::remove_file(&self.path);
+        match (unlock_res, remove_res) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(u), Ok(())) => Err(TsdbError::Io(u)),
+            (Ok(()), Err(r)) => Err(TsdbError::Io(r)),
+            (Err(u), Err(r)) => Err(TsdbError::Other(format!("{u}; {r}"))),
+        }
+    }
+}
+
+impl Drop for DirLocker {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 struct TsdbInner {
     dir: PathBuf,
     opts: TsdbOptions,
+    dir_lock: Mutex<Option<DirLocker>>,
     head: Arc<Head>,
     blocks: Arc<RwLock<Vec<Arc<Block>>>>,
     /// Protected by `blocks.write()` on updates and read under `blocks.read()` when snapshotting
@@ -393,11 +450,38 @@ impl Tsdb {
     /// (passing `Duration::ZERO` disables the background loop).
     pub fn open_with_reload_interval(
         dir: impl AsRef<Path>,
-        opts: TsdbOptions,
+        mut opts: TsdbOptions,
         block_reload_interval: Duration,
     ) -> Result<Self, TsdbError> {
+        // Go `validateOpts` (db.go:1067-1075).
+        if opts.head.float_chunk_encoding == Encoding::None {
+            opts.head.float_chunk_encoding = Encoding::Xor;
+        }
+        match opts.head.float_chunk_encoding {
+            Encoding::Xor | Encoding::Xor2 => {}
+            other => {
+                return Err(TsdbError::Other(format!(
+                    "unsupported float chunk encoding {other:?}; valid values are \"xor\" and \"xor2\""
+                )));
+            }
+        }
+        if opts.head.enable_st_storage && opts.head.float_chunk_encoding == Encoding::Xor {
+            return Err(TsdbError::Other(
+                "float chunk encoding \"xor\" is incompatible with start-timestamp storage; XOR chunks do not store start timestamps, use \"xor2\""
+                    .to_string(),
+            ));
+        }
+
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+
+        let metrics = DbMetrics::new(opts.head.registry.as_deref());
+        // Acquire the directory lockfile before touching WAL/tmp/blocks (Go db.go:1219-1227).
+        let dir_lock = if !opts.no_lockfile {
+            Some(DirLocker::acquire(&dir, &metrics.clean_start)?)
+        } else {
+            None
+        };
 
         // Go `DB.Open`: remove leftover tmp block dirs (crashed compactions / deletions)
         // and interrupted temporary checkpoints.
@@ -407,8 +491,6 @@ impl Tsdb {
                 TsdbError::Other(format!("delete temp checkpoints: {e}"))
             })?;
         }
-
-        let metrics = DbMetrics::new(opts.head.registry.as_deref());
         metrics.retention_limit_bytes.set(0.0);
         metrics.retention_limit_percentage.set(0.0);
         metrics
@@ -477,6 +559,7 @@ impl Tsdb {
         let inner = Arc::new(TsdbInner {
             dir,
             opts,
+            dir_lock: Mutex::new(dir_lock),
             head,
             blocks,
             last_garbage_collected_mmap_ref: AtomicU64::new(0),
@@ -795,7 +878,10 @@ impl Tsdb {
             b.close_and_wait();
         }
         drop(blocks);
-        self.inner.head.close()?;
+        let head_res = self.inner.head.close();
+        let lock_res = self.inner.release_lock();
+        head_res?;
+        lock_res?;
         Ok(())
     }
 }
@@ -1106,6 +1192,13 @@ impl TsdbInner {
         self.reload_blocks_locked()
     }
 
+    fn release_lock(&self) -> Result<(), TsdbError> {
+        if let Some(mut locker) = self.dir_lock.lock().take() {
+            locker.release()?;
+        }
+        Ok(())
+    }
+
     /// Go `LeveledCompactor.write` bookkeeping: every block write attempt counts as a
     /// compaction run (`prometheus_tsdb_compactions_total`) and observes its duration.
     fn timed_write<T>(&self, f: impl FnOnce() -> T) -> T {
@@ -1116,6 +1209,20 @@ impl TsdbInner {
             .compaction_duration
             .observe(start.elapsed().as_secs_f64());
         res
+    }
+
+    /// Accounts for empty aligned windows skipped via `next_interval_action` so
+    /// `prometheus_tsdb_compactions_total` and `prometheus_tsdb_compaction_duration_seconds`
+    /// match Go's per-window `c.write(...)` invocation loop.
+    fn record_skipped_empty_windows(&self, skipped: i128) {
+        if skipped <= 0 {
+            return;
+        }
+        let n = skipped as u64;
+        self.metrics.compactions_total.inc_by(n as f64);
+        for _ in 0..n.min(10_000) {
+            self.metrics.compaction_duration.observe(0.0);
+        }
     }
 
     /// Reloads blocks after writing `uids`; on failure removes them (Go `compactHead`).
@@ -1165,6 +1272,9 @@ impl TsdbInner {
 
         let res = (|| -> Result<(), TsdbError> {
             while self.head.compactable() {
+                if self.closed.load(Ordering::Acquire) {
+                    break;
+                }
                 let mint = self.head.min_time();
                 let maxt = range_for_timestamp(mint, self.head.options().chunk_range_ms);
                 if let Some(uid) =
@@ -1174,6 +1284,9 @@ impl TsdbInner {
                 }
                 // Consider only successful compactions for WAL truncation.
                 last_block_maxt = maxt;
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Ok(());
             }
             // Clear some disk space before compacting blocks.
             self.head.truncate_wal(last_block_maxt)?;
@@ -1406,9 +1519,16 @@ impl TsdbInner {
                         maxt.saturating_sub(1)
                     };
                     match next_interval_action(&ooo_intervals, mint, maxt_inclusive) {
-                        IntervalAction::Done => break,
+                        IntervalAction::Done => {
+                            self.record_skipped_empty_windows((maxt_for_24h_block - t) / day128);
+                            break;
+                        }
                         IntervalAction::SkipTo(next_mint) => {
-                            t = floor_align_i128(next_mint, DAY_MS);
+                            let next_t = floor_align_i128(next_mint, DAY_MS);
+                            self.record_skipped_empty_windows(
+                                (next_t.min(maxt_for_24h_block) - t) / day128,
+                            );
+                            t = next_t;
                             continue;
                         }
                         IntervalAction::Overlaps => {}
@@ -1421,6 +1541,7 @@ impl TsdbInner {
                 }
             }
             let block_size128 = block_size as i128;
+            let ooo_end_t = floor_align_i128(ooo_maxt, block_size) + block_size128;
             let mut t = floor_align_i128(ooo_start, block_size);
             while t <= ooo_maxt as i128 {
                 let mint = t.max(i64::MIN as i128) as i64;
@@ -1431,9 +1552,16 @@ impl TsdbInner {
                     maxt.saturating_sub(1)
                 };
                 match next_interval_action(&ooo_intervals, mint, maxt_inclusive) {
-                    IntervalAction::Done => break,
+                    IntervalAction::Done => {
+                        self.record_skipped_empty_windows((ooo_end_t - t) / block_size128);
+                        break;
+                    }
                     IntervalAction::SkipTo(next_mint) => {
-                        t = floor_align_i128(next_mint, block_size);
+                        let next_t = floor_align_i128(next_mint, block_size);
+                        self.record_skipped_empty_windows(
+                            (next_t.min(ooo_end_t) - t) / block_size128,
+                        );
+                        t = next_t;
                         continue;
                     }
                     IntervalAction::Overlaps => {}
@@ -1495,15 +1623,13 @@ impl TsdbInner {
             let loaded_blocks = self.blocks.read().clone();
             let mut plan_blocks: Vec<Arc<Block>> = Vec::with_capacity(plan_dirs.len());
             for dir in &plan_dirs {
-                let name = dir
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .and_then(parse_block_dir_name);
-                if let Some(uid) = name {
-                    if let Some(existing) = loaded_blocks.iter().find(|b| b.ulid() == uid) {
-                        plan_blocks.push(Arc::clone(existing));
-                        continue;
-                    }
+                let meta = read_meta_file(dir)?;
+                if let Some(existing) = loaded_blocks
+                    .iter()
+                    .find(|b| b.ulid() == meta.ulid && b.meta() == &meta)
+                {
+                    plan_blocks.push(Arc::clone(existing));
+                    continue;
                 }
                 let blk = match self.opts.shared_block_postings_cache.as_ref() {
                     Some(shared) => Block::open_with_shared_postings_cache(dir, Arc::clone(shared))?,
@@ -1516,31 +1642,21 @@ impl TsdbInner {
             }
             let block_refs: Vec<&Block> = plan_blocks.iter().map(|b| b.as_ref()).collect();
             let compact_res = self.timed_write(|| {
-                compact_blocks_with_float_encoding_and_metrics(
+                compact_blocks_with_float_encoding_and_segment_size_and_metrics(
                     &self.dir,
                     &block_refs,
                     self.head.float_chunk_encoding(),
+                    self.opts.max_block_chunk_segment_size,
                     Some(&self.metrics.compactor),
                 )
             });
             let meta_opt = match compact_res {
                 Ok(v) => v,
                 Err(err) => {
-                    // Go LeveledCompactor.CompactWithBlockPopulator (compact.go:730-740):
-                    // mark every input block compaction.failed = true on disk and refresh blocks.
-                    let mut errs = vec![err.to_string()];
-                    for b in &plan_blocks {
-                        if let Err(set_err) = b.set_compaction_failed() {
-                            errs.push(format!(
-                                "setting compaction failed for block: {}: {set_err}",
-                                b.dir().display()
-                            ));
-                        }
-                    }
                     drop(plan_blocks);
                     drop(loaded_blocks);
                     let _ = self.reload_blocks_locked();
-                    return Err(TsdbError::Other(errs.join("\n")));
+                    return Err(TsdbError::Compact(err));
                 }
             };
             match meta_opt {
@@ -1551,12 +1667,7 @@ impl TsdbInner {
                     created.push(meta.ulid);
                 }
                 None => {
-                    // All samples deleted by tombstones: mark input blocks deletable (Go compact.go:714-725).
-                    for b in &plan_blocks {
-                        let mut m = b.meta().clone();
-                        m.compaction.deletable = true;
-                        write_meta_file(b.dir(), &mut m)?;
-                    }
+                    // compact_blocks* already persisted `compaction.deletable = true` on source blocks.
                     drop(plan_blocks);
                     drop(loaded_blocks);
                     self.reload_blocks_locked()?;
@@ -1590,6 +1701,7 @@ impl TsdbInner {
                     .head
                     .collect_selected_compaction_intervals(&candidates, range);
                 let range128 = range as i128;
+                let end_t = floor_align_i128(data_maxt, range) + range128;
                 let mut t = floor_align_i128(data_mint, range);
                 let write_res = (|| -> Result<(), TsdbError> {
                     while t <= data_maxt as i128 {
@@ -1601,9 +1713,16 @@ impl TsdbInner {
                             maxt.saturating_sub(1)
                         };
                         match next_interval_action(&intervals, mint, maxt_inclusive) {
-                            IntervalAction::Done => break,
+                            IntervalAction::Done => {
+                                self.record_skipped_empty_windows((end_t - t) / range128);
+                                break;
+                            }
                             IntervalAction::SkipTo(next_mint) => {
-                                t = floor_align_i128(next_mint, range);
+                                let next_t = floor_align_i128(next_mint, range);
+                                self.record_skipped_empty_windows(
+                                    (next_t.min(end_t) - t) / range128,
+                                );
+                                t = next_t;
                                 continue;
                             }
                             IntervalAction::Overlaps => {}
@@ -2307,6 +2426,312 @@ mod tests {
         // the healthy [3*range, 6*range) range!
         let created = db.compact_blocks().unwrap();
         assert_eq!(created.len(), 1, "healthy range must compact after broken range marked failed");
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a1_1_compact_blocks_locked_reloads_when_on_disk_meta_changed_no_tombstone_resurrection() {
+        use crate::tombstones::{write_tombstones_file, Interval, MemTombstones};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Tsdb::open_with_reload_interval(dir.path(), TsdbOptions::default(), Duration::ZERO)
+            .unwrap();
+        let range = 7_200_000i64;
+        db.set_block_ranges(vec![range]);
+
+        // Create a block in [0, range) with 2 series, plus a trailing block so plan_block_compactions
+        // leaves block[0] eligible for tombstone compaction (>5% tombstones) without needing reload_blocks.
+        let mut app = db.appender();
+        app.append_float(None, &[("__name__", "keep_me")], 1_000, 1.0).unwrap();
+        app.append_float(None, &[("__name__", "delete_me")], 1_000, 99.0).unwrap();
+        app.append_float(None, &[("__name__", "trailing")], range + 1_000, 2.0).unwrap();
+        app.commit().unwrap();
+        let uid0 = db.compact_head_range(0, range).unwrap().unwrap();
+        let _uid1 = db.compact_head_range(range, range * 2).unwrap().unwrap();
+
+        let bdir0 = dir.path().join(uid0.to_string());
+        let blk0 = db.blocks().into_iter().find(|b| b.ulid() == uid0).unwrap();
+        let ref_del = blk0
+            .postings_for_matchers(&[LabelMatcher::new(MatchType::Equal, "__name__", "delete_me").unwrap()])
+            .unwrap()[0];
+        drop(blk0);
+
+        // Write on-disk tombstones + updated meta.json (numTombstones = 1) WITHOUT calling reload_blocks!
+        let tombs = MemTombstones::new();
+        tombs.add_interval(ref_del, Interval::new(i64::MIN, i64::MAX));
+        write_tombstones_file(&bdir0, &tombs).unwrap();
+        let mut m0 = read_meta_file(&bdir0).unwrap();
+        m0.stats.num_tombstones = 1;
+        crate::block::write_meta_file(&bdir0, &mut m0).unwrap();
+
+        let created = db.compact_blocks().unwrap();
+        assert_eq!(created.len(), 1);
+
+        let q = db.querier(i64::MIN, i64::MAX);
+        let res_del = q
+            .select(false, &[LabelMatcher::new(MatchType::Equal, "__name__", "delete_me").unwrap()])
+            .unwrap();
+        assert!(res_del.is_empty(), "on-disk tombstones must not be resurrected by stale in-memory Block");
+        let res_keep = q
+            .select(false, &[LabelMatcher::new(MatchType::Equal, "__name__", "keep_me").unwrap()])
+            .unwrap();
+        assert_eq!(res_keep.len(), 1);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a1_2_missing_chunks_dir_fails_reload_and_increments_reloads_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(prometheus::Registry::new());
+        let mut opts = TsdbOptions::default();
+        opts.head.registry = Some(Arc::clone(&reg));
+        let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+
+        let mut app = db.appender();
+        app.append_float(None, &[("__name__", "m_chunks_missing")], 1_000, 1.0).unwrap();
+        app.commit().unwrap();
+        let uid = db.compact_head_range(0, 7_200_000).unwrap().unwrap();
+        db.close().unwrap();
+
+        // Remove chunks/ from the persisted block.
+        fs::remove_dir_all(dir.path().join(uid.to_string()).join("chunks")).unwrap();
+
+        // Reopening (or reloading) must fail on the corrupted block and count reloads_failures_total.
+        let reg2 = Arc::new(prometheus::Registry::new());
+        let mut opts2 = TsdbOptions::default();
+        opts2.head.registry = Some(Arc::clone(&reg2));
+        let err = Tsdb::open_with_reload_interval(dir.path(), opts2, Duration::ZERO)
+            .err()
+            .expect("missing chunks/ dir must fail TSDB open/reload");
+        let _ = err;
+        let fails = reg2
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "prometheus_tsdb_reloads_failures_total")
+            .unwrap()
+            .get_metric()[0]
+            .get_counter()
+            .get_value();
+        assert_eq!(fails, 1.0);
+    }
+
+    #[test]
+    fn a1_3_db_compact_blocks_respects_max_block_chunk_segment_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = TsdbOptions::default();
+        opts.head.samples_per_chunk = 20;
+        opts.max_block_chunk_segment_size = 200;
+        let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+        let range = 7_200_000i64;
+        db.set_block_ranges(vec![range, range * 3]);
+
+        for i in 0..4i64 {
+            let mut app = db.appender();
+            for j in 0..60i64 {
+                let t = i * range + j * 1_000;
+                app.append_float(None, &[("__name__", "seg_db_m"), ("s", "1")], t, j as f64)
+                    .unwrap();
+            }
+            app.commit().unwrap();
+            db.compact_head_range(i * range, (i + 1) * range).unwrap().unwrap();
+        }
+
+        let created = db.compact_blocks().unwrap();
+        assert_eq!(created.len(), 1);
+        let seg_count = fs::read_dir(dir.path().join(created[0].to_string()).join("chunks"))
+            .unwrap()
+            .count();
+        assert!(seg_count >= 2, "expected L2 block to split chunk segments at 200 bytes, got {seg_count}");
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a1_5_validates_st_storage_and_xor_encoding_and_dir_lockfile() {
+        fn clean_start_val(reg: &prometheus::Registry) -> f64 {
+            reg.gather()
+                .into_iter()
+                .find(|mf| mf.get_name() == "prometheus_tsdb_clean_start")
+                .unwrap()
+                .get_metric()[0]
+                .get_gauge()
+                .get_value()
+        }
+
+        // 1. enable_st_storage + Encoding::Xor (including default) must fail.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = TsdbOptions::default();
+            opts.head.enable_st_storage = true;
+            let err = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO)
+                .err()
+                .expect("enable_st_storage + Xor must be rejected");
+            assert!(err.to_string().contains("incompatible with start-timestamp storage"));
+        }
+        // Unsupported float encoding must fail.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = TsdbOptions::default();
+            opts.head.float_chunk_encoding = Encoding::Histogram;
+            let err = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO)
+                .err()
+                .expect("non-XOR float encoding must be rejected");
+            assert!(err.to_string().contains("unsupported float chunk encoding"));
+        }
+        // enable_st_storage + Encoding::Xor2 must succeed.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = TsdbOptions::default();
+            opts.head.enable_st_storage = true;
+            opts.head.float_chunk_encoding = Encoding::Xor2;
+            let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+            db.close().unwrap();
+        }
+
+        // 2. no_lockfile: true -> clean_start = -1.0, no lock file created.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let reg = Arc::new(prometheus::Registry::new());
+            let mut opts = TsdbOptions {
+                no_lockfile: true,
+                ..TsdbOptions::default()
+            };
+            opts.head.registry = Some(Arc::clone(&reg));
+            let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+            assert!(!dir.path().join("lock").exists());
+            assert_eq!(clean_start_val(&reg), -1.0);
+            db.close().unwrap();
+        }
+
+        // 3. no_lockfile: false -> clean_start = 1.0, lock held, second opener fails, close removes lock.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let reg1 = Arc::new(prometheus::Registry::new());
+            let mut opts1 = TsdbOptions {
+                no_lockfile: false,
+                ..TsdbOptions::default()
+            };
+            opts1.head.registry = Some(Arc::clone(&reg1));
+            let db1 = Tsdb::open_with_reload_interval(dir.path(), opts1, Duration::ZERO).unwrap();
+            assert!(dir.path().join("lock").exists());
+            assert_eq!(clean_start_val(&reg1), 1.0);
+
+            let opts2 = TsdbOptions {
+                no_lockfile: false,
+                ..TsdbOptions::default()
+            };
+            assert!(
+                Tsdb::open_with_reload_interval(dir.path(), opts2, Duration::ZERO).is_err(),
+                "concurrent open with lockfile enabled must fail"
+            );
+            assert!(dir.path().join("lock").exists(), "failed second open must not delete active lock");
+
+            db1.close().unwrap();
+            assert!(!dir.path().join("lock").exists(), "close() must unlink lockfile");
+        }
+
+        // 4. Stale lockfile from crashed execution -> clean_start = 0.0, lock replaced and cleaned on drop.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("lock"), b"").unwrap();
+            let reg = Arc::new(prometheus::Registry::new());
+            let mut opts = TsdbOptions {
+                no_lockfile: false,
+                ..TsdbOptions::default()
+            };
+            opts.head.registry = Some(Arc::clone(&reg));
+            let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+            assert_eq!(clean_start_val(&reg), 0.0);
+            assert!(dir.path().join("lock").exists());
+            drop(db);
+            assert!(!dir.path().join("lock").exists(), "Drop must unlink lockfile");
+        }
+    }
+
+    #[test]
+    fn a1_7a_compact_stops_between_head_windows_when_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_target: Arc<std::sync::OnceLock<std::sync::Weak<TsdbInner>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let hook_target_cb = Arc::clone(&hook_target);
+        let mut opts = TsdbOptions::default();
+        opts.head.chunk_range_ms = 1_000;
+        opts.on_blocks_reload = Some(Arc::new(move |get_blocks| {
+            if !get_blocks().is_empty() {
+                if let Some(weak) = hook_target_cb.get() {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.closed.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }));
+        let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+        hook_target.set(Arc::downgrade(&db.inner)).ok().unwrap();
+
+        let mut app = db.appender();
+        for i in 0..5i64 {
+            app.append_float(None, &[("__name__", "stop_m")], i * 1_000 + 100, i as f64)
+                .unwrap();
+        }
+        app.commit().unwrap();
+        assert!(db.head().compactable());
+
+        let created = db.inner.compact().unwrap();
+        assert_eq!(
+            created.len(),
+            1,
+            "compact() must stop after first head window once closed is set"
+        );
+        assert!(db.head().compactable(), "remaining head windows must not have compacted");
+        db.inner.closed.store(false, Ordering::Release);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a1_10_empty_intermediate_windows_increment_compactions_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(prometheus::Registry::new());
+        let mut opts = TsdbOptions::default();
+        opts.head.chunk_range_ms = 1_000;
+        opts.head.ooo_time_window_ms = 100_000;
+        opts.head.registry = Some(Arc::clone(&reg));
+        let db = Tsdb::open_with_reload_interval(dir.path(), opts, Duration::ZERO).unwrap();
+
+        let compactions_total = || -> f64 {
+            reg.gather()
+                .into_iter()
+                .find(|mf| mf.get_name() == "prometheus_tsdb_compactions_total")
+                .unwrap()
+                .get_metric()[0]
+                .get_counter()
+                .get_value()
+        };
+
+        // Selected-series compaction across windows [0, 1000), [1000, 2000), [2000, 3000), [3000, 4000)
+        // where [1000, 2000) and [2000, 3000) are empty -> 4 compactions_total.
+        let r_sel = {
+            let mut app = db.appender();
+            let r = app.append_float(None, &[("__name__", "sel_gap")], 100, 1.0).unwrap();
+            app.append_float(Some(r), &[("__name__", "sel_gap")], 3_100, 2.0).unwrap();
+            app.append_float(None, &[("__name__", "ooo_gap")], 10_000, 1.0).unwrap();
+            app.commit().unwrap();
+            r
+        };
+        let created_sel = db.compact_selected_series(&[r_sel]).unwrap();
+        assert_eq!(created_sel.len(), 2);
+        assert_eq!(compactions_total(), 4.0);
+
+        // OOO compaction across [0, 1000), [1000, 2000), [2000, 3000) where [1000, 2000) is empty -> +3 = 7.0.
+        {
+            let mut app = db.appender();
+            app.append_float(None, &[("__name__", "ooo_gap")], 100, 1.0).unwrap();
+            app.append_float(None, &[("__name__", "ooo_gap")], 2_100, 2.0).unwrap();
+            app.commit().unwrap();
+        }
+        let created_ooo = db.compact_ooo_head().unwrap();
+        assert_eq!(created_ooo.len(), 2);
+        assert_eq!(compactions_total(), 7.0);
 
         db.close().unwrap();
     }
