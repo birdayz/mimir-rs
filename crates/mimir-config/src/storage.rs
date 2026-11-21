@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::duration::GoDuration;
 use crate::error::ConfigError;
 use crate::flags::FlagSet;
-use crate::types::{LimitsMap, S3BucketLookupType, SASLMechanism, StringSliceCSV};
+use crate::types::{
+    LimitsMap, S3BucketLookupType, SASLMechanism, StringSliceCSV, INVALID_SASL_MECHANISM_ERR,
+};
 
 pub const MIN_PRODUCER_RECORD_DATA_BYTES_LIMIT: i64 = 1024 * 1024;
 pub const MAX_PRODUCER_RECORD_DATA_BYTES_LIMIT: i64 = 16_000_000 - 16_384;
@@ -114,9 +116,10 @@ impl S3SSEConfig {
                 "unsupported S3 SSE type".to_string(),
             ));
         }
-        // parseKMSEncryptionContext: json.Unmarshal into map[string]string ("null" is valid).
+        // parseKMSEncryptionContext: json.Unmarshal into map[string]string ("null" top-level and
+        // JSON null map values decode to "" in Go encoding/json).
         if !self.kms_encryption_context.is_empty()
-            && serde_json::from_str::<Option<std::collections::BTreeMap<String, String>>>(
+            && serde_json::from_str::<Option<std::collections::BTreeMap<String, Option<String>>>>(
                 &self.kms_encryption_context,
             )
             .is_err()
@@ -154,19 +157,8 @@ pub const S3_SUPPORTED_STORAGE_CLASSES: &[&str] = &[
 
 /// Mimir `util.IsValidURL`: `url.Parse` succeeds with a non-empty scheme and host.
 fn is_valid_url(endpoint: &str) -> bool {
-    let Some((scheme, rest)) = endpoint.split_once("://") else {
-        return false;
-    };
-    let scheme_ok = scheme
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
-    scheme_ok && !host.is_empty() && !host.contains(' ')
+    reqwest::Url::parse(endpoint)
+        .is_ok_and(|u| !u.scheme().is_empty() && u.host_str().is_some_and(|h| !h.is_empty()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -868,6 +860,31 @@ impl MemcachedClientConfig {
         f.string_var(&format!("{prefix}tls-cipher-suites"), &self.tls_cipher_suites, "TLS cipher suites.", move |t| &get(t).tls_cipher_suites, move |t| &mut get_mut(t).tls_cipher_suites);
         f.string_var(&format!("{prefix}tls-min-version"), &self.tls_min_version, "Minimum TLS version.", move |t| &get(t).tls_min_version, move |t| &mut get_mut(t).tls_min_version);
     }
+
+    /// Ported from `dskit/cache/memcached_client.go:MemcachedClientConfig.Validate`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.addresses.is_empty() {
+            return Err(ConfigError::Validation(
+                "no memcached addresses provided".to_string(),
+            ));
+        }
+        if self.max_async_concurrency <= 0 {
+            return Err(ConfigError::Validation(
+                "max async concurrency must be positive".to_string(),
+            ));
+        }
+        if self.addresses_lookup_period.0 <= 0 {
+            return Err(ConfigError::Validation(
+                "address lookup period must be greater than 0".to_string(),
+            ));
+        }
+        if self.free_list_shards <= 0 {
+            return Err(ConfigError::Validation(
+                "free list shards must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -921,6 +938,9 @@ impl IndexCacheConfig {
             return Err(ConfigError::Validation(
                 "unsupported index cache backend".to_string(),
             ));
+        }
+        if self.backend == "memcached" {
+            self.memcached.validate()?;
         }
         Ok(())
     }
@@ -977,6 +997,9 @@ impl IndexHeaderCacheConfig {
                 self.backend
             )));
         }
+        if self.backend == "memcached" {
+            self.memcached.validate()?;
+        }
         Ok(())
     }
 }
@@ -1028,6 +1051,9 @@ impl ChunksCacheConfig {
                 "unsupported cache backend: {}",
                 self.backend
             )));
+        }
+        if self.backend == "memcached" {
+            self.memcached.validate()?;
         }
         Ok(())
     }
@@ -1101,6 +1127,9 @@ impl MetadataCacheConfig {
                 "unsupported cache backend: {}",
                 self.backend
             )));
+        }
+        if self.backend == "memcached" {
+            self.memcached.validate()?;
         }
         Ok(())
     }
@@ -1308,10 +1337,24 @@ impl BucketStoreConfig {
                 "value for -blocks-storage.bucket-store.ignore-deletion-marks-while-querying-delay must be greater than 3× -blocks-storage.bucket-store.sync-interval".to_string(),
             ));
         }
-        self.index_cache.validate()?;
-        self.chunks_cache.validate()?;
-        self.index_header_cache.validate()?;
-        self.metadata_cache.validate()?;
+        let wrap = |prefix: &'static str| {
+            move |e: ConfigError| match e {
+                ConfigError::Validation(msg) => ConfigError::Validation(format!("{prefix}: {msg}")),
+                other => ConfigError::Validation(format!("{prefix}: {other}")),
+            }
+        };
+        self.index_cache
+            .validate()
+            .map_err(wrap("index-cache configuration"))?;
+        self.chunks_cache
+            .validate()
+            .map_err(wrap("chunks-cache configuration"))?;
+        self.index_header_cache
+            .validate()
+            .map_err(wrap("index-header-cache configuration"))?;
+        self.metadata_cache
+            .validate()
+            .map_err(wrap("metadata-cache configuration"))?;
         if self.series_fetch_preference <= 0.0 {
             return Err(ConfigError::Validation(
                 "invalid worst-case series preference; must be positive".to_string(),
@@ -1770,8 +1813,7 @@ impl OrderedConsumptionConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KafkaConfig {
     pub backend: String,
     pub address: StringSliceCSV,
@@ -1793,21 +1835,20 @@ pub struct KafkaConfig {
 
     // SASL
     pub sasl_mechanism: SASLMechanism,
+    /// Raw YAML string preserved when `sasl_mechanism` is empty or unrecognized at YAML decode
+    /// time (Go `type SASLMechanism string` allows arbitrary YAML strings and validates only when
+    /// `ingest_storage.enabled` is true).
+    pub sasl_mechanism_raw: Option<String>,
     pub sasl_username: String,
-    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_password: String,
-    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_oauthbearer_token: String,
     pub sasl_oauthbearer_zid: String,
     pub sasl_oauthbearer_extensions: LimitsMap<String>,
     pub sasl_oauthbearer_file_path: String,
     pub sasl_oauthbearer_http_socket_path: String,
     pub sasl_oauthbearer_http_socket_timeout: GoDuration,
-    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_msk_iam_access_key: String,
-    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_msk_iam_secret_key: String,
-    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
     pub sasl_msk_iam_session_token: String,
     pub sasl_msk_iam_user_agent: String,
     pub sasl_msk_iam_file_path: String,
@@ -1871,6 +1912,7 @@ impl Default for KafkaConfig {
             warpstream_hedge_max_agents: 3,
             warpstream_demoter_probe_interval: GoDuration::from_secs(1),
             sasl_mechanism: SASLMechanism::Plain,
+            sasl_mechanism_raw: None,
             sasl_username: String::new(),
             sasl_password: String::new(),
             sasl_oauthbearer_token: String::new(),
@@ -1973,7 +2015,30 @@ impl KafkaConfig {
         f.i64_var(&format!("{prefix}ingestion-concurrency-estimated-bytes-per-sample"), self.ingestion_concurrency_estimated_bytes_per_sample, "Estimated number of bytes per sample.", move |t| &get(t).ingestion_concurrency_estimated_bytes_per_sample, move |t| &mut get_mut(t).ingestion_concurrency_estimated_bytes_per_sample);
 
         // SASL
-        f.sasl_mechanism_var(&format!("{prefix}sasl-mechanism"), self.sasl_mechanism, "The SASL mechanism used to authenticate to Kafka.", move |t| &get(t).sasl_mechanism, move |t| &mut get_mut(t).sasl_mechanism);
+        f.register_raw(
+            format!("{prefix}sasl-mechanism"),
+            false,
+            "string",
+            self.sasl_mechanism_raw
+                .as_deref()
+                .unwrap_or(self.sasl_mechanism.as_str())
+                .to_string(),
+            "The SASL mechanism used to authenticate to Kafka.",
+            move |t, s| {
+                let parsed = SASLMechanism::parse(s)?;
+                let k = get_mut(t);
+                k.sasl_mechanism = parsed;
+                k.sasl_mechanism_raw = None;
+                Ok(())
+            },
+            move |t| {
+                let k = get(t);
+                k.sasl_mechanism_raw
+                    .as_deref()
+                    .unwrap_or(k.sasl_mechanism.as_str())
+                    .to_string()
+            },
+        );
         f.string_var(&format!("{prefix}sasl-username"), &self.sasl_username, "The username used to authenticate to Kafka using SASL.", move |t| &get(t).sasl_username, move |t| &mut get_mut(t).sasl_username);
         f.string_var(&format!("{prefix}sasl-password"), &self.sasl_password, "The password used to authenticate to Kafka using SASL.", move |t| &get(t).sasl_password, move |t| &mut get_mut(t).sasl_password);
         f.string_var(&format!("{prefix}sasl-oauthbearer-token"), &self.sasl_oauthbearer_token, "The OAuth token to use to authenticate to Kafka.", move |t| &get(t).sasl_oauthbearer_token, move |t| &mut get_mut(t).sasl_oauthbearer_token);
@@ -2159,6 +2224,11 @@ impl KafkaConfig {
     }
 
     fn validate_sasl(&self) -> Result<(), ConfigError> {
+        if self.sasl_mechanism_raw.is_some() {
+            return Err(ConfigError::Validation(
+                INVALID_SASL_MECHANISM_ERR.to_string(),
+            ));
+        }
         match self.sasl_mechanism {
             SASLMechanism::Plain => {
                 if self.sasl_username.is_empty() != self.sasl_password.is_empty() {
@@ -2211,6 +2281,253 @@ impl KafkaConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KafkaConfigSerde {
+    pub backend: String,
+    pub address: StringSliceCSV,
+    pub topic: String,
+    pub client_id: String,
+    pub client_rack: String,
+    pub dial_timeout: GoDuration,
+    pub write_timeout: GoDuration,
+    pub write_timeout_overhead: GoDuration,
+    pub warpstream_health_check_slow_multiplier: f64,
+    pub warpstream_health_check_max_slow_fraction: f64,
+    pub warpstream_health_check_faulty_threshold: f64,
+    pub warpstream_health_check_max_faulty_fraction: f64,
+    pub warpstream_hedge_min_delay: GoDuration,
+    pub warpstream_hedge_max_agents: i64,
+    pub warpstream_demoter_probe_interval: GoDuration,
+    pub sasl_mechanism: String,
+    pub sasl_username: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
+    pub sasl_password: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
+    pub sasl_oauthbearer_token: String,
+    pub sasl_oauthbearer_zid: String,
+    pub sasl_oauthbearer_extensions: LimitsMap<String>,
+    pub sasl_oauthbearer_file_path: String,
+    pub sasl_oauthbearer_http_socket_path: String,
+    pub sasl_oauthbearer_http_socket_timeout: GoDuration,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
+    pub sasl_msk_iam_access_key: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
+    pub sasl_msk_iam_secret_key: String,
+    #[serde(serialize_with = "crate::secret::serialize_flagext_secret")]
+    pub sasl_msk_iam_session_token: String,
+    pub sasl_msk_iam_user_agent: String,
+    pub sasl_msk_iam_file_path: String,
+    pub sasl_msk_iam_http_socket_path: String,
+    pub sasl_msk_iam_http_socket_timeout: GoDuration,
+    pub tls_enabled: bool,
+    pub tls_cert_path: String,
+    pub tls_key_path: String,
+    pub tls_ca_path: String,
+    pub tls_server_name: String,
+    pub tls_insecure_skip_verify: bool,
+    pub tls_cipher_suites: String,
+    pub tls_min_version: String,
+    pub consumer_group: String,
+    pub consumer_group_offset_commit_interval: GoDuration,
+    pub consumer_group_offset_commit_file_enforced: bool,
+    pub last_produced_offset_poll_interval: GoDuration,
+    pub last_produced_offset_retry_timeout: GoDuration,
+    pub consume_from_position_at_startup: String,
+    pub consume_from_timestamp_at_startup: i64,
+    pub target_consumer_lag_at_startup: GoDuration,
+    pub max_consumer_lag_at_startup: GoDuration,
+    pub auto_create_topic_enabled: bool,
+    pub auto_create_topic_default_partitions: i64,
+    pub producer_max_record_size_bytes: i64,
+    pub producer_max_buffered_bytes: i64,
+    pub producer_compression: String,
+    pub wait_strong_read_consistency_timeout: GoDuration,
+    pub producer_record_version: i64,
+    pub fetch_max_wait: GoDuration,
+    pub fetch_concurrency_max: i64,
+    pub use_compressed_bytes_as_fetch_max_bytes: bool,
+    pub max_buffered_bytes: i64,
+    pub ingestion_concurrency_max: i64,
+    pub ingestion_concurrency_batch_size: i64,
+    pub ingestion_concurrency_queue_capacity: i64,
+    pub ingestion_concurrency_target_flushes_per_shard: i64,
+    pub ingestion_concurrency_estimated_bytes_per_sample: i64,
+}
+
+impl Default for KafkaConfigSerde {
+    fn default() -> Self {
+        let d = KafkaConfig::default();
+        Self::from(&d)
+    }
+}
+
+impl From<&KafkaConfig> for KafkaConfigSerde {
+    fn from(k: &KafkaConfig) -> Self {
+        Self {
+            backend: k.backend.clone(),
+            address: k.address.clone(),
+            topic: k.topic.clone(),
+            client_id: k.client_id.clone(),
+            client_rack: k.client_rack.clone(),
+            dial_timeout: k.dial_timeout,
+            write_timeout: k.write_timeout,
+            write_timeout_overhead: k.write_timeout_overhead,
+            warpstream_health_check_slow_multiplier: k.warpstream_health_check_slow_multiplier,
+            warpstream_health_check_max_slow_fraction: k.warpstream_health_check_max_slow_fraction,
+            warpstream_health_check_faulty_threshold: k.warpstream_health_check_faulty_threshold,
+            warpstream_health_check_max_faulty_fraction: k.warpstream_health_check_max_faulty_fraction,
+            warpstream_hedge_min_delay: k.warpstream_hedge_min_delay,
+            warpstream_hedge_max_agents: k.warpstream_hedge_max_agents,
+            warpstream_demoter_probe_interval: k.warpstream_demoter_probe_interval,
+            sasl_mechanism: k
+                .sasl_mechanism_raw
+                .clone()
+                .unwrap_or_else(|| k.sasl_mechanism.as_str().to_string()),
+            sasl_username: k.sasl_username.clone(),
+            sasl_password: k.sasl_password.clone(),
+            sasl_oauthbearer_token: k.sasl_oauthbearer_token.clone(),
+            sasl_oauthbearer_zid: k.sasl_oauthbearer_zid.clone(),
+            sasl_oauthbearer_extensions: k.sasl_oauthbearer_extensions.clone(),
+            sasl_oauthbearer_file_path: k.sasl_oauthbearer_file_path.clone(),
+            sasl_oauthbearer_http_socket_path: k.sasl_oauthbearer_http_socket_path.clone(),
+            sasl_oauthbearer_http_socket_timeout: k.sasl_oauthbearer_http_socket_timeout,
+            sasl_msk_iam_access_key: k.sasl_msk_iam_access_key.clone(),
+            sasl_msk_iam_secret_key: k.sasl_msk_iam_secret_key.clone(),
+            sasl_msk_iam_session_token: k.sasl_msk_iam_session_token.clone(),
+            sasl_msk_iam_user_agent: k.sasl_msk_iam_user_agent.clone(),
+            sasl_msk_iam_file_path: k.sasl_msk_iam_file_path.clone(),
+            sasl_msk_iam_http_socket_path: k.sasl_msk_iam_http_socket_path.clone(),
+            sasl_msk_iam_http_socket_timeout: k.sasl_msk_iam_http_socket_timeout,
+            tls_enabled: k.tls_enabled,
+            tls_cert_path: k.tls_cert_path.clone(),
+            tls_key_path: k.tls_key_path.clone(),
+            tls_ca_path: k.tls_ca_path.clone(),
+            tls_server_name: k.tls_server_name.clone(),
+            tls_insecure_skip_verify: k.tls_insecure_skip_verify,
+            tls_cipher_suites: k.tls_cipher_suites.clone(),
+            tls_min_version: k.tls_min_version.clone(),
+            consumer_group: k.consumer_group.clone(),
+            consumer_group_offset_commit_interval: k.consumer_group_offset_commit_interval,
+            consumer_group_offset_commit_file_enforced: k.consumer_group_offset_commit_file_enforced,
+            last_produced_offset_poll_interval: k.last_produced_offset_poll_interval,
+            last_produced_offset_retry_timeout: k.last_produced_offset_retry_timeout,
+            consume_from_position_at_startup: k.consume_from_position_at_startup.clone(),
+            consume_from_timestamp_at_startup: k.consume_from_timestamp_at_startup,
+            target_consumer_lag_at_startup: k.target_consumer_lag_at_startup,
+            max_consumer_lag_at_startup: k.max_consumer_lag_at_startup,
+            auto_create_topic_enabled: k.auto_create_topic_enabled,
+            auto_create_topic_default_partitions: k.auto_create_topic_default_partitions,
+            producer_max_record_size_bytes: k.producer_max_record_size_bytes,
+            producer_max_buffered_bytes: k.producer_max_buffered_bytes,
+            producer_compression: k.producer_compression.clone(),
+            wait_strong_read_consistency_timeout: k.wait_strong_read_consistency_timeout,
+            producer_record_version: k.producer_record_version,
+            fetch_max_wait: k.fetch_max_wait,
+            fetch_concurrency_max: k.fetch_concurrency_max,
+            use_compressed_bytes_as_fetch_max_bytes: k.use_compressed_bytes_as_fetch_max_bytes,
+            max_buffered_bytes: k.max_buffered_bytes,
+            ingestion_concurrency_max: k.ingestion_concurrency_max,
+            ingestion_concurrency_batch_size: k.ingestion_concurrency_batch_size,
+            ingestion_concurrency_queue_capacity: k.ingestion_concurrency_queue_capacity,
+            ingestion_concurrency_target_flushes_per_shard: k
+                .ingestion_concurrency_target_flushes_per_shard,
+            ingestion_concurrency_estimated_bytes_per_sample: k
+                .ingestion_concurrency_estimated_bytes_per_sample,
+        }
+    }
+}
+
+impl From<KafkaConfigSerde> for KafkaConfig {
+    fn from(w: KafkaConfigSerde) -> Self {
+        let (sasl_mechanism, sasl_mechanism_raw) = match SASLMechanism::parse(&w.sasl_mechanism) {
+            Ok(m) => (m, None),
+            Err(_) => (SASLMechanism::Plain, Some(w.sasl_mechanism)),
+        };
+        Self {
+            backend: w.backend,
+            address: w.address,
+            topic: w.topic,
+            client_id: w.client_id,
+            client_rack: w.client_rack,
+            dial_timeout: w.dial_timeout,
+            write_timeout: w.write_timeout,
+            write_timeout_overhead: w.write_timeout_overhead,
+            warpstream_health_check_slow_multiplier: w.warpstream_health_check_slow_multiplier,
+            warpstream_health_check_max_slow_fraction: w.warpstream_health_check_max_slow_fraction,
+            warpstream_health_check_faulty_threshold: w.warpstream_health_check_faulty_threshold,
+            warpstream_health_check_max_faulty_fraction: w.warpstream_health_check_max_faulty_fraction,
+            warpstream_hedge_min_delay: w.warpstream_hedge_min_delay,
+            warpstream_hedge_max_agents: w.warpstream_hedge_max_agents,
+            warpstream_demoter_probe_interval: w.warpstream_demoter_probe_interval,
+            sasl_mechanism,
+            sasl_mechanism_raw,
+            sasl_username: w.sasl_username,
+            sasl_password: w.sasl_password,
+            sasl_oauthbearer_token: w.sasl_oauthbearer_token,
+            sasl_oauthbearer_zid: w.sasl_oauthbearer_zid,
+            sasl_oauthbearer_extensions: w.sasl_oauthbearer_extensions,
+            sasl_oauthbearer_file_path: w.sasl_oauthbearer_file_path,
+            sasl_oauthbearer_http_socket_path: w.sasl_oauthbearer_http_socket_path,
+            sasl_oauthbearer_http_socket_timeout: w.sasl_oauthbearer_http_socket_timeout,
+            sasl_msk_iam_access_key: w.sasl_msk_iam_access_key,
+            sasl_msk_iam_secret_key: w.sasl_msk_iam_secret_key,
+            sasl_msk_iam_session_token: w.sasl_msk_iam_session_token,
+            sasl_msk_iam_user_agent: w.sasl_msk_iam_user_agent,
+            sasl_msk_iam_file_path: w.sasl_msk_iam_file_path,
+            sasl_msk_iam_http_socket_path: w.sasl_msk_iam_http_socket_path,
+            sasl_msk_iam_http_socket_timeout: w.sasl_msk_iam_http_socket_timeout,
+            tls_enabled: w.tls_enabled,
+            tls_cert_path: w.tls_cert_path,
+            tls_key_path: w.tls_key_path,
+            tls_ca_path: w.tls_ca_path,
+            tls_server_name: w.tls_server_name,
+            tls_insecure_skip_verify: w.tls_insecure_skip_verify,
+            tls_cipher_suites: w.tls_cipher_suites,
+            tls_min_version: w.tls_min_version,
+            consumer_group: w.consumer_group,
+            consumer_group_offset_commit_interval: w.consumer_group_offset_commit_interval,
+            consumer_group_offset_commit_file_enforced: w.consumer_group_offset_commit_file_enforced,
+            last_produced_offset_poll_interval: w.last_produced_offset_poll_interval,
+            last_produced_offset_retry_timeout: w.last_produced_offset_retry_timeout,
+            consume_from_position_at_startup: w.consume_from_position_at_startup,
+            consume_from_timestamp_at_startup: w.consume_from_timestamp_at_startup,
+            target_consumer_lag_at_startup: w.target_consumer_lag_at_startup,
+            max_consumer_lag_at_startup: w.max_consumer_lag_at_startup,
+            auto_create_topic_enabled: w.auto_create_topic_enabled,
+            auto_create_topic_default_partitions: w.auto_create_topic_default_partitions,
+            producer_max_record_size_bytes: w.producer_max_record_size_bytes,
+            producer_max_buffered_bytes: w.producer_max_buffered_bytes,
+            producer_compression: w.producer_compression,
+            wait_strong_read_consistency_timeout: w.wait_strong_read_consistency_timeout,
+            producer_record_version: w.producer_record_version,
+            fetch_max_wait: w.fetch_max_wait,
+            fetch_concurrency_max: w.fetch_concurrency_max,
+            use_compressed_bytes_as_fetch_max_bytes: w.use_compressed_bytes_as_fetch_max_bytes,
+            max_buffered_bytes: w.max_buffered_bytes,
+            ingestion_concurrency_max: w.ingestion_concurrency_max,
+            ingestion_concurrency_batch_size: w.ingestion_concurrency_batch_size,
+            ingestion_concurrency_queue_capacity: w.ingestion_concurrency_queue_capacity,
+            ingestion_concurrency_target_flushes_per_shard: w
+                .ingestion_concurrency_target_flushes_per_shard,
+            ingestion_concurrency_estimated_bytes_per_sample: w
+                .ingestion_concurrency_estimated_bytes_per_sample,
+        }
+    }
+}
+
+impl Serialize for KafkaConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        KafkaConfigSerde::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for KafkaConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        KafkaConfigSerde::deserialize(deserializer).map(Self::from)
     }
 }
 
@@ -2361,5 +2678,115 @@ mod tests {
             .to_string()
             .contains("warpstream"));
         assert!(base().validate_mimir_rs_support().is_ok());
+    }
+
+    #[test]
+    fn w26_s4_03_memcached_cache_validation_in_bucket_store() {
+        let mut bs = BucketStoreConfig::default();
+        bs.validate().unwrap();
+
+        // Each of the 4 caches must validate MemcachedClientConfig when backend == "memcached".
+        bs.index_cache.backend = "memcached".to_string();
+        assert_eq!(
+            bs.validate().unwrap_err().to_string(),
+            "error validating config: index-cache configuration: no memcached addresses provided"
+        );
+        bs.index_cache.memcached.addresses = "127.0.0.1:11211".to_string();
+        bs.index_cache.memcached.max_async_concurrency = 0;
+        assert_eq!(
+            bs.validate().unwrap_err().to_string(),
+            "error validating config: index-cache configuration: max async concurrency must be positive"
+        );
+        bs.index_cache.memcached.max_async_concurrency = 1;
+        bs.index_cache.memcached.addresses_lookup_period = GoDuration::ZERO;
+        assert_eq!(
+            bs.validate().unwrap_err().to_string(),
+            "error validating config: index-cache configuration: address lookup period must be greater than 0"
+        );
+        bs.index_cache.memcached.addresses_lookup_period = GoDuration::from_secs(30);
+        bs.index_cache.memcached.free_list_shards = 0;
+        assert_eq!(
+            bs.validate().unwrap_err().to_string(),
+            "error validating config: index-cache configuration: free list shards must be greater than 0"
+        );
+        bs.index_cache.memcached.free_list_shards = 1;
+        bs.validate().unwrap();
+
+        bs.chunks_cache.backend = "memcached".to_string();
+        assert_eq!(
+            bs.validate().unwrap_err().to_string(),
+            "error validating config: chunks-cache configuration: no memcached addresses provided"
+        );
+        bs.chunks_cache.memcached.addresses = "127.0.0.1:11211".to_string();
+
+        bs.index_header_cache.backend = "memcached".to_string();
+        assert_eq!(
+            bs.validate().unwrap_err().to_string(),
+            "error validating config: index-header-cache configuration: no memcached addresses provided"
+        );
+        bs.index_header_cache.memcached.addresses = "127.0.0.1:11211".to_string();
+
+        bs.metadata_cache.backend = "memcached".to_string();
+        assert_eq!(
+            bs.validate().unwrap_err().to_string(),
+            "error validating config: metadata-cache configuration: no memcached addresses provided"
+        );
+        bs.metadata_cache.memcached.addresses = "127.0.0.1:11211".to_string();
+        bs.validate().unwrap();
+    }
+
+    #[test]
+    fn w26_s4_08_s4_09_s3_and_kafka_sasl_parity() {
+        // S4-09(a): S3 sts_endpoint rejects bad port and unclosed IPv6.
+        for bad_url in ["https://example.com:notaport", "https://[::1", "://missing"] {
+            let cfg = S3Config {
+                sts_endpoint: bad_url.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.validate().unwrap_err().to_string(),
+                "error validating config: sts-endpoint must be a valid url"
+            );
+        }
+        let good_s3 = S3Config {
+            sts_endpoint: "https://[::1]:443/sts".to_string(),
+            ..Default::default()
+        };
+        good_s3.validate().unwrap();
+
+        // S4-09(b): S3 SSE kms_encryption_context accepts JSON null map values (Go encoding/json).
+        let sse_null_val = S3SSEConfig {
+            sse_type: "SSE-KMS".to_string(),
+            kms_key_id: "key-1".to_string(),
+            kms_encryption_context: r#"{"k": null}"#.to_string(),
+        };
+        sse_null_val.validate().unwrap();
+
+        let sse_bad_type = S3SSEConfig {
+            sse_type: "SSE-KMS".to_string(),
+            kms_key_id: "key-1".to_string(),
+            kms_encryption_context: r#"{"k": 123}"#.to_string(),
+        };
+        assert_eq!(
+            sse_bad_type.validate().unwrap_err().to_string(),
+            "error validating config: invalid S3 SSE encryption context"
+        );
+
+        // S4-08: Kafka sasl_mechanism accepts "" or unknown in YAML when disabled, rejects when enabled.
+        for bad_mech in ["", "INVALID"] {
+            let yaml = format!("enabled: false
+kafka:
+  sasl_mechanism: {bad_mech:?}
+");
+            let mut cfg: IngestStorageConfig = serde_yaml::from_str(&yaml).unwrap();
+            cfg.validate().unwrap();
+            cfg.enabled = true;
+            cfg.kafka.address = StringSliceCSV(vec!["127.0.0.1:9092".to_string()]);
+            cfg.kafka.topic = "ingest".to_string();
+            assert_eq!(
+                cfg.validate().unwrap_err().to_string(),
+                format!("error validating config: {INVALID_SASL_MECHANISM_ERR}")
+            );
+        }
     }
 }

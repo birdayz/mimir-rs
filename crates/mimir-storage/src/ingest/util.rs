@@ -908,6 +908,10 @@ impl IngestKafkaClient {
         self.inner.produce_timeout()
     }
 
+    pub fn into_inner(self) -> super::kafka_client::KafkaClient {
+        self.inner
+    }
+
     pub fn extended_metrics(&self) -> Option<&KafkaClientExtendedMetrics> {
         self.inner.extended_metrics()
     }

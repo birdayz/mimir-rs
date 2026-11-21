@@ -154,55 +154,62 @@ struct TenantRegistryEntry {
     reg: Arc<Registry>,
 }
 
+struct TenantRegistriesInner {
+    regs: Vec<TenantRegistryEntry>,
+    archived: HashMap<String, MetricFamily>,
+}
+
 /// Manages per-tenant Prometheus registries and archives counter/histogram/summary values
 /// on soft removal to prevent counter resets.
 /// Ported from `github.com/grafana/dskit/metrics/tenant_registries.go`.
 struct TenantRegistries {
-    regs: Mutex<Vec<TenantRegistryEntry>>,
-    archived: Mutex<HashMap<String, MetricFamily>>,
+    inner: Mutex<TenantRegistriesInner>,
 }
 
 impl TenantRegistries {
     fn new() -> Self {
         Self {
-            regs: Mutex::new(Vec::new()),
-            archived: Mutex::new(HashMap::new()),
+            inner: Mutex::new(TenantRegistriesInner {
+                regs: Vec::new(),
+                archived: HashMap::new(),
+            }),
         }
     }
 
     fn get_registry_for_tenant(&self, tenant: &str) -> Option<Arc<Registry>> {
-        self.regs
+        self.inner
             .lock()
+            .regs
             .iter()
             .find(|e| e.tenant == tenant)
             .map(|e| Arc::clone(&e.reg))
     }
 
     fn add_tenant_registry(&self, tenant: &str, reg: Arc<Registry>) {
-        let mut regs = self.regs.lock();
+        let mut inner = self.inner.lock();
         let mut idx = 0;
-        while idx < regs.len() {
-            if regs[idx].tenant == tenant {
-                let removed = regs.remove(idx);
-                self.archive_tenant_registry(&removed);
+        while idx < inner.regs.len() {
+            if inner.regs[idx].tenant == tenant {
+                let removed = inner.regs.remove(idx);
+                Self::archive_tenant_registry_locked(&mut inner.archived, &removed);
             } else {
                 idx += 1;
             }
         }
-        regs.push(TenantRegistryEntry {
+        inner.regs.push(TenantRegistryEntry {
             tenant: tenant.to_string(),
             reg,
         });
     }
 
     fn remove_tenant_registry(&self, tenant: &str, hard: bool) {
-        let mut regs = self.regs.lock();
+        let mut inner = self.inner.lock();
         let mut idx = 0;
-        while idx < regs.len() {
-            if regs[idx].tenant == tenant {
-                let removed = regs.remove(idx);
+        while idx < inner.regs.len() {
+            if inner.regs[idx].tenant == tenant {
+                let removed = inner.regs.remove(idx);
                 if !hard {
-                    self.archive_tenant_registry(&removed);
+                    Self::archive_tenant_registry_locked(&mut inner.archived, &removed);
                 }
             } else {
                 idx += 1;
@@ -210,9 +217,11 @@ impl TenantRegistries {
         }
     }
 
-    fn archive_tenant_registry(&self, entry: &TenantRegistryEntry) {
+    fn archive_tenant_registry_locked(
+        archived: &mut HashMap<String, MetricFamily>,
+        entry: &TenantRegistryEntry,
+    ) {
         let families = entry.reg.gather();
-        let mut archived = self.archived.lock();
         for mf in families {
             match mf.get_field_type() {
                 MetricType::COUNTER | MetricType::SUMMARY | MetricType::HISTOGRAM => {}
@@ -232,13 +241,16 @@ impl TenantRegistries {
     }
 
     fn build_metric_families_per_tenant(&self) -> Vec<(String, HashMap<String, MetricFamily>)> {
-        let snapshot: Vec<(String, Arc<Registry>)> = {
-            let regs = self.regs.lock();
-            regs.iter()
+        let (snapshot, archived_map) = {
+            let inner = self.inner.lock();
+            let snapshot: Vec<(String, Arc<Registry>)> = inner
+                .regs
+                .iter()
                 .map(|e| (e.tenant.clone(), Arc::clone(&e.reg)))
-                .collect()
+                .collect();
+            let archived_map = inner.archived.clone();
+            (snapshot, archived_map)
         };
-        let archived_map = self.archived.lock().clone();
 
         let mut out = Vec::with_capacity(snapshot.len() + if archived_map.is_empty() { 0 } else { 1 });
         if !archived_map.is_empty() {
@@ -327,7 +339,11 @@ fn merge_archived_metric_family(existing: &mut MetricFamily, incoming: &MetricFa
                     for q in s_in.get_quantile() {
                         q_map
                             .entry(q.get_quantile().to_bits())
-                            .and_modify(|e| e.1 += q.get_value())
+                            .and_modify(|e| {
+                                if q.get_value() > e.1 {
+                                    e.1 = q.get_value();
+                                }
+                            })
                             .or_insert((q.get_quantile(), q.get_value()));
                     }
                     let mut qs: Vec<Quantile> = q_map
@@ -1145,4 +1161,122 @@ fn sum_of_summaries(
         MetricType::SUMMARY,
         vec![m],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::core::Collector;
+    use prometheus::IntCounter;
+
+    struct FixedSummaryCollector {
+        desc: Desc,
+        val: f64,
+    }
+
+    impl FixedSummaryCollector {
+        fn register_into(reg: &Registry, name: &str, val: f64) {
+            let c = Self {
+                desc: Desc::new(name.to_string(), "help".to_string(), Vec::new(), HashMap::new())
+                    .unwrap(),
+                val,
+            };
+            reg.register(Box::new(c)).unwrap();
+        }
+    }
+
+    impl Collector for FixedSummaryCollector {
+        fn desc(&self) -> Vec<&Desc> {
+            vec![&self.desc]
+        }
+
+        fn collect(&self) -> Vec<MetricFamily> {
+            let mut qs = Vec::new();
+            for qv in [0.5, 0.9, 0.99] {
+                let mut q = Quantile::default();
+                q.set_quantile(qv);
+                q.set_value(self.val);
+                qs.push(q);
+            }
+            let mut s = ProtoSummary::default();
+            s.set_sample_count(1);
+            s.set_sample_sum(self.val);
+            s.set_quantile(qs.into());
+            let mut m = Metric::default();
+            m.set_summary(s);
+            let mut mf = MetricFamily::default();
+            mf.set_name(self.desc.fq_name.clone());
+            mf.set_help(self.desc.help.clone());
+            mf.set_field_type(MetricType::SUMMARY);
+            mf.set_metric(vec![m].into());
+            vec![mf]
+        }
+    }
+
+    #[test]
+    fn tenant_registries_archive_summary_quantiles_uses_max_and_concurrent_scrape_never_double_counts() {
+        let base_reg = Registry::new();
+        let tsdb_metrics = TSDBMetrics::new("cortex_ingester_", Some(&base_reg));
+
+        let setup_tenant = |name: &str, fsync_val: f64, created: u64| {
+            let reg = Arc::new(Registry::new());
+            FixedSummaryCollector::register_into(
+                &reg,
+                "prometheus_tsdb_wal_fsync_duration_seconds",
+                fsync_val,
+            );
+            let ctr = IntCounter::new("prometheus_tsdb_head_series_created_total", "h").unwrap();
+            ctr.inc_by(created);
+            reg.register(Box::new(ctr)).unwrap();
+            tsdb_metrics.set_registry_for_tenant(name, reg);
+        };
+        setup_tenant("t1", 0.25, 5);
+        setup_tenant("t2", 0.60, 7);
+        setup_tenant("t3", 0.40, 3);
+
+        // Concurrent scrape + tenant unloading must never double-count total counters.
+        let tm_bg = Arc::clone(&tsdb_metrics);
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            tm_bg.remove_registry_for_tenant("t1");
+            tm_bg.remove_registry_for_tenant("t2");
+            tm_bg.remove_registry_for_tenant("t3");
+        });
+
+        for _ in 0..200 {
+            let mfs = base_reg.gather();
+            if let Some(created) = mfs
+                .iter()
+                .find(|mf| mf.get_name() == "cortex_ingester_tsdb_head_series_created_total")
+            {
+                let total: f64 = created
+                    .get_metric()
+                    .iter()
+                    .map(|m| m.get_counter().get_value())
+                    .sum();
+                assert!(
+                    (total - 15.0).abs() < 1e-9,
+                    "expected exact 15.0 total without double-count or drop, got {total}"
+                );
+            }
+        }
+        remover.join().unwrap();
+
+        let mfs = base_reg.gather();
+        let fsync = mfs
+            .iter()
+            .find(|mf| mf.get_name() == "cortex_ingester_tsdb_wal_fsync_duration_seconds")
+            .expect("wal fsync summary metric present");
+        let summary = fsync.get_metric()[0].get_summary();
+        assert_eq!(summary.get_sample_count(), 3);
+        assert!((summary.get_sample_sum() - 1.25).abs() < 1e-9);
+        for q in summary.get_quantile() {
+            assert!(
+                (q.get_value() - 0.60).abs() < 1e-9,
+                "archived summary quantile {} must take max (0.60), not sum; got {}",
+                q.get_quantile(),
+                q.get_value()
+            );
+        }
+    }
 }

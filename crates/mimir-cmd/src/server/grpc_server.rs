@@ -673,17 +673,37 @@ impl RpcGuard {
         if self.span_ctx.is_sampled() {
             if let Some(rt) = global_tracing() {
                 if rt.exporter.is_some() {
+                    let trimmed = self.method.trim_start_matches('/');
+                    let (rpc_service, rpc_method) = trimmed
+                        .split_once('/')
+                        .unwrap_or(("", trimmed));
                     let mut attributes = vec![SpanAttribute {
                         key: "rpc.system".to_string(),
                         value: SpanAttrValue::String("grpc".to_string()),
                     }];
+                    if !rpc_service.is_empty() {
+                        attributes.push(SpanAttribute {
+                            key: "rpc.service".to_string(),
+                            value: SpanAttrValue::String(rpc_service.to_string()),
+                        });
+                    }
+                    if !rpc_method.is_empty() {
+                        attributes.push(SpanAttribute {
+                            key: "rpc.method".to_string(),
+                            value: SpanAttrValue::String(rpc_method.to_string()),
+                        });
+                    }
+                    attributes.push(SpanAttribute {
+                        key: "rpc.grpc.status_code".to_string(),
+                        value: SpanAttrValue::Int(i64::from(code)),
+                    });
                     attributes.extend(self.span_attributes.0.lock().iter().cloned());
                     export_span(ExportedSpan {
                         service_name: rt.service_name.clone(),
                         trace_id: self.span_ctx.trace_id,
                         span_id: self.span_ctx.span_id,
                         parent_span_id: self.parent_span_id,
-                        name: self.method.trim_start_matches('/').to_string(),
+                        name: trimmed.to_string(),
                         kind: 2,
                         start_time_unix_nano: self.span_start_unix_nano,
                         end_time_unix_nano: now_unix_nanos(),

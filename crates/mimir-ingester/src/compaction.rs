@@ -23,7 +23,7 @@ use crate::owned_series::{
     DEFAULT_OWNED_SERIES_INITIAL_RETRY_INTERVAL, RECOMPUTE_OWNED_SERIES_REASON_COMPACTION,
     RECOMPUTE_OWNED_SERIES_REASON_EARLY_COMPACTION,
 };
-use crate::user_tsdb::{TsdbCloseCheckResult, TsdbState};
+use crate::user_tsdb::{TsdbCloseCheckResult, TsdbState, TsdbStateGuard};
 
 impl Ingester {
     /// Flushes all head blocks to disk, syncs offset catalogues, and ships blocks to bucket storage.
@@ -160,9 +160,13 @@ impl Ingester {
             info!(user = %user_id, state = st.as_str(), "shipper skipped because TSDB is not active");
             return;
         }
+        // Hold ActiveShipping across both shipper.sync() AND update_cached_shipped_blocks()
+        // (matching Go `defer userDB.changeState(activeShipping, active)`) so concurrent
+        // close_and_delete_user_tsdb_if_idle or compact_head cannot observe stale shipped blocks
+        // or strand the TSDB in ActiveShipping if cancelled.
+        let _state_guard = TsdbStateGuard::new(&user_db, TsdbState::ActiveShipping);
 
         let sync_res = shipper.sync().await;
-        let _ = user_db.change_state(TsdbState::ActiveShipping, TsdbState::Active);
 
         let uploaded = match sync_res {
             Ok(uploaded) => {
@@ -670,12 +674,12 @@ impl Ingester {
         if !ok {
             return TsdbCloseCheckResult::NotActive;
         }
+        let mut state_guard = TsdbStateGuard::new(&user_db, TsdbState::Closing);
 
         user_db.wait_in_flight_appends().await;
 
         let recheck = user_db.should_close_tsdb(idle_timeout);
         if !recheck.should_close() {
-            let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
             return recheck;
         }
         let tenant_deleted = recheck == TsdbCloseCheckResult::TenantMarkedForDeletion;
@@ -698,12 +702,10 @@ impl Ingester {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 warn!(user = %user_id, err = %e, "failed to close idle TSDB");
-                let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
                 return TsdbCloseCheckResult::CloseFailed;
             }
             Err(e) => {
                 warn!(user = %user_id, err = %e, "idle TSDB close join error");
-                let _ = user_db.change_state(TsdbState::Closing, TsdbState::Active);
                 return TsdbCloseCheckResult::CloseFailed;
             }
         }
@@ -711,7 +713,7 @@ impl Ingester {
         struct RemoveTsdbGuard<'a> {
             ingester: &'a Ingester,
             user_id: &'a str,
-            user_db: &'a Arc<crate::user_tsdb::UserTsdb>,
+            user_db: Arc<crate::user_tsdb::UserTsdb>,
         }
         impl Drop for RemoveTsdbGuard<'_> {
             fn drop(&mut self) {
@@ -719,7 +721,7 @@ impl Ingester {
                 if self
                     .ingester
                     .tsdbs
-                    .remove_if(self.user_id, |_, v| Arc::ptr_eq(v, self.user_db))
+                    .remove_if(self.user_id, |_, v| Arc::ptr_eq(v, &self.user_db))
                     .is_some()
                 {
                     self.ingester.metrics.mem_users.dec();
@@ -727,14 +729,17 @@ impl Ingester {
             }
         }
 
-        let _ = user_db.change_state(TsdbState::Closing, TsdbState::Closed);
+        if user_db.change_state(TsdbState::Closing, TsdbState::Closed).0 {
+            state_guard.disarm();
+        }
+        drop(state_guard);
         // Keep user_id (in Closed state) in self.tsdbs until metric cleanup and
         // remove_dir_all finish so concurrent Push/get_or_create_tsdb cannot reopen
         // a fresh TSDB in the directory while it is being deleted (Go defer parity).
         let _remove_guard = RemoveTsdbGuard {
             ingester: self,
             user_id,
-            user_db: &user_db,
+            user_db,
         };
         self.tsdb_metrics.remove_registry_for_tenant(user_id);
         self.delete_user_metadata(user_id);
@@ -760,7 +765,6 @@ impl Ingester {
         }
 
         drop(_remove_guard);
-        drop(user_db);
 
         if tenant_deleted {
             info!(user = %user_id, "deleted local TSDB, user marked for deletion");
@@ -1015,8 +1019,10 @@ pub fn spawn_compaction_loop(
         }
     };
 
+    // Mark Running synchronously before spawning so /ingester/flush cannot observe a stale
+    // pre-Running state while the task waits for its first poll (Go `StartAndAwaitHealthy`).
+    ingester.set_compaction_service_state(State::Running);
     tokio::spawn(async move {
-        ingester.set_compaction_service_state(State::Running);
         let first = first_interval.max(Duration::from_millis(10));
         let std_period = standard_interval.max(Duration::from_millis(10));
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + first, std_period);
@@ -1808,5 +1814,263 @@ mod tests {
             1.0,
             "!= series_before check must trigger even when concurrent pushes raise num_series above series_before"
         );
+    }
+
+    #[tokio::test]
+    async fn ship_user_blocks_and_idle_close_guards_hold_and_restore_state() {
+        use crate::ingester::Ingester;
+        use crate::user_tsdb::TsdbState;
+        use mimir_storage::bucket::BucketClient;
+        use object_store::path::Path as ObjPath;
+        use object_store::{
+            GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+            PutMultipartOpts, PutOptions, PutPayload, PutResult,
+        };
+        use std::fmt;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ing_cfg = mimir_config::IngesterConfig::default();
+        ing_cfg.ring.instance_id = "inst-guard".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().to_string();
+        blocks_cfg.tsdb.close_idle_tsdb_when_shipping_disabled = true;
+        blocks_cfg.tsdb.ship_interval = mimir_config::GoDuration::from_secs(60);
+
+        #[derive(Debug)]
+        struct PausingStore {
+            inner: object_store::memory::InMemory,
+            pause_on_put: AtomicBool,
+            put_started: tokio::sync::Notify,
+        }
+        impl fmt::Display for PausingStore {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "PausingStore")
+            }
+        }
+        impl ObjectStore for PausingStore {
+            fn put<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+                payload: PutPayload,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<PutResult>> + Send + 'async_trait>,
+            >
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                let location = location.clone();
+                Box::pin(async move {
+                    if self.pause_on_put.load(std::sync::atomic::Ordering::Acquire) {
+                        self.put_started.notify_waiters();
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    self.inner.put(&location, payload).await
+                })
+            }
+            fn put_opts<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<PutResult>> + Send + 'async_trait>,
+            >
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                let location = location.clone();
+                Box::pin(async move { self.inner.put_opts(&location, payload, opts).await })
+            }
+            fn put_multipart_opts<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+                opts: PutMultipartOpts,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = object_store::Result<Box<dyn MultipartUpload>>,
+                        > + Send
+                        + 'async_trait,
+                >,
+            >
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                let location = location.clone();
+                Box::pin(async move { self.inner.put_multipart_opts(&location, opts).await })
+            }
+            fn get_opts<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+                options: GetOptions,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<GetResult>> + Send + 'async_trait>,
+            >
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                let location = location.clone();
+                Box::pin(async move { self.inner.get_opts(&location, options).await })
+            }
+            fn delete<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                location: &'life1 ObjPath,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<()>> + Send + 'async_trait>,
+            >
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                let location = location.clone();
+                Box::pin(async move { self.inner.delete(&location).await })
+            }
+            fn list(
+                &self,
+                prefix: Option<&ObjPath>,
+            ) -> futures::stream::BoxStream<'_, object_store::Result<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+            fn list_with_delimiter<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                prefix: Option<&'life1 ObjPath>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<ListResult>> + Send + 'async_trait>,
+            >
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                let prefix = prefix.cloned();
+                Box::pin(async move { self.inner.list_with_delimiter(prefix.as_ref()).await })
+            }
+            fn copy<'life0, 'life1, 'life2, 'async_trait>(
+                &'life0 self,
+                from: &'life1 ObjPath,
+                to: &'life2 ObjPath,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<()>> + Send + 'async_trait>,
+            >
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                'life2: 'async_trait,
+                Self: 'async_trait,
+            {
+                let from = from.clone();
+                let to = to.clone();
+                Box::pin(async move { self.inner.copy(&from, &to).await })
+            }
+            fn copy_if_not_exists<'life0, 'life1, 'life2, 'async_trait>(
+                &'life0 self,
+                from: &'life1 ObjPath,
+                to: &'life2 ObjPath,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<()>> + Send + 'async_trait>,
+            >
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                'life2: 'async_trait,
+                Self: 'async_trait,
+            {
+                let from = from.clone();
+                let to = to.clone();
+                Box::pin(async move { self.inner.copy_if_not_exists(&from, &to).await })
+            }
+        }
+
+        let store = Arc::new(PausingStore {
+            inner: object_store::memory::InMemory::new(),
+            pause_on_put: AtomicBool::new(true),
+            put_started: tokio::sync::Notify::new(),
+        });
+        let bkt = Arc::new(BucketClient::from_object_store(
+            store.clone(),
+            "test-bkt",
+            "TEST",
+        ));
+
+        let ing = Ingester::new(
+            ing_cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_bucket(Some(bkt));
+
+        // 1. Test idle-close TsdbStateGuard cancellation restoration.
+        let db = ing.get_or_create_tsdb("u-idle-cancel").unwrap();
+        let append_guard = db.acquire_append_lock(1_000).unwrap();
+        {
+            let close_fut =
+                ing.close_and_delete_user_tsdb_if_idle("u-idle-cancel", Duration::ZERO);
+            tokio::pin!(close_fut);
+            let timed = tokio::time::timeout(Duration::from_millis(15), &mut close_fut).await;
+            assert!(timed.is_err());
+            assert_eq!(db.state(), TsdbState::Closing);
+        }
+        drop(append_guard);
+        assert_eq!(
+            db.state(),
+            TsdbState::Active,
+            "cancelled close_and_delete_user_tsdb_if_idle must restore TsdbState::Active"
+        );
+
+        // 2. Test ship_user_blocks TsdbStateGuard holds ActiveShipping and restores Active on cancel
+        //    and after update_cached_shipped_blocks completes.
+        let ship_db = ing.get_or_create_tsdb("u-ship-guard").unwrap();
+        {
+            let mut app = ship_db.db.appender();
+            app.append_float(None, &[("__name__", "m")], 1_000, 1.0)
+                .unwrap();
+            app.commit().unwrap();
+        }
+        ship_db.compact_head(i64::MAX).await.unwrap();
+        assert!(ship_db.oldest_unshipped_block_time_ms() > 0);
+
+        {
+            let notified = store.put_started.notified();
+            let ship_fut = ing.ship_user_blocks("u-ship-guard");
+            tokio::pin!(ship_fut);
+            tokio::select! {
+                _ = &mut ship_fut => panic!("ship_fut should have paused on put"),
+                _ = notified => {}
+            }
+            assert_eq!(ship_db.state(), TsdbState::ActiveShipping);
+        }
+        assert_eq!(
+            ship_db.state(),
+            TsdbState::Active,
+            "cancelled ship_user_blocks must restore TsdbState::Active"
+        );
+
+        // Now allow put to complete and verify update_cached_shipped_blocks runs before ActiveShipping -> Active.
+        store
+            .pause_on_put
+            .store(false, std::sync::atomic::Ordering::Release);
+        ing.ship_user_blocks("u-ship-guard").await;
+        assert_eq!(ship_db.state(), TsdbState::Active);
+        assert_eq!(ship_db.oldest_unshipped_block_time_ms(), 0);
     }
 }

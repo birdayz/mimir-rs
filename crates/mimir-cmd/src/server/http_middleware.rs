@@ -31,7 +31,7 @@ use mimir_common::logging::{LogLevel, LogValue, Logger};
 use mimir_common::tracing::{
     export_span, extract_from_http_headers, global_tracing, now_unix_nanos,
     start_server_span_context, with_trace_context, ExportedSpan, SpanAttrValue, SpanAttribute,
-    TraceContext,
+    SpanEvent, SpanLink, TraceContext,
 };
 use mimir_config::GoDuration;
 use parking_lot::Mutex;
@@ -326,6 +326,22 @@ fn dump_headers(headers: &HeaderMap, exclude: &[String]) -> String {
     lines.iter().map(|l| format!("{l}; ")).collect()
 }
 
+fn standardize_http_method(raw: &str) -> (&'static str, Option<&str>) {
+    match raw.to_ascii_uppercase().as_str() {
+        "CONNECT" => ("CONNECT", (raw != "CONNECT").then_some(raw)),
+        "DELETE" => ("DELETE", (raw != "DELETE").then_some(raw)),
+        "GET" => ("GET", (raw != "GET").then_some(raw)),
+        "HEAD" => ("HEAD", (raw != "HEAD").then_some(raw)),
+        "OPTIONS" => ("OPTIONS", (raw != "OPTIONS").then_some(raw)),
+        "PATCH" => ("PATCH", (raw != "PATCH").then_some(raw)),
+        "POST" => ("POST", (raw != "POST").then_some(raw)),
+        "PUT" => ("PUT", (raw != "PUT").then_some(raw)),
+        "TRACE" => ("TRACE", (raw != "TRACE").then_some(raw)),
+        "" => ("_OTHER", None),
+        _ => ("_OTHER", Some(raw)),
+    }
+}
+
 fn build_http_span_attributes(
     req: &Request,
     route: Option<&str>,
@@ -333,8 +349,58 @@ fn build_http_span_attributes(
     remote: &str,
     trace_headers: bool,
     trace_exclude_headers: &[String],
-) -> Vec<SpanAttribute> {
+    start_unix_nano: u64,
+) -> (Vec<SpanAttribute>, Option<SpanEvent>) {
     let mut attrs = Vec::new();
+    let (std_method, orig_method) = standardize_http_method(req.method().as_str());
+    attrs.push(SpanAttribute {
+        key: "http.request.method".to_string(),
+        value: SpanAttrValue::String(std_method.to_string()),
+    });
+    if let Some(orig) = orig_method {
+        attrs.push(SpanAttribute {
+            key: "http.request.method_original".to_string(),
+            value: SpanAttrValue::String(orig.to_string()),
+        });
+    }
+    let scheme = if req.uri().scheme_str() == Some("https") {
+        "https"
+    } else {
+        "http"
+    };
+    attrs.push(SpanAttribute {
+        key: "url.scheme".to_string(),
+        value: SpanAttrValue::String(scheme.to_string()),
+    });
+    let url_path = req.uri().path();
+    if !url_path.is_empty() {
+        attrs.push(SpanAttribute {
+            key: "url.path".to_string(),
+            value: SpanAttrValue::String(url_path.to_string()),
+        });
+    }
+    if let Some(ua) = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()) {
+        if !ua.is_empty() {
+            attrs.push(SpanAttribute {
+                key: "user_agent.original".to_string(),
+                value: SpanAttrValue::String(ua.to_string()),
+            });
+        }
+    }
+    let proto_ver = match req.version() {
+        http::Version::HTTP_09 => Some("0.9"),
+        http::Version::HTTP_10 => Some("1.0"),
+        http::Version::HTTP_11 => Some("1.1"),
+        http::Version::HTTP_2 => Some("2"),
+        http::Version::HTTP_3 => Some("3"),
+        _ => None,
+    };
+    if let Some(pv) = proto_ver {
+        attrs.push(SpanAttribute {
+            key: "network.protocol.version".to_string(),
+            value: SpanAttrValue::String(pv.to_string()),
+        });
+    }
     if let Some(r) = route.filter(|r| !r.is_empty()) {
         attrs.push(SpanAttribute {
             key: "http.route".to_string(),
@@ -347,10 +413,18 @@ fn build_http_span_attributes(
             value: SpanAttrValue::String(sips.get(req.headers(), remote)),
         });
     }
+    let mut overflow_event = None;
     if trace_headers {
         const MAX_HEADERS: usize = 100;
-        for name in req.headers().keys().take(MAX_HEADERS) {
+        let mut total_headers = 0usize;
+        let mut not_added = Vec::new();
+        for name in req.headers().keys() {
+            total_headers += 1;
             let canon = crate::grpc::http_canonical_header_key(name.as_str());
+            if total_headers > MAX_HEADERS {
+                not_added.push(canon);
+                continue;
+            }
             if ALWAYS_EXCLUDED_HEADERS.contains(&canon.as_str())
                 || trace_exclude_headers.contains(&canon)
             {
@@ -371,8 +445,24 @@ fn build_http_span_attributes(
                 });
             }
         }
+        if !not_added.is_empty() {
+            overflow_event = Some(SpanEvent {
+                name: "Client sent too many headers, some of them were not included in the span attributes: ".to_string(),
+                time_unix_nano: start_unix_nano,
+                attributes: vec![
+                    SpanAttribute {
+                        key: "headers_total".to_string(),
+                        value: SpanAttrValue::Int(total_headers as i64),
+                    },
+                    SpanAttribute {
+                        key: "headers_not_added_as_span_attributes".to_string(),
+                        value: SpanAttrValue::StringArray(not_added),
+                    },
+                ],
+            });
+        }
     }
-    attrs
+    (attrs, overflow_event)
 }
 
 /// The dskit HTTP middleware chain (`Tracer` + `Log` + `Instrument` + cluster validation).
@@ -403,7 +493,7 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
     let extracted_trace = extract_from_http_headers(req.headers());
     let (span_ctx, parent_span_id) = start_server_span_context(&extracted_trace, cfg.create_new_traces);
     let should_export = span_ctx.is_sampled() && global_tracing().is_some_and(|t| t.exporter.is_some());
-    let span_attrs = if should_export {
+    let (span_attrs, span_overflow_event) = if should_export {
         build_http_span_attributes(
             &req,
             matched_route.as_deref(),
@@ -411,9 +501,10 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
             &remote,
             cfg.trace_request_headers,
             &cfg.trace_exclude_headers,
+            start_unix_nano,
         )
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     if span_ctx.is_valid() {
         req.extensions_mut().insert(span_ctx.clone());
@@ -496,7 +587,12 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
         let elapsed = begin.elapsed();
         if should_export {
             if let Some(rt) = global_tracing() {
-                export_span(ExportedSpan {
+                let mut attributes = span_attrs.clone();
+                attributes.push(SpanAttribute {
+                    key: "http.response.status_code".to_string(),
+                    value: SpanAttrValue::Int(i64::from(code)),
+                });
+                let mut exported = ExportedSpan {
                     service_name: rt.service_name.clone(),
                     trace_id: span_ctx.trace_id,
                     span_id: span_ctx.span_id,
@@ -505,9 +601,21 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
                     kind: 2,
                     start_time_unix_nano: start_unix_nano,
                     end_time_unix_nano: start_unix_nano.saturating_add(elapsed.as_nanos() as u64),
-                    attributes: span_attrs.clone(),
+                    attributes,
                     status_error: code >= 500,
-                });
+                };
+                if cfg2.create_new_traces && extracted_trace.is_valid() {
+                    exported.push_link(SpanLink {
+                        trace_id: extracted_trace.trace_id,
+                        span_id: extracted_trace.span_id,
+                        trace_state: extracted_trace.tracestate.clone(),
+                        attributes: Vec::new(),
+                    });
+                }
+                if let Some(ev) = span_overflow_event {
+                    exported.push_event(ev);
+                }
+                export_span(exported);
             }
         }
         m.received_message_size

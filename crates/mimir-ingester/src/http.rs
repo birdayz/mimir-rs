@@ -36,7 +36,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{on, post, MethodFilter};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
-use mimir_common::services::State;
+use mimir_common::services::{ServiceContext, State};
 use mimir_common::shutdownmarker;
 use mimir_common::tenant::{
     extract_org_id_bytes_from_http_headers, parse_single_tenant_id_bytes, parse_tenant_ids_bytes,
@@ -265,6 +265,18 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
             tracing::info!("flushing TSDB blocks: ingester not running, ignoring flush request");
             return;
         }
+        let ctx_opt = ing.service_context();
+        if ctx_opt.as_ref().is_some_and(ServiceContext::is_canceled) {
+            tracing::info!("flushing TSDB blocks: ingester not running, ignoring flush request");
+            return;
+        }
+
+        async fn wait_canceled(ctx: &Option<ServiceContext>) {
+            match ctx {
+                Some(c) => c.canceled().await,
+                None => std::future::pending().await,
+            }
+        }
 
         ing.num_compactions_in_progress
             .fetch_add(1, Ordering::AcqRel);
@@ -272,18 +284,28 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
 
         tracing::info!("flushing TSDB blocks: triggering compaction");
         let (cb_tx, cb_rx) = oneshot::channel();
-        if fc_tx
-            .send(TriggerRequest {
+        let sent = tokio::select! {
+            _ = wait_canceled(&ctx_opt) => {
+                tracing::warn!("failed to compact TSDB blocks, ingester not running anymore");
+                return;
+            }
+            r = fc_tx.send(TriggerRequest {
                 users: users.clone(),
                 callback: cb_tx,
-            })
-            .await
-            .is_err()
-        {
+            }) => r.is_ok(),
+        };
+        if !sent {
             tracing::warn!("failed to compact TSDB blocks, ingester not running anymore");
             return;
         }
-        if cb_rx.await.is_err() {
+        let compacted = tokio::select! {
+            _ = wait_canceled(&ctx_opt) => {
+                tracing::warn!("failed to compact TSDB blocks, ingester not running anymore");
+                return;
+            }
+            r = cb_rx => r.is_ok(),
+        };
+        if !compacted {
             tracing::warn!("failed to compact TSDB blocks, ingester not running anymore");
             return;
         }
@@ -293,18 +315,28 @@ async fn flush_handler(AxumState(st): AxumState<HttpState>, req: Request) -> Res
         if let Some(ship_tx) = ship_tx_opt {
             tracing::info!("flushing TSDB blocks: triggering shipping");
             let (scb_tx, scb_rx) = oneshot::channel();
-            if ship_tx
-                .send(TriggerRequest {
+            let ship_sent = tokio::select! {
+                _ = wait_canceled(&ctx_opt) => {
+                    tracing::warn!("failed to ship TSDB blocks, ingester not running anymore");
+                    return;
+                }
+                r = ship_tx.send(TriggerRequest {
                     users,
                     callback: scb_tx,
-                })
-                .await
-                .is_err()
-            {
+                }) => r.is_ok(),
+            };
+            if !ship_sent {
                 tracing::warn!("failed to ship TSDB blocks, ingester not running anymore");
                 return;
             }
-            if scb_rx.await.is_err() {
+            let shipped = tokio::select! {
+                _ = wait_canceled(&ctx_opt) => {
+                    tracing::warn!("failed to ship TSDB blocks, ingester not running anymore");
+                    return;
+                }
+                r = scb_rx => r.is_ok(),
+            };
+            if !shipped {
                 tracing::warn!("failed to ship TSDB blocks, ingester not running anymore");
                 return;
             }
@@ -1708,5 +1740,56 @@ mod tests {
             !ing.flush_on_shutdown.load(Ordering::Acquire),
             "flush_on_shutdown must be restored even after HTTP client disconnect"
         );
+    }
+
+    #[tokio::test]
+    async fn flush_handler_wait_returns_204_immediately_on_service_context_cancel() {
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ing = test_ingester(&tmp);
+        ing.start().await.unwrap();
+        let ctx = ing.service_context().expect("service_ctx set");
+        ing.set_compaction_service_state(State::Running);
+
+        // Hold a compaction receiver that never replies on cb_rx, simulating an in-progress tick.
+        let (fc_tx, mut fc_rx) = tokio::sync::mpsc::channel::<crate::ingester::TriggerRequest>(4);
+        let _old_fc = ing.force_compact_tx.write().replace(fc_tx);
+        let _keep_req = tokio::spawn(async move {
+            let _req = fc_rx.recv().await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let app = ingester_router(Arc::clone(&ing));
+        let resp_fut = tokio::spawn(async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/ingester/flush?wait=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        // Wait until flush_handler increments num_compactions_in_progress, then cancel service ctx.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ing.num_compactions_in_progress.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        ctx.cancel();
+        let resp = tokio::time::timeout(Duration::from_secs(1), resp_fut)
+            .await
+            .expect("flush_handler must unblock immediately when service_ctx is canceled")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(ing.num_compactions_in_progress.load(Ordering::Acquire), 0);
+
+        ing.stop().await.unwrap();
     }
 }

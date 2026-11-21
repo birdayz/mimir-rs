@@ -398,4 +398,29 @@ mod tests {
         assert_eq!(data.data[&id.to_string()][&0], OffsetWatermark { partition: 1, offset: 100 });
         assert_eq!(data.data[&id.to_string()][&1], OffsetWatermark { partition: 1, offset: 250 });
     }
+
+    #[test]
+    fn test_offset_catalogue_sync_fails_without_recreating_removed_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let tenant_dir = root.path().join("tenant-a");
+        fs::create_dir_all(&tenant_dir).unwrap();
+        let id = Ulid::from_parts(1000, 1);
+        create_dummy_block_dir(&tenant_dir, id);
+
+        let cat = OffsetCatalogue::new(&tenant_dir, "tenant-a", 1, OffsetCatalogueMetrics::new(None));
+        // Simulate concurrent close_and_delete_user_tsdb_if_idle removing the tenant dir.
+        fs::remove_dir_all(&tenant_dir).unwrap();
+
+        let err = cat
+            .sync(&PartitionOffsets::new_single_cluster(42))
+            .unwrap_err();
+        assert!(
+            matches!(err, OffsetCatalogueError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound),
+            "expected NotFound IO error, got {err:?}"
+        );
+        assert!(
+            !tenant_dir.exists(),
+            "OffsetCatalogue::sync must not resurrect a removed tenant directory"
+        );
+    }
 }

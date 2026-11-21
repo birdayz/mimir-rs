@@ -129,6 +129,36 @@ impl TsdbState {
     }
 }
 
+/// RAII guard restoring `TsdbState::Active` from `from` on drop unless disarmed
+/// (e.g. after `Closing -> Closed` succeeds).
+pub struct TsdbStateGuard<'a> {
+    user_db: &'a UserTsdb,
+    from: TsdbState,
+    armed: bool,
+}
+
+impl<'a> TsdbStateGuard<'a> {
+    pub fn new(user_db: &'a UserTsdb, from: TsdbState) -> Self {
+        Self {
+            user_db,
+            from,
+            armed: true,
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TsdbStateGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.user_db.change_state(self.from, TsdbState::Active);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TsdbCloseCheckResult {
     Idle,
@@ -1039,6 +1069,7 @@ impl UserTsdb {
                 s.as_str()
             ));
         }
+        let _state_guard = TsdbStateGuard::new(self, TsdbState::ForceCompacting);
 
         self.wait_in_flight_before_forced_compaction().await;
 
@@ -1079,7 +1110,7 @@ impl UserTsdb {
             ))))
         });
 
-        let _ = self.change_state(TsdbState::ForceCompacting, TsdbState::Active);
+        drop(_state_guard);
         self.refresh_oldest_unshipped_block_time_ms();
         res.map_err(|e| e.to_string())
     }
@@ -2289,5 +2320,75 @@ mod tests {
         assert!(!std::ptr::eq(ba.postings_cache(), db_a.db.head().postings_cache()));
         assert_eq!(ba.postings_for_matchers(&m_up).unwrap().len(), 1);
         assert_eq!(bb.postings_for_matchers(&m_up).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tsdb_state_guard_restores_active_on_drop_and_compact_head_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk_db = |uid: &str| {
+            let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+            blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+            blocks_cfg.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+            let main_reg = Registry::new();
+            let shared = SharedTsdbMetrics::new(Some(&main_reg));
+            let shipper = ShipperMetrics::new(Some(&main_reg));
+            let overrides = Overrides::new(mimir_config::LimitsConfig::default());
+            let limiter = Arc::new(Limiter::new(overrides.clone(), Arc::new(OneInstanceStrategy)));
+            let rejected = CounterVec::new(prometheus::Opts::new("t_rej_guard", "h"), &["reason"]).unwrap();
+            UserTsdb::open(
+                uid.to_string(),
+                &mimir_config::IngesterConfig::default(),
+                &blocks_cfg,
+                overrides,
+                limiter,
+                None,
+                shipper,
+                &shared,
+                None,
+                1,
+                Arc::new(AtomicI64::new(0)),
+                Arc::new(|| 0),
+                rejected,
+                HashSet::new(),
+                0,
+                0,
+                None,
+            )
+            .unwrap()
+        };
+        let db = mk_db("guard-u");
+
+        assert!(db.change_state(TsdbState::Active, TsdbState::ActiveShipping).0);
+        {
+            let _g = TsdbStateGuard::new(&db, TsdbState::ActiveShipping);
+            assert_eq!(db.state(), TsdbState::ActiveShipping);
+        }
+        assert_eq!(db.state(), TsdbState::Active);
+
+        // Disarm keeps target state (used on Closing -> Closed).
+        assert!(db.change_state(TsdbState::Active, TsdbState::Closing).0);
+        {
+            let mut g = TsdbStateGuard::new(&db, TsdbState::Closing);
+            assert!(db.change_state(TsdbState::Closing, TsdbState::Closed).0);
+            g.disarm();
+        }
+        assert_eq!(db.state(), TsdbState::Closed);
+
+        // Dropping compact_head future mid-await (while an append lock is held) restores Active.
+        let db2 = mk_db("guard-u2");
+        let append_guard = db2.acquire_append_lock(1_000).unwrap();
+        {
+            let fut = db2.compact_head(i64::MAX);
+            tokio::pin!(fut);
+            let timed = tokio::time::timeout(std::time::Duration::from_millis(15), &mut fut).await;
+            assert!(timed.is_err());
+            assert_eq!(db2.state(), TsdbState::ForceCompacting);
+        }
+        drop(append_guard);
+        assert_eq!(
+            db2.state(),
+            TsdbState::Active,
+            "dropped compact_head future must restore TsdbState::Active via TsdbStateGuard"
+        );
     }
 }
