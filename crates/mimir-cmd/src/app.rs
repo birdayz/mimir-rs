@@ -37,7 +37,7 @@ use mimir_ingester::grpc::SnappyDecompressService;
 use mimir_ingester::{Ingester, IngesterLifecycler, IngesterService, TokenlessLifecycler};
 use mimir_proto::httpgrpcpb::http_server::HttpServer;
 use mimir_ring::kv::ha_replica::replica_desc_codec;
-use mimir_ring::kv::memberlist::{KvOptions, MemberlistKv};
+use mimir_ring::kv::memberlist::{propagation_delay_tracker_codec, KvOptions, MemberlistKv};
 use mimir_ring::kv::multi::runtime_config_provider;
 use mimir_ring::kv::{
     build_kv_client_with_multi_config_provider, registerer_with_kv_name, Codec, Registerer,
@@ -470,6 +470,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             ring_desc_codec(),
             partition_ring_desc_codec(),
             replica_desc_codec(),
+            propagation_delay_tracker_codec(),
         ];
         let ml = MemberlistKv::new(
             cfg.memberlist.clone(),
@@ -530,8 +531,10 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             multi_cfg_provider.clone(),
         )
         .context("creating ingester ring")?;
+        let ring_settings =
+            RingSettings::try_from_config(&cfg.ingester.ring).context("creating ingester ring")?;
         let instance_ring = Ring::with_store_and_strategy(
-            RingSettings::from(&cfg.ingester.ring),
+            ring_settings,
             INGEST_RING_NAME,
             INGEST_RING_KEY,
             instance_ring_kv,
@@ -902,9 +905,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         }
     }
 
-    let mut startup_err: Option<(String, anyhow::Error)> = None;
-    let mut signaled = false;
-    {
+    let (signaled, startup_err) = {
         let startup_fut = async {
             // memberlist-kv: mirrors Go KVInitService — transitions to Running immediately while
             // inner MemberlistKv starts (transport + fast-join) in the background, failing only if
@@ -954,29 +955,14 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             }
             Ok::<(), (String, anyhow::Error)>(())
         };
-        tokio::pin!(startup_fut);
-
-        tokio::select! {
-            res = &mut startup_fut => {
-                if let Err(err) = res {
-                    startup_err = Some(err);
-                }
-            }
-            _ = &mut shutdown_sig => {
-                signaled = true;
-                // Go keeps starting modules during -shutdown-delay, then stops the manager.
-                shutdown_requested.store(true, Ordering::Release);
-                tokio::select! {
-                    _ = tokio::time::sleep(shutdown_delay) => {}
-                    res = &mut startup_fut => {
-                        if res.is_ok() {
-                            tokio::time::sleep(shutdown_delay).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
+        await_startup_with_shutdown(
+            startup_fut,
+            &mut shutdown_sig,
+            &shutdown_requested,
+            shutdown_delay,
+        )
+        .await
+    };
 
     let mut runtime_failure: Option<(String, String)> = None;
     if !signaled && startup_err.is_none() {
@@ -1529,6 +1515,36 @@ pub fn try_build_span_exporter() -> Result<Option<SpanExporterFn>, String> {
     })))
 }
 
+async fn await_startup_with_shutdown<F, S>(
+    startup_fut: F,
+    shutdown_sig: &mut S,
+    shutdown_requested: &AtomicBool,
+    shutdown_delay: Duration,
+) -> (bool, Option<(String, anyhow::Error)>)
+where
+    F: std::future::Future<Output = std::result::Result<(), (String, anyhow::Error)>>,
+    S: std::future::Future<Output = ()> + Unpin,
+{
+    tokio::pin!(startup_fut);
+    tokio::select! {
+        res = &mut startup_fut => (false, res.err()),
+        _ = shutdown_sig => {
+            // Go keeps starting modules during -shutdown-delay, then stops the manager.
+            shutdown_requested.store(true, Ordering::Release);
+            let delay_deadline = tokio::time::Instant::now() + shutdown_delay;
+            tokio::select! {
+                _ = tokio::time::sleep_until(delay_deadline) => {}
+                res = &mut startup_fut => {
+                    if res.is_ok() {
+                        tokio::time::sleep_until(delay_deadline).await;
+                    }
+                }
+            }
+            (true, None)
+        }
+    }
+}
+
 pub fn build_span_exporter() -> Option<SpanExporterFn> {
     match try_build_span_exporter() {
         Ok(exp) => exp,
@@ -1562,5 +1578,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.starts_with("target module \"distributor\" is not yet implemented"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn c04_run_mimir_rejects_non_positive_replication_factor() {
+        for rf in [0, -1] {
+            let dir = tempfile::tempdir().unwrap();
+            let args = vec![
+                "-target=ingester".to_string(),
+                "-server.http-listen-address=127.0.0.1".to_string(),
+                "-server.http-listen-port=0".to_string(),
+                "-server.grpc-listen-address=127.0.0.1".to_string(),
+                "-server.grpc-listen-port=0".to_string(),
+                "-ingester.ring.store=inmemory".to_string(),
+                "-ingester.ring.instance-id=c04-test".to_string(),
+                "-ingester.ring.instance-addr=127.0.0.1".to_string(),
+                "-activity-tracker.filepath=".to_string(),
+                format!("-ingester.ring.replication-factor={rf}"),
+                format!("-blocks-storage.tsdb.dir={}", dir.path().display()),
+            ];
+            let outcome = crate::cli::parse_cli_for_run("mimir", &args);
+            assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+            let err = run_mimir(outcome).await.unwrap_err();
+            let chain = format!("{err:#}");
+            assert!(
+                chain.contains(&format!("ReplicationFactor must be greater than zero: {rf}")),
+                "expected replication factor error for {rf}, got: {chain}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn d2_06_shutdown_during_startup_sleeps_only_remaining_shutdown_delay() {
+        let shutdown_requested = AtomicBool::new(false);
+        let shutdown_delay = Duration::from_millis(120);
+
+        let startup_fut = async {
+            // Finishes after 80ms (> 0 and < shutdown_delay=120ms) with Ok(()).
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok::<(), (String, anyhow::Error)>(())
+        };
+        let mut sig = Box::pin(async {
+            // Fires 10ms after startup begins.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+
+        let start = tokio::time::Instant::now();
+        let (signaled, err) =
+            await_startup_with_shutdown(startup_fut, &mut sig, &shutdown_requested, shutdown_delay)
+                .await;
+        let elapsed = start.elapsed();
+
+        assert!(signaled);
+        assert!(err.is_none());
+        assert!(shutdown_requested.load(Ordering::Acquire));
+        // Signal fired at ~10ms, delay_deadline is ~130ms. Startup finished at ~80ms, so we must
+        // sleep only the remaining ~50ms — total ~130ms, well below 2*shutdown_delay (240ms)!
+        assert!(
+            elapsed >= Duration::from_millis(115),
+            "must wait full shutdown_delay from signal ({elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(190),
+            "must NOT sleep 2 * shutdown_delay ({elapsed:?})"
+        );
     }
 }

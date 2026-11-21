@@ -21,6 +21,8 @@ use prometheus::proto::{
 
 const SUMMARY_MAX_AGE: Duration = Duration::from_secs(10);
 const QUANTILES: [f64; 3] = [0.5, 0.9, 0.99];
+const OBSERVE_PRUNE_THRESHOLD: usize = 256;
+const OBSERVE_MAX_SAMPLES: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -106,6 +108,18 @@ impl GoMetrics {
     fn observe(&self, name: String, v: f64, labels: &[(&str, &str)]) {
         let now = Instant::now();
         self.with_series(name, Kind::Summary, labels, |s| {
+            if s.samples.len() >= OBSERVE_PRUNE_THRESHOLD {
+                while s
+                    .samples
+                    .front()
+                    .is_some_and(|(t, _)| now.duration_since(*t) > SUMMARY_MAX_AGE)
+                {
+                    s.samples.pop_front();
+                }
+                while s.samples.len() >= OBSERVE_MAX_SAMPLES {
+                    s.samples.pop_front();
+                }
+            }
             s.samples.push_back((now, v));
             s.sum += v;
             s.count += 1;
@@ -246,5 +260,49 @@ mod tests {
         assert!(text.contains("# HELP counter_memberlist_msg_alive counter_memberlist_msg_alive"));
         assert!(text.contains("timer_memberlist_probeNode{quantile=\"0.99\"}"));
         assert!(text.contains("timer_memberlist_probeNode_count 1"));
+    }
+
+    #[test]
+    fn c10_observe_prunes_expired_and_bounds_unscraped_samples() {
+        let gm = GoMetrics::new();
+        // Seed expired samples directly, then observe OBSERVE_PRUNE_THRESHOLD times without scraping.
+        let expired_ts = Instant::now() - SUMMARY_MAX_AGE - Duration::from_secs(5);
+        gm.with_series(
+            "timer_memberlist_gossip".to_string(),
+            Kind::Summary,
+            &[],
+            |s| {
+                for _ in 0..OBSERVE_PRUNE_THRESHOLD {
+                    s.samples.push_back((expired_ts, 0.01));
+                    s.sum += 0.01;
+                    s.count += 1;
+                }
+            },
+        );
+        gm.observe("timer_memberlist_gossip".to_string(), 0.02, &[]);
+
+        {
+            let fams = gm.families.lock();
+            let s = fams["timer_memberlist_gossip"]
+                .series
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(s.samples.len(), 1, "expired samples must be pruned on observe");
+            assert_eq!(s.count, (OBSERVE_PRUNE_THRESHOLD + 1) as u64);
+        }
+
+        // Also verify safety cap under heavy burst without scraping.
+        for i in 0..(OBSERVE_MAX_SAMPLES + 500) {
+            gm.observe("timer_memberlist_burst".to_string(), i as f64, &[]);
+        }
+        let fams = gm.families.lock();
+        let s = fams["timer_memberlist_burst"]
+            .series
+            .values()
+            .next()
+            .unwrap();
+        assert!(s.samples.len() <= OBSERVE_MAX_SAMPLES);
+        assert_eq!(s.count, (OBSERVE_MAX_SAMPLES + 500) as u64);
     }
 }

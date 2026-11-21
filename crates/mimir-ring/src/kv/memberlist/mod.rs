@@ -12,6 +12,7 @@ pub mod lzw;
 pub mod mergeable;
 mod metrics;
 pub mod node_meta;
+pub mod propagation_tracker;
 pub mod queue;
 mod stream;
 pub mod suspicion;
@@ -22,4 +23,8 @@ mod zone_aware;
 pub use client::{KvOptions, MemberlistKv, MemberlistKvClient, NodeState, ValueDesc};
 pub use mergeable::Mergeable;
 pub use node_meta::{encode_node_metadata, EncodedNodeMetadata, NodeRole};
+pub use propagation_tracker::{
+    propagation_delay_tracker_codec, PROPAGATION_DELAY_TRACKER_CODEC_ID,
+    PROPAGATION_DELAY_TRACKER_KEY,
+};
 pub use tcp_transport::TcpTransport;

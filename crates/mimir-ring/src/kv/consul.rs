@@ -446,7 +446,7 @@ struct SimpleRateLimiter {
 
 impl SimpleRateLimiter {
     fn new(rate_per_sec: f64, burst: i64) -> Option<Self> {
-        if rate_per_sec <= 0.0 {
+        if !rate_per_sec.is_finite() || rate_per_sec <= 0.0 {
             return None;
         }
         let b = (burst.max(1)) as f64;
@@ -473,7 +473,7 @@ impl SimpleRateLimiter {
                     None
                 } else {
                     let needed = (1.0 - st.0) / self.rate_per_sec;
-                    Some(Duration::from_secs_f64(needed))
+                    Some(Duration::try_from_secs_f64(needed).unwrap_or(Duration::from_secs(3600)))
                 }
             };
             match sleep_dur {
@@ -513,7 +513,6 @@ pub struct ConsulKv {
     partition: String,
     cfg: ConsulConfig,
     codec: Arc<dyn Codec>,
-    limiter: Option<SimpleRateLimiter>,
     request_duration: HistogramVec,
     long_poll_duration: Duration,
 }
@@ -734,7 +733,6 @@ impl ConsulKv {
             let _ = r.register(Box::new(request_duration.clone()));
         }
 
-        let limiter = SimpleRateLimiter::new(cfg.watch_rate_limit, cfg.watch_burst_size);
         Ok(Self {
             http,
             scheme,
@@ -744,10 +742,13 @@ impl ConsulKv {
             partition: env.partition.clone(),
             cfg,
             codec,
-            limiter,
             request_duration,
             long_poll_duration: LONG_POLL_DURATION,
         })
+    }
+
+    fn create_rate_limiter(&self) -> Option<SimpleRateLimiter> {
+        SimpleRateLimiter::new(self.cfg.watch_rate_limit, self.cfg.watch_burst_size)
     }
 
     /// Put a key directly (Go `consul.Client.Put`, used primarily by tests).
@@ -1207,10 +1208,11 @@ impl KvClient for ConsulKv {
                 max_backoff: Duration::from_secs(60),
                 max_retries: 0,
             });
+            let limiter = self.create_rate_limiter();
             let mut index = 0u64;
 
             while backoff.ongoing() && !cancel.is_canceled() {
-                if let Some(lim) = &self.limiter {
+                if let Some(lim) = &limiter {
                     if !lim.wait(&cancel).await {
                         return;
                     }
@@ -1271,10 +1273,11 @@ impl KvClient for ConsulKv {
                 max_backoff: Duration::from_secs(60),
                 max_retries: 0,
             });
+            let limiter = self.create_rate_limiter();
             let mut index = 0u64;
 
             while backoff.ongoing() && !cancel.is_canceled() {
-                if let Some(lim) = &self.limiter {
+                if let Some(lim) = &limiter {
                     if !lim.wait(&cancel).await {
                         return;
                     }
@@ -2398,5 +2401,95 @@ mod tests {
             }
         }
         assert!(saw_get_500, "canceled watch must record operation=Get, status_code=500");
+    }
+
+    #[tokio::test]
+    async fn c06_rate_limiter_per_watcher_and_nan_safe() {
+        assert!(SimpleRateLimiter::new(f64::NAN, 1).is_none());
+        assert!(SimpleRateLimiter::new(f64::INFINITY, 1).is_none());
+        assert!(SimpleRateLimiter::new(f64::NEG_INFINITY, 1).is_none());
+        assert!(SimpleRateLimiter::new(0.0, 1).is_none());
+        assert!(SimpleRateLimiter::new(-1.0, 1).is_none());
+
+        // Verify ConsulKv::new with NaN watch_rate_limit does not panic and disables limiting.
+        let st = MockConsulState::new();
+        let (addr, srv) = spawn_http_mock(st).await;
+
+        let consul_nan = ConsulKv::new(
+            ConsulConfig {
+                host: addr.to_string(),
+                watch_rate_limit: f64::NAN,
+                watch_burst_size: 1,
+                ..Default::default()
+            },
+            Arc::new(StringCodec),
+            None,
+        )
+        .unwrap();
+        assert!(consul_nan.create_rate_limiter().is_none());
+
+        let consul = Arc::new(
+            ConsulKv::new(
+                ConsulConfig {
+                    host: addr.to_string(),
+                    watch_rate_limit: 1.0,
+                    watch_burst_size: 1,
+                    ..Default::default()
+                },
+                Arc::new(StringCodec),
+                None,
+            )
+            .unwrap(),
+        );
+        consul.put("a", &"va".to_string()).await.unwrap();
+        consul.put("b", &"vb".to_string()).await.unwrap();
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let tx1 = Arc::new(std::sync::Mutex::new(Some(tx1)));
+        let tx2 = Arc::new(std::sync::Mutex::new(Some(tx2)));
+        let ctx = ServiceContext::background();
+        let c1 = Arc::clone(&consul);
+        let c2 = Arc::clone(&consul);
+        let ctx1 = ctx.clone();
+        let ctx2 = ctx.clone();
+
+        let t1 = tokio::spawn(async move {
+            c1.watch_key(
+                "a",
+                ctx1,
+                Box::new(move |_| {
+                    if let Some(tx) = tx1.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    false
+                }),
+            )
+            .await;
+        });
+        let t2 = tokio::spawn(async move {
+            c2.watch_key(
+                "b",
+                ctx2,
+                Box::new(move |_| {
+                    if let Some(tx) = tx2.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    false
+                }),
+            )
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            rx1.await.unwrap();
+            rx2.await.unwrap();
+        })
+        .await
+        .expect("two independent watchers must each get their burst=1 token without waiting 1s");
+
+        ctx.cancel();
+        let _ = tokio::join!(t1, t2);
+        srv.abort();
     }
 }

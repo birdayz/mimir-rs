@@ -34,11 +34,27 @@ impl Operation {
 
     #[inline]
     pub fn is_instance_in_state_healthy(self, s: InstanceState) -> bool {
+        self.is_raw_state_healthy(s as i32)
+    }
+
+    #[inline]
+    pub fn is_raw_state_healthy(self, s: i32) -> bool {
+        if !(0..16).contains(&s) {
+            return false;
+        }
         (self.0 & (1u32 << (s as u32))) != 0
     }
 
     #[inline]
     pub fn should_extend_replica_set_on_state(self, s: InstanceState) -> bool {
+        self.should_extend_raw_state(s as i32)
+    }
+
+    #[inline]
+    pub fn should_extend_raw_state(self, s: i32) -> bool {
+        if !(0..16).contains(&s) {
+            return false;
+        }
         (self.0 & (0x10000u32 << (s as u32))) != 0
     }
 }

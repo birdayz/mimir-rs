@@ -130,7 +130,7 @@ pub async fn handle_ring_get(
     let mut shards = Vec::with_capacity(ids.len());
     for id in &ids {
         let ing = &desc.ingesters[id];
-        let mut st_str = ing.instance_state().as_str_name().to_string();
+        let mut st_str = ing.state_display().into_owned();
         if !ing.is_healthy(REPORTING, hb_timeout, now) {
             st_str = "UNHEALTHY".to_string();
         }
@@ -304,7 +304,17 @@ pub(crate) fn go_format_g3(f: f64) -> String {
 fn go_duration_since(now: SystemTime, t: DateTime<FixedOffset>) -> String {
     let now_dt = DateTime::<Utc>::from(now);
     let diff = now_dt.signed_duration_since(t.with_timezone(&Utc));
-    let total_secs = diff.num_seconds();
+    let ns = match diff.num_nanoseconds() {
+        Some(ns) => ns,
+        None => {
+            if diff < chrono::TimeDelta::zero() {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        }
+    };
+    let total_secs = ns / 1_000_000_000;
     if total_secs == 0 {
         return "0s".to_string();
     }
@@ -343,13 +353,17 @@ fn time_or_empty_string_unix(secs: i64) -> String {
     )
 }
 
+fn utc_from_unix(secs: i64) -> DateTime<FixedOffset> {
+    DateTime::<Utc>::from_timestamp(secs, 0)
+        .map(|d| d.fixed_offset())
+        .unwrap_or_else(go_zero_time)
+}
+
 fn utc_from_unix_or_zero(secs: i64) -> DateTime<FixedOffset> {
     if secs == 0 {
         return go_zero_time();
     }
-    DateTime::<Utc>::from_timestamp(secs, 0)
-        .map(|d| d.fixed_offset())
-        .unwrap_or_else(go_zero_time)
+    utc_from_unix(secs)
 }
 
 fn render_ring_html(
@@ -420,7 +434,7 @@ fn render_ring_html(
             let empty_or_ts = if ro_ts > 0 { time_or_empty_string_unix(ro_ts) } else { String::new() };
             out.push_str(&format!("            <td>{}</td>\n", html_escape(&empty_or_ts)));
         }
-        let hb_dt = utc_from_unix_or_zero(hb_ts);
+        let hb_dt = utc_from_unix(hb_ts);
         out.push_str(&format!(
             "            <td>{} ago ({})</td>\n",
             go_duration_since(now, hb_dt),
@@ -1099,5 +1113,120 @@ mod tests {
             "error forgetting instance 'ing-0': found empty ring when trying to unregister\n"
         );
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn c07_and_c12_ring_http_unknown_state_zero_hb_and_duration_saturation() {
+        use crate::kv::inmemory::InMemoryKv;
+        use crate::ring::ring_desc_codec;
+        use mimir_common::services::Service;
+        use mimir_proto::ringpb::InstanceState;
+        let kv = Arc::new(InMemoryKv::new(ring_desc_codec()));
+        let now_s = crate::ring::model::system_time_to_unix_secs(SystemTime::now());
+        kv.cas(
+            "ring",
+            Box::new(move |_| {
+                let mut desc = Desc::default();
+                desc.ingesters.insert(
+                    "ing-unk".into(),
+                    InstanceDesc {
+                        id: "ing-unk".into(),
+                        addr: "127.0.0.1:9095".into(),
+                        state: 5,
+                        timestamp: now_s,
+                        tokens: vec![10],
+                        ..Default::default()
+                    },
+                );
+                desc.ingesters.insert(
+                    "ing-zero".into(),
+                    InstanceDesc {
+                        id: "ing-zero".into(),
+                        addr: "127.0.0.1:9096".into(),
+                        state: InstanceState::Active as i32,
+                        timestamp: 0,
+                        read_only: true,
+                        read_only_updated_timestamp: 0,
+                        tokens: vec![20],
+                        ..Default::default()
+                    },
+                );
+                Ok(CasOutcome::Update(Box::new(desc)))
+            }),
+        )
+        .await
+        .unwrap();
+
+        let ring_cfg = mimir_config::ingester::RingConfig {
+            heartbeat_timeout: mimir_config::GoDuration::from_secs(60),
+            ..Default::default()
+        };
+        let ring = Ring::with_store_and_strategy(
+            crate::ring::RingSettings::from(&ring_cfg),
+            "ingester",
+            "ring",
+            kv,
+            Arc::new(crate::ring::replication_strategy::DefaultReplicationStrategy),
+            None,
+        )
+        .unwrap();
+        let svc = Arc::clone(&ring).into_service();
+        svc.start_async(mimir_common::services::ServiceContext::background())
+            .await
+            .unwrap();
+        svc.await_running().await.unwrap();
+
+        let app = ring_router(ring, crate::ring::to_status_page_config(&ring_cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let html = client
+            .get(format!("http://{addr}/ingester/ring"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(html.contains("<td>5</td>"), "unknown state must render numerically in HTML: {html}");
+        // read_only with zero timestamp uses 0001-01-01 -> durationSince saturates at math.MaxInt64 ns.
+        assert!(
+            html.contains("<td>2562047h47m16s ago (00:00:00.000)</td>"),
+            "read_only with zero timestamp must saturate durationSince at math.MaxInt64 ns: {html}"
+        );
+        // heartbeat timestamp=0 uses 1970-01-01T00:00:00Z (NOT 0001-01-01 -> NOT 2562047h47m16s).
+        let zero_row = html.split("ing-zero").nth(1).unwrap();
+        let last_hb_td = zero_row.split("<td>").nth(7).unwrap();
+        assert!(
+            !last_hb_td.starts_with("2562047h47m16s"),
+            "timestamp=0 heartbeat must use 1970-01-01 (not 0001-01-01): {last_hb_td}"
+        );
+        assert!(
+            last_hb_td.contains("ago (00:00:00.000)</td>"),
+            "timestamp=0 heartbeat must format UTC 00:00:00.000: {last_hb_td}"
+        );
+
+        let json: serde_json::Value = client
+            .get(format!("http://{addr}/ingester/ring"))
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let shards = json["shards"].as_array().unwrap();
+        let unk = shards.iter().find(|s| s["id"] == "ing-unk").unwrap();
+        assert_eq!(unk["state"], "5");
+        let zero = shards.iter().find(|s| s["id"] == "ing-zero").unwrap();
+        assert_eq!(zero["timestamp"], "1970-01-01T00:00:00Z");
+
+        srv.abort();
+        svc.stop_async();
+        let _ = svc.await_terminated().await;
     }
 }
