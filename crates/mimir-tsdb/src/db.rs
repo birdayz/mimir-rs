@@ -1412,7 +1412,6 @@ impl TsdbInner {
                     if t0.elapsed() < self.opts.compaction_delay {
                         break;
                     }
-                    *started = None;
                 }
                 let mint = self.head.min_time();
                 let maxt = range_for_timestamp(mint, self.head.options().chunk_range_ms);

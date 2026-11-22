@@ -225,8 +225,8 @@ pub struct PropagationDelayTracker {
     node_name: String,
     kv: Weak<MemberlistKv>,
     codec: Arc<dyn Codec>,
-    /// Maps beacon_id -> whether this beacon has been observed in a watch snapshot.
-    seen_beacons: RwLock<HashMap<u64, bool>>,
+    /// Maps beacon_id -> `None` once observed in KV, or `Some(published_at)` while awaiting first KV observation.
+    seen_beacons: RwLock<HashMap<u64, Option<std::time::Instant>>>,
     pending_beacon_id: AtomicU64,
     startup_time_ms: AtomicI64,
     propagation_delay: SingleHistogram,
@@ -332,9 +332,10 @@ impl PropagationDelayTracker {
             watch_self.watch_beacons(watch_ctx_c).await;
         });
 
-        let initial_nanos = rand::thread_rng().gen_range(1..=(beacon_interval.as_nanos().max(1) as u64));
+        let period = beacon_interval.max(Duration::from_nanos(1));
+        let initial_nanos = rand::thread_rng().gen_range(1..=(period.as_nanos().min(u64::MAX as u128) as u64));
         let start_at = tokio::time::Instant::now() + Duration::from_nanos(initial_nanos);
-        let mut ticker = tokio::time::interval_at(start_at, beacon_interval);
+        let mut ticker = tokio::time::interval_at(start_at, period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -416,17 +417,31 @@ impl PropagationDelayTracker {
     }
 
     fn mark_as_seen(&self, beacon_id: u64, observed_in_kv: bool) {
-        self.seen_beacons
-            .write()
-            .entry(beacon_id)
-            .and_modify(|seen| *seen |= observed_in_kv)
-            .or_insert(observed_in_kv);
+        let mut guard = self.seen_beacons.write();
+        if observed_in_kv {
+            guard.insert(beacon_id, None);
+        } else {
+            guard.entry(beacon_id).or_insert_with(|| Some(std::time::Instant::now()));
+        }
     }
 
     fn cleanup_seen_beacons(&self, desc: &PropagationDelayTrackerDesc) {
         let pending_id = self.pending_beacon_id.load(Ordering::Acquire);
-        self.seen_beacons.write().retain(|id, observed_in_kv| {
-            if *id == pending_id || !*observed_in_kv {
+        let lifetime = self
+            .cfg
+            .beacon_lifetime
+            .as_std()
+            .unwrap_or(Duration::from_secs(60));
+        self.seen_beacons.write().retain(|id, unseen_since| {
+            if *id == pending_id {
+                return true;
+            }
+            if let Some(pub_at) = unseen_since {
+                if desc.beacons.get(id).is_some_and(|b| b.deleted_at != 0)
+                    || pub_at.elapsed() >= lifetime
+                {
+                    return false;
+                }
                 return true;
             }
             desc.beacons.get(id).is_some_and(|b| b.deleted_at == 0)
