@@ -171,6 +171,16 @@ impl BitStream {
     }
 
     #[inline]
+    pub fn reset(&mut self, stream: Vec<u8>) {
+        *self = Self::from_bytes(stream, 0);
+    }
+
+    #[inline]
+    pub fn count(&self) -> u8 {
+        self.count.as_u8()
+    }
+
+    #[inline]
     pub fn from_bytes(mut stream: Vec<u8>, count: u8) -> Self {
         if stream.capacity() > u32::MAX as usize && stream.len() <= u32::MAX as usize {
             stream.shrink_to_fit();
@@ -443,6 +453,28 @@ impl<'a> BitReader<'a> {
             .saturating_sub(self.stream_offset)
             .saturating_mul(8)
             .saturating_add(self.valid as usize)
+    }
+
+    #[inline]
+    pub fn read_bit_fast(&mut self) -> Result<bool, ChunkError> {
+        if self.valid == 0 {
+            return Err(ChunkError::UnexpectedEof);
+        }
+        self.valid -= 1;
+        let mask = 1u64 << self.valid;
+        Ok((self.buffer & mask) != 0)
+    }
+
+    #[inline]
+    pub fn read_bits_fast(&mut self, nbits: u8) -> Result<u64, ChunkError> {
+        if nbits == 0 {
+            return Ok(0);
+        }
+        if nbits > self.valid {
+            return Err(ChunkError::UnexpectedEof);
+        }
+        self.valid -= nbits;
+        Ok((self.buffer >> self.valid) & bitmask(nbits))
     }
 
     #[inline]

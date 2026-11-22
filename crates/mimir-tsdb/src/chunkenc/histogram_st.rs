@@ -60,6 +60,11 @@ impl HistogramStChunk {
     }
 
     #[inline]
+    pub fn reset(&mut self, stream: Vec<u8>) {
+        self.b.reset(stream);
+    }
+
+    #[inline]
     pub const fn encoding(&self) -> Encoding {
         Encoding::HistogramSt
     }
@@ -214,6 +219,11 @@ impl<'a> HistogramStAppender<'a> {
     #[inline]
     pub fn into_state(self) -> HistogramAppenderState {
         self.state
+    }
+
+    #[inline]
+    pub fn num_samples(&self) -> usize {
+        self.chunk.num_samples()
     }
 
     #[inline]
@@ -493,6 +503,11 @@ impl<'a> HistogramStIterator<'a> {
                 first_st_known,
             },
         }
+    }
+
+    #[inline]
+    pub fn reset(&mut self, b: &'a [u8]) {
+        *self = Self::new(b);
     }
 
     #[inline]

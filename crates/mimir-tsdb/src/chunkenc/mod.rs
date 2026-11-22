@@ -86,6 +86,10 @@ pub enum ChunkError {
     HistogramCounterReset,
     #[error("histogram schema change")]
     HistogramSchemaChange,
+    #[error("float histogram counter reset")]
+    FloatHistogramCounterReset,
+    #[error("float histogram schema change")]
+    FloatHistogramSchemaChange,
     #[error("histogram layout change")]
     HistogramLayoutChange,
     #[error("chunk capacity exceeded")]
@@ -140,6 +144,19 @@ impl Encoding {
         )
     }
 
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Xor => "XOR",
+            Self::Histogram => "histogram",
+            Self::FloatHistogram => "floathistogram",
+            Self::Xor2 => "XOR2",
+            Self::HistogramSt => "histogramST",
+            Self::FloatHistogramSt => "floathistogramST",
+        }
+    }
+
     /// Reports whether two encodings are mutually compatible with respect to
     /// sample-value encoding (`Xor` and `Xor2`), matching Go `chunkenc.CompatibleValues`.
     #[inline]
@@ -148,6 +165,12 @@ impl Encoding {
             (self, other),
             (Self::Xor | Self::Xor2, Self::Xor | Self::Xor2)
         )
+    }
+}
+
+impl std::fmt::Display for Encoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -296,6 +319,45 @@ impl EncodedChunk {
     }
 
     #[inline]
+    pub fn reset(&mut self, stream: Vec<u8>) {
+        match self {
+            Self::Xor(c) => c.reset(stream),
+            Self::Xor2(c) => c.reset(stream),
+            Self::Histogram(c) => c.reset(stream),
+            Self::HistogramSt(c) => c.reset(stream),
+            Self::FloatHistogram(c) => c.reset(stream),
+            Self::FloatHistogramSt(c) => c.reset(stream),
+        }
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn bstream_parts(&self) -> (&[u8], u8) {
+        match self {
+            Self::Xor(c) => (c.b.bytes(), c.b.count()),
+            Self::Xor2(c) => (c.b.bytes(), c.b.count()),
+            Self::Histogram(c) => (c.b.bytes(), c.b.count()),
+            Self::HistogramSt(c) => (c.b.bytes(), c.b.count()),
+            Self::FloatHistogram(c) => (c.b.bytes(), c.b.count()),
+            Self::FloatHistogramSt(c) => (c.b.bytes(), c.b.count()),
+        }
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn set_bstream_for_test(&mut self, stream: Vec<u8>, count: u8) {
+        let bs = bstream::BitStream::from_bytes(stream, count);
+        match self {
+            Self::Xor(c) => c.b = bs,
+            Self::Xor2(c) => c.b = bs,
+            Self::Histogram(c) => c.b = bs,
+            Self::HistogramSt(c) => c.b = bs,
+            Self::FloatHistogram(c) => c.b = bs,
+            Self::FloatHistogramSt(c) => c.b = bs,
+        }
+    }
+
+    #[inline]
     pub(crate) fn from_bstream(enc: Encoding, b: bstream::BitStream) -> Self {
         match enc {
             Encoding::Xor => Self::Xor(XorChunk { b }),
@@ -306,5 +368,95 @@ impl EncodedChunk {
             Encoding::FloatHistogramSt => Self::FloatHistogramSt(FloatHistogramStChunk { b }),
             Encoding::None => unreachable!("Encoding::None cannot form an EncodedChunk"),
         }
+    }
+}
+
+const MAX_POOLED_CHUNKS: usize = 64;
+
+fn push_capped<T>(pool: &parking_lot::Mutex<Vec<T>>, item: T) {
+    let mut guard = pool.lock();
+    if guard.len() < MAX_POOLED_CHUNKS {
+        guard.push(item);
+    }
+}
+
+/// Chunk object pool matching Prometheus `tsdb/chunkenc.Pool`.
+#[derive(Default)]
+pub struct Pool {
+    xor: parking_lot::Mutex<Vec<XorChunk>>,
+    xor2: parking_lot::Mutex<Vec<Xor2Chunk>>,
+    histogram: parking_lot::Mutex<Vec<HistogramChunk>>,
+    histogram_st: parking_lot::Mutex<Vec<HistogramStChunk>>,
+    float_histogram: parking_lot::Mutex<Vec<FloatHistogramChunk>>,
+    float_histogram_st: parking_lot::Mutex<Vec<FloatHistogramStChunk>>,
+}
+
+impl Pool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, encoding: Encoding, b: Vec<u8>) -> Result<EncodedChunk, ChunkError> {
+        match encoding {
+            Encoding::Xor => {
+                let mut c = self.xor.lock().pop().unwrap_or_else(|| XorChunk::from_bytes(Vec::new()));
+                c.reset(b);
+                Ok(EncodedChunk::Xor(c))
+            }
+            Encoding::Xor2 => {
+                let mut c = self.xor2.lock().pop().unwrap_or_else(|| Xor2Chunk::from_bytes(Vec::new()));
+                c.reset(b);
+                Ok(EncodedChunk::Xor2(c))
+            }
+            Encoding::Histogram => {
+                let mut c = self.histogram.lock().pop().unwrap_or_else(|| HistogramChunk::from_bytes(Vec::new()));
+                c.reset(b);
+                Ok(EncodedChunk::Histogram(c))
+            }
+            Encoding::HistogramSt => {
+                let mut c = self.histogram_st.lock().pop().unwrap_or_else(|| HistogramStChunk::from_bytes(Vec::new()));
+                c.reset(b);
+                Ok(EncodedChunk::HistogramSt(c))
+            }
+            Encoding::FloatHistogram => {
+                let mut c = self.float_histogram.lock().pop().unwrap_or_else(|| FloatHistogramChunk::from_bytes(Vec::new()));
+                c.reset(b);
+                Ok(EncodedChunk::FloatHistogram(c))
+            }
+            Encoding::FloatHistogramSt => {
+                let mut c = self.float_histogram_st.lock().pop().unwrap_or_else(|| FloatHistogramStChunk::from_bytes(Vec::new()));
+                c.reset(b);
+                Ok(EncodedChunk::FloatHistogramSt(c))
+            }
+            Encoding::None => Err(ChunkError::InvalidEncoding(Encoding::None.as_u8())),
+        }
+    }
+
+    pub fn put(&self, c: &mut EncodedChunk) -> Result<(), ChunkError> {
+        c.reset(Vec::new());
+        match c {
+            EncodedChunk::Xor(_) => push_capped(&self.xor, XorChunk::from_bytes(Vec::new())),
+            EncodedChunk::Xor2(_) => push_capped(&self.xor2, Xor2Chunk::from_bytes(Vec::new())),
+            EncodedChunk::Histogram(_) => push_capped(&self.histogram, HistogramChunk::from_bytes(Vec::new())),
+            EncodedChunk::HistogramSt(_) => push_capped(&self.histogram_st, HistogramStChunk::from_bytes(Vec::new())),
+            EncodedChunk::FloatHistogram(_) => push_capped(&self.float_histogram, FloatHistogramChunk::from_bytes(Vec::new())),
+            EncodedChunk::FloatHistogramSt(_) => push_capped(&self.float_histogram_st, FloatHistogramStChunk::from_bytes(Vec::new())),
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_put_caps_capacity_at_64() {
+        let pool = Pool::new();
+        for _ in 0..128 {
+            let mut c = pool.get(Encoding::Xor, Vec::new()).unwrap();
+            pool.put(&mut c).unwrap();
+        }
+        assert!(pool.xor.lock().len() <= MAX_POOLED_CHUNKS);
     }
 }

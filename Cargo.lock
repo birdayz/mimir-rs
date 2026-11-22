@@ -2104,6 +2104,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "hashbrown 0.15.5",
+ "libc",
  "memmap2",
  "mimir-common",
  "mimir-proto",

@@ -105,6 +105,19 @@ pub struct MemTombstones {
     has_tombstones: AtomicBool,
 }
 
+impl PartialEq for MemTombstones {
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        let g1 = self.groups.read();
+        let g2 = other.groups.read();
+        *g1 == *g2
+    }
+}
+
+impl Eq for MemTombstones {}
+
 impl MemTombstones {
     pub fn new() -> Self {
         Self::default()
@@ -299,5 +312,6 @@ mod tests {
         assert_eq!(read_back.get(1), vec![Interval::new(100, 300)]);
         assert_eq!(read_back.get(42), vec![Interval::new(500, 600)]);
         assert_eq!(read_back.total(), 2);
+        assert_eq!(read_back, read_back);
     }
 }

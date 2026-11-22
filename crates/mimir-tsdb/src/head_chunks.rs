@@ -3,11 +3,15 @@
 //! Ported from github.com/prometheus/prometheus/tsdb/chunks/head_chunks.go
 //! and github.com/prometheus/prometheus/tsdb/chunks/chunks.go.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use memmap2::{Mmap, MmapOptions};
 use thiserror::Error;
@@ -1108,6 +1112,1568 @@ impl HeadChunksReader {
         self.truncate_in_place(before_seq)?;
         Ok(self)
     }
+
+    /// Like [`Self::iterate_all_chunks`], also passing the raw masked-off encoding byte
+    /// (`raw_enc & !OUT_OF_ORDER_MASK`) to `f`.
+    pub fn iterate_all_chunks_raw<F>(&self, mut f: F) -> Result<(), HeadChunksError>
+    where
+        F: FnMut(HeadChunkRecord, u8) -> Result<(), HeadChunksError>,
+    {
+        for (&seq, mmap) in &self.files {
+            let file_end = mmap.len();
+            let mut idx = HEAD_CHUNK_FILE_HEADER_SIZE;
+
+            while idx < file_end {
+                if file_end - idx < MAX_HEAD_CHUNK_META_SIZE {
+                    if mmap[idx..file_end].iter().all(|&b| b == 0) {
+                        break;
+                    }
+                    return Err(HeadChunksError::Corruption {
+                        dir: self.dir.clone(),
+                        file_index: seq as i64,
+                        message: format!(
+                            "trailing non-zero bytes without complete chunk header at offset {idx}"
+                        ),
+                    });
+                }
+
+                let start_idx = idx;
+                let chunk_ref = ChunkDiskMapperRef::new(seq as u32, start_idx as u32);
+
+                let series_ref = u64::from_be_bytes(mmap[idx..idx + 8].try_into().unwrap());
+                idx += SERIES_REF_SIZE;
+                let mint = i64::from_be_bytes(mmap[idx..idx + 8].try_into().unwrap());
+                idx += MINT_MAXT_SIZE;
+                let maxt = i64::from_be_bytes(mmap[idx..idx + 8].try_into().unwrap());
+                idx += MINT_MAXT_SIZE;
+
+                if series_ref == 0 && mint == 0 && maxt == 0 {
+                    break;
+                }
+
+                let raw_enc_byte = mmap[idx];
+                idx += CHUNK_ENCODING_SIZE;
+                let is_ooo = (raw_enc_byte & OUT_OF_ORDER_MASK) != 0;
+                let stripped_enc = raw_enc_byte & !OUT_OF_ORDER_MASK;
+                let encoding = Encoding::from_u8(stripped_enc).unwrap_or(Encoding::None);
+
+                let (data_len, ulen) = decode_uvarint(
+                    &mmap[idx..(idx + MAX_CHUNK_LENGTH_FIELD_SIZE).min(file_end)],
+                )
+                .ok_or_else(|| HeadChunksError::Corruption {
+                    dir: self.dir.clone(),
+                    file_index: seq as i64,
+                    message: "invalid chunk length uvarint".to_string(),
+                })?;
+                idx += ulen;
+
+                let data_len = usize::try_from(data_len).map_err(|_| HeadChunksError::Corruption {
+                    dir: self.dir.clone(),
+                    file_index: seq as i64,
+                    message: "chunk data length overflow".to_string(),
+                })?;
+                let entry_end = idx
+                    .checked_add(data_len)
+                    .and_then(|end| end.checked_add(CRC_SIZE))
+                    .ok_or_else(|| HeadChunksError::Corruption {
+                        dir: self.dir.clone(),
+                        file_index: seq as i64,
+                        message: "chunk data length overflow".to_string(),
+                    })?;
+                if data_len < 2 || entry_end > file_end {
+                    return Err(HeadChunksError::Corruption {
+                        dir: self.dir.clone(),
+                        file_index: seq as i64,
+                        message: "chunk data extends past end of head chunk file".to_string(),
+                    });
+                }
+
+                let raw_num_samples = u16::from_be_bytes([mmap[idx], mmap[idx + 1]]);
+                let num_samples = match encoding {
+                    Encoding::HistogramSt | Encoding::FloatHistogramSt => raw_num_samples & 0x3FFF,
+                    _ => raw_num_samples,
+                };
+                idx += data_len;
+
+                let expected_crc =
+                    u32::from_be_bytes(mmap[idx..idx + CRC_SIZE].try_into().unwrap());
+                let actual_crc = crc32c::crc32c(&mmap[start_idx..idx]);
+                if actual_crc != expected_crc {
+                    return Err(HeadChunksError::Corruption {
+                        dir: self.dir.clone(),
+                        file_index: seq as i64,
+                        message: format!(
+                            "checksum mismatch expected:{expected_crc:#x}, actual:{actual_crc:#x}"
+                        ),
+                    });
+                }
+                idx += CRC_SIZE;
+
+                f(
+                    HeadChunkRecord {
+                        series_ref,
+                        chunk_ref,
+                        mint,
+                        maxt,
+                        num_samples,
+                        encoding,
+                        is_ooo,
+                    },
+                    stripped_enc,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reads the header bytes from `rdr` into `buf` and drops/closes `rdr` (Go `readChunkHeaderAndClose`).
+pub fn read_chunk_header_and_close<R: Read>(mut rdr: R, buf: &mut [u8]) -> io::Result<usize> {
+    let res = rdr.read(buf);
+    drop(rdr);
+    res
+}
+
+/// Deletes `path` using `remove_fn`, retrying with exponential backoff when `is_retryable` returns true.
+pub fn remove_chunk_file_with_retry<F, P>(
+    path: &Path,
+    mut remove_fn: F,
+    mut is_retryable: P,
+) -> io::Result<()>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+    P: FnMut(&io::Error) -> bool,
+{
+    const INITIAL_BACKOFF: Duration = Duration::from_millis(1);
+    const MAX_BACKOFF: Duration = Duration::from_millis(250);
+    const DEADLINE: Duration = Duration::from_secs(2);
+
+    let mut backoff = INITIAL_BACKOFF;
+    let start = Instant::now();
+    loop {
+        match remove_fn(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if !is_retryable(&e) || start.elapsed() >= DEADLINE => return Err(e),
+            Err(_) => {
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Repairs the last head chunk file in `files` using an injectable `remove_fn` and retry predicate.
+pub fn repair_last_chunk_file_with_remover<F, P>(
+    files: &mut BTreeMap<usize, PathBuf>,
+    mut remove_fn: F,
+    mut is_retryable: P,
+) -> Result<(), HeadChunksError>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+    P: FnMut(&io::Error) -> bool,
+{
+    let Some((&last_seq, last_path)) = files.iter().next_back() else {
+        return Ok(());
+    };
+    if last_seq == 0 {
+        return Ok(());
+    }
+    let f = File::open(last_path)?;
+    let mut buf = [0u8; MAGIC_CHUNKS_SIZE];
+    let n = read_chunk_header_and_close(f, &mut buf)?;
+    if n < MAGIC_CHUNKS_SIZE || u32::from_be_bytes(buf) == 0 {
+        match remove_chunk_file_with_retry(last_path, &mut remove_fn, &mut is_retryable) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(HeadChunksError::Io(e)),
+        }
+        files.remove(&last_seq);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub enum ChunkPayload {
+    Encoded(EncodedChunk),
+    Raw { encoding: u8, bytes: Vec<u8> },
+}
+
+impl ChunkPayload {
+    #[inline]
+    pub fn encoding_u8(&self) -> u8 {
+        match self {
+            Self::Encoded(c) => c.encoding().as_u8(),
+            Self::Raw { encoding, .. } => *encoding,
+        }
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Encoded(c) => c.as_bytes(),
+            Self::Raw { bytes, .. } => bytes,
+        }
+    }
+
+    #[inline]
+    pub fn as_encoded(&self) -> Option<&EncodedChunk> {
+        match self {
+            Self::Encoded(c) => Some(c),
+            Self::Raw { .. } => None,
+        }
+    }
+}
+
+pub type ChunkWriteCallback = Box<dyn FnOnce(Result<(), HeadChunksError>) + Send>;
+
+pub struct ChunkWriteJob {
+    pub series_ref: u64,
+    pub mint: i64,
+    pub maxt: i64,
+    pub chk: Option<ChunkPayload>,
+    pub r#ref: ChunkDiskMapperRef,
+    pub cut_file: bool,
+    pub is_ooo: bool,
+    pub callback: Option<ChunkWriteCallback>,
+}
+
+impl Default for ChunkWriteJob {
+    fn default() -> Self {
+        Self {
+            series_ref: 0,
+            mint: 0,
+            maxt: 0,
+            chk: None,
+            r#ref: ChunkDiskMapperRef(0),
+            cut_file: false,
+            is_ooo: false,
+            callback: None,
+        }
+    }
+}
+
+struct QueueSegment {
+    segment: Vec<Option<ChunkWriteJob>>,
+    next_read: usize,
+    next_write: usize,
+}
+
+struct WriteJobQueueInner {
+    segments: VecDeque<QueueSegment>,
+    size: usize,
+    closed: bool,
+}
+
+/// Bounded segmented blocking FIFO queue matching Go `tsdb/chunks/queue.go:writeJobQueue`.
+pub struct WriteJobQueue {
+    max_size: usize,
+    segment_size: usize,
+    inner: Mutex<WriteJobQueueInner>,
+    pushed: Condvar,
+    popped: Condvar,
+}
+
+impl WriteJobQueue {
+    pub fn new(max_size: usize, segment_size: usize) -> Self {
+        assert!(max_size > 0 && segment_size > 0, "invalid queue");
+        Self {
+            max_size,
+            segment_size,
+            inner: Mutex::new(WriteJobQueueInner {
+                segments: VecDeque::new(),
+                size: 0,
+                closed: false,
+            }),
+            pushed: Condvar::new(),
+            popped: Condvar::new(),
+        }
+    }
+
+    pub fn close(&self) {
+        let mut g = self.inner.lock();
+        g.closed = true;
+        self.pushed.notify_all();
+        self.popped.notify_all();
+    }
+
+    pub fn push(&self, job: ChunkWriteJob) -> bool {
+        self.push_or_return(job).is_ok()
+    }
+
+    fn push_or_return(&self, job: ChunkWriteJob) -> Result<(), ChunkWriteJob> {
+        let mut g = self.inner.lock();
+        while !g.closed && g.size >= self.max_size {
+            self.popped.wait(&mut g);
+        }
+        if g.closed {
+            return Err(job);
+        }
+        let need_new = match g.segments.back() {
+            None => true,
+            Some(last) => last.next_write >= self.segment_size,
+        };
+        if need_new {
+            let mut segment = Vec::with_capacity(self.segment_size);
+            segment.resize_with(self.segment_size, || None);
+            g.segments.push_back(QueueSegment {
+                segment,
+                next_read: 0,
+                next_write: 0,
+            });
+        }
+        let last = g.segments.back_mut().unwrap();
+        let nw = last.next_write;
+        last.segment[nw] = Some(job);
+        last.next_write += 1;
+        g.size += 1;
+        self.pushed.notify_one();
+        Ok(())
+    }
+
+    pub fn pop(&self) -> Option<ChunkWriteJob> {
+        let mut g = self.inner.lock();
+        while g.size == 0 {
+            if g.closed {
+                return None;
+            }
+            self.pushed.wait(&mut g);
+        }
+        let pop_front = {
+            let first = g.segments.front_mut().unwrap();
+            let nr = first.next_read;
+            let job = first.segment[nr].take().expect("queue slot occupied");
+            first.next_read += 1;
+            (job, first.next_read >= self.segment_size)
+        };
+        g.size -= 1;
+        if pop_front.1 {
+            g.segments.pop_front();
+        }
+        let job = pop_front.0;
+        self.popped.notify_one();
+        Some(job)
+    }
+
+    pub fn length(&self) -> usize {
+        self.inner.lock().size
+    }
+
+    #[doc(hidden)]
+    pub fn assert_invariants(&self) {
+        let g = self.inner.lock();
+        let mut total_size = 0usize;
+        let len = g.segments.len();
+        for (idx, s) in g.segments.iter().enumerate() {
+            assert_eq!(s.segment.len(), self.segment_size);
+            assert!(s.next_read <= s.next_write);
+            total_size += s.next_write - s.next_read;
+            let is_first = idx == 0;
+            let is_last = idx + 1 == len;
+            if !is_first {
+                assert_eq!(s.next_read, 0);
+            }
+            if is_first && s.next_read == s.next_write {
+                assert!(s.next_write < s.segment.len());
+            }
+            if !is_first && !is_last {
+                assert_eq!(s.next_write, s.segment.len());
+            }
+            assert!(s.next_write > 0);
+        }
+        assert_eq!(g.size, total_size);
+    }
+
+    #[doc(hidden)]
+    pub fn first_segment_indices(&self) -> Option<(usize, usize)> {
+        self.inner
+            .lock()
+            .segments
+            .front()
+            .map(|s| (s.next_read, s.next_write))
+    }
+}
+
+pub type WriteChunkFn = Arc<
+    dyn Fn(u64, i64, i64, Option<ChunkPayload>, ChunkDiskMapperRef, bool, bool) -> Result<(), HeadChunksError>
+        + Send
+        + Sync,
+>;
+
+const MAX_CHUNK_QUEUE_SEGMENT_SIZE: usize = 8192;
+
+struct ChunkRefMapState {
+    map: HashMap<ChunkDiskMapperRef, ChunkPayload>,
+    peak_size: usize,
+    last_shrink: Instant,
+}
+
+/// Async non-blocking chunk write queue matching Go `tsdb/chunks/chunk_write_queue.go`.
+pub struct ChunkWriteQueue {
+    jobs: Arc<WriteJobQueue>,
+    ref_map: Arc<RwLock<ChunkRefMapState>>,
+    is_running: Mutex<bool>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    write_chunk: Arc<RwLock<WriteChunkFn>>,
+    metrics: Option<crate::metrics::ChunkWriteQueueMetrics>,
+}
+
+impl ChunkWriteQueue {
+    pub fn new(
+        metrics: Option<crate::metrics::ChunkWriteQueueMetrics>,
+        size: usize,
+        write_chunk: WriteChunkFn,
+    ) -> Self {
+        let seg_size = size.min(MAX_CHUNK_QUEUE_SEGMENT_SIZE);
+        let jobs = Arc::new(WriteJobQueue::new(size, seg_size));
+        let ref_map = Arc::new(RwLock::new(ChunkRefMapState {
+            map: HashMap::new(),
+            peak_size: 0,
+            last_shrink: Instant::now(),
+        }));
+        let write_chunk = Arc::new(RwLock::new(write_chunk));
+
+        let q = Self {
+            jobs,
+            ref_map,
+            is_running: Mutex::new(false),
+            worker: Mutex::new(None),
+            write_chunk,
+            metrics,
+        };
+        q.start();
+        q
+    }
+
+    fn start(&self) {
+        let jobs = Arc::clone(&self.jobs);
+        let ref_map = Arc::clone(&self.ref_map);
+        let write_chunk = Arc::clone(&self.write_chunk);
+        let metrics = self.metrics.clone();
+        let handle = thread::Builder::new()
+            .name("chunk-write-queue".to_string())
+            .spawn(move || {
+                while let Some(mut job) = jobs.pop() {
+                    let f = Arc::clone(&*write_chunk.read());
+                    let payload = job.chk.take();
+                    let res = f(
+                        job.series_ref,
+                        job.mint,
+                        job.maxt,
+                        payload,
+                        job.r#ref,
+                        job.is_ooo,
+                        job.cut_file,
+                    );
+                    if let Some(cb) = job.callback.take() {
+                        cb(res);
+                    }
+                    let mut g = ref_map.write();
+                    g.map.remove(&job.r#ref);
+                    if let Some(ref m) = metrics {
+                        m.completed.inc();
+                    }
+                    if g.map.is_empty()
+                        && g.peak_size >= 1000
+                        && g.last_shrink.elapsed() >= Duration::from_secs(600)
+                    {
+                        let new_cap = g.peak_size / 2;
+                        g.map = HashMap::with_capacity(new_cap);
+                        g.peak_size = 0;
+                        g.last_shrink = Instant::now();
+                    }
+                }
+            })
+            .expect("spawn chunk-write-queue worker");
+        *self.worker.lock() = Some(handle);
+        *self.is_running.lock() = true;
+    }
+
+    pub fn set_write_chunk_for_test(&self, f: WriteChunkFn) {
+        *self.write_chunk.write() = f;
+    }
+
+    pub fn write_chunk_fn(&self) -> WriteChunkFn {
+        Arc::clone(&*self.write_chunk.read())
+    }
+
+    pub fn add_job(&self, job: ChunkWriteJob) -> Result<(), HeadChunksError> {
+        self.add_job_with_return(job).map_err(|b| b.0)
+    }
+
+    pub(crate) fn add_job_with_return(
+        &self,
+        job: ChunkWriteJob,
+    ) -> Result<(), Box<(HeadChunksError, ChunkWriteJob)>> {
+        let mut running = self.is_running.lock();
+        if !*running {
+            return Err(Box::new((HeadChunksError::Closed, job)));
+        }
+        {
+            let mut g = self.ref_map.write();
+            let val = job.chk.clone().unwrap_or(ChunkPayload::Raw {
+                encoding: 0,
+                bytes: Vec::new(),
+            });
+            g.map.insert(job.r#ref, val);
+            if g.map.len() > g.peak_size {
+                g.peak_size = g.map.len();
+            }
+        }
+        let ref_id = job.r#ref;
+        if let Err(job) = self.jobs.push_or_return(job) {
+            self.ref_map.write().map.remove(&ref_id);
+            *running = false;
+            return Err(Box::new((HeadChunksError::Closed, job)));
+        }
+        if let Some(ref m) = self.metrics {
+            m.adds.inc();
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, ref_id: ChunkDiskMapperRef) -> Option<ChunkPayload> {
+        let g = self.ref_map.read();
+        g.map.get(&ref_id).cloned()
+    }
+
+    pub fn queue_size(&self) -> usize {
+        self.ref_map.read().map.len()
+    }
+
+    pub fn queue_is_empty(&self) -> bool {
+        self.queue_size() == 0
+    }
+
+    pub fn queue_is_full(&self) -> bool {
+        self.queue_size() == self.jobs.max_size + 1
+    }
+
+    pub fn stop(&self) {
+        let mut running = self.is_running.lock();
+        if !*running {
+            return;
+        }
+        *running = false;
+        drop(running);
+        self.jobs.close();
+        if let Some(handle) = self.worker.lock().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ChunkWriteQueue {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[derive(Default)]
+struct EvtlPos {
+    seq: u64,
+    offset: u64,
+    cut_file: bool,
+}
+
+impl EvtlPos {
+    fn bytes_to_write_for_chunk(chk_len: usize) -> u64 {
+        let mut len_buf = [0u8; MAX_CHUNK_LENGTH_FIELD_SIZE];
+        let ulen = put_uvarint(&mut len_buf, chk_len as u64);
+        (SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE + CHUNK_ENCODING_SIZE + ulen + chk_len + CRC_SIZE)
+            as u64
+    }
+
+    fn should_cut_new_file(&self, bytes_to_write: u64) -> bool {
+        if self.cut_file || self.seq == 0 {
+            return true;
+        }
+        (self.offset + bytes_to_write) > MAX_HEAD_CHUNK_FILE_SIZE as u64
+    }
+
+    fn advance_to_new_file(&mut self) {
+        self.seq += 1;
+        self.offset = HEAD_CHUNK_FILE_HEADER_SIZE as u64;
+    }
+
+    fn get_next_chunk_ref(&mut self, chk_len: usize) -> (ChunkDiskMapperRef, bool) {
+        let bytes_to_write = Self::bytes_to_write_for_chunk(chk_len);
+        let mut cut_file = false;
+        if self.should_cut_new_file(bytes_to_write) {
+            self.advance_to_new_file();
+            self.cut_file = false;
+            cut_file = true;
+        }
+        let chk_offset = self.offset;
+        self.offset += bytes_to_write;
+        (ChunkDiskMapperRef::new(self.seq as u32, chk_offset as u32), cut_file)
+    }
+}
+
+struct ActiveReadFile {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
+    file: Mutex<File>,
+}
+
+impl ActiveReadFile {
+    fn open_read_only(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        Ok(Self {
+            #[cfg(unix)]
+            file,
+            #[cfg(not(unix))]
+            file: Mutex::new(file),
+        })
+    }
+
+    fn read_at_all(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<usize> {
+        let mut total = 0usize;
+        while !buf.is_empty() {
+            #[cfg(unix)]
+            let res = std::os::unix::fs::FileExt::read_at(&self.file, buf, offset);
+            #[cfg(not(unix))]
+            let res = {
+                let mut f = self.file.lock();
+                f.seek(SeekFrom::Start(offset)).and_then(|_| f.read(buf))
+            };
+            match res {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    offset += n as u64;
+                    buf = &mut buf[n..];
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    }
+}
+
+struct MapperReadState {
+    /// Sealed, immutable head chunk files mapped read-only.
+    /// Active `cur_file` is never inserted here as an `Mmap`.
+    mmaps: BTreeMap<usize, Arc<Mmap>>,
+    /// Read-only handle for positioned I/O on the currently active unsealed file.
+    active_file: Option<(usize, Arc<ActiveReadFile>)>,
+    cur_file_seq: usize,
+    closed: bool,
+}
+
+struct MapperWriteState {
+    cur_file: Option<File>,
+    cur_file_seq: usize,
+    cur_file_offset: usize,
+    file_maxt_set: bool,
+    write_buf: Vec<u8>,
+    write_buffer_size: usize,
+    closed: bool,
+}
+
+/// Full Go `chunks.ChunkDiskMapper` supporting buffered writes, optional async `ChunkWriteQueue`,
+/// in-memory buffered chunk reads, mmap reads for sealed files, positioned I/O for the active file,
+/// `IterateAllChunks`, and `Truncate`.
+///
+/// Strict lock acquisition order: `evtl_pos` -> `write_path_mtx` -> `read_path_mtx` -> `chunk_buffer`.
+pub struct ChunkDiskMapper {
+    dir: PathBuf,
+    evtl_pos: Mutex<EvtlPos>,
+    read_path_mtx: RwLock<MapperReadState>,
+    write_path_mtx: Mutex<MapperWriteState>,
+    chunk_buffer: RwLock<HashMap<ChunkDiskMapperRef, ChunkPayload>>,
+    write_queue: std::sync::OnceLock<Arc<ChunkWriteQueue>>,
+}
+
+impl ChunkDiskMapper {
+    pub fn open(
+        dir: impl AsRef<Path>,
+        write_buffer_size: usize,
+        write_queue_size: usize,
+        queue_metrics: Option<crate::metrics::ChunkWriteQueueMetrics>,
+    ) -> Result<Arc<Self>, HeadChunksError> {
+        if !write_buffer_size.is_multiple_of(1024) {
+            return Err(HeadChunksError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ChunkDiskMapper write buffer size should be a multiple of 1024 (actual: {write_buffer_size})"),
+            )));
+        }
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir)?;
+
+        let mut files = list_chunk_files(&dir)?;
+        repair_last_chunk_file(&mut files)?;
+
+        let mut mmaps = BTreeMap::new();
+        let mut prev_seq: Option<usize> = None;
+        for (seq, path) in &files {
+            if let Some(prev) = prev_seq {
+                if *seq != prev + 1 {
+                    return Err(HeadChunksError::NonSequentialFiles {
+                        prev,
+                        next: *seq,
+                    });
+                }
+            }
+            prev_seq = Some(*seq);
+            let mmap = HeadChunksReader::map_and_validate_file(path)?;
+            mmaps.insert(*seq, Arc::new(mmap));
+        }
+        let last_seq = prev_seq.unwrap_or(0);
+
+        let cdm = Arc::new(Self {
+            dir,
+            evtl_pos: Mutex::new(EvtlPos {
+                seq: last_seq as u64,
+                offset: 0,
+                cut_file: last_seq > 0,
+            }),
+            read_path_mtx: RwLock::new(MapperReadState {
+                mmaps,
+                active_file: None,
+                cur_file_seq: last_seq,
+                closed: false,
+            }),
+            write_path_mtx: Mutex::new(MapperWriteState {
+                cur_file: None,
+                cur_file_seq: last_seq,
+                cur_file_offset: 0,
+                file_maxt_set: false,
+                write_buf: Vec::with_capacity(write_buffer_size),
+                write_buffer_size,
+                closed: false,
+            }),
+            chunk_buffer: RwLock::new(HashMap::new()),
+            write_queue: std::sync::OnceLock::new(),
+        });
+
+        if write_queue_size > 0 {
+            let weak = Arc::downgrade(&cdm);
+            let write_fn: WriteChunkFn = Arc::new(move |series_ref, mint, maxt, chk, ref_id, is_ooo, cut_file| {
+                let Some(cdm) = weak.upgrade() else {
+                    return Err(HeadChunksError::Closed);
+                };
+                let payload = chk.expect("chunk payload must be present");
+                cdm.write_chunk_internal(series_ref, mint, maxt, &payload, ref_id, is_ooo, cut_file)
+            });
+            let queue = Arc::new(ChunkWriteQueue::new(queue_metrics, write_queue_size, write_fn));
+            let _ = cdm.write_queue.set(queue);
+        }
+        Ok(cdm)
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn write_queue(&self) -> Option<&Arc<ChunkWriteQueue>> {
+        self.write_queue.get()
+    }
+
+    pub fn is_queue_empty(&self) -> bool {
+        self.write_queue.get().is_none_or(|q| q.queue_is_empty())
+    }
+
+    pub fn cur_file_sequence(&self) -> usize {
+        self.write_path_mtx.lock().cur_file_seq
+    }
+
+    pub fn write_buf_buffered(&self) -> usize {
+        self.write_path_mtx.lock().write_buf.len()
+    }
+
+    pub fn mmapped_file_count(&self) -> usize {
+        let r = self.read_path_mtx.read();
+        r.mmaps.len() + usize::from(r.active_file.is_some())
+    }
+
+    pub fn has_mmapped_file(&self, seq: usize) -> bool {
+        let r = self.read_path_mtx.read();
+        r.mmaps.contains_key(&seq) || r.active_file.as_ref().is_some_and(|(s, _)| *s == seq)
+    }
+
+    pub fn file_maxt_set(&self) -> bool {
+        self.write_path_mtx.lock().file_maxt_set
+    }
+
+    pub fn cut_new_file(&self) {
+        self.evtl_pos.lock().cut_file = true;
+    }
+
+    #[doc(hidden)]
+    pub fn cut_empty_file_for_test(&self) -> Result<(), HeadChunksError> {
+        let seq = {
+            let mut pos = self.evtl_pos.lock();
+            pos.advance_to_new_file();
+            pos.seq as usize
+        };
+        let mut st = self.write_path_mtx.lock();
+        self.cut_seq_locked(&mut st, seq)
+    }
+
+    fn flush_buffer_locked(
+        st: &mut MapperWriteState,
+        chunk_buffer: &RwLock<HashMap<ChunkDiskMapperRef, ChunkPayload>>,
+    ) -> Result<(), HeadChunksError> {
+        if !st.write_buf.is_empty() {
+            if let Some(ref mut f) = st.cur_file {
+                f.write_all(&st.write_buf)?;
+                f.flush()?;
+                st.cur_file_offset += st.write_buf.len();
+            }
+            st.write_buf.clear();
+        }
+        chunk_buffer.write().clear();
+        Ok(())
+    }
+
+    fn finalize_cur_file_locked(
+        &self,
+        st: &mut MapperWriteState,
+        map_sealed: bool,
+    ) -> Result<(), HeadChunksError> {
+        if st.cur_file.is_some() {
+            Self::flush_buffer_locked(st, &self.chunk_buffer)?;
+            if let Some(f) = st.cur_file.take() {
+                f.sync_all()?;
+                drop(f);
+            }
+            let seq = st.cur_file_seq;
+            if map_sealed {
+                let path = head_chunk_file_path(&self.dir, seq);
+                let mmap = HeadChunksReader::map_and_validate_file(&path)?;
+                let mut r = self.read_path_mtx.write();
+                r.active_file = None;
+                r.mmaps.insert(seq, Arc::new(mmap));
+            } else {
+                self.read_path_mtx.write().active_file = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn cut_seq_locked(&self, st: &mut MapperWriteState, file_seq: usize) -> Result<(), HeadChunksError> {
+        self.finalize_cur_file_locked(st, true)?;
+        let path = head_chunk_file_path(&self.dir, file_seq);
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        #[cfg(unix)]
+        {
+            let prealloc_len = HEAD_CHUNK_FILE_PREALLOCATION_SIZE as u64;
+            f.set_len(prealloc_len)?;
+            f.seek(SeekFrom::Start(0))?;
+        }
+        let mut hdr = [0u8; HEAD_CHUNK_FILE_HEADER_SIZE];
+        hdr[..MAGIC_CHUNKS_SIZE].copy_from_slice(&MAGIC_HEAD_CHUNKS.to_be_bytes());
+        hdr[MAGIC_CHUNKS_SIZE] = HEAD_CHUNKS_FORMAT_V1;
+        f.write_all(&hdr)?;
+        f.flush()?;
+        let active_read = Arc::new(ActiveReadFile::open_read_only(&path)?);
+        {
+            let mut r = self.read_path_mtx.write();
+            r.active_file = Some((file_seq, active_read));
+            r.cur_file_seq = file_seq;
+        }
+        st.cur_file = Some(f);
+        st.cur_file_seq = file_seq;
+        st.cur_file_offset = HEAD_CHUNK_FILE_HEADER_SIZE;
+        Ok(())
+    }
+
+    pub fn write_chunk<F>(
+        &self,
+        series_ref: u64,
+        mint: i64,
+        maxt: i64,
+        chunk: EncodedChunk,
+        is_ooo: bool,
+        callback: F,
+    ) -> ChunkDiskMapperRef
+    where
+        F: FnOnce(Result<(), HeadChunksError>) + Send + 'static,
+    {
+        self.write_payload(series_ref, mint, maxt, ChunkPayload::Encoded(chunk), is_ooo, callback)
+    }
+
+    pub fn write_payload<F>(
+        &self,
+        series_ref: u64,
+        mint: i64,
+        maxt: i64,
+        payload: ChunkPayload,
+        is_ooo: bool,
+        callback: F,
+    ) -> ChunkDiskMapperRef
+    where
+        F: FnOnce(Result<(), HeadChunksError>) + Send + 'static,
+    {
+        let mut pos = self.evtl_pos.lock();
+        let (ref_id, cut_file) = pos.get_next_chunk_ref(payload.as_bytes().len());
+        if let Some(q) = self.write_queue.get() {
+            let job = ChunkWriteJob {
+                series_ref,
+                mint,
+                maxt,
+                chk: Some(payload),
+                r#ref: ref_id,
+                cut_file,
+                is_ooo,
+                callback: Some(Box::new(callback)),
+            };
+            if let Err(err_box) = q.add_job_with_return(job) {
+                let (e, mut job) = *err_box;
+                drop(pos);
+                if let Some(cb) = job.callback.take() {
+                    cb(Err(e));
+                }
+            }
+            return ref_id;
+        }
+        let res = self.write_chunk_internal(series_ref, mint, maxt, &payload, ref_id, is_ooo, cut_file);
+        drop(pos);
+        callback(res);
+        ref_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_chunk_internal(
+        &self,
+        series_ref: u64,
+        mint: i64,
+        maxt: i64,
+        payload: &ChunkPayload,
+        ref_id: ChunkDiskMapperRef,
+        is_ooo: bool,
+        cut_file: bool,
+    ) -> Result<(), HeadChunksError> {
+        let mut st = self.write_path_mtx.lock();
+        if st.closed {
+            return Err(HeadChunksError::Closed);
+        }
+        if cut_file {
+            let (exp_seq, exp_off) = ref_id.unpack();
+            self.cut_seq_locked(&mut st, exp_seq as usize)?;
+            if st.cur_file_seq != exp_seq as usize || st.cur_file_offset != exp_off as usize {
+                return Err(HeadChunksError::Io(io::Error::other(format!(
+                    "expected newly cut file {exp_seq}:{exp_off}, got {}:{}",
+                    st.cur_file_seq, st.cur_file_offset
+                ))));
+            }
+        }
+
+        let data = payload.as_bytes();
+        let mut meta_buf = [0u8; MAX_HEAD_CHUNK_META_SIZE];
+        meta_buf[0..8].copy_from_slice(&series_ref.to_be_bytes());
+        meta_buf[8..16].copy_from_slice(&mint.to_be_bytes());
+        meta_buf[16..24].copy_from_slice(&maxt.to_be_bytes());
+        let mut enc_byte = payload.encoding_u8();
+        if is_ooo {
+            enc_byte |= OUT_OF_ORDER_MASK;
+        }
+        meta_buf[24] = enc_byte;
+        let ulen = put_uvarint(&mut meta_buf[25..], data.len() as u64);
+        let hdr_len = 25 + ulen;
+        let crc = crc32c::crc32c(&meta_buf[..hdr_len]);
+        let crc = crc32c::crc32c_append(crc, data);
+        let needed = hdr_len + data.len() + CRC_SIZE;
+
+        if needed < st.write_buffer_size && st.write_buf.len() + needed > st.write_buffer_size {
+            Self::flush_buffer_locked(&mut st, &self.chunk_buffer)?;
+        }
+
+        if needed >= st.write_buffer_size {
+            Self::flush_buffer_locked(&mut st, &self.chunk_buffer)?;
+            if let Some(ref mut f) = st.cur_file {
+                f.write_all(&meta_buf[..hdr_len])?;
+                f.write_all(data)?;
+                f.write_all(&crc.to_be_bytes())?;
+                f.flush()?;
+                st.cur_file_offset += needed;
+            }
+        } else {
+            st.write_buf.extend_from_slice(&meta_buf[..hdr_len]);
+            st.write_buf.extend_from_slice(data);
+            st.write_buf.extend_from_slice(&crc.to_be_bytes());
+            self.chunk_buffer.write().insert(ref_id, payload.clone());
+        }
+        Ok(())
+    }
+
+    fn decode_chunk_from_slice(
+        dir: &Path,
+        seq: usize,
+        off: usize,
+        bytes: &[u8],
+    ) -> Result<EncodedChunk, HeadChunksError> {
+        let chk_start = off
+            .checked_add(SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE)
+            .ok_or_else(|| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk offset overflow".to_string(),
+            })?;
+        if chk_start
+            .checked_add(MAX_CHUNK_LENGTH_FIELD_SIZE)
+            .is_none_or(|end| end > bytes.len())
+        {
+            return Err(HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "not enough bytes to read chunk length".to_string(),
+            });
+        }
+        let raw_enc = bytes[chk_start] & !OUT_OF_ORDER_MASK;
+        let encoding = Encoding::from_u8(raw_enc).map_err(|_| HeadChunksError::Corruption {
+            dir: dir.to_path_buf(),
+            file_index: seq as i64,
+            message: "invalid chunk encoding \"<unknown>\"".to_string(),
+        })?;
+        let len_start = chk_start + CHUNK_ENCODING_SIZE;
+        let (data_len, ulen) = decode_uvarint(
+            &bytes[len_start..(len_start + MAX_CHUNK_LENGTH_FIELD_SIZE).min(bytes.len())],
+        )
+        .ok_or_else(|| HeadChunksError::Corruption {
+            dir: dir.to_path_buf(),
+            file_index: seq as i64,
+            message: "invalid chunk length uvarint".to_string(),
+        })?;
+        let data_len = usize::try_from(data_len).map_err(|_| HeadChunksError::Corruption {
+            dir: dir.to_path_buf(),
+            file_index: seq as i64,
+            message: "chunk data length overflow".to_string(),
+        })?;
+        let data_start = len_start + ulen;
+        let data_end = data_start
+            .checked_add(data_len)
+            .ok_or_else(|| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk data length overflow".to_string(),
+            })?;
+        let chk_end = data_end
+            .checked_add(CRC_SIZE)
+            .ok_or_else(|| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk data length overflow".to_string(),
+            })?;
+        if chk_end > bytes.len() {
+            return Err(HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "not enough bytes to read chunk data and CRC".to_string(),
+            });
+        }
+        let expected_crc = u32::from_be_bytes(bytes[data_end..chk_end].try_into().unwrap());
+        let actual_crc = crc32c::crc32c(&bytes[off..data_end]);
+        if actual_crc != expected_crc {
+            return Err(HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: format!(
+                    "checksum mismatch expected:{expected_crc:#x}, actual:{actual_crc:#x}"
+                ),
+            });
+        }
+        EncodedChunk::from_bytes(encoding, bytes[data_start..data_end].to_vec()).map_err(|e| {
+            HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: e.to_string(),
+            }
+        })
+    }
+
+    fn decode_chunk_from_active_file(
+        dir: &Path,
+        seq: usize,
+        off: usize,
+        active_file: &ActiveReadFile,
+    ) -> Result<EncodedChunk, HeadChunksError> {
+        const HDR_PREFIX_LEN: usize =
+            SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE + CHUNK_ENCODING_SIZE + MAX_CHUNK_LENGTH_FIELD_SIZE;
+        let chk_start = off
+            .checked_add(SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE)
+            .ok_or_else(|| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk offset overflow".to_string(),
+            })?;
+        let mut hdr = [0u8; HDR_PREFIX_LEN];
+        let hdr_read = active_file.read_at_all(&mut hdr, off as u64)?;
+        let min_hdr_for_len = SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE + MAX_CHUNK_LENGTH_FIELD_SIZE;
+        if hdr_read < min_hdr_for_len {
+            return Err(HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "not enough bytes to read chunk length".to_string(),
+            });
+        }
+        let rel_enc = chk_start - off;
+        let raw_enc = hdr[rel_enc] & !OUT_OF_ORDER_MASK;
+        let encoding = Encoding::from_u8(raw_enc).map_err(|_| HeadChunksError::Corruption {
+            dir: dir.to_path_buf(),
+            file_index: seq as i64,
+            message: "invalid chunk encoding \"<unknown>\"".to_string(),
+        })?;
+        let rel_len = rel_enc + CHUNK_ENCODING_SIZE;
+        let (data_len, ulen) = decode_uvarint(
+            &hdr[rel_len..hdr_read.min(rel_len + MAX_CHUNK_LENGTH_FIELD_SIZE)],
+        )
+        .ok_or_else(|| HeadChunksError::Corruption {
+            dir: dir.to_path_buf(),
+            file_index: seq as i64,
+            message: "invalid chunk length uvarint".to_string(),
+        })?;
+        let data_len = usize::try_from(data_len).map_err(|_| HeadChunksError::Corruption {
+            dir: dir.to_path_buf(),
+            file_index: seq as i64,
+            message: "chunk data length overflow".to_string(),
+        })?;
+        let rel_data_start = rel_len + ulen;
+        let rel_data_end = rel_data_start
+            .checked_add(data_len)
+            .ok_or_else(|| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk data length overflow".to_string(),
+            })?;
+        let rel_chk_end = rel_data_end
+            .checked_add(CRC_SIZE)
+            .ok_or_else(|| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk data length overflow".to_string(),
+            })?;
+        let mut buf = vec![0u8; rel_chk_end];
+        let copy_len = hdr_read.min(rel_chk_end);
+        buf[..copy_len].copy_from_slice(&hdr[..copy_len]);
+        if rel_chk_end > hdr_read {
+            let tail_read =
+                active_file.read_at_all(&mut buf[hdr_read..], (off + hdr_read) as u64)?;
+            if hdr_read + tail_read < rel_chk_end {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "not enough bytes to read chunk data and CRC".to_string(),
+                });
+            }
+        }
+        let expected_crc = u32::from_be_bytes(buf[rel_data_end..rel_chk_end].try_into().unwrap());
+        let actual_crc = crc32c::crc32c(&buf[..rel_data_end]);
+        if actual_crc != expected_crc {
+            return Err(HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: format!(
+                    "checksum mismatch expected:{expected_crc:#x}, actual:{actual_crc:#x}"
+                ),
+            });
+        }
+        EncodedChunk::from_bytes(encoding, buf[rel_data_start..rel_data_end].to_vec()).map_err(
+            |e| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: e.to_string(),
+            },
+        )
+    }
+
+    pub fn chunk(&self, ref_id: ChunkDiskMapperRef) -> Result<EncodedChunk, HeadChunksError> {
+        let r = self.read_path_mtx.read();
+        if r.closed {
+            return Err(HeadChunksError::Closed);
+        }
+        if let Some(q) = self.write_queue.get() {
+            if let Some(ChunkPayload::Encoded(c)) = q.get(ref_id) {
+                return Ok(c);
+            }
+        }
+        let (seq_u32, off_u32) = ref_id.unpack();
+        let seq = seq_u32 as usize;
+        let off = off_u32 as usize;
+        if seq == r.cur_file_seq {
+            if let Some(ChunkPayload::Encoded(c)) = self.chunk_buffer.read().get(&ref_id) {
+                return Ok(c.clone());
+            }
+        }
+        if let Some(mmap) = r.mmaps.get(&seq) {
+            return Self::decode_chunk_from_slice(&self.dir, seq, off, mmap);
+        }
+        if let Some((active_seq, ref active_file)) = r.active_file {
+            if active_seq == seq {
+                return Self::decode_chunk_from_active_file(&self.dir, seq, off, active_file);
+            }
+        }
+        if seq > r.cur_file_seq {
+            return Err(HeadChunksError::Corruption {
+                dir: self.dir.clone(),
+                file_index: -1,
+                message: format!("head chunk file index {seq} more than current open file"),
+            });
+        }
+        Err(HeadChunksError::Corruption {
+            dir: self.dir.clone(),
+            file_index: seq as i64,
+            message: format!("head chunk file index {seq} does not exist on disk"),
+        })
+    }
+
+    fn iterate_slice_raw<F>(
+        dir: &Path,
+        seq: usize,
+        bytes: &[u8],
+        file_end: usize,
+        f: &mut F,
+    ) -> Result<(), HeadChunksError>
+    where
+        F: FnMut(HeadChunkRecord, u8) -> Result<(), HeadChunksError>,
+    {
+        let mut idx = HEAD_CHUNK_FILE_HEADER_SIZE;
+        while idx < file_end {
+            if file_end - idx < MAX_HEAD_CHUNK_META_SIZE {
+                if bytes[idx..file_end].iter().all(|&b| b == 0) {
+                    break;
+                }
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: format!("trailing non-zero bytes at offset {idx}"),
+                });
+            }
+            let start_idx = idx;
+            let chunk_ref = ChunkDiskMapperRef::new(seq as u32, start_idx as u32);
+            let series_ref = u64::from_be_bytes(bytes[idx..idx + 8].try_into().unwrap());
+            idx += SERIES_REF_SIZE;
+            let mint = i64::from_be_bytes(bytes[idx..idx + 8].try_into().unwrap());
+            idx += MINT_MAXT_SIZE;
+            let maxt = i64::from_be_bytes(bytes[idx..idx + 8].try_into().unwrap());
+            idx += MINT_MAXT_SIZE;
+            if series_ref == 0 && mint == 0 && maxt == 0 {
+                break;
+            }
+            let raw_enc_byte = bytes[idx];
+            idx += CHUNK_ENCODING_SIZE;
+            let is_ooo = (raw_enc_byte & OUT_OF_ORDER_MASK) != 0;
+            let stripped_enc = raw_enc_byte & !OUT_OF_ORDER_MASK;
+            let encoding = Encoding::from_u8(stripped_enc).unwrap_or(Encoding::None);
+            let Some((data_len, ulen)) = decode_uvarint(
+                &bytes[idx..(idx + MAX_CHUNK_LENGTH_FIELD_SIZE).min(file_end)],
+            ) else {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "invalid chunk length uvarint".to_string(),
+                });
+            };
+            idx += ulen;
+            let data_len = usize::try_from(data_len).map_err(|_| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk data length overflow".to_string(),
+            })?;
+            let data_end = idx.checked_add(data_len).ok_or_else(|| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk data length overflow".to_string(),
+            })?;
+            let chk_end = data_end.checked_add(CRC_SIZE).ok_or_else(|| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk data length overflow".to_string(),
+            })?;
+            if data_len < 2 || chk_end > file_end {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "chunk data extends past end of file".to_string(),
+                });
+            }
+            let raw_num_samples = u16::from_be_bytes([bytes[idx], bytes[idx + 1]]);
+            let num_samples = match encoding {
+                Encoding::HistogramSt | Encoding::FloatHistogramSt => raw_num_samples & 0x3FFF,
+                _ => raw_num_samples,
+            };
+            idx = data_end;
+            let expected_crc = u32::from_be_bytes(bytes[idx..idx + CRC_SIZE].try_into().unwrap());
+            let actual_crc = crc32c::crc32c(&bytes[start_idx..idx]);
+            if actual_crc != expected_crc {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: format!(
+                        "checksum mismatch expected:{expected_crc:#x}, actual:{actual_crc:#x}"
+                    ),
+                });
+            }
+            idx += CRC_SIZE;
+            f(
+                HeadChunkRecord {
+                    series_ref,
+                    chunk_ref,
+                    mint,
+                    maxt,
+                    num_samples,
+                    encoding,
+                    is_ooo,
+                },
+                stripped_enc,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn iterate_active_file_raw<F>(
+        dir: &Path,
+        seq: usize,
+        active_file: &ActiveReadFile,
+        file_end: usize,
+        f: &mut F,
+    ) -> Result<(), HeadChunksError>
+    where
+        F: FnMut(HeadChunkRecord, u8) -> Result<(), HeadChunksError>,
+    {
+        const HDR_PREFIX_LEN: usize =
+            SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE + CHUNK_ENCODING_SIZE + MAX_CHUNK_LENGTH_FIELD_SIZE;
+        let mut idx = HEAD_CHUNK_FILE_HEADER_SIZE;
+        let mut rec_buf = Vec::new();
+        while idx < file_end {
+            if file_end - idx < MAX_HEAD_CHUNK_META_SIZE {
+                let rem = file_end - idx;
+                rec_buf.resize(rem, 0);
+                let n = active_file.read_at_all(&mut rec_buf, idx as u64)?;
+                if n < rem {
+                    return Err(HeadChunksError::Corruption {
+                        dir: dir.to_path_buf(),
+                        file_index: seq as i64,
+                        message: "unexpected EOF while reading active head chunk file".to_string(),
+                    });
+                }
+                if rec_buf.iter().all(|&b| b == 0) {
+                    break;
+                }
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: format!("trailing non-zero bytes at offset {idx}"),
+                });
+            }
+            let start_idx = idx;
+            let chunk_ref = ChunkDiskMapperRef::new(seq as u32, start_idx as u32);
+            let mut hdr = [0u8; HDR_PREFIX_LEN];
+            let max_hdr = HDR_PREFIX_LEN.min(file_end - idx);
+            let n = active_file.read_at_all(&mut hdr[..max_hdr], idx as u64)?;
+            if n < max_hdr {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "unexpected EOF reading chunk header".to_string(),
+                });
+            }
+            let series_ref = u64::from_be_bytes(hdr[0..8].try_into().unwrap());
+            let mint = i64::from_be_bytes(hdr[8..16].try_into().unwrap());
+            let maxt = i64::from_be_bytes(hdr[16..24].try_into().unwrap());
+            if series_ref == 0 && mint == 0 && maxt == 0 {
+                break;
+            }
+            let raw_enc_byte = hdr[24];
+            let is_ooo = (raw_enc_byte & OUT_OF_ORDER_MASK) != 0;
+            let stripped_enc = raw_enc_byte & !OUT_OF_ORDER_MASK;
+            let encoding = Encoding::from_u8(stripped_enc).unwrap_or(Encoding::None);
+            let Some((data_len, ulen)) = decode_uvarint(&hdr[25..max_hdr]) else {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "invalid chunk length uvarint".to_string(),
+                });
+            };
+            let data_len = usize::try_from(data_len).map_err(|_| HeadChunksError::Corruption {
+                dir: dir.to_path_buf(),
+                file_index: seq as i64,
+                message: "chunk data length overflow".to_string(),
+            })?;
+            let rel_data_start = 25 + ulen;
+            let rel_data_end = rel_data_start
+                .checked_add(data_len)
+                .ok_or_else(|| HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "chunk data length overflow".to_string(),
+                })?;
+            let rel_chk_end = rel_data_end
+                .checked_add(CRC_SIZE)
+                .ok_or_else(|| HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "chunk data length overflow".to_string(),
+                })?;
+            if data_len < 2 || start_idx.checked_add(rel_chk_end).is_none_or(|e| e > file_end) {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "chunk data extends past end of file".to_string(),
+                });
+            }
+            rec_buf.resize(rel_chk_end, 0);
+            let copy_len = max_hdr.min(rel_chk_end);
+            rec_buf[..copy_len].copy_from_slice(&hdr[..copy_len]);
+            if rel_chk_end > max_hdr {
+                let tail_needed = rel_chk_end - max_hdr;
+                let n_tail = active_file
+                    .read_at_all(&mut rec_buf[max_hdr..], (start_idx + max_hdr) as u64)?;
+                if n_tail < tail_needed {
+                    return Err(HeadChunksError::Corruption {
+                        dir: dir.to_path_buf(),
+                        file_index: seq as i64,
+                        message: "chunk data extends past end of file".to_string(),
+                    });
+                }
+            }
+            let raw_num_samples =
+                u16::from_be_bytes([rec_buf[rel_data_start], rec_buf[rel_data_start + 1]]);
+            let num_samples = match encoding {
+                Encoding::HistogramSt | Encoding::FloatHistogramSt => raw_num_samples & 0x3FFF,
+                _ => raw_num_samples,
+            };
+            let expected_crc =
+                u32::from_be_bytes(rec_buf[rel_data_end..rel_chk_end].try_into().unwrap());
+            let actual_crc = crc32c::crc32c(&rec_buf[..rel_data_end]);
+            if actual_crc != expected_crc {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: format!(
+                        "checksum mismatch expected:{expected_crc:#x}, actual:{actual_crc:#x}"
+                    ),
+                });
+            }
+            idx = start_idx + rel_chk_end;
+            f(
+                HeadChunkRecord {
+                    series_ref,
+                    chunk_ref,
+                    mint,
+                    maxt,
+                    num_samples,
+                    encoding,
+                    is_ooo,
+                },
+                stripped_enc,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn iterate_all_chunks_raw<F>(&self, mut f: F) -> Result<(), HeadChunksError>
+    where
+        F: FnMut(HeadChunkRecord, u8) -> Result<(), HeadChunksError>,
+    {
+        let mut st = self.write_path_mtx.lock();
+        if st.cur_file.is_some() && !st.write_buf.is_empty() {
+            Self::flush_buffer_locked(&mut st, &self.chunk_buffer)?;
+        }
+        let cur_file_offset = st.cur_file_offset;
+        let (mmaps_snapshot, active_snapshot) = {
+            let r = self.read_path_mtx.read();
+            let mmaps: Vec<(usize, Arc<Mmap>)> =
+                r.mmaps.iter().map(|(&seq, m)| (seq, Arc::clone(m))).collect();
+            let active = r
+                .active_file
+                .as_ref()
+                .map(|(seq, file)| (*seq, Arc::clone(file), cur_file_offset));
+            (mmaps, active)
+        };
+
+        let mut res = Ok(());
+        for (seq, mmap) in mmaps_snapshot {
+            if let Err(e) = Self::iterate_slice_raw(&self.dir, seq, &mmap, mmap.len(), &mut f) {
+                res = Err(e);
+                break;
+            }
+        }
+        if res.is_ok() {
+            if let Some((seq, active_file, file_end)) = active_snapshot {
+                if file_end > HEAD_CHUNK_FILE_HEADER_SIZE {
+                    if let Err(e) = Self::iterate_active_file_raw(
+                        &self.dir,
+                        seq,
+                        &active_file,
+                        file_end,
+                        &mut f,
+                    ) {
+                        res = Err(e);
+                    }
+                }
+            }
+        }
+        st.file_maxt_set = true;
+        res
+    }
+
+    pub fn truncate(&self, file_no: usize) -> Result<(), HeadChunksError> {
+        let cur_seq = self.write_path_mtx.lock().cur_file_seq;
+        let removed: Vec<usize> = {
+            let r = self.read_path_mtx.read();
+            r.mmaps
+                .keys()
+                .copied()
+                .take_while(|&seq| seq != cur_seq && seq < file_no)
+                .collect()
+        };
+        let cur_has_chunks = {
+            let st = self.write_path_mtx.lock();
+            st.cur_file.is_some() && (st.cur_file_offset + st.write_buf.len()) > HEAD_CHUNK_FILE_HEADER_SIZE
+        };
+        if cur_has_chunks {
+            self.cut_new_file();
+        }
+        {
+            let mut r = self.read_path_mtx.write();
+            for &seq in &removed {
+                r.mmaps.remove(&seq);
+            }
+        }
+        for seq in removed {
+            match fs::remove_file(head_chunk_file_path(&self.dir, seq)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(HeadChunksError::Io(e)),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn close(&self) -> Result<(), HeadChunksError> {
+        if let Some(q) = self.write_queue.get() {
+            q.stop();
+        }
+        let _pos = self.evtl_pos.lock();
+        let mut st = self.write_path_mtx.lock();
+        if st.closed {
+            return Ok(());
+        }
+        let finalize_res = self.finalize_cur_file_locked(&mut st, false);
+        st.closed = true;
+        {
+            let mut r = self.read_path_mtx.write();
+            r.closed = true;
+            r.active_file = None;
+            r.mmaps.clear();
+        }
+        self.chunk_buffer.write().clear();
+        finalize_res
+    }
+}
+
+impl Drop for ChunkDiskMapper {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
 }
 
 #[cfg(test)]
@@ -1390,5 +2956,82 @@ mod tests {
         assert_eq!(all[1].mint, 4000);
         assert_eq!(reader.chunk(c1).unwrap(), encoded);
         assert_eq!(reader.chunk(c_after).unwrap(), encoded);
+    }
+
+    #[test]
+    fn chunk_disk_mapper_active_file_past_128kib_preallocation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Small write buffer (1024 bytes) so writes flush into the active cur_file and
+        // bypass chunk_buffer well past the 128 KiB (131,072 byte) preallocation size.
+        let cdm = ChunkDiskMapper::open(dir.path(), 1024, 0, None).unwrap();
+
+        let mut xc = XorChunk::new();
+        {
+            let mut app = xc.appender().unwrap();
+            for i in 0..200 {
+                app.append(0, i * 1000, (i as f64) * 1.25 + 0.5).unwrap();
+            }
+        }
+        let encoded = EncodedChunk::Xor(xc);
+
+        let mut refs = Vec::new();
+        let mut total_bytes = HEAD_CHUNK_FILE_HEADER_SIZE;
+        let mut seq_num = 0usize;
+        while total_bytes <= 220 * 1024 {
+            let s = seq_num as u64 + 1;
+            let r = cdm.write_chunk(s, 0, 199_000, encoded.clone(), false, |res| res.unwrap());
+            refs.push((s, r));
+            total_bytes = refs.last().unwrap().1.unpack().1 as usize;
+            seq_num += 1;
+        }
+        assert_eq!(cdm.cur_file_sequence(), 1);
+        assert!(
+            refs.last().unwrap().1.unpack().1 as usize > HEAD_CHUNK_FILE_PREALLOCATION_SIZE,
+            "expected chunks past 128 KiB preallocation"
+        );
+
+        // Active file must NOT be mapped as an Mmap while open, yet all chunks (including >128 KiB)
+        // must be readable via chunk() and iterate_all_chunks_raw().
+        for &(_s, r) in &refs {
+            let got = cdm.chunk(r).unwrap();
+            assert_eq!(got, encoded);
+        }
+
+        let mut seen = Vec::new();
+        cdm.iterate_all_chunks_raw(|rec, _| {
+            seen.push((rec.series_ref, rec.chunk_ref));
+            // Calling chunk() from inside iterate_all_chunks_raw callback must not deadlock.
+            assert_eq!(cdm.chunk(rec.chunk_ref).unwrap(), encoded);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, refs);
+
+        cdm.close().unwrap();
+
+        // Reopen as sealed mmap and verify everything still reads cleanly.
+        let reopened = ChunkDiskMapper::open(dir.path(), 1024, 0, None).unwrap();
+        for &(_s, r) in &refs {
+            assert_eq!(reopened.chunk(r).unwrap(), encoded);
+        }
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn chunk_disk_mapper_write_payload_propagates_closed_queue_error_to_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cdm = ChunkDiskMapper::open(dir.path(), 1024, 8, None).unwrap();
+        let mut xc = XorChunk::new();
+        xc.appender().unwrap().append(0, 1000, 1.0).unwrap();
+        let encoded = EncodedChunk::Xor(xc);
+
+        cdm.close().unwrap();
+        let cb_res = Arc::new(Mutex::new(None::<Result<(), HeadChunksError>>));
+        let cb_res2 = Arc::clone(&cb_res);
+        let _ = cdm.write_chunk(1, 1000, 1000, encoded, false, move |res| {
+            *cb_res2.lock() = Some(res);
+        });
+        let got = cb_res.lock().take().expect("callback must be invoked on closed queue");
+        assert!(matches!(got, Err(HeadChunksError::Closed)));
     }
 }

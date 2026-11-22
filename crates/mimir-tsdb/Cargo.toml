@@ -10,6 +10,7 @@ mimir-proto = { path = "../mimir-proto" }
 bytes = { workspace = true }
 crc32c = { workspace = true }
 hashbrown = { workspace = true }
+libc = { workspace = true }
 memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
