@@ -263,6 +263,7 @@ pub struct WlogWriter {
     rollback_page_buf: Vec<u8>,
     fault_hook: Option<WriteFaultHook>,
     metrics: Option<crate::metrics::WlogMetrics>,
+    metrics_reg: Option<(prometheus::Registry, String)>,
 }
 
 impl WlogWriter {
@@ -306,7 +307,38 @@ impl WlogWriter {
             rollback_page_buf: Vec::new(),
             fault_hook: None,
             metrics: None,
+            metrics_reg: None,
         })
+    }
+
+    pub fn with_registry(
+        dir: impl AsRef<Path>,
+        segment_size: usize,
+        compress: CompressionType,
+        reg: Option<prometheus::Registry>,
+        prefix: &str,
+    ) -> Result<Self, WlogError> {
+        let mut w = Self::with_segment_size(&dir, segment_size, compress)?;
+        if let Some(ref r) = reg {
+            let m = crate::metrics::WlogMetrics::new_with_dir(Some(r), prefix, Some(w.dir()));
+            w.set_metrics(m);
+            w.metrics_reg = Some((r.clone(), prefix.to_string()));
+        }
+        Ok(w)
+    }
+
+    #[inline]
+    pub fn current_segment_index(&self) -> Option<usize> {
+        self.segment.as_ref().map(|s| s.index)
+    }
+
+    #[inline]
+    pub fn done_pages(&self) -> usize {
+        self.done_pages
+    }
+
+    pub fn dir_size(&self) -> io::Result<u64> {
+        crate::encoding::fileutil::dir_size(&self.dir)
     }
 
     /// Installs or clears a write fault-injection hook (used by durability tests).
@@ -753,6 +785,25 @@ impl WlogWriter {
         Ok(())
     }
 
+    pub fn fsync_segments_until_current(&mut self) -> Result<(), WlogError> {
+        if self.closed {
+            return Err(WlogError::Io(io::Error::other(
+                "unable to fsync segments: write log is closed",
+            )));
+        }
+        if let Some(seg) = self.segment.as_ref() {
+            Self::fsync_file(self.metrics.as_ref(), &seg.file)?;
+        }
+        Ok(())
+    }
+
+    pub fn close_mut(&mut self) -> Result<(), WlogError> {
+        if self.closed {
+            return Err(WlogError::Closed);
+        }
+        self.close_inner()
+    }
+
     pub fn close(mut self) -> Result<(), WlogError> {
         self.close_inner()
     }
@@ -778,6 +829,35 @@ impl WlogWriter {
                 Self::fsync_file(self.metrics.as_ref(), &seg.file)?;
             }
             self.segment = None;
+        }
+        if let (Some((ref reg, ref prefix)), Some(ref m)) = (&self.metrics_reg, &self.metrics) {
+            let _ = reg.unregister(Box::new(m.fsync_duration.clone()));
+            let _ = reg.unregister(Box::new(m.page_flushes.clone()));
+            let _ = reg.unregister(Box::new(m.page_completions.clone()));
+            let _ = reg.unregister(Box::new(m.truncate_fail.clone()));
+            let _ = reg.unregister(Box::new(m.truncate_total.clone()));
+            let _ = reg.unregister(Box::new(m.current_segment.clone()));
+            let _ = reg.unregister(Box::new(m.writes_failed.clone()));
+            let _ = reg.unregister(Box::new(m.record_part_writes.clone()));
+            let _ = reg.unregister(Box::new(m.record_parts_bytes_written.clone()));
+            let _ = reg.unregister(Box::new(m.record_bytes_saved.clone()));
+            if let Ok(desc) = prometheus::core::Desc::new(
+                format!("{prefix}storage_size_bytes"),
+                "Size of the write log directory.".to_string(),
+                Vec::new(),
+                HashMap::new(),
+            ) {
+                struct SizeDesc(prometheus::core::Desc);
+                impl prometheus::core::Collector for SizeDesc {
+                    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+                        vec![&self.0]
+                    }
+                    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+                        Vec::new()
+                    }
+                }
+                let _ = reg.unregister(Box::new(SizeDesc(desc)));
+            }
         }
         self.closed = true;
         Ok(())
@@ -1747,6 +1827,886 @@ where
         let _ = fs::remove_dir_all(&cp_tmp);
     }
     res
+}
+
+/// Creates an empty WAL segment file at `segment_name(dir, index)` (Go `wlog.CreateSegment`).
+pub fn create_segment_file(dir: &Path, index: usize) -> Result<File, WlogError> {
+    fs::create_dir_all(dir)?;
+    let path = segment_name(dir, index);
+    Ok(OpenOptions::new().create(true).truncate(true).write(true).open(path)?)
+}
+
+// ============================================================================
+// LiveReader & Watcher (tsdb/wlog/live_reader.go & tsdb/wlog/watcher.go)
+// ============================================================================
+
+#[derive(Clone)]
+pub struct LiveReaderMetrics {
+    reg: Option<prometheus::Registry>,
+    reader_corruption_errors: prometheus::CounterVec,
+}
+
+impl LiveReaderMetrics {
+    pub fn new(reg: Option<prometheus::Registry>) -> Self {
+        let reader_corruption_errors = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "prometheus_tsdb_wal_reader_corruption_errors_total",
+                "Errors encountered when reading the WAL.",
+            ),
+            &["error"],
+        )
+        .expect("valid LiveReaderMetrics counter vec");
+        if let Some(ref r) = reg {
+            let _ = r.register(Box::new(reader_corruption_errors.clone()));
+        }
+        Self {
+            reg,
+            reader_corruption_errors,
+        }
+    }
+
+    pub fn unregister(&self) {
+        if let Some(ref r) = self.reg {
+            let _ = r.unregister(Box::new(self.reader_corruption_errors.clone()));
+        }
+    }
+}
+
+/// Streaming WAL reader for segments still being written (`wlog.LiveReader`).
+pub struct LiveReader<R> {
+    rdr: R,
+    err: Option<WlogError>,
+    rec: Vec<u8>,
+    precompr_buf: Vec<u8>,
+    buf: Box<[u8; PAGE_SIZE]>,
+    read_index: usize,
+    write_index: usize,
+    total: usize,
+    part_idx: usize,
+    hdr: [u8; RECORD_HEADER_SIZE],
+    pub eof_non_err: bool,
+    permissive: bool,
+    metrics: Option<LiveReaderMetrics>,
+}
+
+impl<R: Read> LiveReader<R> {
+    pub fn new(metrics: Option<LiveReaderMetrics>, rdr: R) -> Self {
+        Self {
+            rdr,
+            err: None,
+            rec: Vec::new(),
+            precompr_buf: Vec::new(),
+            buf: Box::new([0u8; PAGE_SIZE]),
+            read_index: 0,
+            write_index: 0,
+            total: 0,
+            part_idx: 0,
+            hdr: [0u8; RECORD_HEADER_SIZE],
+            eof_non_err: false,
+            permissive: true,
+            metrics,
+        }
+    }
+
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.total
+    }
+
+    #[inline]
+    pub fn record(&self) -> &[u8] {
+        &self.rec
+    }
+
+    pub fn is_eof_err(e: &WlogError) -> bool {
+        matches!(e, WlogError::Io(io_e) if io_e.kind() == io::ErrorKind::UnexpectedEof)
+    }
+
+    pub fn err(&self) -> Option<&WlogError> {
+        match self.err.as_ref() {
+            Some(e) if self.eof_non_err && Self::is_eof_err(e) => None,
+            other => other,
+        }
+    }
+
+    fn fill_buffer(&mut self) -> io::Result<usize> {
+        loop {
+            match self.rdr.read(&mut self.buf[self.write_index..PAGE_SIZE]) {
+                Ok(n) => {
+                    self.write_index += n;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub fn next_record(&mut self) -> bool {
+        loop {
+            match self.build_record() {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(e) if !Self::is_eof_err(&e) => {
+                    self.err = Some(e);
+                    return false;
+                }
+                Err(_) => {}
+            }
+
+            if self.permissive && self.write_index == PAGE_SIZE && self.read_index > 0 {
+                self.buf.copy_within(self.read_index..self.write_index, 0);
+                self.write_index -= self.read_index;
+                self.read_index = 0;
+                continue;
+            }
+
+            if self.read_index == PAGE_SIZE {
+                self.write_index = 0;
+                self.read_index = 0;
+            }
+
+            if self.write_index != PAGE_SIZE {
+                match self.fill_buffer() {
+                    Ok(0) => {
+                        self.err = Some(WlogError::Io(io::Error::from(
+                            io::ErrorKind::UnexpectedEof,
+                        )));
+                        return false;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.err = Some(WlogError::Io(e));
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_record_part(&mut self) -> Result<Option<usize>, WlogError> {
+        if self.buf[self.read_index] == REC_PAGE_TERM {
+            let remaining = PAGE_SIZE - (self.total % PAGE_SIZE);
+            if self.read_index + remaining > self.write_index {
+                return Err(WlogError::Io(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            if self.buf[self.read_index..self.read_index + remaining]
+                .iter()
+                .any(|&b| b != 0)
+            {
+                return Err(WlogError::Corruption {
+                    dir: None,
+                    segment: None,
+                    offset: self.total,
+                    message: "unexpected non-zero byte in page term bytes".to_string(),
+                });
+            }
+            self.read_index += remaining;
+            self.total += remaining;
+            return Ok(None);
+        }
+
+        if self.write_index - self.read_index < RECORD_HEADER_SIZE {
+            return Err(WlogError::Io(io::Error::from(
+                io::ErrorKind::UnexpectedEof,
+            )));
+        }
+        self.hdr
+            .copy_from_slice(&self.buf[self.read_index..self.read_index + RECORD_HEADER_SIZE]);
+        let length = u16::from_be_bytes([self.hdr[1], self.hdr[2]]) as usize;
+        let crc = u32::from_be_bytes([self.hdr[3], self.hdr[4], self.hdr[5], self.hdr[6]]);
+
+        if self.read_index + RECORD_HEADER_SIZE + length > PAGE_SIZE {
+            if !self.permissive {
+                return Err(WlogError::Corruption {
+                    dir: None,
+                    segment: None,
+                    offset: self.total,
+                    message: format!(
+                        "record would overflow current page: {} > {PAGE_SIZE}",
+                        self.read_index + RECORD_HEADER_SIZE + length
+                    ),
+                });
+            }
+            if let Some(ref m) = self.metrics {
+                m.reader_corruption_errors
+                    .with_label_values(&["record_span_page"])
+                    .inc();
+            }
+        }
+
+        if RECORD_HEADER_SIZE + length > PAGE_SIZE {
+            return Err(WlogError::Corruption {
+                dir: None,
+                segment: None,
+                offset: self.total,
+                message: format!(
+                    "record length greater than a single page: {} > {PAGE_SIZE}",
+                    RECORD_HEADER_SIZE + length
+                ),
+            });
+        }
+        if self.read_index + RECORD_HEADER_SIZE + length > self.write_index {
+            return Err(WlogError::Io(io::Error::from(
+                io::ErrorKind::UnexpectedEof,
+            )));
+        }
+
+        let rec_slice = &self.buf
+            [self.read_index + RECORD_HEADER_SIZE..self.read_index + RECORD_HEADER_SIZE + length];
+        let actual_crc = crc32c::crc32c(rec_slice);
+        if actual_crc != crc {
+            return Err(WlogError::Corruption {
+                dir: None,
+                segment: None,
+                offset: self.total,
+                message: format!("unexpected checksum {actual_crc:#x}, expected {crc:#x}"),
+            });
+        }
+        let consumed = length + RECORD_HEADER_SIZE;
+        let start = self.read_index + RECORD_HEADER_SIZE;
+        self.read_index += consumed;
+        self.total += consumed;
+        Ok(Some(start))
+    }
+
+    fn build_record(&mut self) -> Result<bool, WlogError> {
+        loop {
+            if self.write_index <= self.read_index {
+                return Ok(false);
+            }
+            let Some(payload_start) = self.read_record_part()? else {
+                continue;
+            };
+            let length = u16::from_be_bytes([self.hdr[1], self.hdr[2]]) as usize;
+            let hdr0 = self.hdr[0];
+            let rt = hdr0 & REC_TYPE_MASK;
+            if rt == REC_FIRST || rt == REC_FULL {
+                self.precompr_buf.clear();
+            }
+            let compr = if (hdr0 & SNAPPY_MASK) == SNAPPY_MASK {
+                CompressionType::Snappy
+            } else if (hdr0 & ZSTD_MASK) == ZSTD_MASK {
+                CompressionType::Zstd
+            } else {
+                CompressionType::None
+            };
+            self.precompr_buf
+                .extend_from_slice(&self.buf[payload_start..payload_start + length]);
+            if let Err(msg) = validate_record(rt, self.part_idx) {
+                self.part_idx = 0;
+                return Err(WlogError::Corruption {
+                    dir: None,
+                    segment: None,
+                    offset: self.total,
+                    message: msg,
+                });
+            }
+            if rt == REC_LAST || rt == REC_FULL {
+                self.part_idx = 0;
+                if let Err(msg) = decompress_record_into(compr, &self.precompr_buf, &mut self.rec) {
+                    return Err(WlogError::Corruption {
+                        dir: None,
+                        segment: None,
+                        offset: self.total,
+                        message: msg,
+                    });
+                }
+                return Ok(true);
+            }
+            self.part_idx += 1;
+        }
+    }
+}
+
+/// Sink trait used by [`Watcher`] to forward WAL records (`wlog.WriteTo`).
+pub trait WriteTo: Send + Sync {
+    fn append(&self, samples: &[crate::record::RefSample]) -> bool;
+    fn append_exemplars(&self, exemplars: &[crate::record::RefExemplar]) -> bool;
+    fn append_histograms(&self, histograms: &[crate::record::RefHistogramSample]) -> bool;
+    fn append_float_histograms(&self, float_histograms: &[crate::record::RefFloatHistogramSample])
+        -> bool;
+    fn store_series(&self, series: &[crate::record::RefSeries], index: usize);
+    fn store_metadata(&self, meta: &[crate::record::RefMetadata]);
+    fn update_series_segment(&self, series: &[crate::record::RefSeries], index: usize);
+    fn series_reset(&self, index: usize);
+}
+
+#[derive(Clone)]
+pub struct WatcherMetrics {
+    reg: Option<prometheus::Registry>,
+    pub records_read: prometheus::CounterVec,
+    pub record_decode_fails: prometheus::CounterVec,
+    pub samples_sent_pre_tailing: prometheus::CounterVec,
+    pub current_segment: prometheus::GaugeVec,
+    pub notifications_skipped: prometheus::CounterVec,
+}
+
+impl WatcherMetrics {
+    pub fn new(reg: Option<prometheus::Registry>) -> Self {
+        let records_read = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "prometheus_wal_watcher_records_read_total",
+                "Number of records read by the WAL watcher from the WAL.",
+            ),
+            &["consumer", "type"],
+        )
+        .unwrap();
+        let record_decode_fails = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "prometheus_wal_watcher_record_decode_failures_total",
+                "Number of records read by the WAL watcher that resulted in an error when decoding.",
+            ),
+            &["consumer"],
+        )
+        .unwrap();
+        let samples_sent_pre_tailing = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "prometheus_wal_watcher_samples_sent_pre_tailing_total",
+                "Number of sample records read by the WAL watcher and sent during replay of existing WAL.",
+            ),
+            &["consumer"],
+        )
+        .unwrap();
+        let current_segment = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "prometheus_wal_watcher_current_segment",
+                "Current segment the WAL watcher is reading records from.",
+            ),
+            &["consumer"],
+        )
+        .unwrap();
+        let notifications_skipped = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "prometheus_wal_watcher_notifications_skipped_total",
+                "The number of WAL write notifications that the Watcher has skipped.",
+            ),
+            &["consumer"],
+        )
+        .unwrap();
+        if let Some(ref r) = reg {
+            let _ = r.register(Box::new(records_read.clone()));
+            let _ = r.register(Box::new(record_decode_fails.clone()));
+            let _ = r.register(Box::new(samples_sent_pre_tailing.clone()));
+            let _ = r.register(Box::new(current_segment.clone()));
+            let _ = r.register(Box::new(notifications_skipped.clone()));
+        }
+        Self {
+            reg,
+            records_read,
+            record_decode_fails,
+            samples_sent_pre_tailing,
+            current_segment,
+            notifications_skipped,
+        }
+    }
+
+    pub fn unregister(&self) {
+        if let Some(ref r) = self.reg {
+            let _ = r.unregister(Box::new(self.records_read.clone()));
+            let _ = r.unregister(Box::new(self.record_decode_fails.clone()));
+            let _ = r.unregister(Box::new(self.samples_sent_pre_tailing.clone()));
+            let _ = r.unregister(Box::new(self.current_segment.clone()));
+            let _ = r.unregister(Box::new(self.notifications_skipped.clone()));
+        }
+    }
+}
+
+struct WatcherCtrl {
+    quit: bool,
+    notified: bool,
+    in_read: bool,
+}
+
+struct WatcherState {
+    last_checkpoint: Option<String>,
+    start_timestamp: i64,
+    send_samples: bool,
+    max_segment: Option<usize>,
+    read_timeout: std::time::Duration,
+}
+
+/// WAL watcher that replays existing segments/checkpoints and tails active segments (`wlog.Watcher`).
+pub struct Watcher<W: WriteTo> {
+    name: String,
+    writer: std::sync::Arc<W>,
+    wal_dir: PathBuf,
+    send_exemplars: bool,
+    send_histograms: bool,
+    send_metadata: bool,
+    metrics: Option<WatcherMetrics>,
+    reader_metrics: Option<LiveReaderMetrics>,
+    state: parking_lot::Mutex<WatcherState>,
+    ctrl: parking_lot::Mutex<WatcherCtrl>,
+    cvar: parking_lot::Condvar,
+    worker: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl<W: WriteTo + 'static> Watcher<W> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        metrics: Option<WatcherMetrics>,
+        reader_metrics: Option<LiveReaderMetrics>,
+        name: impl Into<String>,
+        writer: std::sync::Arc<W>,
+        dir: impl AsRef<Path>,
+        send_exemplars: bool,
+        send_histograms: bool,
+        send_metadata: bool,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            name: name.into(),
+            writer,
+            wal_dir: dir.as_ref().join("wal"),
+            send_exemplars,
+            send_histograms,
+            send_metadata,
+            metrics,
+            reader_metrics,
+            state: parking_lot::Mutex::new(WatcherState {
+                last_checkpoint: None,
+                start_timestamp: 0,
+                send_samples: false,
+                max_segment: None,
+                read_timeout: std::time::Duration::from_secs(15),
+            }),
+            ctrl: parking_lot::Mutex::new(WatcherCtrl {
+                quit: false,
+                notified: false,
+                in_read: false,
+            }),
+            cvar: parking_lot::Condvar::new(),
+            worker: parking_lot::Mutex::new(None),
+        })
+    }
+
+    pub fn set_start_time(&self, t: std::time::SystemTime) {
+        let ms = t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.state.lock().start_timestamp = ms;
+    }
+
+    pub fn set_max_segment(&self, max_seg: Option<usize>) {
+        self.state.lock().max_segment = max_seg;
+    }
+
+    pub fn set_read_timeout(&self, timeout: std::time::Duration) {
+        self.state.lock().read_timeout = timeout;
+    }
+
+    pub fn wal_dir(&self) -> &Path {
+        &self.wal_dir
+    }
+
+    pub fn notify(&self) {
+        let mut g = self.ctrl.lock();
+        if g.in_read || g.notified {
+            if let Some(ref m) = self.metrics {
+                m.notifications_skipped
+                    .with_label_values(&[self.name.as_str()])
+                    .inc();
+            }
+            return;
+        }
+        g.notified = true;
+        self.cvar.notify_all();
+    }
+
+    fn is_quit(&self) -> bool {
+        self.ctrl.lock().quit
+    }
+
+    pub fn start(self: &std::sync::Arc<Self>) {
+        let me = std::sync::Arc::clone(self);
+        let h = std::thread::Builder::new()
+            .name(format!("wal-watcher-{}", self.name))
+            .spawn(move || {
+                me.loop_run();
+            })
+            .expect("spawn wal watcher");
+        *self.worker.lock() = Some(h);
+    }
+
+    pub fn stop(&self) {
+        {
+            let mut g = self.ctrl.lock();
+            g.quit = true;
+            self.cvar.notify_all();
+        }
+        if let Some(h) = self.worker.lock().take() {
+            let _ = h.join();
+        }
+    }
+
+    fn loop_run(&self) {
+        while !self.is_quit() {
+            self.set_start_time(std::time::SystemTime::now());
+            let _ = self.run();
+            if self.is_quit() {
+                break;
+            }
+            let mut g = self.ctrl.lock();
+            if !g.quit {
+                let _ = self.cvar.wait_for(&mut g, std::time::Duration::from_secs(5));
+            }
+        }
+    }
+
+    pub fn run(&self) -> Result<(), WlogError> {
+        let (_, last_segment) = segments_range(&self.wal_dir)?.ok_or_else(|| {
+            WlogError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "failed to find segment for index",
+            ))
+        })?;
+        self.state.lock().send_samples = false;
+
+        let mut checkpoint_index = 0usize;
+        let last_cp = last_checkpoint(&self.wal_dir)?;
+        if let Some((ref cp_dir, idx)) = last_cp {
+            checkpoint_index = idx;
+            self.read_checkpoint(cp_dir, false)?;
+            let prev_cp = self.state.lock().last_checkpoint.clone();
+            let cp_str = cp_dir.to_string_lossy().into_owned();
+            if prev_cp.as_deref() != Some(cp_str.as_str()) {
+                self.writer.series_reset(checkpoint_index);
+            }
+            self.state.lock().last_checkpoint = Some(cp_str);
+        } else {
+            self.state.lock().last_checkpoint = None;
+        }
+
+        let mut current_segment = self.find_segment_for_index(checkpoint_index)?;
+        while !self.is_quit() {
+            if let Some(ref m) = self.metrics {
+                m.current_segment
+                    .with_label_values(&[self.name.as_str()])
+                    .set(current_segment as f64);
+            }
+            let only_series = current_segment < last_segment;
+            match self.watch(current_segment, only_series) {
+                Ok(()) => {}
+                Err(e) if only_series => {
+                    let _ = e;
+                }
+                Err(e) => return Err(e),
+            }
+            if self.state.lock().max_segment == Some(current_segment) {
+                return Ok(());
+            }
+            current_segment += 1;
+        }
+        Ok(())
+    }
+
+    fn find_segment_for_index(&self, index: usize) -> Result<usize, WlogError> {
+        let refs = list_segments(&self.wal_dir)?;
+        for r in refs {
+            if r.index >= index {
+                return Ok(r.index);
+            }
+        }
+        Err(WlogError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "failed to find segment for index",
+        )))
+    }
+
+    fn watch(&self, segment_num: usize, only_series: bool) -> Result<(), WlogError> {
+        let seg_path = segment_name(&self.wal_dir, segment_num);
+        let seg_file = File::open(&seg_path)?;
+        let mut reader = LiveReader::new(self.reader_metrics.clone(), seg_file);
+        if only_series {
+            let _ = self.read_segment(&mut reader, segment_num, true);
+            return Ok(());
+        }
+
+        let checkpoint_period = std::time::Duration::from_secs(5);
+        let segment_check_period = std::time::Duration::from_millis(100);
+        let mut last_cp_check = std::time::Instant::now();
+        let mut last_seg_check = std::time::Instant::now();
+        let mut last_read = std::time::Instant::now();
+
+        loop {
+            if self.is_quit() {
+                return Ok(());
+            }
+            let read_timeout = self.state.lock().read_timeout;
+            let now = std::time::Instant::now();
+            let next_cp = checkpoint_period.saturating_sub(now.duration_since(last_cp_check));
+            let next_seg = segment_check_period.saturating_sub(now.duration_since(last_seg_check));
+            let next_read = read_timeout.saturating_sub(now.duration_since(last_read));
+            let wait_dur = next_cp.min(next_seg).min(next_read);
+
+            let do_read = {
+                let mut g = self.ctrl.lock();
+                if !g.quit && !g.notified {
+                    let _ = self.cvar.wait_for(&mut g, wait_dur);
+                }
+                if g.quit {
+                    return Ok(());
+                }
+                let was_notified = g.notified;
+                g.notified = false;
+                g.in_read = was_notified;
+                was_notified
+            };
+
+            if do_read {
+                let res = self.read_and_handle_error(&mut reader, segment_num, false);
+                self.ctrl.lock().in_read = false;
+                res?;
+                last_read = std::time::Instant::now();
+                continue;
+            }
+
+            let now = std::time::Instant::now();
+            if now.duration_since(last_cp_check) >= checkpoint_period {
+                last_cp_check = now;
+                let _ = self.garbage_collect_series(segment_num);
+            }
+            if now.duration_since(last_seg_check) >= segment_check_period {
+                last_seg_check = now;
+                if let Some((_, last)) = segments_range(&self.wal_dir)? {
+                    if last > segment_num {
+                        self.read_and_handle_error(&mut reader, segment_num, false)?;
+                        return Ok(());
+                    }
+                }
+            }
+            if now.duration_since(last_read) >= read_timeout {
+                self.read_and_handle_error(&mut reader, segment_num, false)?;
+                last_read = std::time::Instant::now();
+            }
+        }
+    }
+
+    fn read_and_handle_error<R: Read>(
+        &self,
+        reader: &mut LiveReader<R>,
+        segment_num: usize,
+        only_series: bool,
+    ) -> Result<(), WlogError> {
+        match self.read_segment(reader, segment_num, only_series) {
+            Ok(()) => Ok(()),
+            Err(e) if LiveReader::<R>::is_eof_err(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn garbage_collect_series(&self, segment_num: usize) -> Result<(), WlogError> {
+        let Some((cp_dir, index)) = last_checkpoint(&self.wal_dir)? else {
+            return Ok(());
+        };
+        let cp_str = cp_dir.to_string_lossy().into_owned();
+        if self.state.lock().last_checkpoint.as_deref() == Some(cp_str.as_str()) {
+            return Ok(());
+        }
+        if index >= segment_num {
+            return Ok(());
+        }
+        self.read_checkpoint(&cp_dir, true)?;
+        self.state.lock().last_checkpoint = Some(cp_str);
+        self.writer.series_reset(index);
+        Ok(())
+    }
+
+    pub fn read_checkpoint(&self, cp_dir: &Path, gc: bool) -> Result<(), WlogError> {
+        let cp_name = cp_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| WlogError::CheckpointNotDir(cp_dir.display().to_string()))?;
+        let index: usize = cp_name
+            .strip_prefix(CHECKPOINT_PREFIX)
+            .and_then(|s| s.parse::<usize>().ok())
+            .ok_or_else(|| WlogError::CheckpointNotDir(cp_dir.display().to_string()))?;
+        let segs = list_segments(cp_dir)?;
+        for seg_ref in segs {
+            let seg_path = cp_dir.join(&seg_ref.name);
+            let size = fs::metadata(&seg_path)?.len() as usize;
+            let f = File::open(&seg_path)?;
+            let mut r = LiveReader::new(self.reader_metrics.clone(), f);
+            let res = if gc {
+                self.read_segment_for_gc(&mut r, index)
+            } else {
+                self.read_segment(&mut r, index, true)
+            };
+            match res {
+                Ok(()) => {}
+                Err(e) if LiveReader::<File>::is_eof_err(&e) => {}
+                Err(e) => return Err(e),
+            }
+            if r.offset() != size {
+                return Err(WlogError::Corruption {
+                    dir: Some(cp_dir.to_path_buf()),
+                    segment: Some(seg_ref.index),
+                    offset: r.offset(),
+                    message: format!(
+                        "readCheckpoint wasn't able to read all data, size: {size}, totalRead: {}",
+                        r.offset()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn read_segment<R: Read>(
+        &self,
+        r: &mut LiveReader<R>,
+        segment_num: usize,
+        only_series: bool,
+    ) -> Result<(), WlogError> {
+        let dec = RecordDecoder::new();
+        let mut series = Vec::with_capacity(512);
+        let mut samples = Vec::with_capacity(512);
+        let mut exemplars = Vec::with_capacity(512);
+        let mut histograms = Vec::with_capacity(512);
+        let mut float_histograms = Vec::with_capacity(512);
+        let mut metadata = Vec::with_capacity(512);
+
+        while r.next_record() && !self.is_quit() {
+            let rec = r.record();
+            let rt = dec.record_type(rec);
+            match rt {
+                RecordType::Series => {
+                    series.clear();
+                    dec.series_into(rec, &mut series)?;
+                    self.writer.store_series(&series, segment_num);
+                }
+                RecordType::Samples | RecordType::SamplesV2 => {
+                    if only_series {
+                        continue;
+                    }
+                    samples.clear();
+                    dec.samples_into(rec, &mut samples)?;
+                    let start_ts = self.state.lock().start_timestamp;
+                    let to_send: Vec<_> = samples
+                        .iter()
+                        .copied()
+                        .filter(|s| s.t > start_ts)
+                        .collect();
+                    if !to_send.is_empty() {
+                        self.state.lock().send_samples = true;
+                        self.writer.append(&to_send);
+                    }
+                }
+                RecordType::Exemplars => {
+                    if !self.send_exemplars || only_series {
+                        continue;
+                    }
+                    exemplars.clear();
+                    dec.exemplars_into(rec, &mut exemplars)?;
+                    self.writer.append_exemplars(&exemplars);
+                }
+                RecordType::HistogramSamples
+                | RecordType::CustomBucketsHistogramSamples
+                | RecordType::HistogramSamplesV2 => {
+                    if !self.send_histograms || only_series {
+                        continue;
+                    }
+                    histograms.clear();
+                    dec.histogram_samples_into(rec, &mut histograms)?;
+                    let start_ts = self.state.lock().start_timestamp;
+                    let to_send: Vec<_> = histograms
+                        .iter()
+                        .filter(|h| h.t > start_ts)
+                        .cloned()
+                        .collect();
+                    if !to_send.is_empty() {
+                        self.state.lock().send_samples = true;
+                        self.writer.append_histograms(&to_send);
+                    }
+                }
+                RecordType::FloatHistogramSamples
+                | RecordType::CustomBucketsFloatHistogramSamples
+                | RecordType::FloatHistogramSamplesV2 => {
+                    if !self.send_histograms || only_series {
+                        continue;
+                    }
+                    float_histograms.clear();
+                    dec.float_histogram_samples_into(rec, &mut float_histograms)?;
+                    let start_ts = self.state.lock().start_timestamp;
+                    let to_send: Vec<_> = float_histograms
+                        .iter()
+                        .filter(|h| h.t > start_ts)
+                        .cloned()
+                        .collect();
+                    if !to_send.is_empty() {
+                        self.state.lock().send_samples = true;
+                        self.writer.append_float_histograms(&to_send);
+                    }
+                }
+                RecordType::Metadata => {
+                    if !self.send_metadata {
+                        continue;
+                    }
+                    metadata.clear();
+                    dec.metadata_into(rec, &mut metadata)?;
+                    self.writer.store_metadata(&metadata);
+                }
+                RecordType::Unknown => {
+                    if let Some(ref m) = self.metrics {
+                        m.record_decode_fails
+                            .with_label_values(&[self.name.as_str()])
+                            .inc();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(e) = r.err() {
+            return Err(match e {
+                WlogError::Io(ioe) => WlogError::Io(io::Error::new(ioe.kind(), ioe.to_string())),
+                other => WlogError::Corruption {
+                    dir: None,
+                    segment: Some(segment_num),
+                    offset: r.offset(),
+                    message: other.to_string(),
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn read_segment_for_gc<R: Read>(&self, r: &mut LiveReader<R>, segment_num: usize) -> Result<(), WlogError> {
+        let dec = RecordDecoder::new();
+        let mut series = Vec::with_capacity(512);
+        while r.next_record() && !self.is_quit() {
+            let rec = r.record();
+            match dec.record_type(rec) {
+                RecordType::Series => {
+                    series.clear();
+                    dec.series_into(rec, &mut series)?;
+                    self.writer.update_series_segment(&series, segment_num);
+                }
+                RecordType::Unknown => {
+                    if let Some(ref m) = self.metrics {
+                        m.record_decode_fails
+                            .with_label_values(&[self.name.as_str()])
+                            .inc();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(e) = r.err() {
+            return Err(match e {
+                WlogError::Io(ioe) => WlogError::Io(io::Error::new(ioe.kind(), ioe.to_string())),
+                other => WlogError::Corruption {
+                    dir: None,
+                    segment: Some(segment_num),
+                    offset: r.offset(),
+                    message: other.to_string(),
+                },
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,14 @@ use std::path::{Path, PathBuf};
 use memmap2::{Mmap, MmapOptions};
 use thiserror::Error;
 
-use crate::chunkenc::{ChunkError, EncodedChunk, Encoding};
+use crate::chunkenc::{
+    ChunkError, EncodedChunk, Encoding, FloatHistogram, FloatHistogramChunk,
+    FloatHistogramStChunk, Histogram, HistogramChunk, HistogramStChunk, Xor2Chunk, XorChunk,
+    float_histogram::AppendFloatHistogramOutcome,
+    float_histogram_st::AppendFloatHistogramStOutcome,
+    histogram::AppendHistogramOutcome,
+    histogram_st::AppendHistogramStOutcome,
+};
 use crate::encoding::{decode_uvarint, put_uvarint};
 
 pub const MAGIC_CHUNKS: u32 = 0x85BD_40DD;
@@ -234,10 +241,28 @@ impl Drop for BlockChunksWriter {
     }
 }
 
+#[derive(Debug)]
+enum BlockSegmentData {
+    Mmap(Mmap),
+    Bytes(Vec<u8>),
+}
+
+impl std::ops::Deref for BlockSegmentData {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mmap(m) => m,
+            Self::Bytes(b) => b,
+        }
+    }
+}
+
 /// Memory-mapped reader for Prometheus block `chunks/000001`, ... segment files.
 #[derive(Debug)]
 pub struct BlockChunksReader {
-    segments: Vec<Mmap>,
+    segments: Vec<BlockSegmentData>,
     total_size: usize,
 }
 
@@ -281,13 +306,22 @@ impl BlockChunksReader {
                 });
             }
             total_size += mmap.len();
-            segments.push(mmap);
+            segments.push(BlockSegmentData::Mmap(mmap));
         }
 
         Ok(Self {
             segments,
             total_size,
         })
+    }
+
+    /// Constructs a reader directly over raw segment byte slices (used in unit tests).
+    pub fn from_raw_bytes(segments: Vec<Vec<u8>>) -> Self {
+        let total_size = segments.iter().map(|s| s.len()).sum();
+        Self {
+            segments: segments.into_iter().map(BlockSegmentData::Bytes).collect(),
+            total_size,
+        }
     }
 
     #[inline]
@@ -365,6 +399,164 @@ impl BlockChunksReader {
         EncodedChunk::from_bytes(encoding, mmap[data_start..data_end].to_vec())
             .map_err(BlockChunksError::Chunk)
     }
+}
+
+/// Sample value for [`chunk_from_samples`] (matching Go `chunks.Sample`).
+#[derive(Clone, Debug)]
+pub enum BlockSampleValue {
+    Float(f64),
+    Histogram(Histogram),
+    FloatHistogram(FloatHistogram),
+}
+
+/// Input sample for [`chunk_from_samples`].
+#[derive(Clone, Debug)]
+pub struct BlockSample {
+    pub st: i64,
+    pub t: i64,
+    pub value: BlockSampleValue,
+}
+
+/// Computes the exact serialized byte size of `chunk` inside a block chunk segment
+/// (`uvarint(len(data)) + encoding(1) + len(data) + crc32c(4)`), matching Go `EncodedSizeInBytes`.
+pub fn encoded_size_in_bytes(chunk: &EncodedChunk) -> usize {
+    let mut len_buf = [0u8; MAX_CHUNK_LENGTH_FIELD_SIZE];
+    let data_len = chunk.as_bytes().len();
+    let ulen = put_uvarint(&mut len_buf, data_len as u64);
+    ulen + CHUNK_ENCODING_SIZE + data_len + CRC_SIZE
+}
+
+/// Builds a [`ChunkMeta`] holding a compacted single chunk from `samples`,
+/// matching Go `chunks.ChunkFromSamples`.
+pub fn chunk_from_samples(samples: &[BlockSample]) -> Result<ChunkMeta, BlockChunksError> {
+    if samples.is_empty() {
+        return Ok(ChunkMeta {
+            ref_id: 0,
+            min_time: 0,
+            max_time: 0,
+            chunk: None,
+        });
+    }
+    let mint = samples[0].t;
+    let maxt = samples[samples.len() - 1].t;
+    let has_st = samples.iter().any(|s| s.st != 0);
+
+    let chunk = match &samples[0].value {
+        BlockSampleValue::Float(_) => {
+            if has_st {
+                let mut c = Xor2Chunk::new();
+                {
+                    let mut app = c.appender()?;
+                    for s in samples {
+                        let BlockSampleValue::Float(v) = s.value else {
+                            return Err(BlockChunksError::Chunk(ChunkError::InvalidChunk));
+                        };
+                        app.append(s.st, s.t, v)?;
+                    }
+                }
+                c.compact();
+                EncodedChunk::Xor2(c)
+            } else {
+                let mut c = XorChunk::new();
+                {
+                    let mut app = c.appender()?;
+                    for s in samples {
+                        let BlockSampleValue::Float(v) = s.value else {
+                            return Err(BlockChunksError::Chunk(ChunkError::InvalidChunk));
+                        };
+                        app.append(s.st, s.t, v)?;
+                    }
+                }
+                c.compact();
+                EncodedChunk::Xor(c)
+            }
+        }
+        BlockSampleValue::Histogram(_) => {
+            if has_st {
+                let mut c = HistogramStChunk::new();
+                {
+                    let mut app = c.appender()?;
+                    for s in samples {
+                        let BlockSampleValue::Histogram(ref h) = s.value else {
+                            return Err(BlockChunksError::Chunk(ChunkError::InvalidChunk));
+                        };
+                        if matches!(
+                            app.append_histogram(None, s.st, s.t, h, false)?,
+                            AppendHistogramStOutcome::NewChunk(_)
+                        ) {
+                            return Err(BlockChunksError::Chunk(ChunkError::CapacityExceeded));
+                        }
+                    }
+                }
+                c.compact();
+                EncodedChunk::HistogramSt(c)
+            } else {
+                let mut c = HistogramChunk::new();
+                {
+                    let mut app = c.appender()?;
+                    for s in samples {
+                        let BlockSampleValue::Histogram(ref h) = s.value else {
+                            return Err(BlockChunksError::Chunk(ChunkError::InvalidChunk));
+                        };
+                        if matches!(
+                            app.append_histogram(None, s.st, s.t, h, false)?,
+                            AppendHistogramOutcome::NewChunk(_)
+                        ) {
+                            return Err(BlockChunksError::Chunk(ChunkError::CapacityExceeded));
+                        }
+                    }
+                }
+                c.compact();
+                EncodedChunk::Histogram(c)
+            }
+        }
+        BlockSampleValue::FloatHistogram(_) => {
+            if has_st {
+                let mut c = FloatHistogramStChunk::new();
+                {
+                    let mut app = c.appender()?;
+                    for s in samples {
+                        let BlockSampleValue::FloatHistogram(ref fh) = s.value else {
+                            return Err(BlockChunksError::Chunk(ChunkError::InvalidChunk));
+                        };
+                        if matches!(
+                            app.append_float_histogram(None, s.st, s.t, fh, false)?,
+                            AppendFloatHistogramStOutcome::NewChunk(_)
+                        ) {
+                            return Err(BlockChunksError::Chunk(ChunkError::CapacityExceeded));
+                        }
+                    }
+                }
+                c.compact();
+                EncodedChunk::FloatHistogramSt(c)
+            } else {
+                let mut c = FloatHistogramChunk::new();
+                {
+                    let mut app = c.appender()?;
+                    for s in samples {
+                        let BlockSampleValue::FloatHistogram(ref fh) = s.value else {
+                            return Err(BlockChunksError::Chunk(ChunkError::InvalidChunk));
+                        };
+                        if matches!(
+                            app.append_float_histogram(None, s.st, s.t, fh, false)?,
+                            AppendFloatHistogramOutcome::NewChunk(_)
+                        ) {
+                            return Err(BlockChunksError::Chunk(ChunkError::CapacityExceeded));
+                        }
+                    }
+                }
+                c.compact();
+                EncodedChunk::FloatHistogram(c)
+            }
+        }
+    };
+
+    Ok(ChunkMeta {
+        ref_id: 0,
+        min_time: mint,
+        max_time: maxt,
+        chunk: Some(chunk),
+    })
 }
 
 #[cfg(test)]

@@ -85,6 +85,11 @@ impl Xor2Chunk {
     }
 
     #[inline]
+    pub fn reset(&mut self, stream: Vec<u8>) {
+        self.b.reset(stream);
+    }
+
+    #[inline]
     pub const fn encoding(&self) -> Encoding {
         Encoding::Xor2
     }
@@ -631,6 +636,76 @@ impl<'a> Xor2Iterator<'a> {
             st_diff: 0,
             baseline_v: 0.0,
         }
+    }
+
+    #[inline]
+    pub fn reset(&mut self, b: &'a [u8]) {
+        *self = Self::new(b);
+    }
+
+    #[doc(hidden)]
+    pub fn from_reader(br: BitReader<'a>) -> Self {
+        Self {
+            br,
+            num_total: 0,
+            num_read: 0,
+            first_st_known: false,
+            first_st_change_on: 0,
+            leading: 0,
+            trailing: 0,
+            st: 0,
+            t: 0,
+            val: 0.0,
+            t_delta: 0,
+            st_diff: 0,
+            baseline_v: 0.0,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_baseline_v(&mut self, v: f64) {
+        self.baseline_v = v;
+    }
+
+    #[doc(hidden)]
+    pub fn baseline_v(&self) -> f64 {
+        self.baseline_v
+    }
+
+    #[doc(hidden)]
+    pub fn set_window(&mut self, leading: u8, trailing: u8) {
+        self.leading = leading;
+        self.trailing = trailing;
+    }
+
+    #[doc(hidden)]
+    pub fn leading(&self) -> u8 {
+        self.leading
+    }
+
+    #[doc(hidden)]
+    pub fn trailing(&self) -> u8 {
+        self.trailing
+    }
+
+    #[doc(hidden)]
+    pub fn val(&self) -> f64 {
+        self.val
+    }
+
+    #[doc(hidden)]
+    pub fn decode_value_step(&mut self) -> Result<(), ChunkError> {
+        self.decode_value()
+    }
+
+    #[doc(hidden)]
+    pub fn decode_value_known_non_zero_step(&mut self) -> Result<(), ChunkError> {
+        self.decode_value_known_non_zero()
+    }
+
+    #[doc(hidden)]
+    pub fn decode_new_leading_trailing_step(&mut self) -> Result<(), ChunkError> {
+        self.decode_new_leading_trailing()
     }
 
     #[inline]

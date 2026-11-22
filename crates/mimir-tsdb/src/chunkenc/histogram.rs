@@ -67,6 +67,11 @@ impl HistogramChunk {
     }
 
     #[inline]
+    pub fn reset(&mut self, stream: Vec<u8>) {
+        self.b.reset(stream);
+    }
+
+    #[inline]
     pub const fn encoding(&self) -> Encoding {
         Encoding::Histogram
     }
@@ -217,14 +222,15 @@ pub struct HistogramAppenderState {
 }
 
 #[derive(Default)]
-pub(super) struct AppendableGauge {
-    pub(super) p_fwd: Vec<Insert>,
-    pub(super) n_fwd: Vec<Insert>,
-    pub(super) p_bwd: Vec<Insert>,
-    pub(super) n_bwd: Vec<Insert>,
-    pub(super) p_merged: Vec<HistogramSpan>,
-    pub(super) n_merged: Vec<HistogramSpan>,
-    pub(super) ok_to_append: bool,
+#[doc(hidden)]
+pub struct AppendableGauge {
+    pub p_fwd: Vec<Insert>,
+    pub n_fwd: Vec<Insert>,
+    pub p_bwd: Vec<Insert>,
+    pub n_bwd: Vec<Insert>,
+    pub p_merged: Vec<HistogramSpan>,
+    pub n_merged: Vec<HistogramSpan>,
+    pub ok_to_append: bool,
 }
 
 impl HistogramAppenderState {
@@ -253,7 +259,8 @@ impl HistogramAppenderState {
         }
     }
 
-    pub(crate) fn appendable(
+    #[doc(hidden)]
+    pub fn appendable(
         &self,
         h: &Histogram,
     ) -> (
@@ -388,7 +395,8 @@ impl HistogramAppenderState {
         )
     }
 
-    pub(super) fn appendable_gauge(&self, h: &Histogram) -> AppendableGauge {
+    #[doc(hidden)]
+    pub fn appendable_gauge(&self, h: &Histogram) -> AppendableGauge {
         if self.num_samples > 0 && self.counter_reset_header != CounterResetHeader::GaugeType {
             return AppendableGauge::default();
         }
@@ -440,6 +448,43 @@ impl<'a> HistogramAppender<'a> {
     #[inline]
     pub fn into_state(self) -> HistogramAppenderState {
         self.state
+    }
+
+    #[inline]
+    pub fn num_samples(&self) -> usize {
+        self.chunk.num_samples()
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn appendable(
+        &self,
+        h: &Histogram,
+    ) -> (
+        Vec<Insert>,
+        Vec<Insert>,
+        Vec<Insert>,
+        Vec<Insert>,
+        bool,
+        CounterResetHeader,
+    ) {
+        self.state.appendable(h)
+    }
+
+    #[doc(hidden)]
+    pub fn appendable_gauge(&self, h: &Histogram) -> AppendableGauge {
+        self.state.appendable_gauge(h)
+    }
+
+    #[doc(hidden)]
+    pub fn recode_chunk(
+        &mut self,
+        positive_inserts: &[Insert],
+        negative_inserts: &[Insert],
+        positive_spans: &[HistogramSpan],
+        negative_spans: &[HistogramSpan],
+    ) -> Result<(), ChunkError> {
+        self.recode_in_place(positive_inserts, negative_inserts, positive_spans, negative_spans)
     }
 
     #[inline]
@@ -802,7 +847,8 @@ impl<'a> HistogramAppender<'a> {
     }
 }
 
-fn expand_int_spans_and_buckets(
+#[doc(hidden)]
+pub fn expand_int_spans_and_buckets(
     a: &[HistogramSpan],
     b: &[HistogramSpan],
     a_buckets: &[i64],
@@ -1057,6 +1103,11 @@ impl<'a> HistogramIterator<'a> {
             leading: 0,
             trailing: 0,
         }
+    }
+
+    #[inline]
+    pub fn reset(&mut self, b: &'a [u8]) {
+        *self = Self::new(b);
     }
 
     pub fn at_histogram(&self) -> (i64, Histogram) {

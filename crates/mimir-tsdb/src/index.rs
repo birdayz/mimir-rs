@@ -7,14 +7,22 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use std::ops::Deref;
+
 use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
+use parking_lot::RwLock;
 use thiserror::Error;
 
 use crate::chunks_block::ChunkMeta;
 use crate::encoding::{Decbuf, Encbuf, EncodingError};
 use crate::labels::{encode_stringlabel_size, Labels};
-use crate::postings::{merge_postings, PostingsError, PostingsSource};
+use crate::matcher::{LabelMatcher, MatchType};
+use crate::postings::{
+    contains_all, intersect_any, merge_iters, merge_postings, BigEndianPostings, ContextCheck,
+    EmptyPostingsIter, ErrPostingsIter, ListPostings, PostingsCloner, PostingsError, PostingsIter,
+    PostingsSource, CHECK_CONTEXT_EVERY_N_ITERATIONS,
+};
 
 pub const MAGIC_INDEX: u32 = 0xBAAA_D700;
 pub const INDEX_HEADER_LEN: usize = 5;
@@ -63,6 +71,8 @@ pub enum IndexError {
     PostingsOffsetTableTooLarge(u64),
     #[error("posting size {0} exceeds 4 bytes")]
     PostingSizeTooLarge(usize),
+    #[error("context canceled: {0}")]
+    ContextCanceled(String),
 }
 
 /// 6-entry Table of Contents at the end of a Prometheus index file.
@@ -499,7 +509,7 @@ impl IndexWriter {
                         break;
                     }
                     return Err(IndexError::Corrupt(format!(
-                        "label {:?} has {cnt} uses > max_postings {max_postings}",
+                        "corruption detected when writing postings to index: label {:?} has {cnt} uses, but maxPostings is {max_postings}",
                         names[name_idx]
                     )));
                 }
@@ -723,10 +733,48 @@ struct PostingOffsetEntry {
     table_rel_off: usize,
 }
 
-/// Memory-mapped reader for Prometheus TSDB Index v1/v2/v3 files.
+#[derive(Debug)]
+enum IndexData {
+    Mmap(Mmap),
+    Bytes(Bytes),
+}
+
+impl Deref for IndexData {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mmap(m) => m,
+            Self::Bytes(b) => b,
+        }
+    }
+}
+
+/// Optional per-block cache of `SeriesRef -> StableHash` for `IndexReader::sharded_postings`.
+#[derive(Debug, Default)]
+pub struct SeriesHashCache {
+    hashes: RwLock<HashMap<u64, u64>>,
+}
+
+impl SeriesHashCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn fetch(&self, id: u64) -> Option<u64> {
+        self.hashes.read().get(&id).copied()
+    }
+
+    pub fn store(&self, id: u64, hash: u64) {
+        self.hashes.write().insert(id, hash);
+    }
+}
+
+/// Memory-mapped or byte-slice reader for Prometheus TSDB Index v1/v2/v3 files.
 #[derive(Debug)]
 pub struct IndexReader {
-    mmap: Mmap,
+    mmap: IndexData,
     version: u8,
     toc: IndexToc,
     symbol_offsets: Vec<usize>,
@@ -741,6 +789,15 @@ impl IndexReader {
         let f = File::open(path.as_ref())?;
         // SAFETY: persisted block index files are immutable.
         let mmap = unsafe { MmapOptions::new().map(&f)? };
+        drop(f);
+        Self::from_data(IndexData::Mmap(mmap))
+    }
+
+    pub fn from_bytes(bytes: impl Into<Bytes>) -> Result<Self, IndexError> {
+        Self::from_data(IndexData::Bytes(bytes.into()))
+    }
+
+    fn from_data(mmap: IndexData) -> Result<Self, IndexError> {
         if mmap.len() < INDEX_HEADER_LEN {
             return Err(IndexError::Encoding(EncodingError::InvalidSize));
         }
@@ -1298,6 +1355,354 @@ impl IndexReader {
         names.sort_unstable();
         Ok(names)
     }
+
+    /// Context-aware `label_names_for`, checking `ctx` every `CHECK_CONTEXT_EVERY_N_ITERATIONS`
+    /// series (matching Go `index.Reader.LabelNamesFor`).
+    pub fn label_names_for_ctx(
+        &self,
+        ctx: &dyn ContextCheck,
+        postings: &mut dyn PostingsIter,
+    ) -> Result<Vec<String>, IndexError> {
+        let mut name_ids: HashSet<u32> = HashSet::new();
+        let mut i = 0usize;
+        while postings.next() {
+            let id = postings.at();
+            i += 1;
+            if i.is_multiple_of(CHECK_CONTEXT_EVERY_N_ITERATIONS) {
+                if let Some(msg) = ctx.err() {
+                    return Err(IndexError::ContextCanceled(msg));
+                }
+            }
+            let offset = self.series_offset(id)?;
+            let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
+            let mut dec = Decbuf::new(payload);
+            let k = dec.uvarint()?;
+            for _ in 0..k {
+                let lno = dec.uvarint32()?;
+                let _ = dec.uvarint32()?;
+                name_ids.insert(lno);
+            }
+        }
+        if let Some(e) = postings.err() {
+            return Err(IndexError::Corrupt(e.to_string()));
+        }
+        let mut names = Vec::with_capacity(name_ids.len());
+        for lno in name_ids {
+            let s = match self.name_cache.get(&lno) {
+                Some(&(off, len)) => self.mmap_str(off, len),
+                None => self.lookup_symbol(lno)?,
+            };
+            names.push(s.to_string());
+        }
+        names.sort_unstable();
+        Ok(names)
+    }
+
+    fn decode_postings_iter_at(&self, postings_off: u64) -> Result<BigEndianPostings, IndexError> {
+        let off = usize::try_from(postings_off)
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let payload = checked_decbuf_at(&self.mmap, off)?;
+        let (_, bep) = decode_postings_raw(payload)?;
+        Ok(bep)
+    }
+
+    /// Streaming postings iterator for `name` and `values`.
+    pub fn postings_iter(
+        &self,
+        name: &str,
+        values: &[&str],
+    ) -> Result<Box<dyn PostingsIter>, IndexError> {
+        if self.version == INDEX_FORMAT_V1 {
+            let Some(vals) = self.postings_v1.get(name) else {
+                return Ok(Box::new(EmptyPostingsIter));
+            };
+            let mut its: Vec<Box<dyn PostingsIter>> = Vec::with_capacity(values.len());
+            for &v in values {
+                if let Some(&off) = vals.get(v) {
+                    its.push(Box::new(self.decode_postings_iter_at(off)?));
+                }
+            }
+            return Ok(merge_iters(its));
+        }
+        let Some(entries) = self.postings_entries(name) else {
+            return Ok(Box::new(EmptyPostingsIter));
+        };
+        if entries.is_empty() || values.is_empty() {
+            return Ok(Box::new(EmptyPostingsIter));
+        }
+        let mut sorted_vals: Vec<&str> = values.to_vec();
+        sorted_vals.sort_unstable();
+        sorted_vals.dedup();
+        let first_val = self.mmap_str(entries[0].val_off, entries[0].val_len);
+        let mut vi = 0usize;
+        while vi < sorted_vals.len() && sorted_vals[vi] < first_val {
+            vi += 1;
+        }
+        let mut its: Vec<Box<dyn PostingsIter>> = Vec::with_capacity(sorted_vals.len());
+        while vi < sorted_vals.len() {
+            let prev_vi = vi;
+            let target = sorted_vals[vi];
+            let mut idx = entries.partition_point(|e| self.mmap_str(e.val_off, e.val_len) < target);
+            if idx == entries.len() {
+                break;
+            }
+            if idx > 0 && self.mmap_str(entries[idx].val_off, entries[idx].val_len) != target {
+                idx -= 1;
+            }
+            let next_anchor = entries
+                .get(idx + 1)
+                .map(|e| self.mmap_str(e.val_off, e.val_len));
+            self.traverse_posting_offsets(entries[idx].table_rel_off, |val, postings_off| {
+                while vi < sorted_vals.len() && val >= sorted_vals[vi] {
+                    if val == sorted_vals[vi] {
+                        its.push(Box::new(self.decode_postings_iter_at(postings_off)?));
+                    }
+                    vi += 1;
+                }
+                if vi >= sorted_vals.len() {
+                    return Ok(false);
+                }
+                match next_anchor {
+                    None => return Ok(false),
+                    Some(next_v) if sorted_vals[vi] >= next_v => return Ok(false),
+                    Some(_) => {}
+                }
+                Ok(true)
+            })?;
+            if vi == prev_vi {
+                return Err(IndexError::Corrupt(format!(
+                    "postings offset table traversal made no progress for label {name:?}"
+                )));
+            }
+        }
+        Ok(merge_iters(its))
+    }
+
+    fn traverse_posting_offsets_ctx<F>(
+        &self,
+        ctx: &dyn ContextCheck,
+        start_rel_off: usize,
+        mut cb: F,
+    ) -> Result<(), IndexError>
+    where
+        F: FnMut(&str, u64) -> Result<bool, IndexError>,
+    {
+        let table_start = usize::try_from(self.toc.postings_table)
+            .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
+        let payload_start = table_start
+            .checked_add(4)
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+        if payload_start > self.mmap.len() {
+            return Err(IndexError::Encoding(EncodingError::InvalidSize));
+        }
+        let payload_len =
+            u32::from_be_bytes(self.mmap[table_start..payload_start].try_into().unwrap())
+                as usize;
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+        if payload_end > self.mmap.len() {
+            return Err(IndexError::Encoding(EncodingError::InvalidSize));
+        }
+        let mut dec = Decbuf::new(&self.mmap[payload_start..payload_end]);
+        dec.skip(start_rel_off)?;
+        let mut prefix_skip: Option<usize> = None;
+        let mut ctx_err = ctx.err();
+        while !dec.is_empty() && ctx_err.is_none() {
+            match prefix_skip {
+                None => {
+                    let before = dec.len();
+                    let _ = dec.uvarint()?;
+                    let _ = dec.uvarint_bytes()?;
+                    prefix_skip = Some(before - dec.len());
+                }
+                Some(skip) => {
+                    dec.skip(skip)?;
+                }
+            }
+            let val = dec.uvarint_str()?;
+            let postings_off = dec.uvarint64()?;
+            if !cb(val, postings_off)? {
+                break;
+            }
+            ctx_err = ctx.err();
+        }
+        if let Some(msg) = ctx_err {
+            return Err(IndexError::ContextCanceled(msg));
+        }
+        Ok(())
+    }
+
+    /// Context-aware streaming `PostingsForLabelMatching`, matching Go `index.Reader.PostingsForLabelMatching`.
+    pub fn postings_for_label_matching_iter_ctx(
+        &self,
+        ctx: &dyn ContextCheck,
+        name: &str,
+        pred: &mut dyn FnMut(&str) -> bool,
+    ) -> Box<dyn PostingsIter> {
+        if self.version == INDEX_FORMAT_V1 {
+            let Some(vals) = self.postings_v1.get(name) else {
+                return Box::new(EmptyPostingsIter);
+            };
+            let mut its: Vec<Box<dyn PostingsIter>> = Vec::new();
+            for (count, (val, &off)) in (1usize..).zip(vals.iter()) {
+                if count.is_multiple_of(CHECK_CONTEXT_EVERY_N_ITERATIONS) {
+                    if let Some(msg) = ctx.err() {
+                        return Box::new(ErrPostingsIter::new(PostingsError::ContextCanceled(msg)));
+                    }
+                }
+                if !pred(val) {
+                    continue;
+                }
+                match self.decode_postings_iter_at(off) {
+                    Ok(p) => its.push(Box::new(p)),
+                    Err(e) => return Box::new(ErrPostingsIter::new(PostingsError::Index(e.to_string()))),
+                }
+            }
+            return merge_iters(its);
+        }
+
+        let Some(entries) = self.postings_entries(name) else {
+            return Box::new(EmptyPostingsIter);
+        };
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+            return Box::new(EmptyPostingsIter);
+        };
+        let last_val = self.mmap_str(last.val_off, last.val_len);
+        let mut its: Vec<Box<dyn PostingsIter>> = Vec::new();
+        let res = self.traverse_posting_offsets_ctx(ctx, first.table_rel_off, |val, postings_off| {
+            if pred(val) {
+                its.push(Box::new(self.decode_postings_iter_at(postings_off)?));
+            }
+            Ok(val != last_val)
+        });
+        match res {
+            Ok(()) => merge_iters(its),
+            Err(IndexError::ContextCanceled(msg)) => {
+                Box::new(ErrPostingsIter::new(PostingsError::ContextCanceled(msg)))
+            }
+            Err(e) => Box::new(ErrPostingsIter::new(PostingsError::Index(e.to_string()))),
+        }
+    }
+
+    /// Streaming `PostingsForAllLabelValues`, matching Go `index.Reader.PostingsForAllLabelValues`.
+    pub fn postings_for_all_values_iter(&self, name: &str) -> Box<dyn PostingsIter> {
+        self.postings_for_label_matching_iter_ctx(&crate::postings::NoopContext, name, &mut |_| true)
+    }
+
+    /// Filters `p` to series whose `Labels::stable_hash() % shard_count == shard_index`,
+    /// matching Go `index.Reader.ShardedPostings`.
+    pub fn sharded_postings(
+        &self,
+        p: &mut dyn PostingsIter,
+        shard_index: u64,
+        shard_count: u64,
+        cache: Option<&SeriesHashCache>,
+    ) -> Box<dyn PostingsIter> {
+        let mut out = Vec::with_capacity(128);
+        while p.next() {
+            let id = p.at();
+            let hash = if let Some(h) = cache.and_then(|c| c.fetch(id)) {
+                h
+            } else {
+                let lbls = match self.series_labels(id) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        return Box::new(ErrPostingsIter::new(PostingsError::Index(format!(
+                            "series {id} not found"
+                        ))));
+                    }
+                };
+                let h = lbls.stable_hash();
+                if let Some(c) = cache {
+                    c.store(id, h);
+                }
+                h
+            };
+            if hash % shard_count == shard_index {
+                out.push(id);
+            }
+        }
+        if let Some(e) = p.err() {
+            return Box::new(ErrPostingsIter::new(e.clone_for_iter()));
+        }
+        Box::new(ListPostings::new(out))
+    }
+
+    /// Returns sorted label values for `name` present in series referred to by `postings`,
+    /// matching Go `index.Reader.LabelValuesFor`.
+    pub fn label_values_for(
+        &self,
+        postings: &mut dyn PostingsIter,
+        name: &str,
+    ) -> Result<Vec<String>, IndexError> {
+        self.label_values_for_inner(postings, name, true)
+    }
+
+    /// Returns sorted label values for `name` present in series NOT covered by `postings`,
+    /// matching Go `index.Reader.LabelValuesExcluding`.
+    pub fn label_values_excluding(
+        &self,
+        postings: &mut dyn PostingsIter,
+        name: &str,
+    ) -> Result<Vec<String>, IndexError> {
+        self.label_values_for_inner(postings, name, false)
+    }
+
+    fn label_values_for_inner(
+        &self,
+        postings: &mut dyn PostingsIter,
+        name: &str,
+        include_matches: bool,
+    ) -> Result<Vec<String>, IndexError> {
+        let cloner = PostingsCloner::new(postings);
+        if let Some(err) = cloner.clone_iter().err() {
+            return Err(IndexError::Corrupt(err.to_string()));
+        }
+
+        if self.version == INDEX_FORMAT_V1 {
+            let Some(vals) = self.postings_v1.get(name) else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for (val, &off) in vals {
+                let mut cur_postings = self.decode_postings_iter_at(off)?;
+                let mut cloned = cloner.clone_iter();
+                let is_match = if include_matches {
+                    intersect_any(&mut *cloned, &mut cur_postings)
+                } else {
+                    !contains_all(&mut *cloned, &mut cur_postings)
+                };
+                if is_match {
+                    out.push(val.clone());
+                }
+            }
+            return Ok(out);
+        }
+
+        let Some(entries) = self.postings_entries(name) else {
+            return Ok(Vec::new());
+        };
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+            return Ok(Vec::new());
+        };
+        let last_val = self.mmap_str(last.val_off, last.val_len);
+        let mut out = Vec::new();
+        self.traverse_posting_offsets(first.table_rel_off, |val, postings_off| {
+            let mut cur_postings = self.decode_postings_iter_at(postings_off)?;
+            let mut cloned = cloner.clone_iter();
+            let is_match = if include_matches {
+                intersect_any(&mut *cloned, &mut cur_postings)
+            } else {
+                !contains_all(&mut *cloned, &mut cur_postings)
+            };
+            if is_match {
+                out.push(val.to_string());
+            }
+            Ok(val != last_val)
+        })?;
+        Ok(out)
+    }
 }
 
 impl PostingsSource for IndexReader {
@@ -1355,7 +1760,176 @@ fn checked_decbuf_at(buf: &[u8], off: usize) -> Result<&[u8], IndexError> {
     Ok(payload)
 }
 
-fn checked_uvarint_decbuf_at(buf: &[u8], off: usize) -> Result<&[u8], IndexError> {
+/// Decodes a raw big-endian postings payload, matching Go `index.DecodePostingsRaw`.
+pub fn decode_postings_raw(buf: &[u8]) -> Result<(usize, BigEndianPostings), IndexError> {
+    let mut dec = Decbuf::new(buf);
+    let n = dec.be32()? as usize;
+    let expected_len = 4usize
+        .checked_mul(n)
+        .ok_or(IndexError::Encoding(EncodingError::InvalidSize))?;
+    if dec.len() != expected_len {
+        return Err(IndexError::Corrupt(format!(
+            "unexpected postings length: expected {expected_len}, got {}",
+            dec.len()
+        )));
+    }
+    Ok((n, BigEndianPostings::from_slice(dec.remaining())))
+}
+
+/// Prometheus `index.Symbols` view over an index symbol table section.
+#[derive(Debug)]
+pub struct Symbols {
+    bytes: Bytes,
+    version: u8,
+    off: usize,
+    offsets: Vec<usize>,
+    seen: usize,
+}
+
+impl Symbols {
+    pub fn new(bytes: Bytes, version: u8, off: usize) -> Result<Self, IndexError> {
+        let (offsets, seen) = parse_symbols_index(&bytes, off)?;
+        Ok(Self {
+            bytes,
+            version,
+            off,
+            offsets,
+            seen,
+        })
+    }
+
+    pub fn size(&self) -> usize {
+        self.offsets.len() * 8
+    }
+
+    pub fn lookup(&self, o: u32) -> Result<&str, IndexError> {
+        if self.version == INDEX_FORMAT_V1 {
+            let slice = self
+                .bytes
+                .get(o as usize..)
+                .ok_or(IndexError::UnknownSymbolOffset(o))?;
+            let mut dec = Decbuf::new(slice);
+            return Ok(dec.uvarint_str()?);
+        }
+        if (o as usize) >= self.seen {
+            return Err(IndexError::UnknownSymbolOffset(o));
+        }
+        let block = (o as usize) / SYMBOL_FACTOR;
+        let rem = (o as usize) % SYMBOL_FACTOR;
+        let mut dec = Decbuf::new(&self.bytes[self.offsets[block]..]);
+        for _ in 0..rem {
+            let _ = dec.uvarint_bytes()?;
+        }
+        Ok(dec.uvarint_str()?)
+    }
+
+    pub fn reverse_lookup(&self, sym: &str) -> Result<u32, IndexError> {
+        reverse_lookup_symbol(&self.bytes, &self.offsets, self.seen, sym, self.version)
+    }
+
+    pub fn iter(&self) -> Result<Vec<&str>, IndexError> {
+        let payload = checked_decbuf_at(&self.bytes, self.off)?;
+        let mut dec = Decbuf::new(payload);
+        let cnt = dec.be32()? as usize;
+        let mut out = Vec::with_capacity(cnt.min(dec.len()));
+        for _ in 0..cnt {
+            out.push(dec.uvarint_str()?);
+        }
+        Ok(out)
+    }
+}
+
+/// Planning interface matching `index.LookupPlan` in `tsdb/index/lookup.go`.
+pub trait LookupPlan {
+    fn scan_matchers(&self) -> &[LabelMatcher];
+    fn index_matchers(&self) -> &[LabelMatcher];
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexOnlyLookupPlan(pub Vec<LabelMatcher>);
+
+impl LookupPlan for IndexOnlyLookupPlan {
+    fn scan_matchers(&self) -> &[LabelMatcher] {
+        &[]
+    }
+
+    fn index_matchers(&self) -> &[LabelMatcher] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConcreteLookupPlan {
+    pub index_matchers: Vec<LabelMatcher>,
+    pub scan_matchers: Vec<LabelMatcher>,
+}
+
+impl LookupPlan for ConcreteLookupPlan {
+    fn scan_matchers(&self) -> &[LabelMatcher] {
+        &self.scan_matchers
+    }
+
+    fn index_matchers(&self) -> &[LabelMatcher] {
+        &self.index_matchers
+    }
+}
+
+/// Defers empty/non-selective matchers (`l=""`, `l=~".+"`) to scan matchers,
+/// matching `index.ScanEmptyMatchersLookupPlanner` in `tsdb/index/lookup.go`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanEmptyMatchersLookupPlanner;
+
+impl ScanEmptyMatchersLookupPlanner {
+    fn should_drop_matcher(matcher: &LabelMatcher) -> bool {
+        matcher.match_type == MatchType::RegexMatch && matcher.value == ".*"
+    }
+
+    fn should_scan_matcher(matcher: &LabelMatcher) -> bool {
+        (matcher.match_type == MatchType::Equal && matcher.value.is_empty())
+            || (matcher.match_type == MatchType::RegexMatch && matcher.value == ".+")
+    }
+
+    fn can_optimize_index_matchers(matchers: &[LabelMatcher]) -> bool {
+        matchers
+            .iter()
+            .any(|m| Self::should_scan_matcher(m) || Self::should_drop_matcher(m))
+    }
+
+    pub fn plan_index_lookup(&self, plan: &dyn LookupPlan) -> Box<dyn LookupPlan> {
+        let orig_index = plan.index_matchers();
+        if orig_index.len() <= 1 || !Self::can_optimize_index_matchers(orig_index) {
+            return Box::new(ConcreteLookupPlan {
+                index_matchers: orig_index.to_vec(),
+                scan_matchers: plan.scan_matchers().to_vec(),
+            });
+        }
+        let mut index_matchers = Vec::with_capacity(orig_index.len());
+        let mut scan_matchers = plan.scan_matchers().to_vec();
+        for matcher in orig_index {
+            if Self::should_drop_matcher(matcher) {
+                continue;
+            }
+            if Self::should_scan_matcher(matcher) {
+                scan_matchers.push(matcher.clone());
+            } else {
+                index_matchers.push(matcher.clone());
+            }
+        }
+        if index_matchers.is_empty() && !scan_matchers.is_empty() {
+            index_matchers.push(scan_matchers.remove(0));
+        }
+        if scan_matchers.is_empty() {
+            Box::new(IndexOnlyLookupPlan(index_matchers))
+        } else {
+            Box::new(ConcreteLookupPlan {
+                index_matchers,
+                scan_matchers,
+            })
+        }
+    }
+}
+
+pub fn checked_uvarint_decbuf_at(buf: &[u8], off: usize) -> Result<&[u8], IndexError> {
     if off >= buf.len() {
         return Err(IndexError::Encoding(EncodingError::InvalidSize));
     }

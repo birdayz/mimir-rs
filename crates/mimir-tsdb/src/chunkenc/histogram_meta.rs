@@ -10,14 +10,16 @@ use super::varbit::{put_varbit_int, put_varbit_uint, read_varbit_int, read_varbi
 use super::ChunkError;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Insert {
+#[doc(hidden)]
+pub struct Insert {
     pub pos: usize,
     pub num: usize,
     pub bucket_idx: i64,
 }
 
 #[inline]
-pub(crate) fn count_spans(spans: &[HistogramSpan]) -> usize {
+#[doc(hidden)]
+pub fn count_spans(spans: &[HistogramSpan]) -> usize {
     spans.iter().map(|s| s.length as usize).sum()
 }
 
@@ -28,7 +30,8 @@ pub(crate) fn checked_count_spans(spans: &[HistogramSpan]) -> Option<usize> {
         .try_fold(0usize, |acc, s| acc.checked_add(s.length as usize))
 }
 
-pub(crate) fn write_histogram_chunk_layout(
+#[doc(hidden)]
+pub fn write_histogram_chunk_layout(
     b: &mut BitStream,
     schema: i32,
     zero_threshold: f64,
@@ -46,7 +49,8 @@ pub(crate) fn write_histogram_chunk_layout(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HistogramChunkLayout {
+#[doc(hidden)]
+pub struct HistogramChunkLayout {
     pub schema: i32,
     pub zero_threshold: f64,
     pub positive_spans: Vec<HistogramSpan>,
@@ -54,7 +58,8 @@ pub(crate) struct HistogramChunkLayout {
     pub custom_values: Vec<f64>,
 }
 
-pub(crate) fn read_histogram_chunk_layout(
+#[doc(hidden)]
+pub fn read_histogram_chunk_layout(
     b: &mut BitReader<'_>,
 ) -> Result<HistogramChunkLayout, ChunkError> {
     let zero_threshold = read_zero_threshold(b)?;
@@ -187,7 +192,8 @@ pub(crate) fn read_custom_bound(br: &mut BitReader<'_>) -> Result<f64, ChunkErro
     }
 }
 
-pub(crate) struct BucketIterator<'a> {
+#[doc(hidden)]
+pub struct BucketIterator<'a> {
     spans: &'a [HistogramSpan],
     span: usize,
     bucket: isize,
@@ -233,7 +239,8 @@ impl<'a> BucketIterator<'a> {
     }
 }
 
-pub(crate) fn expand_spans_both_ways(
+#[doc(hidden)]
+pub fn expand_spans_both_ways(
     a: &[HistogramSpan],
     b: &[HistogramSpan],
 ) -> (Vec<Insert>, Vec<Insert>, Vec<HistogramSpan>) {
@@ -330,7 +337,8 @@ pub(crate) fn expand_spans_both_ways(
     (f_inserts, b_inserts, merged_spans)
 }
 
-pub(crate) trait BucketNum: Copy + Default {
+#[doc(hidden)]
+pub trait BucketNum: Copy + Default {
     fn wrapping_add(self, rhs: Self) -> Self;
     fn wrapping_neg(self) -> Self;
 }
@@ -359,7 +367,8 @@ impl BucketNum for f64 {
     }
 }
 
-pub(crate) fn insert_buckets<BV: BucketNum>(
+#[doc(hidden)]
+pub fn insert_buckets<BV: BucketNum>(
     in_vals: &[BV],
     out_len: usize,
     inserts: &[Insert],
@@ -437,7 +446,8 @@ pub(crate) fn counter_reset_hint_from_header(
     }
 }
 
-pub(crate) fn adjust_for_inserts(
+#[doc(hidden)]
+pub fn adjust_for_inserts(
     spans: &[HistogramSpan],
     inserts: &[Insert],
 ) -> Vec<HistogramSpan> {
