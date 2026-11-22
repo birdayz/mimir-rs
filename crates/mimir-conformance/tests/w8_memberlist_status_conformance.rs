@@ -18,7 +18,7 @@ use chrono::{DateTime, FixedOffset};
 use mimir_cmd::memberlist_status::render_memberlist_status_page;
 use mimir_config::server::ZoneAwareRoutingConfig;
 use mimir_conformance::oracle::{invoke_oracle, workspace_root};
-use mimir_proto::memberlistpb::KeyValuePair;
+use mimir_proto::memberlistpb::{BeaconDesc, KeyValuePair, PropagationDelayTrackerDesc};
 use mimir_proto::ringpb::{Desc, InstanceDesc, OwnerDesc, PartitionDesc, PartitionRingDesc};
 use mimir_ring::kv::ha_replica::{replica_desc_codec, ReplicaDesc};
 use mimir_ring::kv::memberlist::http_status::{
@@ -26,7 +26,7 @@ use mimir_ring::kv::memberlist::http_status::{
 };
 use mimir_ring::kv::memberlist::node_meta::{encode_node_metadata, NodeRole};
 use mimir_ring::kv::memberlist::wire::NodeStateType;
-use mimir_ring::kv::memberlist::NodeState;
+use mimir_ring::kv::memberlist::{propagation_delay_tracker_codec, NodeState};
 use mimir_ring::kv::Codec;
 use mimir_ring::partition_ring::model::partition_ring_desc_codec;
 use mimir_ring::ring::model::ring_desc_codec;
@@ -417,4 +417,62 @@ fn w8_memberlist_format_value_matches_go() {
         elected_changes: 3,
     };
     check_format_value(rdc.as_ref(), &rdc.encode_mergeable(&rd).unwrap(), "distributor.ReplicaDesc");
+}
+
+#[derive(Deserialize)]
+struct FormatPropTrackerResp {
+    go_string: String,
+    json_encode: String,
+    json_encode_indent: String,
+}
+
+#[test]
+fn w8_propagation_tracker_format_value_matches_go() {
+    let codec = propagation_delay_tracker_codec();
+
+    let empty = PropagationDelayTrackerDesc::default();
+    let mut single = PropagationDelayTrackerDesc::default();
+    single.beacons.insert(
+        2,
+        BeaconDesc {
+            published_by: "node-a".into(),
+            published_at: 1000,
+            deleted_at: 0,
+        },
+    );
+    let mut multi = single.clone();
+    multi.beacons.insert(
+        10,
+        BeaconDesc {
+            published_by: "node-b<&>\"ü".into(),
+            published_at: 2000,
+            deleted_at: 3000,
+        },
+    );
+    multi.beacons.insert(
+        0xdead_beef,
+        BeaconDesc {
+            published_by: "node-c".into(),
+            published_at: 4000,
+            deleted_at: 0,
+        },
+    );
+
+    for (what, desc) in [("empty", &empty), ("single", &single), ("multi", &multi)] {
+        let encoded = codec.encode_mergeable(desc).unwrap();
+        let val = codec.decode_mergeable(&encoded).unwrap();
+        let go: FormatPropTrackerResp = invoke_oracle(
+            "format-propagation-tracker",
+            &json!({ "value_b64": b64(&encoded) }),
+        )
+        .expect("oracle format-propagation-tracker");
+
+        assert_eq!(val.to_go_json().encode(), go.json_encode, "{what} format=json");
+        assert_eq!(
+            val.to_go_json().encode_indent("    "),
+            go.json_encode_indent,
+            "{what} format=json-pretty"
+        );
+        assert_eq!(val.go_string(), go.go_string, "{what} format=struct");
+    }
 }

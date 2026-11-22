@@ -40,7 +40,7 @@ use mimir_ingester::grpc::SnappyDecompressService;
 use mimir_ingester::{Ingester, IngesterLifecycler, IngesterService, TokenlessLifecycler};
 use mimir_proto::httpgrpcpb::http_server::HttpServer;
 use mimir_ring::kv::ha_replica::replica_desc_codec;
-use mimir_ring::kv::memberlist::{propagation_delay_tracker_codec, KvOptions, MemberlistKv};
+use mimir_ring::kv::memberlist::{KvOptions, MemberlistKv};
 use mimir_ring::kv::multi::runtime_config_provider;
 use mimir_ring::kv::{
     build_kv_client_with_multi_config_provider, registerer_with_kv_name, Codec, Registerer,
@@ -496,7 +496,6 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             ring_desc_codec(),
             partition_ring_desc_codec(),
             replica_desc_codec(),
-            propagation_delay_tracker_codec(),
         ];
         let ml = MemberlistKv::new(
             cfg.memberlist.clone(),

@@ -218,15 +218,16 @@ async fn concurrent_push_vs_idle_close_never_unlinks_live_wal() {
 
     let tenant = "tenant-race";
     let stop = Arc::new(AtomicBool::new(false));
+    let shared_ts = Arc::new(std::sync::atomic::AtomicI64::new(10_000));
     let mut push_tasks = Vec::new();
     for worker_id in 0..3 {
         let ing_c = Arc::clone(&ing);
         let stop_c = Arc::clone(&stop);
+        let ts_c = Arc::clone(&shared_ts);
         push_tasks.push(tokio::spawn(async move {
             let metric = format!("race_metric_{worker_id}");
-            let mut ts_ms = 10_000i64;
             while !stop_c.load(Ordering::Relaxed) {
-                ts_ms += 100;
+                let ts_ms = ts_c.fetch_add(10, Ordering::Relaxed) + 10;
                 let req = build_write_request(&metric, ts_ms, ts_ms as f64);
                 match ing_c.push_write_request_sync(tenant, &req) {
                     Ok(()) => {}

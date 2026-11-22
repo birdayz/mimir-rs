@@ -138,12 +138,9 @@ pub fn request_activity(
                 label_matcher_to_string(&mut s, Some(m));
                 s.push(',');
             }
-            let cm = match ingesterpb::CountMethod::try_from(r.count_method) {
-                Ok(ingesterpb::CountMethod::InMemory) => "IN_MEMORY",
-                Ok(ingesterpb::CountMethod::Active) => "ACTIVE",
-                Err(_) => "UNKNOWN",
-            };
-            let _ = write!(s, "}},CountMethod:{cm},}}");
+            s.push_str("},CountMethod:");
+            push_count_method(&mut s, r.count_method);
+            s.push_str(",}");
             s
         }
         ActivityRequest::ActiveSeries(r) => {
@@ -309,16 +306,15 @@ pub fn label_matcher_to_string(sb: &mut String, m: Option<&ingesterpb::LabelMatc
         sb.push_str("nil");
         return;
     };
-    let ty = match ingesterpb::MatchType::try_from(m.r#type) {
-        Ok(ingesterpb::MatchType::Equal) => "EQUAL",
-        Ok(ingesterpb::MatchType::NotEqual) => "NOT_EQUAL",
-        Ok(ingesterpb::MatchType::RegexMatch) => "REGEX_MATCH",
-        Ok(ingesterpb::MatchType::RegexNoMatch) => "REGEX_NO_MATCH",
-        Err(_) => "UNKNOWN",
-    };
-    let _ = write!(
-        sb,
-        "&LabelMatcher{{Type:{ty},Name:{},Value:{},}}",
-        m.name, m.value
-    );
+    sb.push_str("&LabelMatcher{Type:");
+    match ingesterpb::MatchType::try_from(m.r#type) {
+        Ok(ingesterpb::MatchType::Equal) => sb.push_str("EQUAL"),
+        Ok(ingesterpb::MatchType::NotEqual) => sb.push_str("NOT_EQUAL"),
+        Ok(ingesterpb::MatchType::RegexMatch) => sb.push_str("REGEX_MATCH"),
+        Ok(ingesterpb::MatchType::RegexNoMatch) => sb.push_str("REGEX_NO_MATCH"),
+        Err(_) => {
+            let _ = write!(sb, "{}", m.r#type);
+        }
+    }
+    let _ = write!(sb, ",Name:{},Value:{},}}", m.name, m.value);
 }

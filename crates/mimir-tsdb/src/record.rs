@@ -686,6 +686,11 @@ pub fn decode_labels(dec: &mut Decbuf<'_>) -> Result<Labels, EncodingError> {
         }
         let name = String::from_utf8_lossy(name_bytes);
         let value = String::from_utf8_lossy(value_bytes);
+        // Re-check after lossy UTF-8 expansion: invalid bytes expand 3x to U+FFFD,
+        // so >= ~5.6 MiB of raw invalid bytes can exceed the 24-bit stringlabels limit.
+        if name.len() >= (1 << 24) || value.len() >= (1 << 24) {
+            return Err(EncodingError::InvalidSize);
+        }
         pairs.push((name, value));
     }
     if pairs.windows(2).all(|w| w[0].0 < w[1].0) && pairs.iter().all(|(_, v)| !v.is_empty()) {
@@ -1546,5 +1551,26 @@ mod tests {
         };
         let (rec_fh_mismatch, _) = enc.float_histogram_samples(&[mismatch_fh], Vec::new());
         assert!(dec.float_histogram_samples(&rec_fh_mismatch).is_err());
+    }
+
+    #[test]
+    fn decode_labels_rejects_lossy_utf8_expansion_exceeding_24bit_limit() {
+        // 6 MiB of 0xFF (< 1<<24 raw) expands 3x under from_utf8_lossy to 18 MiB (>= 1<<24).
+        // decode_labels must return Err(EncodingError::InvalidSize) instead of panicking in
+        // encode_stringlabel_size.
+        let invalid_6mib = vec![0xffu8; 6 * 1024 * 1024];
+        let mut buf = Encbuf::new();
+        buf.put_uvarint(1); // 1 label pair
+        buf.put_uvarint_bytes(&invalid_6mib);
+        buf.put_uvarint_bytes(b"ok");
+        let mut dec = Decbuf::new(buf.as_slice());
+        assert_eq!(decode_labels(&mut dec), Err(EncodingError::InvalidSize));
+
+        let mut buf2 = Encbuf::new();
+        buf2.put_uvarint(1);
+        buf2.put_uvarint_bytes(b"ok");
+        buf2.put_uvarint_bytes(&invalid_6mib);
+        let mut dec2 = Decbuf::new(buf2.as_slice());
+        assert_eq!(decode_labels(&mut dec2), Err(EncodingError::InvalidSize));
     }
 }

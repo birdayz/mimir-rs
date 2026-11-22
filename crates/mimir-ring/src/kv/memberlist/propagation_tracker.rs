@@ -11,11 +11,13 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mimir_common::backoff::{Backoff, BackoffConfig};
+use mimir_common::logging::format_rfc3339_nano_utc;
+use mimir_common::native_histogram::{HistogramOpts, SingleHistogram, DEF_BUCKETS};
 use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext};
 use mimir_config::server::PropagationDelayTrackerConfig;
 use mimir_proto::memberlistpb::{BeaconDesc, PropagationDelayTrackerDesc};
 use parking_lot::RwLock;
-use prometheus::{Counter, Histogram, HistogramOpts, Opts, Registry};
+use prometheus::{Counter, Opts, Registry};
 use rand::Rng;
 use tracing::{info, warn};
 
@@ -26,6 +28,7 @@ use crate::kv::{CasOutcome, Codec, KvClient, ProtoSnappyCodec};
 
 pub const PROPAGATION_DELAY_TRACKER_KEY: &str = "memberlist-propagation-delay-tracker";
 pub const PROPAGATION_DELAY_TRACKER_CODEC_ID: &str = "propagationDelayTracker";
+const COMPONENT: &str = "memberlist-propagation-delay-tracker";
 
 pub fn propagation_delay_tracker_codec() -> Arc<dyn Codec> {
     Arc::new(
@@ -43,17 +46,18 @@ fn system_time_to_unix_millis(t: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
-fn unix_millis_before(ts_millis: i64, limit: SystemTime) -> bool {
+fn unix_millis_to_system_time(ts_millis: i64) -> Option<SystemTime> {
     if ts_millis >= 0 {
-        match UNIX_EPOCH.checked_add(Duration::from_millis(ts_millis as u64)) {
-            Some(t) => t < limit,
-            None => false,
-        }
+        UNIX_EPOCH.checked_add(Duration::from_millis(ts_millis as u64))
     } else {
-        match UNIX_EPOCH.checked_sub(Duration::from_millis(ts_millis.unsigned_abs())) {
-            Some(t) => t < limit,
-            None => true,
-        }
+        UNIX_EPOCH.checked_sub(Duration::from_millis(ts_millis.unsigned_abs()))
+    }
+}
+
+fn unix_millis_before(ts_millis: i64, limit: SystemTime) -> bool {
+    match unix_millis_to_system_time(ts_millis) {
+        Some(t) => t < limit,
+        None => ts_millis < 0,
     }
 }
 
@@ -148,40 +152,49 @@ impl Mergeable for PropagationDelayTrackerDesc {
     }
 
     fn to_go_json(&self) -> GoJson {
-        let entries = self
-            .beacons
-            .iter()
-            .map(|(k, b)| {
-                let mut fields = Vec::new();
-                if b.published_at != 0 {
-                    fields.push(("published_at".into(), GoJson::int(b.published_at)));
-                }
-                if b.deleted_at != 0 {
-                    fields.push(("deleted_at".into(), GoJson::int(b.deleted_at)));
-                }
-                if !b.published_by.is_empty() {
-                    fields.push(("published_by".into(), GoJson::str(&b.published_by)));
-                }
-                (k.to_string(), GoJson::Object(fields))
-            })
-            .collect();
-        GoJson::Object(vec![("beacons".into(), GoJson::sorted_map(entries))])
+        let beacons = if self.beacons.is_empty() {
+            GoJson::Null
+        } else {
+            let entries = self
+                .beacons
+                .iter()
+                .map(|(k, b)| {
+                    let mut fields = Vec::new();
+                    if !b.published_by.is_empty() {
+                        fields.push(("published_by".into(), GoJson::str(&b.published_by)));
+                    }
+                    if b.published_at != 0 {
+                        fields.push(("published_at".into(), GoJson::int(b.published_at)));
+                    }
+                    if b.deleted_at != 0 {
+                        fields.push(("deleted_at".into(), GoJson::int(b.deleted_at)));
+                    }
+                    (k.to_string(), GoJson::Object(fields))
+                })
+                .collect();
+            GoJson::sorted_map(entries)
+        };
+        GoJson::Object(vec![("beacons".into(), beacons)])
     }
 
     fn go_string(&self) -> String {
-        let mut keys: Vec<u64> = self.beacons.keys().copied().collect();
-        keys.sort_unstable();
-        let mut s = String::from("&memberlist.PropagationDelayTrackerDesc{Beacons:map[uint64]BeaconDesc{");
-        for k in keys {
-            let b = &self.beacons[&k];
-            s.push_str(&format!(
-                "{k}: memberlist.BeaconDesc{{PublishedAt:{}, DeletedAt:{}, PublishedBy:{}}},",
-                b.published_at,
-                b.deleted_at,
-                go_sharp_v_str(&b.published_by)
-            ));
+        let mut s = String::from("&memberlist.PropagationDelayTrackerDesc{");
+        if !self.beacons.is_empty() {
+            let mut keys: Vec<u64> = self.beacons.keys().copied().collect();
+            keys.sort_unstable();
+            s.push_str("Beacons: map[uint64]BeaconDesc{");
+            for k in keys {
+                let b = &self.beacons[&k];
+                s.push_str(&format!(
+                    "{k:#x}: memberlist.BeaconDesc{{PublishedBy:{}, PublishedAt:{}, DeletedAt:{}}},",
+                    go_sharp_v_str(&b.published_by),
+                    b.published_at,
+                    b.deleted_at,
+                ));
+            }
+            s.push_str("},\n");
         }
-        s.push_str("},}");
+        s.push('}');
         s
     }
 
@@ -206,7 +219,7 @@ pub(crate) struct PropagationDelayTracker {
     seen_beacons: RwLock<HashSet<u64>>,
     pending_beacon_id: AtomicU64,
     startup_time_ms: AtomicI64,
-    propagation_delay: Histogram,
+    propagation_delay: SingleHistogram,
     beacons_published_total: Counter,
     beacons_received_total: Counter,
     service: OnceLock<Arc<ManagedBasicService>>,
@@ -219,12 +232,13 @@ impl PropagationDelayTracker {
         node_name: String,
         reg: Option<&Registry>,
     ) -> Arc<Self> {
-        let propagation_delay = Histogram::with_opts(
+        let propagation_delay = SingleHistogram::new(
             HistogramOpts::new(
                 "memberlist_propagation_tracker_delay_seconds",
                 "Time from beacon publish to receive.",
             )
-            .buckets(prometheus::DEFAULT_BUCKETS.to_vec()),
+            .buckets(DEF_BUCKETS.to_vec())
+            .native(1.1, 100, Duration::from_secs(3600)),
         )
         .expect("valid histogram");
         let beacons_published_total = Counter::with_opts(Opts::new(
@@ -295,6 +309,7 @@ impl PropagationDelayTracker {
             .as_std()
             .unwrap_or(Duration::from_secs(600));
         info!(
+            component = COMPONENT,
             ?beacon_interval,
             ?beacon_lifetime,
             "propagation delay tracker started"
@@ -330,7 +345,10 @@ impl PropagationDelayTracker {
             .await
             .is_err()
         {
-            warn!("timed out waiting for watch goroutine to finish");
+            warn!(
+                component = COMPONENT,
+                "timed out waiting for watch goroutine to finish"
+            );
         }
     }
 
@@ -354,9 +372,7 @@ impl PropagationDelayTracker {
                     PROPAGATION_DELAY_TRACKER_KEY,
                     ctx.clone(),
                     Box::new(move |val| {
-                        if let Ok(desc) = val.downcast::<PropagationDelayTrackerDesc>() {
-                            tracker.on_beacons_received(&desc);
-                        }
+                        Self::handle_watch_value(&tracker, val);
                         true
                     }),
                 )
@@ -369,6 +385,18 @@ impl PropagationDelayTracker {
                 _ = ctx.canceled() => return,
                 _ = boff.wait() => {}
             }
+        }
+    }
+
+    pub(crate) fn handle_watch_value(&self, val: Box<dyn Any + Send + Sync>) {
+        if let Some(desc) = val.downcast_ref::<PropagationDelayTrackerDesc>() {
+            self.on_beacons_received(desc);
+        } else if !val.is::<crate::kv::KeyDeleted>() {
+            warn!(
+                component = COMPONENT,
+                r#type = ?(*val).type_id(),
+                "unexpected value type in watch callback"
+            );
         }
     }
 
@@ -414,17 +442,18 @@ impl PropagationDelayTracker {
             }
 
             received_count += 1;
-            let published = if beacon.published_at >= 0 {
-                UNIX_EPOCH + Duration::from_millis(beacon.published_at as u64)
-            } else {
-                UNIX_EPOCH
-            };
+            let published = unix_millis_to_system_time(beacon.published_at).unwrap_or(UNIX_EPOCH);
             if let Ok(delay) = now.duration_since(published) {
                 self.propagation_delay.observe(delay.as_secs_f64());
                 if !warn_thresh.is_zero() && delay >= warn_thresh {
+                    let published_at = format_rfc3339_nano_utc(published);
+                    let received_at = format_rfc3339_nano_utc(now);
                     warn!(
+                        component = COMPONENT,
                         beacon_id,
                         published_by = %beacon.published_by,
+                        %published_at,
+                        %received_at,
                         ?delay,
                         "high latency beacon detected"
                     );
@@ -450,7 +479,7 @@ impl PropagationDelayTracker {
         let val = match client.get(PROPAGATION_DELAY_TRACKER_KEY).await {
             Ok(v) => v,
             Err(err) => {
-                warn!(%err, "failed to get beacons");
+                warn!(component = COMPONENT, %err, "failed to get beacons");
                 return;
             }
         };
@@ -478,11 +507,7 @@ impl PropagationDelayTracker {
             if beacon.deleted_at != 0 {
                 continue;
             }
-            let published = if beacon.published_at >= 0 {
-                UNIX_EPOCH + Duration::from_millis(beacon.published_at as u64)
-            } else {
-                UNIX_EPOCH
-            };
+            let published = unix_millis_to_system_time(beacon.published_at).unwrap_or(UNIX_EPOCH);
             let age = now.duration_since(published).unwrap_or(Duration::ZERO);
             if age >= beacon_lifetime {
                 beacons_to_delete.push(beacon_id);
@@ -544,7 +569,7 @@ impl PropagationDelayTracker {
 
         drop(_pending_guard);
         if let Err(err) = res {
-            warn!(%err, "failed to publish beacon");
+            warn!(component = COMPONENT, %err, "failed to publish beacon");
             return;
         }
         self.beacons_published_total.inc();
@@ -578,7 +603,7 @@ impl PropagationDelayTracker {
             .await;
 
         if let Err(err) = res {
-            warn!(%err, "failed to mark beacons as deleted");
+            warn!(component = COMPONENT, %err, "failed to mark beacons as deleted");
         }
     }
 }
@@ -728,6 +753,203 @@ mod tests {
         assert!(received, "expected beacons_received_total >= 1");
         assert!(delay_count >= 1, "expected delay_seconds sample_count >= 1");
 
+        let delay_mf = reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "memberlist_propagation_tracker_delay_seconds")
+            .expect("missing memberlist_propagation_tracker_delay_seconds");
+        let delay_metric = delay_mf.get_metric().first().expect("metric present");
+        assert!(delay_metric.has_histogram(), "expected histogram metric");
+        let hist = delay_metric.get_histogram();
+        assert_eq!(hist.get_bucket().len(), DEF_BUCKETS.len());
+        let raw_schema = hist
+            .unknown_fields
+            .get(5)
+            .and_then(|v| v.varint.first().copied())
+            .expect("expected native histogram schema field 5") as u32;
+        let schema = ((raw_schema >> 1) as i32) ^ -((raw_schema & 1) as i32);
+        assert!(schema > 0, "expected native histogram schema > 0, got {schema}");
+
         kv.shutdown().await;
+    }
+
+    #[test]
+    fn c5_propagation_tracker_desc_go_string_and_json_match_go() {
+        let empty = PropagationDelayTrackerDesc::default();
+        assert_eq!(
+            empty.go_string(),
+            "&memberlist.PropagationDelayTrackerDesc{}"
+        );
+        assert_eq!(empty.to_go_json().encode(), "{\"beacons\":null}\n");
+
+        let mut desc = PropagationDelayTrackerDesc::default();
+        desc.beacons.insert(
+            2,
+            BeaconDesc {
+                published_by: "node-a".into(),
+                published_at: 1000,
+                deleted_at: 0,
+            },
+        );
+        desc.beacons.insert(
+            10,
+            BeaconDesc {
+                published_by: "node-b".into(),
+                published_at: 2000,
+                deleted_at: 3000,
+            },
+        );
+
+        assert_eq!(
+            desc.go_string(),
+            "&memberlist.PropagationDelayTrackerDesc{Beacons: map[uint64]BeaconDesc{0x2: memberlist.BeaconDesc{PublishedBy:\"node-a\", PublishedAt:1000, DeletedAt:0},0xa: memberlist.BeaconDesc{PublishedBy:\"node-b\", PublishedAt:2000, DeletedAt:3000},},
+}"
+        );
+        assert_eq!(
+            desc.to_go_json().encode(),
+            "{\"beacons\":{\"10\":{\"published_by\":\"node-b\",\"published_at\":2000,\"deleted_at\":3000},\"2\":{\"published_by\":\"node-a\",\"published_at\":1000}}}\n"
+        );
+    }
+
+    #[test]
+    fn c4_propagation_delay_histogram_emits_native_histogram_schema() {
+        let reg = Registry::new();
+        let kv_cfg = MemberlistConfig::default();
+        let kv = MemberlistKv::new(kv_cfg, Vec::new(), "", Some(&reg), Default::default())
+            .expect("MemberlistKv::new");
+        let tracker = PropagationDelayTracker::new(
+            Arc::downgrade(&kv),
+            PropagationDelayTrackerConfig::default(),
+            "node-a".into(),
+            Some(&reg),
+        );
+        let now_ms = system_time_to_unix_millis(SystemTime::now());
+        let mut desc = PropagationDelayTrackerDesc::default();
+        desc.beacons.insert(
+            7,
+            BeaconDesc {
+                published_by: "remote".into(),
+                published_at: now_ms,
+                deleted_at: 0,
+            },
+        );
+        tracker.on_beacons_received(&desc);
+
+        let mf = reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "memberlist_propagation_tracker_delay_seconds")
+            .expect("missing delay histogram");
+        let m = &mf.get_metric()[0];
+        assert!(m.has_histogram());
+        let h = m.get_histogram();
+        assert_eq!(h.get_sample_count(), 1);
+        assert_eq!(h.get_bucket().len(), DEF_BUCKETS.len());
+        let raw_schema = h
+            .unknown_fields
+            .get(5)
+            .and_then(|v| v.varint.first().copied())
+            .expect("missing native schema field 5") as u32;
+        let schema = ((raw_schema >> 1) as i32) ^ -((raw_schema & 1) as i32);
+        assert_eq!(schema, 3);
+    }
+
+    #[test]
+    fn c6_propagation_tracker_structured_log_fields() {
+        use std::fmt::Write as _;
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct Logs(Arc<Mutex<Vec<String>>>);
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                let _ = write!(self.0, " {}={}", field.name(), value);
+            }
+        }
+        struct Sub(Logs);
+        impl tracing::Subscriber for Sub {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool { true }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut v = Visitor(format!("level={}", event.metadata().level()));
+                event.record(&mut v);
+                self.0 .0.lock().unwrap().push(v.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let logs = Logs::default();
+        let _guard = tracing::subscriber::set_default(Sub(logs.clone()));
+
+        let kv = MemberlistKv::new(MemberlistConfig::default(), Vec::new(), "", None, Default::default())
+            .expect("MemberlistKv::new");
+        let pt_cfg = PropagationDelayTrackerConfig {
+            enabled: true,
+            log_beacons_latency_longer_than: GoDuration::from_millis(10),
+            ..Default::default()
+        };
+        let tracker = PropagationDelayTracker::new(
+            Arc::downgrade(&kv),
+            pt_cfg,
+            "node-a".into(),
+            None,
+        );
+
+        let published_ms = system_time_to_unix_millis(SystemTime::now() - Duration::from_secs(2));
+        let mut desc = PropagationDelayTrackerDesc::default();
+        desc.beacons.insert(
+            99,
+            BeaconDesc {
+                published_by: "node-remote".into(),
+                published_at: published_ms,
+                deleted_at: 0,
+            },
+        );
+        tracker.on_beacons_received(&desc);
+
+        // Non-PropagationDelayTrackerDesc, non-KeyDeleted watch value must log unexpected type.
+        tracker.handle_watch_value(Box::new("unexpected-string".to_string()));
+        // KeyDeleted must NOT log unexpected type.
+        tracker.handle_watch_value(Box::new(crate::kv::KeyDeleted));
+
+        let captured = logs.0.lock().unwrap().join("\n");
+        let high_lat = captured
+            .lines()
+            .find(|l| l.contains("high latency beacon detected"))
+            .expect("expected high latency beacon detected log");
+        assert!(high_lat.contains("component=memberlist-propagation-delay-tracker"), "{high_lat}");
+        assert!(high_lat.contains("beacon_id=99"), "{high_lat}");
+        assert!(high_lat.contains("published_by=node-remote"), "{high_lat}");
+        assert!(high_lat.contains("published_at="), "{high_lat}");
+        assert!(high_lat.contains("received_at="), "{high_lat}");
+        let expected_pub = format_rfc3339_nano_utc(
+            unix_millis_to_system_time(published_ms).unwrap(),
+        );
+        assert!(high_lat.contains(&format!("published_at={expected_pub}")), "{high_lat}");
+
+        let unexpected_lines: Vec<&str> = captured
+            .lines()
+            .filter(|l| l.contains("unexpected value type in watch callback"))
+            .collect();
+        assert_eq!(unexpected_lines.len(), 1, "captured={captured}");
+        assert!(
+            unexpected_lines[0].contains("component=memberlist-propagation-delay-tracker"),
+            "{}",
+            unexpected_lines[0]
+        );
+        assert!(
+            unexpected_lines[0].contains("type="),
+            "{}",
+            unexpected_lines[0]
+        );
     }
 }

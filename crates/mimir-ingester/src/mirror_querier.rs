@@ -290,7 +290,7 @@ impl MirroredChunkQuerier {
 
         // Also check a fresh probe in case delegate errored right before close
         // (matching Go where r.Err() calls delegate.Err() dynamically on Close).
-        let primary_labels = labels_sink.lock().clone();
+        let primary_labels = std::mem::take(&mut *labels_sink.lock());
         let sort_series = self.recorded_request.sort_series;
         let hints = self.recorded_request.hints;
         let matchers = self.recorded_request.matchers.clone();
@@ -509,8 +509,13 @@ impl ChunkSeriesSet for SharedRetainingChunkSeriesSet {
     }
 
     fn at(&mut self) -> Option<Arc<dyn ChunkSeries>> {
+        let was_appended = self.inner.labels_appended;
         let s = self.inner.at();
-        *self.labels_sink.lock() = self.inner.labels.clone();
+        if !was_appended && s.is_some() {
+            if let Some(lbls) = self.inner.labels.last() {
+                self.labels_sink.lock().push(lbls.clone());
+            }
+        }
         s
     }
 
