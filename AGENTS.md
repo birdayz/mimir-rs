@@ -10,7 +10,7 @@
 
 ## Source of Truth
 
-- Upstream Go reference lives at **`.ref/mimir`** (gitignored shallow clone of `github.com/grafana/mimir` `main`).
+- Upstream Go reference lives at **`.ref/mimir`** (gitignored shallow clone pinned in **`UPSTREAM_MIMIR`** — fetch/verify via `./scripts/fetch-upstream-mimir.sh`, never hardcode SHAs elsewhere).
 - **Never guess, invent, simplify, or "improve" externally observable behavior.** Before implementing any struct, RPC, flag, error, hash, codec, or state transition, read the exact Go source and `*_test.go` in `.ref/mimir` (and its `dskit` / `prometheus` dependencies via `go list` / module cache when needed).
 - Every Rust module must carry a top-of-file comment noting the upstream Go file(s) it ports, e.g.:
   `//! Ported from github.com/grafana/mimir/pkg/ingester/owned_series.go`
@@ -93,6 +93,10 @@ Unit tests translated by hand are necessary but **never sufficient** — ported 
    - Boots Go `-target=ingester` and Rust `-target=ingester` side-by-side with identical YAML + CLI flags, replays identical write/error/limit/OOO/histogram/exemplar/metadata workloads and all 13 `cortex.Ingester` read RPCs against both, and diffs gRPC responses, gRPC/`httpgrpc`/`ErrorDetails` error statuses, HTTP admin endpoints, and scraped `/metrics` (`cortex_ingester_*`, `prometheus_tsdb_*`).
 3. **Tier 3 — Mixed Go + Rust Cluster & Kafka Harness:**
    - Runs mixed clusters (Go Distributor + Go Querier + mixed Go & Rust Ingesters over live `memberlist` gossip, plus `franz-go/pkg/kfake` + Go `ingest.Pusher` for Kafka `ingest_storage`) verifying quorum replication, rolling WAL restarts, ring join/leave, and block shipping readable by Go Mimir.
+
+### Wave Engineering Playbook (Repo Skill)
+
+- For multi-file work, waves, hardening passes, and PR/CI gating (including TL-of-TLs delegation, worktree isolation, model routing, hardening checklist, and the 12-job CI gate), load the repo-local skill **`.bruh/skills/mimir-rs-wave-engineering/SKILL.md`**.
 
 ### General Rules
 
