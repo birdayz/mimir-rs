@@ -42,6 +42,7 @@ struct IsolationInner {
 }
 
 /// Global append/read isolation coordinator (`tsdb.isolation`).
+#[derive(Clone)]
 pub struct Isolation {
     inner: Arc<IsolationInner>,
 }
@@ -276,6 +277,16 @@ impl TxRing {
             }
         }
         self.tx_id_first %= len;
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.tx_id_count
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.tx_id_count == 0
     }
 
     pub fn last_append_id(&self) -> Option<u64> {

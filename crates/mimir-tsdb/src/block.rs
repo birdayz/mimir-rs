@@ -471,6 +471,7 @@ pub struct Block {
     postings_cache: Arc<PostingsForMatchersCache>,
     postings_cache_source_id: u64,
     compaction_failed: AtomicBool,
+    compaction_deletable: AtomicBool,
     readers: Arc<BlockReaders>,
     lookup_planner: OnceLock<Arc<dyn Any + Send + Sync>>,
 }
@@ -503,6 +504,7 @@ impl Block {
         let dir = dir.as_ref().to_path_buf();
         let meta = read_meta_file(&dir)?;
         let compaction_failed = AtomicBool::new(meta.compaction.failed);
+        let compaction_deletable = AtomicBool::new(meta.compaction.deletable);
         let index = IndexReader::open(dir.join(INDEX_FILENAME))?;
         let chunks = BlockChunksReader::open(dir.join("chunks"))?;
         let tombstones = read_tombstones_file(&dir)?;
@@ -527,6 +529,7 @@ impl Block {
             postings_cache,
             postings_cache_source_id: next_postings_cache_source_id(),
             compaction_failed,
+            compaction_deletable,
             readers: Arc::new(BlockReaders::default()),
             lookup_planner: OnceLock::new(),
         })
@@ -545,6 +548,44 @@ impl Block {
     #[inline]
     pub fn compaction_failed(&self) -> bool {
         self.meta.compaction.failed || self.compaction_failed.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_deletable(&self) {
+        self.compaction_deletable.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_deletable(&self) -> bool {
+        self.meta.compaction.deletable || self.compaction_deletable.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn num_tombstones(&self) -> u64 {
+        self.tombstones.total()
+    }
+
+    /// Creates a hardlinked snapshot of this block in `dest_dir/<ulid>` (Go `Block.Snapshot`).
+    pub fn snapshot(&self, dest_dir: &Path) -> Result<(), BlockError> {
+        let block_dir = dest_dir.join(self.meta.ulid.to_string());
+        let chunks_dir = block_dir.join("chunks");
+        fs::create_dir_all(&chunks_dir)?;
+        for fname in [META_FILENAME, INDEX_FILENAME, TOMBSTONES_FILENAME] {
+            let src = self.dir.join(fname);
+            if fname == TOMBSTONES_FILENAME && !src.exists() {
+                write_tombstones_file(&block_dir, &MemTombstones::new())?;
+            } else {
+                fs::hard_link(&src, block_dir.join(fname))?;
+            }
+        }
+        let cur_chunks_dir = self.dir.join("chunks");
+        for entry in fs::read_dir(&cur_chunks_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                fs::hard_link(entry.path(), chunks_dir.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Registers an active reader on this block unless it is already closing.
