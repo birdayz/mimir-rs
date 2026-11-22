@@ -4735,6 +4735,7 @@ impl Head {
             has_any_metadata: AtomicBool::new(false),
             enable_st_as_zero_sample: AtomicBool::new(false),
             enable_memory_snapshot_on_shutdown: AtomicBool::new(false),
+            enable_fast_startup: AtomicBool::new(false),
             deleted_series_since_symbol_gc: AtomicU64::new(0),
             symbol_arena_baseline_bytes: AtomicU64::new(0),
             symbol_gc_arena_growth_threshold: AtomicU64::new(DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES),
