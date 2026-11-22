@@ -91,11 +91,20 @@ fn append_stringlabel_pair_slow(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
-/// Iterates over `(name, value)` pairs inside a raw Prometheus `stringlabels` byte slice.
+/// Safely iterates over `(name, value)` pairs inside a raw Prometheus `stringlabels` byte slice.
 ///
-/// Caller must ensure `data` was produced from valid UTF-8 `stringlabels` pairs.
+/// Validates framing bounds and UTF-8 on each pair, returning `None` on malformed or non-UTF-8 bytes.
 #[inline]
-pub fn iter_stringlabels(data: &[u8]) -> LabelsIter<'_> {
+pub fn iter_stringlabels(data: &[u8]) -> StringLabelsIter<'_> {
+    StringLabelsIter { data, pos: 0 }
+}
+
+/// Iterates over `(name, value)` pairs inside a pre-validated `stringlabels` byte slice.
+///
+/// # Safety
+/// Caller must guarantee `data` is validly framed Prometheus `stringlabels` containing valid UTF-8.
+#[inline]
+unsafe fn iter_stringlabels_unchecked(data: &[u8]) -> LabelsIter<'_> {
     LabelsIter { data, pos: 0 }
 }
 
@@ -134,11 +143,13 @@ pub fn decode_stringlabel_size(data: &[u8], pos: usize) -> (usize, usize) {
     }
 }
 
+/// # Safety
+/// Caller must guarantee `data[pos..]` starts with a validly framed `stringlabels` UTF-8 string.
 #[inline]
-fn decode_stringlabel_str(data: &[u8], pos: usize) -> (&str, usize) {
+unsafe fn decode_stringlabel_str(data: &[u8], pos: usize) -> (&str, usize) {
     let (len, start) = decode_stringlabel_size(data, pos);
     let end = start + len;
-    // SAFETY: `Labels` only ever encodes valid UTF-8 strings.
+    // SAFETY: Caller guarantees `data` contains validly framed valid UTF-8 `stringlabels`.
     let s = unsafe { std::str::from_utf8_unchecked(&data[start..end]) };
     (s, end)
 }
@@ -360,7 +371,8 @@ impl Labels {
             if !nbytes.is_empty() {
                 if nbytes[0] == first {
                     if nbytes == name.as_bytes() {
-                        let (val, _) = decode_stringlabel_str(&self.data, nstart + nlen);
+                        // SAFETY: `Labels` guarantees valid `stringlabels` framing and UTF-8.
+                        let (val, _) = unsafe { decode_stringlabel_str(&self.data, nstart + nlen) };
                         return val;
                     }
                 } else if nbytes[0] > first {
@@ -446,10 +458,8 @@ impl Labels {
 
     /// Iterates over `(name, value)` pairs in sorted order.
     pub fn iter(&self) -> LabelsIter<'_> {
-        LabelsIter {
-            data: &self.data,
-            pos: 0,
-        }
+        // SAFETY: `Labels` guarantees `self.data` is validly framed `stringlabels` UTF-8.
+        unsafe { iter_stringlabels_unchecked(&self.data) }
     }
 
     /// Iterates over `(name, value)` pairs in sorted order as zero-copy [`Bytes`] slices
@@ -609,9 +619,52 @@ impl<'a> Iterator for LabelsIter<'a> {
                 return Some((name, value));
             }
         }
-        let (name, p1) = decode_stringlabel_str(data, pos);
-        let (value, p2) = decode_stringlabel_str(data, p1);
+        // SAFETY: `LabelsIter` is only constructed via `iter_stringlabels_unchecked` on validated `Labels`.
+        let (name, p1) = unsafe { decode_stringlabel_str(data, pos) };
+        let (value, p2) = unsafe { decode_stringlabel_str(data, p1) };
         self.pos = p2;
+        Some((name, value))
+    }
+}
+
+/// Safe iterator over `(name, value)` pairs inside a raw Prometheus `stringlabels` byte slice.
+///
+/// Returns `None` when the end of the buffer is reached or if truncated framing, length overflow,
+/// or invalid UTF-8 is encountered.
+#[derive(Clone)]
+pub struct StringLabelsIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for StringLabelsIter<'a> {
+    type Item = (&'a str, &'a str);
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        let data = self.data;
+        let pos = self.pos;
+        let b0 = *data.get(pos)?;
+        let (nlen, nstart) = if b0 < 255 {
+            (b0 as usize, pos + 1)
+        } else {
+            try_decode_stringlabel_size(data, pos).ok()?
+        };
+        let nend = nstart.checked_add(nlen)?;
+        let name_bytes = data.get(nstart..nend)?;
+        let name = std::str::from_utf8(name_bytes).ok()?;
+
+        let b1 = *data.get(nend)?;
+        let (vlen, vstart) = if b1 < 255 {
+            (b1 as usize, nend + 1)
+        } else {
+            try_decode_stringlabel_size(data, nend).ok()?
+        };
+        let vend = vstart.checked_add(vlen)?;
+        let val_bytes = data.get(vstart..vend)?;
+        let value = std::str::from_utf8(val_bytes).ok()?;
+
+        self.pos = vend;
         Some((name, value))
     }
 }
@@ -876,5 +929,23 @@ mod tests {
         // Truncated length
         let trunc = Bytes::from_static(&[5, b'a', b'b']);
         assert!(Labels::try_from_raw_stringlabels_bytes(trunc).is_err());
+    }
+
+    #[test]
+    fn iter_stringlabels_safe_on_malformed_and_non_utf8_bytes() {
+        // Non-UTF-8 bytes in name/value must return None without UB or panic.
+        assert_eq!(iter_stringlabels(&[1, 0xff, 1, 0xff]).next(), None);
+        assert_eq!(iter_stringlabels(&[1, b'k', 1, 0xff]).next(), None);
+
+        // Truncated 1-byte and 4-byte (255-prefix) lengths must return None without panic.
+        assert_eq!(iter_stringlabels(&[5, b'a']).next(), None);
+        assert_eq!(iter_stringlabels(&[1, b'k', 5, b'v']).next(), None);
+        assert_eq!(iter_stringlabels(&[255, 1, 0]).next(), None);
+        assert_eq!(iter_stringlabels(&[255, 0xff, 0xff, 0xff]).next(), None);
+        assert_eq!(iter_stringlabels(&[1, b'k', 255, 1, 0]).next(), None);
+
+        // Valid pair followed by malformed pair yields only the valid pair.
+        let got: Vec<(&str, &str)> = iter_stringlabels(&[1, b'a', 1, b'b', 5, b'x']).collect();
+        assert_eq!(got, vec![("a", "b")]);
     }
 }

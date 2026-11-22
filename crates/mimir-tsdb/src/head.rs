@@ -4752,15 +4752,6 @@ impl Head {
             .store(st.max_time(), Ordering::Release);
     }
 
-    #[inline]
-    fn replay_zero_or_st(&self, st: i64) -> i64 {
-        if self.opts.enable_st_storage {
-            st
-        } else {
-            0
-        }
-    }
-
     fn replay_one_sample(
         &self,
         entry: &SeriesEntry,
@@ -4771,7 +4762,9 @@ impl Head {
         if s.v.to_bits() == QUIET_ZERO_NAN_BITS {
             s.v = 0.0;
         }
-        let st = self.replay_zero_or_st(s.st);
+        // Pass s.st verbatim during WAL replay (matching Go head_wal.go:817-957;
+        // Go only applies zeroOrST on live appenders, never during WAL/WBL replay).
+        let st = s.st;
         let mut state = entry.inner.lock();
         if s.t <= state.mm_max_time() {
             return Ok(());
@@ -4857,7 +4850,7 @@ impl Head {
         mint: &mut i64,
         maxt: &mut i64,
     ) -> Result<(), HeadError> {
-        let st = self.replay_zero_or_st(hs.st);
+        let st = hs.st;
         let mut state = entry.inner.lock();
         if hs.t <= state.mm_max_time() {
             return Ok(());
@@ -4894,7 +4887,7 @@ impl Head {
         mint: &mut i64,
         maxt: &mut i64,
     ) -> Result<(), HeadError> {
-        let st = self.replay_zero_or_st(fhs.st);
+        let st = fhs.st;
         let mut state = entry.inner.lock();
         if fhs.t <= state.mm_max_time() {
             return Ok(());
@@ -4970,7 +4963,7 @@ impl Head {
         const WAL_POSTINGS_BATCH: usize = 4096;
 
         let dec = RecordDecoder::new();
-        let mut min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
+        let min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
         let mut mint = i64::MAX;
         let mut maxt = i64::MIN;
         let mut ooo_mint = i64::MAX;
@@ -5158,13 +5151,11 @@ impl Head {
                         st.set_metadata(compact_meta);
                     }
                 }
-                DecodedRecord::MinValidTime(t) => {
-                    if t > min_valid_time {
-                        min_valid_time = t;
-                        self.min_valid_time.fetch_max(t, Ordering::AcqRel);
-                    }
-                }
-                DecodedRecord::MmapMarkers(_) | DecodedRecord::Unknown(_) => {}
+                // MinValidTime is read strictly from the latest checkpoint's first record
+                // before replay; mid-WAL MinValidTime records are ignored (Go head_wal.go:251-254).
+                DecodedRecord::MinValidTime(_)
+                | DecodedRecord::MmapMarkers(_)
+                | DecodedRecord::Unknown(_) => {}
             }
         }
         if !pending_postings.is_empty() {
@@ -5229,7 +5220,7 @@ impl Head {
             .clamp(2, 32);
         let workers = self.opts.wal_replay_concurrency.min(max_threads).max(2);
         let dec_workers = workers.min(8);
-        let mut min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
+        let min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
         let series_pool = mimir_common::thread_pool::ScopedWorkerPool::new("wal-series", workers);
 
         type RawEntry = (CompressionType, Vec<u8>, Option<PathBuf>, Option<usize>, usize);
@@ -5895,13 +5886,11 @@ impl Head {
                                             st.set_metadata(compact_meta);
                                         }
                                     }
-                                    DecodedRecord::MinValidTime(t) => {
-                                        if t > min_valid_time {
-                                            min_valid_time = t;
-                                            self.min_valid_time.fetch_max(t, Ordering::AcqRel);
-                                        }
-                                    }
-                                    DecodedRecord::MmapMarkers(_) | DecodedRecord::Unknown(_) => {}
+                                    // MinValidTime is read strictly from the latest checkpoint's first record
+                                    // before replay; mid-WAL MinValidTime records are ignored (Go head_wal.go:251-254).
+                                    DecodedRecord::MinValidTime(_)
+                                    | DecodedRecord::MmapMarkers(_)
+                                    | DecodedRecord::Unknown(_) => {}
                                 }
                             }
                         }
@@ -6041,7 +6030,7 @@ impl Head {
                             s.ref_id = mapped;
                         }
                         if let Some(entry) = self.series.get_by_id(s.ref_id) {
-                            let st_val = self.replay_zero_or_st(s.st);
+                            let st_val = s.st;
                             let mut st = entry.inner.lock();
                             let (ok, created, _, _) = st.insert_ooo(
                                 entry.ref_id,
@@ -6071,7 +6060,7 @@ impl Head {
                             hs.ref_id = mapped;
                         }
                         if let Some(entry) = self.series.get_by_id(hs.ref_id) {
-                            let st_val = self.replay_zero_or_st(hs.st);
+                            let st_val = hs.st;
                             let mut st = entry.inner.lock();
                             let (ok, created, _, _) = st.insert_ooo(
                                 entry.ref_id,
@@ -6101,7 +6090,7 @@ impl Head {
                             fhs.ref_id = mapped;
                         }
                         if let Some(entry) = self.series.get_by_id(fhs.ref_id) {
-                            let st_val = self.replay_zero_or_st(fhs.st);
+                            let st_val = fhs.st;
                             let mut st = entry.inner.lock();
                             let (ok, created, _, _) = st.insert_ooo(
                                 entry.ref_id,
@@ -8090,7 +8079,7 @@ impl Head {
     ) -> Vec<(i64, i64)> {
         let mut raw = Vec::new();
         let range128 = range_ms.max(1) as i128;
-        let cr_guard = self.chunk_reader.read();
+        let mut oversized_mmapped: Vec<MmappedChunk> = Vec::new();
         for &(ref_id, _) in candidates {
             let Some(entry) = self.series.get_by_id(ref_id) else {
                 continue;
@@ -8098,18 +8087,10 @@ impl Head {
             let st = entry.inner.lock();
             for mc in st.mmapped() {
                 if (mc.max_time as i128 - mc.min_time as i128) > range128 {
-                    if let Some(ref cr) = *cr_guard {
-                        if let Ok(enc) = cr.chunk(mc.ref_id) {
-                            if let Ok(samples) = decode_chunk_samples(&enc) {
-                                for s in samples {
-                                    raw.push((s.t, s.t));
-                                }
-                                continue;
-                            }
-                        }
-                    }
+                    oversized_mmapped.push(*mc);
+                } else {
+                    raw.push((mc.min_time, mc.max_time));
                 }
-                raw.push((mc.min_time, mc.max_time));
             }
             st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
                 if (hc_max as i128 - hc_min as i128) > range128 {
@@ -8122,6 +8103,25 @@ impl Head {
                 }
                 raw.push((hc_min, hc_max));
             });
+        }
+        if !oversized_mmapped.is_empty() {
+            // Lock order: drop all `entry.inner` and `series` stripe locks before taking
+            // `chunk_reader.read()` as a leaf lock so we never invert against `entry.inner`
+            // -> `chunk_reader.read()` and concurrent `chunk_reader.write()` callers.
+            let cr_guard = self.chunk_reader.read();
+            for mc in oversized_mmapped {
+                if let Some(ref cr) = *cr_guard {
+                    if let Ok(enc) = cr.chunk(mc.ref_id) {
+                        if let Ok(samples) = decode_chunk_samples(&enc) {
+                            for s in samples {
+                                raw.push((s.t, s.t));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                raw.push((mc.min_time, mc.max_time));
+            }
         }
         merge_time_intervals(raw)
     }
@@ -8139,7 +8139,7 @@ impl Head {
             return raw;
         }
         let range128 = range_ms.max(1) as i128;
-        let cr_guard = self.chunk_reader.read();
+        let mut oversized_mmapped: Vec<MmappedChunk> = Vec::new();
         for &(ref_id, _) in candidates {
             let Some(entry) = self.series.get_by_id(ref_id) else {
                 continue;
@@ -8151,18 +8151,10 @@ impl Head {
             for mc in &ooo.ooo_mmapped_chunks {
                 if mc.ref_id <= max_mmap_ref {
                     if (mc.max_time as i128 - mc.min_time as i128) > range128 {
-                        if let Some(ref cr) = *cr_guard {
-                            if let Ok(enc) = cr.chunk(mc.ref_id) {
-                                if let Ok(samples) = decode_chunk_samples(&enc) {
-                                    for s in samples {
-                                        raw.push((s.t, s.t));
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
+                        oversized_mmapped.push(*mc);
+                    } else {
+                        raw.push((mc.min_time, mc.max_time));
                     }
-                    raw.push((mc.min_time, mc.max_time));
                 }
             }
             for p in &ooo.ooo_pending_mmapped {
@@ -8177,6 +8169,24 @@ impl Head {
                     }
                     raw.push((p.mc.min_time, p.mc.max_time));
                 }
+            }
+        }
+        if !oversized_mmapped.is_empty() {
+            // Lock order: drop all `entry.inner` and `series` stripe locks before taking
+            // `chunk_reader.read()` as a leaf lock.
+            let cr_guard = self.chunk_reader.read();
+            for mc in oversized_mmapped {
+                if let Some(ref cr) = *cr_guard {
+                    if let Ok(enc) = cr.chunk(mc.ref_id) {
+                        if let Ok(samples) = decode_chunk_samples(&enc) {
+                            for s in samples {
+                                raw.push((s.t, s.t));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                raw.push((mc.min_time, mc.max_time));
             }
         }
         merge_time_intervals(raw)
@@ -17897,6 +17907,138 @@ mod tests {
         assert_eq!(dup_f(), dup_f_0 + 4.0);
 
         app.rollback().unwrap();
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn compaction_interval_collection_never_deadlocks_with_appends_and_chunk_reader_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            chunk_range_ms: 10_000,
+            samples_per_chunk: 4,
+            ooo_time_window_ms: 200_000,
+            ooo_cap_max: 2,
+            ..HeadOptions::default()
+        };
+        let head = Arc::new(Head::open(dir.path(), opts, 0).unwrap());
+
+        let mut candidates = Vec::new();
+        for i in 0..8usize {
+            let lbls = Labels::from_pairs([("__name__", "m"), ("s", &i.to_string())]);
+            let mut app = head.appender();
+            let mut ref_id = None;
+            for step in 0..4i64 {
+                let r = match ref_id {
+                    Some(id) => app
+                        .append_float_by_ref(id, 100_000 + step * 10_000, step as f64)
+                        .unwrap(),
+                    None => app
+                        .append_float(
+                            None,
+                            &[("__name__", "m"), ("s", &i.to_string())],
+                            100_000 + step * 10_000,
+                            step as f64,
+                        )
+                        .unwrap(),
+                };
+                ref_id = Some(r);
+            }
+            app.commit().unwrap();
+            candidates.push((ref_id.unwrap(), lbls));
+        }
+        head.mmap_head_chunks().unwrap();
+
+        // Populate OOO mmapped chunks (> ooo_cap_max = 2) spanning > range_ms = 1.
+        for &(ref_id, _) in &candidates {
+            let mut app = head.appender();
+            for t in [50_000i64, 51_000, 52_000, 53_000] {
+                app.append_float_by_ref(ref_id, t, 1.0).unwrap();
+            }
+            app.commit().unwrap();
+        }
+
+        // Verify interval helpers return non-empty intervals for oversized mmapped chunks.
+        let sel = head.collect_selected_compaction_intervals(&candidates, 1);
+        assert!(!sel.is_empty());
+        let ooo = head.collect_ooo_compaction_intervals(
+            &candidates,
+            ChunkDiskMapperRef::new(u32::MAX, u32::MAX),
+            1,
+        );
+        assert!(!ooo.is_empty());
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Thread A: compaction interval collectors (previously inverted chunk_reader.read() -> entry.inner).
+        let h_a = Arc::clone(&head);
+        let cands_a = candidates.clone();
+        let b_a = Arc::clone(&barrier);
+        let stop_a = Arc::clone(&stop);
+        let tx_a = done_tx.clone();
+        std::thread::spawn(move || {
+            b_a.wait();
+            for _ in 0..400 {
+                if stop_a.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = h_a.collect_selected_compaction_intervals(&cands_a, 1);
+                let _ = h_a.collect_ooo_compaction_intervals(
+                    &cands_a,
+                    ChunkDiskMapperRef::new(u32::MAX, u32::MAX),
+                    1,
+                );
+            }
+            let _ = tx_a.send("a");
+        });
+
+        // Thread B: concurrent appends touching mmapped timestamps (entry.inner -> chunk_reader.read()).
+        let h_b = Arc::clone(&head);
+        let cands_b = candidates.clone();
+        let b_b = Arc::clone(&barrier);
+        let stop_b = Arc::clone(&stop);
+        let tx_b = done_tx.clone();
+        std::thread::spawn(move || {
+            b_b.wait();
+            for iter in 0..400i64 {
+                if stop_b.load(Ordering::Relaxed) {
+                    break;
+                }
+                let idx = (iter as usize) % cands_b.len();
+                let ref_id = cands_b[idx].0;
+                let mut app = h_b.appender();
+                let _ = app.append_float_by_ref(ref_id, 105_000 + (iter % 200), iter as f64);
+                let _ = app.commit();
+            }
+            let _ = tx_b.send("b");
+        });
+
+        // Thread C: concurrent chunk_reader.write() (refresh_chunk_reader / OOO flush).
+        let h_c = Arc::clone(&head);
+        let b_c = Arc::clone(&barrier);
+        let stop_c = Arc::clone(&stop);
+        let tx_c = done_tx;
+        std::thread::spawn(move || {
+            b_c.wait();
+            for _ in 0..400 {
+                if stop_c.load(Ordering::Relaxed) {
+                    break;
+                }
+                h_c.refresh_chunk_reader().unwrap();
+            }
+            let _ = tx_c.send("c");
+        });
+
+        for _ in 0..3 {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_err()
+            {
+                stop.store(true, Ordering::Relaxed);
+                panic!("3-thread deadlock detected between compaction intervals, appends, and refresh_chunk_reader");
+            }
+        }
         head.close().unwrap();
     }
 }

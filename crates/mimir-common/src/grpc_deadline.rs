@@ -18,16 +18,18 @@ pub fn decode_timeout(s: &str) -> Result<Duration, String> {
         // Spec allows for 8 digits plus the unit.
         return Err(format!("transport: timeout string is too long: {s:?}"));
     }
-    let (digits, unit) = s.split_at(size - 1);
-    let unit_nanos: u128 = match unit {
-        "H" => 3_600_000_000_000,
-        "M" => 60_000_000_000,
-        "S" => 1_000_000_000,
-        "m" => 1_000_000,
-        "u" => 1_000,
-        "n" => 1,
+    // Inspect the raw trailing byte before slicing so multi-byte UTF-8 endings
+    // (e.g. "1µ") return an unrecognized-unit error instead of panicking in split_at.
+    let unit_nanos: u128 = match s.as_bytes()[size - 1] {
+        b'H' => 3_600_000_000_000,
+        b'M' => 60_000_000_000,
+        b'S' => 1_000_000_000,
+        b'm' => 1_000_000,
+        b'u' => 1_000,
+        b'n' => 1,
         _ => return Err(format!("transport: timeout unit is not recognized: {s:?}")),
     };
+    let digits = &s[..size - 1];
     // strconv.ParseUint(digits, 10, 64): ASCII digits only, no sign.
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!("strconv.ParseUint: parsing {digits:?}: invalid syntax"));
@@ -74,6 +76,19 @@ mod tests {
         assert_eq!(
             decode_timeout("1"),
             Err("transport: timeout string is too short: \"1\"".to_string())
+        );
+        // Non-ASCII UTF-8 strings must return errors without panicking on char boundaries.
+        assert_eq!(
+            decode_timeout("1µ"),
+            Err("transport: timeout unit is not recognized: \"1µ\"".to_string())
+        );
+        assert_eq!(
+            decode_timeout("1234567µ"),
+            Err("transport: timeout unit is not recognized: \"1234567µ\"".to_string())
+        );
+        assert_eq!(
+            decode_timeout("µS"),
+            Err("strconv.ParseUint: parsing \"µ\": invalid syntax".to_string())
         );
     }
 }

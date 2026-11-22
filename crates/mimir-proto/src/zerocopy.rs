@@ -629,10 +629,15 @@ pub struct BorrowedWriteRequest<'a, 's> {
     pub source: i32,
     pub skip_label_validation: bool,
     pub skip_label_count_validation: bool,
-    pub labels_utf8_validated: bool,
+    labels_utf8_validated: bool,
 }
 
 impl<'a, 's> BorrowedWriteRequest<'a, 's> {
+    #[inline]
+    pub fn is_labels_utf8_validated(&self) -> bool {
+        self.labels_utf8_validated
+    }
+
     #[inline]
     pub fn timeseries_len(&self) -> usize {
         self.scratch.timeseries.len()
@@ -4876,7 +4881,7 @@ mod tests {
         let mut scratch = WriteRequestScratch::new();
         let rw1_wire = rw1.encode_to_vec();
         let dec1 = decode_write_request(&rw1_wire, DecodeOptions::classic(), &mut scratch).unwrap();
-        assert!(!dec1.labels_utf8_validated);
+        assert!(!dec1.is_labels_utf8_validated());
         assert!(dec1.timeseries_at(0).labels_str().is_none());
 
         let mut rw2_wire = Vec::new();
@@ -4889,7 +4894,7 @@ mod tests {
         .unwrap();
         let dec2 =
             decode_write_request(&rw2_wire, DecodeOptions::kafka_v2(), &mut scratch).unwrap();
-        assert!(dec2.labels_utf8_validated);
+        assert!(dec2.is_labels_utf8_validated());
         let pairs: Vec<_> = dec2.timeseries_at(0).labels_str().unwrap().collect();
         assert_eq!(pairs, vec![("__name__", "up"), ("job", "api")]);
     }
@@ -5139,7 +5144,7 @@ mod tests {
 
         let dec2 = decode_write_request(&rw2_wire, DecodeOptions::rw2(), &mut scratch)
             .expect("rw2 decode should tolerate invalid UTF-8");
-        assert!(!dec2.labels_utf8_validated);
+        assert!(!dec2.is_labels_utf8_validated());
         assert!(dec2.timeseries_at(0).labels_str().is_none());
         let ms2: Vec<_> = dec2.metadata().collect();
         assert_eq!(ms2.len(), 1);
