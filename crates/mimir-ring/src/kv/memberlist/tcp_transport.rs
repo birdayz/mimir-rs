@@ -18,7 +18,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -513,6 +513,7 @@ pub struct TcpTransport {
     stream_tx: mpsc::Sender<MemberlistConn>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     listener_tasks: Mutex<Vec<JoinHandle<()>>>,
+    accept_errors: AtomicUsize,
     metrics: TransportMetrics,
 }
 
@@ -560,7 +561,8 @@ impl TcpTransport {
         let mut local_addrs = Vec::with_capacity(bind_addrs.len());
 
         for addr_str in &bind_addrs {
-            let ip: IpAddr = addr_str.parse().map_err(|_| {
+            let trimmed = addr_str.trim_start_matches('[').trim_end_matches(']');
+            let ip: IpAddr = trimmed.parse().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("could not parse bind addr {addr_str:?} as IP address"),
@@ -606,6 +608,7 @@ impl TcpTransport {
             stream_tx,
             shutdown_tx,
             listener_tasks: Mutex::new(Vec::new()),
+            accept_errors: AtomicUsize::new(0),
             metrics,
         });
 
@@ -710,8 +713,16 @@ impl TcpTransport {
                             } else {
                                 (loop_delay * 2).min(MAX_DELAY)
                             };
+                            self.accept_errors.fetch_add(1, Ordering::Relaxed);
                             error!(component = COMPONENT, err = %err, "Error accepting TCP connection");
-                            tokio::time::sleep(loop_delay).await;
+                            tokio::select! {
+                                _ = shutdown_rx.changed() => {
+                                    if *shutdown_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::time::sleep(loop_delay) => {}
+                            }
                         }
                     }
                 }
@@ -1162,6 +1173,21 @@ impl TcpTransport {
 
     /// Go `Shutdown`: stops accepting, then waits for all in-flight packet writes and for the
     /// listener tasks to finish.
+    pub fn accept_errors_for_test(&self) -> usize {
+        self.accept_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn spawn_errored_tcp_listen_for_test(self: &Arc<Self>) -> io::Result<()> {
+        let std_ln = std::net::TcpListener::bind("127.0.0.1:0")?;
+        std_ln.set_nonblocking(true)?;
+        socket2::SockRef::from(&std_ln).shutdown(std::net::Shutdown::Both)?;
+        let tokio_ln = TcpListener::from_std(std_ln)?;
+        let tr = self.clone();
+        let h = tokio::spawn(async move { tr.tcp_listen(tokio_ln).await });
+        self.listener_tasks.lock().push(h);
+        Ok(())
+    }
+
     pub async fn shutdown_and_wait(&self) {
         self.shutdown();
         if let Ok(all) = self.write_sem.acquire_many(self.max_concurrent_writes).await {

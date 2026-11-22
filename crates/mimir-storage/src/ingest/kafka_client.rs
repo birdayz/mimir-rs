@@ -39,6 +39,7 @@ use kafka_protocol::messages::offset_commit_request::{
 use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
+#[allow(unused_imports)]
 use kafka_protocol::records::{
     Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
     TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
@@ -274,6 +275,8 @@ struct BrokerConn {
     pending_drained: Arc<tokio::sync::Notify>,
     api_versions: RwLock<HashMap<i16, (i16, i16)>>,
     alive: Arc<std::sync::atomic::AtomicBool>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
+    fatal_read_err: Arc<parking_lot::Mutex<Option<String>>>,
     disconnected: Arc<std::sync::atomic::AtomicBool>,
     reader_abort: tokio::task::AbortHandle,
     writer_abort: tokio::task::AbortHandle,
@@ -332,7 +335,24 @@ impl BrokerConn {
         kprom: Option<Arc<KpromMetrics>>,
         extended_metrics: Option<KafkaClientExtendedMetrics>,
     ) -> Result<Arc<Self>, KafkaClientError> {
-        let established = match transport.connect(&addr, &client_id, request_timeout).await {
+        let established = match transport
+            .connect_with_hooks(
+                &addr,
+                &client_id,
+                request_timeout,
+                |_| {
+                    if let Some(ref k) = kprom {
+                        k.on_broker_connect(&node, true);
+                    }
+                },
+                |_| {
+                    if let Some(ref k) = kprom {
+                        k.on_broker_disconnect(&node);
+                    }
+                },
+            )
+            .await
+        {
             Ok(e) => e,
             Err(e) => {
                 if let Some(ref k) = kprom {
@@ -341,9 +361,6 @@ impl BrokerConn {
                 return Err(e);
             }
         };
-        if let Some(ref k) = kprom {
-            k.on_broker_connect(&node, true);
-        }
         if let Some(ref m) = extended_metrics {
             m.connects_total.inc();
         }
@@ -354,6 +371,9 @@ impl BrokerConn {
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let pending_drained = Arc::new(tokio::sync::Notify::new());
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fatal_read_err: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
 
         let alive_w = Arc::clone(&alive);
         let ext_w = extended_metrics.clone();
@@ -389,6 +409,8 @@ impl BrokerConn {
         let pending_r = Arc::clone(&pending);
         let pending_drained_r = Arc::clone(&pending_drained);
         let alive_r = Arc::clone(&alive);
+        let retired_r = Arc::clone(&retired);
+        let fatal_err_r = Arc::clone(&fatal_read_err);
         let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let disconnected_r = Arc::clone(&disconnected);
         let node = Arc::new(parking_lot::RwLock::new(node));
@@ -417,9 +439,20 @@ impl BrokerConn {
                         header_at,
                         done_at,
                     });
+                } else {
+                    *fatal_err_r.lock() = Some("correlation ID mismatch".to_string());
+                    pending_r.lock().clear();
+                    pending_drained_r.notify_waiters();
+                    break;
                 }
             }
             alive_r.store(false, Ordering::SeqCst);
+            if retired_r.load(Ordering::SeqCst) {
+                let mut g = fatal_err_r.lock();
+                if g.is_none() {
+                    *g = Some("retired".to_string());
+                }
+            }
             pending_r.lock().clear();
             pending_drained_r.notify_waiters();
             if let Some((k, node)) = disconnect_hook {
@@ -442,6 +475,8 @@ impl BrokerConn {
             pending_drained,
             api_versions: RwLock::new(established.api_versions),
             alive,
+            retired,
+            fatal_read_err,
             disconnected,
             reader_abort,
             writer_abort,
@@ -549,6 +584,11 @@ impl BrokerConn {
                 .sasl_expiry
                 .lock()
                 .is_some_and(|e| std::time::Instant::now() >= e)
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        self.mark_dead();
     }
 
     fn mark_dead(&self) {
@@ -835,6 +875,17 @@ impl BrokerConn {
                 if let Some(ref k) = self.kprom {
                     let n = self.node.read().clone();
                     k.on_read_error(&n, written);
+                }
+                if let Some(ref msg) = *self.fatal_read_err.lock() {
+                    if msg == "correlation ID mismatch" {
+                        return Err(KafkaClientError::UnexpectedResponse(msg.clone()));
+                    }
+                    if msg == "retired" {
+                        return Err(KafkaClientError::ChosenBrokerDead);
+                    }
+                }
+                if self.retired.load(Ordering::SeqCst) {
+                    return Err(KafkaClientError::ChosenBrokerDead);
                 }
                 return Err(KafkaClientError::ConnectionClosed);
             }
@@ -1560,7 +1611,7 @@ impl KafkaClient {
                 let keep = live_addrs.contains(addr)
                     || self.seed_brokers.iter().any(|seed| seed == addr);
                 if !keep && conn.pending.lock().is_empty() {
-                    conn.mark_dead();
+                    conn.retire();
                 }
                 keep
             });
@@ -3080,7 +3131,7 @@ fn decode_single_batch_slice(
 /// `(records >= fetch_offset, next_fetch_offset, last_batch_end_offset)`. `kprom` receives the
 /// `OnFetchBatchRead` hook for every complete batch.
 pub(crate) fn decode_fetch_records_with_pool<'a>(
-    mut raw_records: Bytes,
+    raw_records: Bytes,
     fetch_offset: i64,
     get_pool: impl FnOnce() -> &'a ScopedWorkerPool,
     kprom: Option<&KpromMetrics>,
@@ -3158,38 +3209,561 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
         return Ok((Vec::new(), next_fetch_offset, last_batch_end_offset));
     }
 
-    let batch = RecordBatchDecoder::decode_with_custom_compression(
-        &mut raw_records,
-        Some(decompress_record_batch),
-    )?;
-    let mut last_batch_end_offset: Option<i64> = None;
-    let mut decoded_records = Vec::with_capacity(batch.len());
-    for rec in batch {
-        if rec.offset >= fetch_offset {
-            last_batch_end_offset = Some(
-                last_batch_end_offset.map_or(rec.offset, |prev| prev.max(rec.offset)),
-            );
+    decode_mixed_or_legacy_batches(raw_records, fetch_offset, kprom)
+}
+
+/// IEEE CRC32 (matches Go `crc32.ChecksumIEEE`) for Kafka v0/v1 message sets.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    const fn make_table() -> [u32; 256] {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut j = 0;
+            while j < 8 {
+                c = if (c & 1) != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                j += 1;
+            }
+            table[i] = c;
+            i += 1;
         }
-        if rec.control || rec.offset < fetch_offset {
-            continue;
-        }
-        let headers = rec
-            .headers
-            .into_iter()
-            .map(|(k, v)| (k.as_str().to_owned(), v.unwrap_or_default()))
-            .collect();
-        decoded_records.push(FetchedRecord {
-            offset: rec.offset,
-            timestamp_ms: rec.timestamp,
-            key: rec.key.unwrap_or_default(),
-            value: rec.value.unwrap_or_default(),
-            headers,
-        });
+        table
     }
+    const TABLE: [u32; 256] = make_table();
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc = TABLE[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+struct LegacyMsg {
+    offset: i64,
+    magic: i8,
+    attrs: i8,
+    timestamp_ms: i64,
+    key: Bytes,
+    value: Bytes,
+}
+
+fn parse_legacy_messages(raw: &Bytes) -> Result<Vec<LegacyMsg>, KafkaClientError> {
+    let buf = raw.as_ref();
+    let mut pos = 0usize;
+    let mut out = Vec::new();
+    while pos < buf.len() {
+        if pos + 12 > buf.len() {
+            if out.is_empty() {
+                return Err(KafkaClientError::UnexpectedResponse(
+                    "truncated legacy message header".to_string(),
+                ));
+            }
+            break;
+        }
+        let offset = be_i64(buf, pos);
+        let msg_size = i32::from_be_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
+        if msg_size < 4 {
+            return Err(KafkaClientError::UnexpectedResponse(format!(
+                "invalid legacy message size {msg_size}"
+            )));
+        }
+        let msg_end = pos + 12 + msg_size as usize;
+        if msg_end > buf.len() {
+            if out.is_empty() {
+                return Err(KafkaClientError::UnexpectedResponse(
+                    "truncated legacy message body".to_string(),
+                ));
+            }
+            break;
+        }
+        let crc_supplied =
+            u32::from_be_bytes([buf[pos + 12], buf[pos + 13], buf[pos + 14], buf[pos + 15]]);
+        let body = &buf[pos + 16..msg_end];
+        let crc_actual = crc32_ieee(body);
+        if crc_supplied != crc_actual {
+            return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                "legacy message CRC mismatch ({crc_supplied} != {crc_actual})"
+            )));
+        }
+        if body.len() < 2 {
+            return Err(KafkaClientError::UnexpectedResponse(
+                "legacy message body too short".to_string(),
+            ));
+        }
+        let magic = body[0] as i8;
+        let attrs = body[1] as i8;
+        let mut p = 2usize;
+        let timestamp_ms = if magic == 1 {
+            if p + 8 > body.len() {
+                return Err(KafkaClientError::UnexpectedResponse(
+                    "truncated v1 legacy message timestamp".to_string(),
+                ));
+            }
+            let ts = be_i64(body, p);
+            p += 8;
+            ts
+        } else if magic == 0 {
+            0
+        } else {
+            return Err(KafkaClientError::UnexpectedResponse(format!(
+                "unexpected legacy message magic {magic}"
+            )));
+        };
+        if p + 4 > body.len() {
+            return Err(KafkaClientError::UnexpectedResponse(
+                "truncated legacy message key length".to_string(),
+            ));
+        }
+        let key_len = i32::from_be_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
+        p += 4;
+        let key = if key_len < 0 {
+            Bytes::new()
+        } else {
+            let klen = key_len as usize;
+            if p + klen > body.len() {
+                return Err(KafkaClientError::UnexpectedResponse(
+                    "truncated legacy message key".to_string(),
+                ));
+            }
+            let k = raw.slice((pos + 16 + p)..(pos + 16 + p + klen));
+            p += klen;
+            k
+        };
+        if p + 4 > body.len() {
+            return Err(KafkaClientError::UnexpectedResponse(
+                "truncated legacy message value length".to_string(),
+            ));
+        }
+        let val_len = i32::from_be_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
+        p += 4;
+        let value = if val_len < 0 {
+            Bytes::new()
+        } else {
+            let vlen = val_len as usize;
+            if p + vlen > body.len() {
+                return Err(KafkaClientError::UnexpectedResponse(
+                    "truncated legacy message value".to_string(),
+                ));
+            }
+            raw.slice((pos + 16 + p)..(pos + 16 + p + vlen))
+        };
+        out.push(LegacyMsg {
+            offset,
+            magic,
+            attrs,
+            timestamp_ms,
+            key,
+            value,
+        });
+        pos = msg_end;
+    }
+    Ok(out)
+}
+
+fn decode_mixed_or_legacy_batches(
+    raw_records: Bytes,
+    fetch_offset: i64,
+    kprom: Option<&KpromMetrics>,
+) -> Result<(Vec<FetchedRecord>, i64, Option<i64>), KafkaClientError> {
+    let mut pos = 0usize;
+    let total = raw_records.len();
+    let mut decoded_records = Vec::new();
+    let mut last_batch_end_offset: Option<i64> = None;
+
+    while pos < total {
+        if pos + 17 > total {
+            if decoded_records.is_empty() && last_batch_end_offset.is_none() {
+                return Err(KafkaClientError::UnexpectedResponse(
+                    "first record batch truncated in fetch response (header < 17 bytes)".to_string(),
+                ));
+            }
+            break;
+        }
+        let magic = raw_records[pos + 16];
+        let body_len = i32::from_be_bytes([
+            raw_records[pos + 8],
+            raw_records[pos + 9],
+            raw_records[pos + 10],
+            raw_records[pos + 11],
+        ]);
+        if body_len < 4 {
+            if decoded_records.is_empty() && last_batch_end_offset.is_none() {
+                return Err(KafkaClientError::UnexpectedResponse(format!(
+                    "invalid batch length {body_len}"
+                )));
+            }
+            break;
+        }
+        let Some(frame_len) = 12usize.checked_add(body_len as usize) else {
+            break;
+        };
+        if pos + frame_len > total {
+            if decoded_records.is_empty() && last_batch_end_offset.is_none() {
+                return Err(KafkaClientError::UnexpectedResponse(
+                    "first record batch truncated".to_string(),
+                ));
+            }
+            break;
+        }
+        let slice = raw_records.slice(pos..pos + frame_len);
+        pos += frame_len;
+        if magic == 2 {
+            let base_offset = be_i64(&slice, 0);
+            let last_offset_delta = i32::from_be_bytes([slice[23], slice[24], slice[25], slice[26]]);
+            let batch_end = base_offset.saturating_add(last_offset_delta as i64);
+            if batch_end >= fetch_offset {
+                last_batch_end_offset = Some(
+                    last_batch_end_offset.map_or(batch_end, |prev| prev.max(batch_end)),
+                );
+            }
+            let (recs, m) = decode_single_batch_slice(slice, fetch_offset)?;
+            if let Some(k) = kprom {
+                k.on_fetch_batch_read(m);
+            }
+            decoded_records.extend(recs);
+        } else if magic == 0 || magic == 1 {
+            let (recs, _, batch_end_opt) = decode_legacy_message_set(slice, fetch_offset)?;
+            if let Some(end) = batch_end_opt {
+                last_batch_end_offset = Some(
+                    last_batch_end_offset.map_or(end, |prev| prev.max(end)),
+                );
+            }
+            decoded_records.extend(recs);
+        } else {
+            return Err(KafkaClientError::UnexpectedResponse(format!(
+                "unknown RecordBatch magic {magic}"
+            )));
+        }
+    }
+
     let next_fetch_offset =
         last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end + 1));
     Ok((decoded_records, next_fetch_offset, last_batch_end_offset))
 }
+
+/// Decodes Kafka v0/v1 legacy message sets preserving inner offsets for compacted compressed
+/// wrappers (ported from `franz-go/pkg/kgo/source.go` `processMessageSet`).
+fn decode_legacy_message_set(
+    raw_records: Bytes,
+    fetch_offset: i64,
+) -> Result<(Vec<FetchedRecord>, i64, Option<i64>), KafkaClientError> {
+    let outer = parse_legacy_messages(&raw_records)?;
+    let mut decoded_records = Vec::new();
+    let mut last_batch_end_offset: Option<i64> = None;
+
+    for msg in outer {
+        let compression = match msg.attrs & 0x07 {
+            0 => Compression::None,
+            1 => Compression::Gzip,
+            2 => Compression::Snappy,
+            3 => Compression::Lz4,
+            other => {
+                return Err(KafkaClientError::Protocol(anyhow::anyhow!(
+                    "Unknown legacy compression algorithm {other}"
+                )));
+            }
+        };
+        if matches!(compression, Compression::None) {
+            if msg.offset >= fetch_offset {
+                last_batch_end_offset = Some(
+                    last_batch_end_offset.map_or(msg.offset, |prev| prev.max(msg.offset)),
+                );
+                decoded_records.push(FetchedRecord {
+                    offset: msg.offset,
+                    timestamp_ms: msg.timestamp_ms,
+                    key: msg.key,
+                    value: msg.value,
+                    headers: Vec::new(),
+                });
+            }
+            continue;
+        }
+
+        let mut comp = msg.value;
+        let decompressed = decompress_record_batch(&mut comp, compression)?;
+        let inner = parse_legacy_messages(&decompressed)?;
+        if inner.is_empty() {
+            continue;
+        }
+        let base_offset = if msg.magic == 1 {
+            if msg.offset == 0 {
+                0
+            } else {
+                let last_inner = inner.last().unwrap().offset;
+                if msg.offset < last_inner {
+                    return Err(KafkaClientError::UnexpectedResponse(format!(
+                        "v1 wrapper offset {} below last inner offset {last_inner}",
+                        msg.offset
+                    )));
+                }
+                msg.offset - last_inner
+            }
+        } else {
+            // v0 compressed wrappers carry absolute inner offsets.
+            0
+        };
+        for im in inner {
+            let abs_offset = base_offset + im.offset;
+            if abs_offset >= fetch_offset {
+                last_batch_end_offset = Some(
+                    last_batch_end_offset.map_or(abs_offset, |prev| prev.max(abs_offset)),
+                );
+                decoded_records.push(FetchedRecord {
+                    offset: abs_offset,
+                    timestamp_ms: im.timestamp_ms,
+                    key: im.key,
+                    value: im.value,
+                    headers: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let next_fetch_offset =
+        last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end + 1));
+    Ok((decoded_records, next_fetch_offset, last_batch_end_offset))
+}
+
+/// Public entry point for decoding fetched record batches (v0, v1, v2), matching
+/// `kgo.ProcessFetchPartition`.
+pub fn process_fetch_partition_batches(
+    raw_records: Bytes,
+    fetch_offset: i64,
+) -> Result<(Vec<FetchedRecord>, i64, Option<i64>), KafkaClientError> {
+    let pool = ScopedWorkerPool::new("fetch-dec", 1);
+    decode_fetch_records_with_pool(raw_records, fetch_offset, || &pool, None)
+}
+
+/// Public broker connection test handle backed by the real `BrokerConn` pipeline (over any
+/// duplex/TCP stream) for testing retired broker classification, correlation ID mismatch,
+/// unexpected first-read EOF warnings, and concurrent teardown safety.
+type OnReadHookSlot = Arc<parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>>;
+
+pub struct KgoBrokerConn {
+    inner: Arc<BrokerConn>,
+    on_read: OnReadHookSlot,
+    warnings: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl KgoBrokerConn {
+    pub fn from_duplex(stream: tokio::io::DuplexStream) -> Arc<Self> {
+        Self::from_async_rw(stream, false)
+    }
+
+    pub fn from_async_rw<S>(stream: S, has_sasl: bool) -> Arc<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (write_tx, mut write_rx) = mpsc::channel::<OutboundFrame>(64);
+        let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<ReadFrame>>>> =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let pending_drained = Arc::new(tokio::sync::Notify::new());
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fatal_read_err: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let successes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let on_read: OnReadHookSlot =
+            Arc::new(parking_lot::Mutex::new(None));
+        let warnings: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let alive_w = Arc::clone(&alive);
+        let writer_handle = tokio::spawn(async move {
+            while let Some(frame) = write_rx.recv().await {
+                if writer.write_all(&frame.body).await.is_err() || writer.flush().await.is_err() {
+                    break;
+                }
+            }
+            alive_w.store(false, Ordering::SeqCst);
+        });
+        let writer_abort = writer_handle.abort_handle();
+
+        let pending_r = Arc::clone(&pending);
+        let pending_drained_r = Arc::clone(&pending_drained);
+        let alive_r = Arc::clone(&alive);
+        let retired_r = Arc::clone(&retired);
+        let fatal_err_r = Arc::clone(&fatal_read_err);
+        let successes_r = Arc::clone(&successes);
+        let on_read_r = Arc::clone(&on_read);
+        let warnings_r = Arc::clone(&warnings);
+        let reader_handle = tokio::spawn(async move {
+            let mut saw_any_frame = false;
+            while let Some((payload, header_at, done_at)) =
+                read_kafka_frame_bounded_timed(&mut reader, MAX_KAFKA_FRAME_BYTES).await
+            {
+                saw_any_frame = true;
+                if let Some(ref cb) = *on_read_r.lock() {
+                    cb();
+                }
+                let corr_id = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let (tx, now_empty) = {
+                    let mut map = pending_r.lock();
+                    let tx = map.remove(&corr_id);
+                    (tx, map.is_empty())
+                };
+                if now_empty {
+                    pending_drained_r.notify_waiters();
+                }
+                if let Some(tx) = tx {
+                    let _ = tx.send(ReadFrame {
+                        payload: Bytes::from(payload),
+                        header_at,
+                        done_at,
+                    });
+                } else {
+                    *fatal_err_r.lock() = Some("correlation ID mismatch".to_string());
+                    pending_r.lock().clear();
+                    pending_drained_r.notify_waiters();
+                    break;
+                }
+            }
+            alive_r.store(false, Ordering::SeqCst);
+            if retired_r.load(Ordering::SeqCst) {
+                let mut g = fatal_err_r.lock();
+                if g.is_none() {
+                    *g = Some("retired".to_string());
+                }
+            } else if !saw_any_frame && successes_r.load(Ordering::Relaxed) == 0 && !has_sasl {
+                let mut g = fatal_err_r.lock();
+                if g.is_none() {
+                    *g = Some("first_read_eof".to_string());
+                    warnings_r.lock().push(
+                        "read from broker errored, killing connection after 0 successful responses (is SASL missing?)".to_string(),
+                    );
+                }
+            }
+            pending_r.lock().clear();
+            pending_drained_r.notify_waiters();
+        });
+        let reader_abort = reader_handle.abort_handle();
+
+        let inner = Arc::new(BrokerConn {
+            addr: "127.0.0.1:9092".to_string(),
+            kind: ConnKind::Normal,
+            client_id: "test".to_string(),
+            transport: None,
+            next_corr_id: AtomicI32::new(1),
+            write_tx,
+            pending,
+            pending_drained,
+            api_versions: RwLock::new(HashMap::new()),
+            alive,
+            retired,
+            fatal_read_err,
+            disconnected,
+            reader_abort,
+            writer_abort,
+            sasl_expiry: parking_lot::Mutex::new(None),
+            requests_since_auth: std::sync::atomic::AtomicU64::new(0),
+            reauth_lock: tokio::sync::Mutex::new(()),
+            successes: std::sync::atomic::AtomicU64::new(0),
+            node: Arc::new(parking_lot::RwLock::new("1".to_string())),
+            kprom: None,
+            extended_metrics: None,
+        });
+        Arc::new(Self {
+            inner,
+            on_read,
+            warnings,
+        })
+    }
+
+    pub fn set_on_read(&self, cb: impl Fn() + Send + Sync + 'static) {
+        *self.on_read.lock() = Some(Box::new(cb));
+    }
+
+    pub fn retire(&self) {
+        self.inner.retire();
+    }
+
+    pub fn die(&self) {
+        self.inner.mark_dead();
+    }
+
+    pub fn is_dead(&self) -> bool {
+        !self.inner.is_alive()
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        self.warnings.lock().clone()
+    }
+
+    pub async fn request_metadata(&self) -> Result<MetadataResponse, KafkaClientError> {
+        let req = MetadataRequest::default();
+        let res = self
+            .inner
+            .send_raw_timeout_outcome::<_, MetadataResponse>(
+                ApiKey::Metadata,
+                4,
+                &req,
+                Duration::from_secs(5),
+            )
+            .await;
+        match res {
+            SendOutcome::Ok(r) => Ok(r),
+            SendOutcome::ReauthFailed(e) | SendOutcome::Err(e) => {
+                if let Some(ref msg) = *self.inner.fatal_read_err.lock() {
+                    if msg == "first_read_eof" {
+                        return Err(KafkaClientError::FirstReadEof(
+                            kgo_retry::FirstReadEofKind::Sasl.to_string(),
+                        ));
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Ported from `kgo.parseBrokerAddr`: parses `host[:port]` or `[ipv6][:port]` or bare `::1`,
+/// defaulting the port to `9092`.
+pub fn parse_broker_addr(addr: &str) -> Result<(String, u16), String> {
+    const DEFAULT_KAFKA_PORT: u16 = 9092;
+    let parse_port = |p: &str| -> Result<u16, String> {
+        p.parse::<u16>()
+            .map_err(|e| format!("invalid port {p:?} in broker addr {addr:?}: {e}"))
+    };
+    if let Some(rest) = addr.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err(format!("missing closing ']' in broker addr {addr:?}"));
+        };
+        let host = &rest[..end];
+        let after = &rest[end + 1..];
+        if after.is_empty() {
+            return Ok((host.to_string(), DEFAULT_KAFKA_PORT));
+        }
+        let Some(port_str) = after.strip_prefix(':') else {
+            return Err(format!("unexpected trailing characters after ']' in {addr:?}"));
+        };
+        return Ok((host.to_string(), parse_port(port_str)?));
+    }
+    // Check if there are multiple colons -> bare IPv6 literal (e.g. "::1").
+    let first_colon = addr.find(':');
+    let last_colon = addr.rfind(':');
+    match (first_colon, last_colon) {
+        (None, None) => Ok((addr.to_string(), DEFAULT_KAFKA_PORT)),
+        (Some(f), Some(l)) if f != l => {
+            // Multiple colons without brackets: verify valid IPv6 literal.
+            addr.parse::<std::net::Ipv6Addr>()
+                .map_err(|e| format!("invalid IPv6 broker addr {addr:?}: {e}"))?;
+            Ok((addr.to_string(), DEFAULT_KAFKA_PORT))
+        }
+        (Some(idx), Some(_)) => {
+            let host = &addr[..idx];
+            let port_str = &addr[idx + 1..];
+            Ok((host.to_string(), parse_port(port_str)?))
+        }
+        _ => unreachable!(),
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -3732,6 +4306,8 @@ mod tests {
                 pending_drained: Arc::new(tokio::sync::Notify::new()),
                 api_versions: RwLock::new(HashMap::new()),
                 alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fatal_read_err: Arc::new(parking_lot::Mutex::new(None)),
                 disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 reader_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 writer_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
@@ -4167,6 +4743,8 @@ mod tests {
                 pending_drained: Arc::clone(&pending_drained),
                 api_versions: RwLock::new(HashMap::new()),
                 alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fatal_read_err: Arc::new(parking_lot::Mutex::new(None)),
                 disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 reader_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 writer_abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),

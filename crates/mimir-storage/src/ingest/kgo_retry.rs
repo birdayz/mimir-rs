@@ -212,6 +212,41 @@ fn dial_error_kind(e: &io::Error) -> Option<DialErrorKind> {
 // Classification (kgo/errors.go)
 // ---------------------------------------------------------------------------------------------
 
+/// Ported from `kgo.errDecompress`.
+#[derive(Debug)]
+pub struct DecompressError {
+    pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl fmt::Display for DecompressError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unable to decompress: {}", self.source)
+    }
+}
+
+impl std::error::Error for DecompressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Ported from `kgo.isDecompressErr`.
+pub fn is_decompress_err(err: Option<&(dyn std::error::Error + 'static)>) -> bool {
+    let mut cur = err;
+    while let Some(e) = cur {
+        if e.is::<DecompressError>() {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// Ported from `kgo.isDecompressErr` for `anyhow::Error`.
+pub fn is_decompress_anyhow_err(err: Option<&anyhow::Error>) -> bool {
+    err.is_some_and(|e| e.chain().any(|c| c.is::<DecompressError>()))
+}
+
 /// `kerr.Error.Retriable` for every Kafka error code flagged retriable in franz-go's `kerr`.
 pub fn is_retriable_error_code(code: i16) -> bool {
     matches!(

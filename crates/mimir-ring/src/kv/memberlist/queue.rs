@@ -92,11 +92,16 @@ impl TransmitLimitedQueue {
 
     /// Go `QueueBroadcast`.
     pub fn queue_broadcast(&self, b: Arc<dyn Broadcast>) {
+        self.queue_broadcast_with_transmits(b, 0);
+    }
+
+    /// Go `queueBroadcast(b, initialTransmits)`.
+    pub fn queue_broadcast_with_transmits(&self, b: Arc<dyn Broadcast>, initial_transmits: usize) {
         let mut q = self.inner.lock();
         q.id_gen = if q.id_gen == i64::MAX { 1 } else { q.id_gen + 1 };
         let id = q.id_gen;
         let e = Entry {
-            transmits: 0,
+            transmits: initial_transmits,
             msg_len: b.message().len() as i64,
             id,
             b: Arc::clone(&b),
@@ -199,12 +204,30 @@ impl TransmitLimitedQueue {
 
     /// Ordered snapshot of queued messages (test helper, Go `orderedView(false)`).
     pub fn ordered_messages(&self) -> Vec<(usize, Vec<u8>)> {
-        self.inner
-            .lock()
-            .tq
-            .values()
-            .map(|e| (e.transmits, e.b.message().to_vec()))
-            .collect()
+        self.ordered_view(false)
+    }
+
+    /// Go `orderedView(reverse)`: emits `(transmits, msg)` ascending when `reverse == false`
+    /// and descending when `reverse == true`.
+    pub fn ordered_view(&self, reverse: bool) -> Vec<(usize, Vec<u8>)> {
+        let q = self.inner.lock();
+        if reverse {
+            q.tq
+                .values()
+                .rev()
+                .map(|e| (e.transmits, e.b.message().to_vec()))
+                .collect()
+        } else {
+            q.tq
+                .values()
+                .map(|e| (e.transmits, e.b.message().to_vec()))
+                .collect()
+        }
+    }
+
+    /// Current id_gen (test helper).
+    pub fn id_gen(&self) -> i64 {
+        self.inner.lock().id_gen
     }
 }
 

@@ -18,6 +18,19 @@ pub const HTTPGRPC_HANDLE_METHOD: &str = "/httpgrpc.HTTP/Handle";
 pub const PROMETHEUS_PUSH_ENDPOINT: &str = "/api/v1/push";
 pub const OTLP_PUSH_ENDPOINT: &str = "/otlp/v1/metrics";
 
+/// Ported from `github.com/grafana/dskit/httpgrpc/httpgrpc.go` (`AppendRequestMetadataToContext`).
+pub fn append_request_metadata_to_context(
+    md: &mut MetadataMap,
+    req: &mimir_proto::httpgrpcpb::HttpRequest,
+) {
+    if let Ok(val) = tonic::metadata::MetadataValue::try_from(req.method.as_str()) {
+        md.append(HTTPGRPC_METADATA_METHOD, val);
+    }
+    if let Ok(val) = tonic::metadata::MetadataValue::try_from(req.url.as_str()) {
+        md.append(HTTPGRPC_METADATA_URL, val);
+    }
+}
+
 pub type FinishFn = Box<dyn FnOnce(Option<&Status>) + Send>;
 
 pub trait PushReceiver: Send + Sync {
@@ -175,4 +188,175 @@ fn get_message_size(md: &MetadataMap, key: &str) -> i64 {
         return 0;
     }
     val.parse::<i64>().unwrap_or(0)
+}
+
+// ============================================================================
+// github.com/grafana/dskit/server/limits.go (GrpcInflightLimitCheck)
+// ============================================================================
+
+pub const UNPROCESSED_REQUEST_CHECK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// Ported from `dskit/server/limits.go` (`GrpcInflightMethodLimiter`).
+pub trait DskitGrpcMethodLimiter: Send + Sync + 'static {
+    type CallCtx: Clone + Send + Sync + 'static;
+
+    #[allow(clippy::result_large_err)]
+    fn rpc_call_starting(
+        &self,
+        method_name: &str,
+        md: &MetadataMap,
+    ) -> Result<Self::CallCtx, Status>;
+
+    #[allow(clippy::result_large_err)]
+    fn rpc_call_processing(
+        &self,
+        ctx: &Self::CallCtx,
+        method_name: &str,
+    ) -> Result<Option<FinishFn>, Status>;
+
+    fn rpc_call_finished(&self, ctx: &Self::CallCtx);
+}
+
+/// Ported from `dskit/server/limits.go` (`isMethodNameValid`).
+pub fn is_method_name_valid(mut method: &str) -> bool {
+    if let Some(stripped) = method.strip_prefix('/') {
+        method = stripped;
+    }
+    method.rfind('/').is_some()
+}
+
+/// Mockable timer handle matching `dskit/server/limits.go` (`testableTimer`).
+pub struct TestableTimer {
+    stop_fn: Box<dyn FnOnce() -> bool + Send + Sync>,
+}
+
+impl TestableTimer {
+    pub fn new(stop_fn: impl FnOnce() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            stop_fn: Box::new(stop_fn),
+        }
+    }
+
+    pub fn stop(self) -> bool {
+        (self.stop_fn)()
+    }
+}
+
+pub type TimeAfterFuncMock = Arc<
+    dyn Fn(std::time::Duration, Box<dyn FnOnce() + Send + Sync>) -> TestableTimer + Send + Sync,
+>;
+
+/// Per-RPC state tracked between `TapHandle`, `HandleRPC(InHeader)`, and `HandleRPC(End)`.
+pub struct LimitCheckerState<C> {
+    pub call_ctx: C,
+    pub full_method: String,
+    headers_processed: std::sync::atomic::AtomicBool,
+    rpc_call_finished_once: std::sync::Once,
+    non_processed_timer: parking_lot::Mutex<Option<TestableTimer>>,
+}
+
+impl<C> LimitCheckerState<C> {
+    pub fn mark_headers_processed(&self) {
+        self.headers_processed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn headers_were_processed(&self) -> bool {
+        self.headers_processed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Ported from `github.com/grafana/dskit/server/limits.go` (`grpcInflightLimitCheck`).
+pub struct GrpcInflightLimitCheck<L: DskitGrpcMethodLimiter> {
+    limiter: Arc<L>,
+    pub time_after_func_mock: Option<TimeAfterFuncMock>,
+}
+
+impl<L: DskitGrpcMethodLimiter> GrpcInflightLimitCheck<L> {
+    pub fn new(limiter: Arc<L>) -> Self {
+        Self {
+            limiter,
+            time_after_func_mock: None,
+        }
+    }
+
+    pub fn with_time_after_mock(mut self, mock: TimeAfterFuncMock) -> Self {
+        self.time_after_func_mock = Some(mock);
+        self
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn tap_handle(
+        &self,
+        full_method_name: &str,
+        md: &MetadataMap,
+        is_ctx_done: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Option<Arc<LimitCheckerState<L::CallCtx>>>, Status> {
+        if !is_method_name_valid(full_method_name) {
+            return Ok(None);
+        }
+        let call_ctx = self.limiter.rpc_call_starting(full_method_name, md)?;
+        let state = Arc::new(LimitCheckerState {
+            call_ctx,
+            full_method: full_method_name.to_string(),
+            headers_processed: std::sync::atomic::AtomicBool::new(false),
+            rpc_call_finished_once: std::sync::Once::new(),
+            non_processed_timer: parking_lot::Mutex::new(None),
+        });
+
+        let limiter_cb = Arc::clone(&self.limiter);
+        let state_cb = Arc::clone(&state);
+        let is_done_cb = Arc::clone(&is_ctx_done);
+        let check_cb: Box<dyn FnOnce() + Send + Sync> = Box::new(move || {
+            if state_cb.headers_were_processed() {
+                return;
+            }
+            if is_done_cb() {
+                state_cb.rpc_call_finished_once.call_once(|| {
+                    limiter_cb.rpc_call_finished(&state_cb.call_ctx);
+                });
+            }
+        });
+
+        let timer = if let Some(ref mock) = self.time_after_func_mock {
+            mock(UNPROCESSED_REQUEST_CHECK_TIMEOUT, check_cb)
+        } else {
+            let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let aborted_c = Arc::clone(&aborted);
+            std::thread::spawn(move || {
+                std::thread::sleep(UNPROCESSED_REQUEST_CHECK_TIMEOUT);
+                if !aborted_c.load(std::sync::atomic::Ordering::Acquire) {
+                    check_cb();
+                }
+            });
+            TestableTimer::new(move || !aborted.swap(true, std::sync::atomic::Ordering::AcqRel))
+        };
+        *state.non_processed_timer.lock() = Some(timer);
+        Ok(Some(state))
+    }
+
+    pub fn handle_rpc_in_header(&self, state: &LimitCheckerState<L::CallCtx>) {
+        if let Some(timer) = state.non_processed_timer.lock().take() {
+            if !timer.stop() {
+                state.mark_headers_processed();
+            }
+        }
+    }
+
+    pub fn handle_rpc_end(&self, state: &LimitCheckerState<L::CallCtx>) {
+        state.rpc_call_finished_once.call_once(|| {
+            self.limiter.rpc_call_finished(&state.call_ctx);
+        });
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn rpc_call_processing(
+        &self,
+        state: &LimitCheckerState<L::CallCtx>,
+        method_name: &str,
+    ) -> Result<Option<FinishFn>, Status> {
+        self.limiter.rpc_call_processing(&state.call_ctx, method_name)
+    }
 }

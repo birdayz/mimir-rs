@@ -15,6 +15,7 @@
 //! silently ignored (see PORT_STATUS.md).
 
 pub mod body;
+pub mod dskit_mw;
 pub mod gzip;
 pub mod grpc_server;
 pub mod http_middleware;
@@ -22,6 +23,7 @@ pub mod http_server;
 pub mod listener;
 pub mod metrics;
 pub mod tls;
+pub mod web;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -92,6 +92,21 @@ fn tls12_suite(name: &str) -> Option<SupportedCipherSuite> {
     })
 }
 
+/// Ported from `dskit/server/tls_config.go` (`stringToCipherSuites`).
+pub fn string_to_cipher_suites(s: &str) -> Result<Option<Vec<SupportedCipherSuite>>> {
+    cipher_suites(s)
+}
+
+/// Ported from `dskit/server/tls_config.go` (`stringToCurvePreferences`).
+pub fn string_to_curve_preferences(s: &str) -> Result<Option<Vec<&'static dyn SupportedKxGroup>>> {
+    kx_groups(s)
+}
+
+/// Ported from `dskit/server/tls_config.go` (`stringToTLSVersion`).
+pub fn string_to_tls_version(min: &str) -> Result<&'static [&'static rustls::SupportedProtocolVersion]> {
+    protocol_versions(min)
+}
+
 fn cipher_suites(s: &str) -> Result<Option<Vec<SupportedCipherSuite>>> {
     if s.is_empty() {
         return Ok(None);
@@ -299,14 +314,432 @@ fn system_roots() -> RootCertStore {
     roots
 }
 
+/// Wraps `WebPkiClientVerifier` to also accept a self-signed certificate explicitly pinned
+/// in `ClientCAs` (even when `BasicConstraints: CA:TRUE` causes `rustls-webpki` to reject
+/// it with `CaUsedAsEndEntity`, matching Go `crypto/x509` mTLS behavior).
+#[derive(Debug)]
+struct PinnedSelfSignedFallbackVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    pinned_ders: Vec<Vec<u8>>,
+}
+
+impl ClientCertVerifier for PinnedSelfSignedFallbackVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        match self.inner.verify_client_cert(end_entity, intermediates, now) {
+            Ok(v) => Ok(v),
+            Err(err) => {
+                if intermediates.is_empty()
+                    && self
+                        .pinned_ders
+                        .iter()
+                        .any(|d| d.as_slice() == end_entity.as_ref())
+                    && !matches!(
+                        err,
+                        rustls::Error::InvalidCertificate(
+                            rustls::CertificateError::Expired
+                                | rustls::CertificateError::NotValidYet
+                                | rustls::CertificateError::Revoked
+                        )
+                    )
+                {
+                    return Ok(ClientCertVerified::assertion());
+                }
+                Err(err)
+            }
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn build_client_cert_verifier(
+    mode: &str,
+    ca: Option<(RootCertStore, Vec<Vec<u8>>)>,
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<dyn ClientCertVerifier>> {
+    let algs = provider.signature_verification_algorithms;
+    Ok(match mode {
+        "" | "NoClientCert" => {
+            if ca.is_some() {
+                bail!("client CA's have been configured without a Client Auth Policy");
+            }
+            WebPkiClientVerifier::no_client_auth()
+        }
+        "RequestClientCert" => Arc::new(AnyClientCert {
+            mandatory: false,
+            algs,
+            hint_subjects: ca.as_ref().map(|(s, _)| s.subjects()).unwrap_or_default(),
+        }),
+        "RequireAnyClientCert" | "RequireClientCert" => Arc::new(AnyClientCert {
+            mandatory: true,
+            algs,
+            hint_subjects: ca.as_ref().map(|(s, _)| s.subjects()).unwrap_or_default(),
+        }),
+        "VerifyClientCertIfGiven" | "RequireAndVerifyClientCert" => {
+            let (roots, pinned_ders) = match ca {
+                Some((s, ders)) => (Arc::new(s), ders),
+                None => (Arc::new(system_roots()), Vec::new()),
+            };
+            if roots.is_empty() {
+                Arc::new(EmptyPoolClientCertVerifier {
+                    mandatory: mode == "RequireAndVerifyClientCert",
+                    algs,
+                })
+            } else {
+                let mut b = WebPkiClientVerifier::builder_with_provider(roots, Arc::clone(provider));
+                if mode == "VerifyClientCertIfGiven" {
+                    b = b.allow_unauthenticated();
+                }
+                let inner = b.build().map_err(|e| anyhow!("client CA pool: {e}"))?;
+                if pinned_ders.is_empty() {
+                    inner
+                } else {
+                    Arc::new(PinnedSelfSignedFallbackVerifier {
+                        inner,
+                        pinned_ders,
+                    })
+                }
+            }
+        }
+        other => bail!("invalid ClientAuth: {other}"),
+    })
+}
+
+/// Live-reloading `ClientCertVerifier` for `client_ca_file` (mirrors Go
+/// `exporter-toolkit/web` per-handshake `ConfigToTLSConfig`).
+struct CachedReloadingClientCaVerifier {
+    path: String,
+    mode: String,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    initial_hint_subjects: Vec<DistinguishedName>,
+    last_check_ms: std::sync::atomic::AtomicU64,
+    reload_lock: parking_lot::Mutex<()>,
+    state: parking_lot::RwLock<(Vec<u8>, Arc<dyn ClientCertVerifier>)>,
+}
+
+impl std::fmt::Debug for CachedReloadingClientCaVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedReloadingClientCaVerifier")
+            .field("path", &self.path)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CachedReloadingClientCaVerifier {
+    fn new(
+        path: String,
+        mode: String,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<Self> {
+        let pem = std::fs::read(&path).map_err(|e| anyhow!(go_read_err(&path, &e)))?;
+        let mut roots = RootCertStore::empty();
+        let mut pinned_ders = Vec::new();
+        for c in CertificateDer::pem_slice_iter(&pem).flatten() {
+            let der = c.as_ref().to_vec();
+            if roots.add(c).is_ok() {
+                pinned_ders.push(der);
+            }
+        }
+        let initial_hint_subjects = roots.subjects();
+        let verifier = build_client_cert_verifier(&mode, Some((roots, pinned_ders)), &provider)?;
+        Ok(Self {
+            path,
+            mode,
+            provider,
+            initial_hint_subjects,
+            last_check_ms: std::sync::atomic::AtomicU64::new(monotonic_ms()),
+            reload_lock: parking_lot::Mutex::new(()),
+            state: parking_lot::RwLock::new((pem, verifier)),
+        })
+    }
+
+    fn current(&self) -> Arc<dyn ClientCertVerifier> {
+        let now = monotonic_ms();
+        let last = self.last_check_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) >= 200
+            && self
+                .last_check_ms
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            if let Some(_g) = self.reload_lock.try_lock() {
+                if let Ok(pem) = std::fs::read(&self.path) {
+                    if pem != self.state.read().0 {
+                        let mut roots = RootCertStore::empty();
+                        let mut pinned_ders = Vec::new();
+                        for c in CertificateDer::pem_slice_iter(&pem).flatten() {
+                            let der = c.as_ref().to_vec();
+                            if roots.add(c).is_ok() {
+                                pinned_ders.push(der);
+                            }
+                        }
+                        if let Ok(v) = build_client_cert_verifier(&self.mode, Some((roots, pinned_ders)), &self.provider) {
+                            *self.state.write() = (pem, v);
+                        }
+                    }
+                }
+            }
+        }
+        Arc::clone(&self.state.read().1)
+    }
+}
+
+fn monotonic_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+impl ClientCertVerifier for CachedReloadingClientCaVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.current().offer_client_auth()
+    }
+    fn client_auth_mandatory(&self) -> bool {
+        self.current().client_auth_mandatory()
+    }
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.initial_hint_subjects
+    }
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        self.current()
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.current().supported_verify_schemes()
+    }
+}
+
 /// Builds the rustls server config for one listener (`alpn`: `["h2", "http/1.1"]` for HTTP like
 /// Go's `http.Server`, `["h2"]` for gRPC like grpc-go's TLS credentials).
 pub fn server_config(cfg: &TLSConfig, opts: &TlsOptions, alpn: &[&[u8]]) -> Result<Arc<rustls::ServerConfig>> {
+    server_config_with_max_version(cfg, opts, alpn, None)
+}
+
+/// Wraps a `ClientCertVerifier` to enforce `client_allowed_sans` (DNS / Email / URI / IP SANs).
+#[derive(Debug)]
+struct SanCheckingClientCertVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    allowed_sans: Vec<String>,
+}
+
+impl ClientCertVerifier for SanCheckingClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let verified = self.inner.verify_client_cert(end_entity, intermediates, now)?;
+        let sans = extract_cert_sans(end_entity.as_ref());
+        if sans.iter().any(|s| self.allowed_sans.iter().any(|a| a == s)) {
+            Ok(verified)
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            ))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let &tag = data.first()?;
+    let &len_b = data.get(1)?;
+    let (len, hdr) = if len_b < 0x80 {
+        (len_b as usize, 2usize)
+    } else {
+        let n = (len_b & 0x7f) as usize;
+        if n == 0 || n > 4 || data.len() < 2 + n {
+            return None;
+        }
+        let mut l = 0usize;
+        for &b in &data[2..2 + n] {
+            l = (l << 8) | (b as usize);
+        }
+        (l, 2 + n)
+    };
+    let end = hdr.checked_add(len)?;
+    if data.len() < end {
+        return None;
+    }
+    Some((tag, &data[hdr..end], &data[end..]))
+}
+
+/// Extracts DNSName (dNSName), RFC822Name, URI, and IPAddress strings from X.509v3 SubjectAltName.
+fn extract_cert_sans(cert_der: &[u8]) -> Vec<String> {
+    const SAN_OID: &[u8] = &[0x55, 0x1d, 0x11]; // 2.5.29.17
+    let mut out = Vec::new();
+    let Some((0x30, cert_seq, _)) = read_der_tlv(cert_der) else { return out };
+    let Some((0x30, mut tbs, _)) = read_der_tlv(cert_seq) else { return out };
+    while let Some((tag, val, rest)) = read_der_tlv(tbs) {
+        if tag == 0xa3 {
+            // [3] EXPLICIT Extensions ::= SEQUENCE OF Extension
+            if let Some((0x30, mut exts, _)) = read_der_tlv(val) {
+                while let Some((0x30, mut ext, next_ext)) = read_der_tlv(exts) {
+                    if let Some((0x06, oid, mut after_oid)) = read_der_tlv(ext) {
+                        if oid == SAN_OID {
+                            if let Some((0x01, _, rest2)) = read_der_tlv(after_oid) {
+                                after_oid = rest2; // optional critical BOOLEAN
+                            }
+                            if let Some((0x04, octets, _)) = read_der_tlv(after_oid) {
+                                if let Some((0x30, mut names, _)) = read_der_tlv(octets) {
+                                    while let Some((ntag, nval, nrest)) = read_der_tlv(names) {
+                                        match ntag {
+                                            0x81 | 0x82 | 0x86 => {
+                                                if let Ok(s) = std::str::from_utf8(nval) {
+                                                    out.push(s.to_string());
+                                                }
+                                            }
+                                            0x87 if nval.len() == 4 => {
+                                                let ip = std::net::Ipv4Addr::new(
+                                                    nval[0], nval[1], nval[2], nval[3],
+                                                );
+                                                out.push(ip.to_string());
+                                            }
+                                            0x87 if nval.len() == 16 => {
+                                                let mut a = [0u8; 16];
+                                                a.copy_from_slice(nval);
+                                                out.push(std::net::Ipv6Addr::from(a).to_string());
+                                            }
+                                            _ => {}
+                                        }
+                                        names = nrest;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let _ = &mut ext;
+                    exts = next_ext;
+                }
+            }
+        }
+        tbs = rest;
+    }
+    out
+}
+
+/// Same as [`server_config`], optionally capping the maximum TLS version and enforcing `allowed_sans`.
+pub fn server_config_with_max_version(
+    cfg: &TLSConfig,
+    opts: &TlsOptions,
+    alpn: &[&[u8]],
+    max_version: Option<&str>,
+) -> Result<Arc<rustls::ServerConfig>> {
+    server_config_with_options(cfg, opts, alpn, max_version, &[])
+}
+
+pub fn server_config_with_options(
+    cfg: &TLSConfig,
+    opts: &TlsOptions,
+    alpn: &[&[u8]],
+    max_version: Option<&str>,
+    allowed_sans: &[String],
+) -> Result<Arc<rustls::ServerConfig>> {
     let mut provider = rustls::crypto::ring::default_provider();
     if let Some(suites) = cipher_suites(&opts.cipher_suites)? {
         provider.cipher_suites = suites;
     }
-    let versions = protocol_versions(&opts.min_version)?;
+    let min_versions = protocol_versions(&opts.min_version)?;
+    let versions: &'static [&'static rustls::SupportedProtocolVersion] = match max_version {
+        Some("TLS12") | Some("VersionTLS12") => {
+            static ONLY_12: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+            if min_versions == [&rustls::version::TLS13] {
+                bail!("no supported versions satisfy MinVersion and MaxVersion");
+            }
+            ONLY_12
+        }
+        Some("TLS13") | Some("VersionTLS13") | None | Some("") => min_versions,
+        Some(other) => bail!("unknown TLS version: {other}"),
+    };
     if let Some(groups) = kx_groups(&opts.curve_preferences)? {
         provider.kx_groups = groups;
     }
@@ -318,7 +751,6 @@ pub fn server_config(cfg: &TLSConfig, opts: &TlsOptions, alpn: &[&[u8]]) -> Resu
     if cfg.key_file.is_empty() && cfg.key.is_empty() {
         bail!("missing one of key or key_file");
     }
-    // Confirm that certificate and key paths are valid and build the cached live reloader.
     let cert_source = if !cfg.cert_file.is_empty() {
         PemSource::File(cfg.cert_file.clone())
     } else {
@@ -340,42 +772,38 @@ pub fn server_config(cfg: &TLSConfig, opts: &TlsOptions, alpn: &[&[u8]]) -> Resu
             CertLoadError::KeyPair(reason) => anyhow!("failed to load X509KeyPair: {reason}"),
         })?;
 
-    let ca = client_ca_pool(cfg)?;
-    let algs = provider.signature_verification_algorithms;
-    let verifier: Arc<dyn ClientCertVerifier> = match cfg.client_auth_type.as_str() {
-        "" | "NoClientCert" => {
-            if ca.is_some() {
-                bail!("client CA's have been configured without a Client Auth Policy");
-            }
-            WebPkiClientVerifier::no_client_auth()
+    let verifier: Arc<dyn ClientCertVerifier> = if !cfg.client_ca_file.is_empty() {
+        if matches!(cfg.client_auth_type.as_str(), "" | "NoClientCert") {
+            let _ = client_ca_pool(cfg)?;
+            bail!("client CA's have been configured without a Client Auth Policy");
         }
-        "RequestClientCert" => Arc::new(AnyClientCert {
-            mandatory: false,
-            algs,
-            hint_subjects: ca.as_ref().map(|s| s.subjects()).unwrap_or_default(),
-        }),
-        "RequireAnyClientCert" | "RequireClientCert" => Arc::new(AnyClientCert {
-            mandatory: true,
-            algs,
-            hint_subjects: ca.as_ref().map(|s| s.subjects()).unwrap_or_default(),
-        }),
-        mode @ ("VerifyClientCertIfGiven" | "RequireAndVerifyClientCert") => {
-            // Go verifies against the system roots when no client CA is configured.
-            let roots = Arc::new(ca.unwrap_or_else(system_roots));
-            if roots.is_empty() {
-                Arc::new(EmptyPoolClientCertVerifier {
-                    mandatory: mode == "RequireAndVerifyClientCert",
-                    algs,
-                })
+        Arc::new(CachedReloadingClientCaVerifier::new(
+            cfg.client_ca_file.clone(),
+            cfg.client_auth_type.clone(),
+            Arc::clone(&provider),
+        )?)
+    } else {
+        let ca = client_ca_pool(cfg)?.map(|s| {
+            let ders: Vec<Vec<u8>> = if !cfg.client_ca.is_empty() {
+                CertificateDer::pem_slice_iter(cfg.client_ca.as_bytes())
+                    .flatten()
+                    .map(|c| c.as_ref().to_vec())
+                    .collect()
             } else {
-                let mut b = WebPkiClientVerifier::builder_with_provider(roots, Arc::clone(&provider));
-                if mode == "VerifyClientCertIfGiven" {
-                    b = b.allow_unauthenticated();
-                }
-                b.build().map_err(|e| anyhow!("client CA pool: {e}"))?
-            }
-        }
-        other => bail!("invalid ClientAuth: {other}"),
+                Vec::new()
+            };
+            (s, ders)
+        });
+        build_client_cert_verifier(&cfg.client_auth_type, ca, &provider)?
+    };
+
+    let verifier: Arc<dyn ClientCertVerifier> = if !allowed_sans.is_empty() {
+        Arc::new(SanCheckingClientCertVerifier {
+            inner: verifier,
+            allowed_sans: allowed_sans.to_vec(),
+        })
+    } else {
+        verifier
     };
 
     let mut sc = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))

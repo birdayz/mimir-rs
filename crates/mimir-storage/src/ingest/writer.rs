@@ -733,7 +733,7 @@ pub fn produce_results_err(results: &[ProduceResult]) -> Result<(), WriterError>
         let Some(ref err) = res.err else {
             continue;
         };
-        if matches!(err, ProducerError::MessageTooLarge) {
+        if err.is_message_too_large() {
             return Err(WriterError::WriteRequestDataItemTooLarge);
         }
         if first_err.is_none() {

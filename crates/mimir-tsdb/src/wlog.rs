@@ -808,8 +808,8 @@ impl WlogWriter {
         self.close_inner()
     }
 
-    #[cfg(test)]
-    pub(crate) fn force_close_for_test(&mut self) {
+    #[doc(hidden)]
+    pub fn force_close_for_test(&mut self) {
         self.closed = true;
     }
 
