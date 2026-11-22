@@ -712,13 +712,23 @@ impl RuntimeConfigConfig {
         get: impl Fn(&T) -> &Self + Copy + 'static,
         get_mut: impl Fn(&mut T) -> &mut Self + Copy + 'static,
     ) {
-        f.string_slice_csv_var("runtime-config.file", &self.file, "Comma separated list of yaml files or URLs with the configuration that can be updated at runtime.", move |t| &get(t).file, move |t| &mut get_mut(t).file);
-        f.go_duration_var("runtime-config.reload-period", self.period, "How often to check runtime config files.", move |t| &get(t).period, move |t| &mut get_mut(t).period);
-        f.go_duration_var("runtime-config.http-client-timeout", self.http_client_timeout, "HTTP client timeout when fetching runtime config from URLs.", move |t| &get(t).http_client_timeout, move |t| &mut get_mut(t).http_client_timeout);
-        f.bool_var("runtime-config.http-client-disable-keep-alives", self.http_client_disable_keep_alives, "Disable HTTP keep-alives for the runtime config HTTP client.", move |t| &get(t).http_client_disable_keep_alives, move |t| &mut get_mut(t).http_client_disable_keep_alives);
+        self.register_flags_with_prefix_into("runtime-config.", f, get, get_mut);
+    }
+
+    pub fn register_flags_with_prefix_into<T: 'static>(
+        &self,
+        prefix: &str,
+        f: &mut FlagSet<T>,
+        get: impl Fn(&T) -> &Self + Copy + 'static,
+        get_mut: impl Fn(&mut T) -> &mut Self + Copy + 'static,
+    ) {
+        f.string_slice_csv_var(&format!("{prefix}file"), &self.file, "Comma separated list of yaml files or URLs with the configuration that can be updated at runtime.", move |t| &get(t).file, move |t| &mut get_mut(t).file);
+        f.go_duration_var(&format!("{prefix}reload-period"), self.period, "How often to check runtime config files.", move |t| &get(t).period, move |t| &mut get_mut(t).period);
+        f.go_duration_var(&format!("{prefix}http-client-timeout"), self.http_client_timeout, "HTTP client timeout when fetching runtime config from URLs.", move |t| &get(t).http_client_timeout, move |t| &mut get_mut(t).http_client_timeout);
+        f.bool_var(&format!("{prefix}http-client-disable-keep-alives"), self.http_client_disable_keep_alives, "Disable HTTP keep-alives for the runtime config HTTP client.", move |t| &get(t).http_client_disable_keep_alives, move |t| &mut get_mut(t).http_client_disable_keep_alives);
         self.http_client_cluster_validation
-            .register_flags_into("runtime-config.http-client-cluster-validation.", f, move |t| &get(t).http_client_cluster_validation, move |t| &mut get_mut(t).http_client_cluster_validation);
-        f.string_var("runtime-config.loader", &self.loader, "Method used to decode the runtime configuration files. Supported values are: \"map\" and \"yaml\".", move |t| &get(t).loader, move |t| &mut get_mut(t).loader);
+            .register_flags_into(&format!("{prefix}http-client-cluster-validation."), f, move |t| &get(t).http_client_cluster_validation, move |t| &mut get_mut(t).http_client_cluster_validation);
+        f.string_var(&format!("{prefix}loader"), &self.loader, "Method used to decode the runtime configuration files. Supported values are: \"map\" and \"yaml\".", move |t| &get(t).loader, move |t| &mut get_mut(t).loader);
     }
 }
 

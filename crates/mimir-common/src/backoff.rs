@@ -35,6 +35,10 @@ impl Default for BackoffConfig {
 pub enum BackoffError {
     #[error("context canceled")]
     Canceled,
+    #[error("context deadline exceeded")]
+    DeadlineExceeded,
+    #[error("{0}")]
+    Cause(String),
     #[error("terminated after {0} retries")]
     MaxRetriesReached(usize),
 }
@@ -44,6 +48,8 @@ pub enum BackoffError {
 pub struct Backoff {
     cfg: BackoffConfig,
     canceled: Option<Arc<AtomicBool>>,
+    deadline: Option<std::time::Instant>,
+    cause: Option<Arc<parking_lot::Mutex<Option<String>>>>,
     num_retries: usize,
     next_delay_min: Duration,
     next_delay_max: Duration,
@@ -55,6 +61,8 @@ impl Backoff {
         Self {
             cfg,
             canceled: None,
+            deadline: None,
+            cause: None,
             num_retries: 0,
             next_delay_min: cfg.min_backoff,
             next_delay_max: double_duration(cfg.min_backoff, cfg.max_backoff),
@@ -65,6 +73,31 @@ impl Backoff {
     pub fn with_cancel_flag(cfg: BackoffConfig, canceled: Arc<AtomicBool>) -> Self {
         let mut b = Self::new(cfg);
         b.canceled = Some(canceled);
+        b
+    }
+
+    /// Creates a new [`Backoff`] with a cancellation flag and optional cause string.
+    pub fn with_cancel_cause(
+        cfg: BackoffConfig,
+        canceled: Arc<AtomicBool>,
+        cause: Arc<parking_lot::Mutex<Option<String>>>,
+    ) -> Self {
+        let mut b = Self::with_cancel_flag(cfg, canceled);
+        b.cause = Some(cause);
+        b
+    }
+
+    /// Creates a new [`Backoff`] with a deadline and optional cause string.
+    pub fn with_deadline(
+        cfg: BackoffConfig,
+        deadline: std::time::Instant,
+        canceled: Option<Arc<AtomicBool>>,
+        cause: Option<Arc<parking_lot::Mutex<Option<String>>>>,
+    ) -> Self {
+        let mut b = Self::new(cfg);
+        b.deadline = Some(deadline);
+        b.canceled = canceled;
+        b.cause = cause;
         b
     }
 
@@ -81,9 +114,16 @@ impl Backoff {
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
+    fn is_deadline_exceeded(&self) -> bool {
+        self.deadline
+            .is_some_and(|dl| std::time::Instant::now() >= dl)
+    }
+
     /// Returns `true` if caller should keep going.
     pub fn ongoing(&self) -> bool {
-        !self.is_canceled() && (self.cfg.max_retries == 0 || self.num_retries < self.cfg.max_retries)
+        !self.is_canceled()
+            && !self.is_deadline_exceeded()
+            && (self.cfg.max_retries == 0 || self.num_retries < self.cfg.max_retries)
     }
 
     /// Returns the reason for terminating the backoff, or `None` if it didn't terminate.
@@ -91,10 +131,25 @@ impl Backoff {
         if self.is_canceled() {
             return Some(BackoffError::Canceled);
         }
+        if self.is_deadline_exceeded() {
+            return Some(BackoffError::DeadlineExceeded);
+        }
         if self.cfg.max_retries != 0 && self.num_retries >= self.cfg.max_retries {
             return Some(BackoffError::MaxRetriesReached(self.num_retries));
         }
         None
+    }
+
+    /// Like [`Backoff::err`], but returns the configured cause if terminated via cancellation or deadline.
+    pub fn err_cause(&self) -> Option<BackoffError> {
+        if self.is_canceled() || self.is_deadline_exceeded() {
+            if let Some(ref cause) = self.cause {
+                if let Some(msg) = cause.lock().clone() {
+                    return Some(BackoffError::Cause(msg));
+                }
+            }
+        }
+        self.err()
     }
 
     /// Returns the number of retries attempted so far.

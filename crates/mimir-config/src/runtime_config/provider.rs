@@ -42,20 +42,20 @@ pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
 }
 
-/// `sanitizeURLForMetrics`: drops userinfo, query and fragment.
+/// `sanitizeURLForMetrics`: drops userinfo, query and fragment, returning an error on invalid URLs.
+pub fn sanitize_url_for_metrics_checked(raw: &str) -> Result<String, ConfigError> {
+    let mut u = reqwest::Url::parse(raw)
+        .map_err(|e| ConfigError::RuntimeConfig(format!("parse runtime config URL: {e}")))?;
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    u.set_query(None);
+    u.set_fragment(None);
+    Ok(u.to_string())
+}
+
+/// `sanitizeURLForMetrics`: drops userinfo, query and fragment (falling back to `raw` if unparseable).
 pub fn sanitize_url_for_metrics(raw: &str) -> String {
-    match reqwest::Url::parse(raw) {
-        Ok(mut u) => {
-            let _ = u.set_username("");
-            let _ = u.set_password(None);
-            u.set_query(None);
-            u.set_fragment(None);
-            u.to_string()
-        }
-        // Go's url.Parse accepts far more than the WHATWG parser; the request itself reports
-        // the problem, so keep the raw path as identifier.
-        Err(_) => raw.to_string(),
-    }
+    sanitize_url_for_metrics_checked(raw).unwrap_or_else(|_| raw.to_string())
 }
 
 /// Formats an `io::Error` the way Go's `os.ReadFile` reports it: `open <path>: <errno text>`.
@@ -234,6 +234,84 @@ fn reqwest_error_text(err: &reqwest::Error) -> String {
     }
 }
 
+/// Error returned by `HttpProvider::read_async` (`dskit/runtimeconfig/provider.go:httpError`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HttpProviderError {
+    #[error("HTTP {status_code} from {url}")]
+    HttpStatus { status_code: u16, url: String },
+    #[error("{0}")]
+    Transport(String),
+}
+
+impl HttpProviderError {
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::HttpStatus { status_code, .. } => Some(*status_code),
+            Self::Transport(_) => None,
+        }
+    }
+}
+
+/// Direct async HTTP provider matching `dskit/runtimeconfig/provider.go:httpProvider`.
+pub struct HttpProvider {
+    url: String,
+    url_for_metrics: String,
+    client: reqwest::Client,
+    disable_keep_alives: bool,
+    cluster_label: String,
+    observer: parking_lot::RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>,
+}
+
+impl HttpProvider {
+    pub fn new(
+        raw_url: impl Into<String>,
+        url_for_metrics: impl Into<String>,
+        timeout: Duration,
+        disable_keep_alives: bool,
+        cluster_label: impl Into<String>,
+        observer: Option<Arc<dyn RuntimeConfigHttpObserver>>,
+    ) -> Result<Self, ConfigError> {
+        let mut builder = reqwest::Client::builder().user_agent(RUNTIME_CONFIG_USER_AGENT);
+        if !timeout.is_zero() {
+            builder = builder.timeout(timeout);
+        }
+        if disable_keep_alives {
+            builder = builder.pool_max_idle_per_host(0);
+        }
+        let client = builder.build().map_err(|e| {
+            ConfigError::RuntimeConfig(format!("creating runtime config HTTP client: {e}"))
+        })?;
+        Ok(Self {
+            url: raw_url.into(),
+            url_for_metrics: url_for_metrics.into(),
+            client,
+            disable_keep_alives,
+            cluster_label: cluster_label.into(),
+            observer: parking_lot::RwLock::new(observer),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.url
+    }
+
+    pub fn disable_keep_alives(&self) -> bool {
+        self.disable_keep_alives
+    }
+
+    pub async fn read_async(&self) -> Result<Vec<u8>, HttpProviderError> {
+        fetch_typed(
+            &self.client,
+            &self.url,
+            &self.url_for_metrics,
+            self.disable_keep_alives,
+            &self.cluster_label,
+            &self.observer,
+        )
+        .await
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ClusterValidationError {
     #[serde(default)]
@@ -250,6 +328,26 @@ async fn fetch(
     cluster_label: &str,
     observer: &parking_lot::RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>,
 ) -> Result<Vec<u8>, String> {
+    fetch_typed(
+        client,
+        url,
+        url_for_metrics,
+        disable_keep_alives,
+        cluster_label,
+        observer,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn fetch_typed(
+    client: &reqwest::Client,
+    url: &str,
+    url_for_metrics: &str,
+    disable_keep_alives: bool,
+    cluster_label: &str,
+    observer: &parking_lot::RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>,
+) -> Result<Vec<u8>, HttpProviderError> {
     let start = Instant::now();
     let observe = |status: &str| {
         if let Some(o) = observer.read().as_ref() {
@@ -270,7 +368,10 @@ async fn fetch(
         Ok(r) => r,
         Err(e) => {
             observe("error");
-            return Err(format!("Get {url:?}: {}", reqwest_error_text(&e)));
+            return Err(HttpProviderError::Transport(format!(
+                "Get {url:?}: {}",
+                reqwest_error_text(&e)
+            )));
         }
     };
 
@@ -290,7 +391,7 @@ async fn fetch(
             Ok(b) => b,
             Err(err_text) => {
                 observe("error");
-                return Err(format!("Get {url:?}: {err_text}"));
+                return Err(HttpProviderError::Transport(format!("Get {url:?}: {err_text}")));
             }
         };
         if let Ok(cv) = serde_json::from_slice::<ClusterValidationError>(&body) {
@@ -302,16 +403,22 @@ async fn fetch(
                 o.invalid_cluster_validation(&msg, &cv.route);
             }
             observe("error");
-            return Err(format!("Get {url:?}: {msg}"));
+            return Err(HttpProviderError::Transport(format!("Get {url:?}: {msg}")));
         }
         observe(&status.to_string());
-        return Err(format!("HTTP {status} from {url}"));
+        return Err(HttpProviderError::HttpStatus {
+            status_code: status,
+            url: url.to_string(),
+        });
     }
 
     if status / 100 != 2 {
         drop(resp);
         observe(&status.to_string());
-        return Err(format!("HTTP {status} from {url}"));
+        return Err(HttpProviderError::HttpStatus {
+            status_code: status,
+            url: url.to_string(),
+        });
     }
 
     match read_bounded_body(resp, MAX_DECOMPRESSED_RUNTIME_CONFIG_BYTES).await {
@@ -321,7 +428,9 @@ async fn fetch(
         }
         Err(err_text) => {
             observe("error");
-            Err(format!("read response body: {err_text}"))
+            Err(HttpProviderError::Transport(format!(
+                "read response body: {err_text}"
+            )))
         }
     }
 }

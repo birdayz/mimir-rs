@@ -9101,6 +9101,43 @@ impl Head {
         Ok(())
     }
 
+    /// Deletes samples in `[mint, maxt]` for series matching `matchers` by recording tombstones
+    /// in memory and logging them to the WAL (`Head.Delete` / `DB.Delete`).
+    pub fn delete(
+        &self,
+        mint: i64,
+        maxt: i64,
+        matchers: &[LabelMatcher],
+    ) -> Result<(), HeadError> {
+        if mint > maxt {
+            return Ok(());
+        }
+        let refs = self.postings_for_matchers_direct(matchers)?;
+        let mut stones = Vec::new();
+        for r in refs {
+            let Some(entry) = self.series.get_by_id(r) else {
+                continue;
+            };
+            let st = entry.inner.lock();
+            let sm = st.min_time();
+            let sx = st.max_time();
+            let has_ooo = st.ooo().is_some_and(|o| !o.is_empty());
+            if (sm != i64::MAX && sm <= maxt && mint <= sx) || has_ooo {
+                drop(st);
+                self.tombstones.add_interval(r, Interval { mint, maxt });
+                stones.push(crate::record::Tombstone { ref_id: r, mint, maxt });
+            }
+        }
+        if !stones.is_empty() {
+            let enc = RecordEncoder::new(false);
+            let rec = enc.tombstones(&stones, Vec::new());
+            if let Some(ref mut wal) = *self.wal.lock() {
+                wal.log(&[&rec])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Truncates head chunks & series older than `mint`, then checkpoints and truncates the WAL.
     pub fn truncate(&self, mint: i64) -> Result<(), HeadError> {
         let initialized = self.initialized();
@@ -9646,6 +9683,25 @@ impl Head {
         }
         vals.sort_unstable();
         Ok(vals)
+    }
+
+    /// Port of Go `HeadAndOOOIndexReader.LabelValues` (`ooo_head_read.go:191-201`):
+    /// returns empty if `[mint, maxt]` overlaps neither `[min_time, max_time]` nor
+    /// `[min_ooo_time, max_ooo_time]`.
+    pub fn ooo_label_values(
+        &self,
+        name: &str,
+        mint: i64,
+        maxt: i64,
+        limit: Option<usize>,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<String>, HeadError> {
+        if (maxt < self.min_time() && maxt < self.min_ooo_time())
+            || (mint > self.max_time() && mint > self.max_ooo_time())
+        {
+            return Ok(Vec::new());
+        }
+        self.label_values_with_limit(name, limit, matchers)
     }
 
     /// Returns `Some(entry.labels.clone())` (O(1) refcount bump, zero chunk clone) if `ref_id`
@@ -10533,6 +10589,14 @@ impl Head {
                 let is_slow = matches!(snap, HeadChunkSnapshot::Precomputed(_));
                 (labels, ivs, is_slow)
             }))
+    }
+
+    /// Attempts a non-blocking `try_lock` on the series entry's state; returns `None` if absent,
+    /// `Some(true)` if currently locked, `Some(false)` if unlocked.
+    pub fn is_series_locked(&self, ref_id: u64) -> Option<bool> {
+        self.series
+            .get_by_id(ref_id)
+            .map(|entry| entry.inner.try_lock().is_none())
     }
 
     pub fn series_labels(&self, ref_id: u64) -> Option<Labels> {

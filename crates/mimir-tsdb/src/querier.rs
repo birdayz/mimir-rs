@@ -50,6 +50,8 @@ pub enum QuerierError {
     Search(#[from] SearchError),
     #[error("TSDB is closed")]
     Closed,
+    #[error("cost sampling unsupported")]
+    CostSamplingUnsupported,
 }
 
 /// A queried series yielding decoded samples in `[mint, maxt]`.
@@ -1577,6 +1579,21 @@ impl<'a> TsdbQuerier<'a> {
         Ok(set.into_iter().collect())
     }
 
+    /// Like [`Self::label_names`], truncating to `limit` when `limit` is `Some(n)` with `n > 0`.
+    pub fn label_names_with_limit(
+        &self,
+        limit: Option<usize>,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<String>, QuerierError> {
+        let mut names = self.label_names(matchers)?;
+        if let Some(lim) = limit {
+            if lim > 0 && names.len() > lim {
+                names.truncate(lim);
+            }
+        }
+        Ok(names)
+    }
+
     /// Returns sorted unique label values for `name` across in-order Head and overlapping Blocks matching `matchers`.
     pub fn label_values(
         &self,
@@ -2410,6 +2427,122 @@ where
 
 fn sort_lazy_entries(entries: &mut [LazySeriesEntry]) {
     sort_by_labels(entries, LazySeriesEntry::entry_labels);
+}
+
+/// Tombstone-filtering sample iterator (`tsdb.DeletedIterator`).
+pub struct DeletedIterator {
+    samples: Vec<DecodedSample>,
+    intervals: crate::tombstones::Intervals,
+    pos: Option<usize>,
+    iv_idx: usize,
+}
+
+impl DeletedIterator {
+    pub fn new(chunk: &EncodedChunk, intervals: crate::tombstones::Intervals) -> Result<Self, ChunkError> {
+        let samples = crate::compact::decode_chunk_samples(chunk)?;
+        Ok(Self {
+            samples,
+            intervals,
+            pos: None,
+            iv_idx: 0,
+        })
+    }
+
+    pub fn reset(&mut self, chunk: &EncodedChunk, intervals: crate::tombstones::Intervals) -> Result<(), ChunkError> {
+        self.samples = crate::compact::decode_chunk_samples(chunk)?;
+        self.intervals = intervals;
+        self.pos = None;
+        self.iv_idx = 0;
+        Ok(())
+    }
+
+    fn skip_deleted(&mut self, mut i: usize) -> Option<usize> {
+        while i < self.samples.len() {
+            let t = self.samples[i].t;
+            while self.iv_idx < self.intervals.len() && self.intervals[self.iv_idx].maxt < t {
+                self.iv_idx += 1;
+            }
+            if self.iv_idx < self.intervals.len() && self.intervals[self.iv_idx].in_bounds(t) {
+                i += 1;
+                continue;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    pub fn next_sample(&mut self) -> Option<&DecodedSample> {
+        let start = match self.pos {
+            None => 0,
+            Some(i) => i + 1,
+        };
+        self.pos = self.skip_deleted(start);
+        self.pos.map(|i| &self.samples[i])
+    }
+
+    pub fn seek(&mut self, t: i64) -> Option<&DecodedSample> {
+        let start = match self.pos {
+            None => self.samples.partition_point(|s| s.t < t),
+            Some(cur) => {
+                if self.samples[cur].t >= t {
+                    return Some(&self.samples[cur]);
+                }
+                cur + 1 + self.samples[cur + 1..].partition_point(|s| s.t < t)
+            }
+        };
+        self.pos = self.skip_deleted(start);
+        self.pos.map(|i| &self.samples[i])
+    }
+
+    pub fn at(&self) -> Option<&DecodedSample> {
+        self.pos.map(|i| &self.samples[i])
+    }
+}
+
+impl<'a> TsdbQuerier<'a> {
+    /// Evaluates `select` using a [`crate::index::IndexLookupPlanner`]: falls back to all `matchers`
+    /// if the planner errors, or filters index postings by `index_matchers` and post-filters by
+    /// `scan_matchers` (`querier.go`).
+    pub fn select_with_planner(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+        planner: &dyn crate::index::IndexLookupPlanner,
+    ) -> Result<Vec<QuerySeries>, QuerierError> {
+        let plan = crate::index::IndexOnlyLookupPlan(matchers.to_vec());
+        match planner.plan_index_lookup(&plan) {
+            Ok(concrete) => {
+                let mut res = self.select(sort_series, &concrete.index_matchers)?;
+                if !concrete.scan_matchers.is_empty() {
+                    res.retain(|s| concrete.scan_matchers.iter().all(|m| m.matches(s.labels.get(&m.name))));
+                }
+                Ok(res)
+            }
+            Err(_) => self.select(sort_series, matchers),
+        }
+    }
+}
+
+impl<'a> TsdbChunkQuerier<'a> {
+    /// Chunk-querier counterpart of [`TsdbQuerier::select_with_planner`].
+    pub fn select_with_planner(
+        &self,
+        sort_series: bool,
+        matchers: &[LabelMatcher],
+        planner: &dyn crate::index::IndexLookupPlanner,
+    ) -> Result<Vec<QueryChunkSeries>, QuerierError> {
+        let plan = crate::index::IndexOnlyLookupPlan(matchers.to_vec());
+        match planner.plan_index_lookup(&plan) {
+            Ok(concrete) => {
+                let mut res = self.select(sort_series, &concrete.index_matchers)?;
+                if !concrete.scan_matchers.is_empty() {
+                    res.retain(|s| concrete.scan_matchers.iter().all(|m| m.matches(s.labels.get(&m.name))));
+                }
+                Ok(res)
+            }
+            Err(_) => self.select(sort_series, matchers),
+        }
+    }
 }
 
 pub fn sort_labels(labels: &mut [Labels]) {

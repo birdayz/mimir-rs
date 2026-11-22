@@ -4087,6 +4087,86 @@ pub fn intersect_any(p1: &mut dyn PostingsIter, p2: &mut dyn PostingsIter) -> bo
     false
 }
 
+/// Prepends a sorted list of series IDs before an underlying [`PostingsIter`]
+/// (`tsdb.prependPostings` in `querier.go`).
+pub struct PrependPostings {
+    prepend: Vec<u64>,
+    prepend_pos: usize,
+    in_inner: bool,
+    cur: Option<u64>,
+    inner: Box<dyn PostingsIter>,
+}
+
+impl PrependPostings {
+    pub fn new(prepend: Vec<u64>, inner: Box<dyn PostingsIter>) -> Self {
+        Self {
+            prepend,
+            prepend_pos: 0,
+            in_inner: false,
+            cur: None,
+            inner,
+        }
+    }
+}
+
+impl PostingsIter for PrependPostings {
+    fn next(&mut self) -> bool {
+        if !self.in_inner && self.prepend_pos < self.prepend.len() {
+            self.cur = Some(self.prepend[self.prepend_pos]);
+            self.prepend_pos += 1;
+            return true;
+        }
+        self.in_inner = true;
+        if self.inner.next() {
+            self.cur = Some(self.inner.at());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn seek(&mut self, x: u64) -> bool {
+        if let Some(c) = self.cur {
+            if c >= x {
+                return true;
+            }
+        }
+        if !self.in_inner {
+            let rel = self.prepend[self.prepend_pos..].partition_point(|&v| v < x);
+            let idx = self.prepend_pos + rel;
+            if idx < self.prepend.len() {
+                self.cur = Some(self.prepend[idx]);
+                self.prepend_pos = idx + 1;
+                return true;
+            }
+            self.prepend_pos = self.prepend.len();
+            self.in_inner = true;
+        }
+        if self.inner.seek(x) {
+            self.cur = Some(self.inner.at());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn at(&self) -> u64 {
+        self.cur.unwrap_or(0)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn err(&self) -> Option<&PostingsError> {
+        if self.in_inner {
+            self.inner.err()
+        } else {
+            None
+        }
+    }
+}
+
 /// Returns `true` if every series ID in `subp` is present in `p`,
 /// matching `index.contains` in `tsdb/index/labelvalues.go`.
 pub fn contains_all(p: &mut dyn PostingsIter, subp: &mut dyn PostingsIter) -> bool {

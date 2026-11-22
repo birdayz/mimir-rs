@@ -14,8 +14,48 @@
 //! the default limits) must keep the real value; they run inside [`with_secrets_revealed`].
 
 use std::cell::Cell;
+use std::fmt;
 
-use serde::Serializer;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// `flagext.Secret`: a secret string whose YAML serialization masks non-empty values as `"********"`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Secret {
+    value: String,
+}
+
+impl Secret {
+    pub fn with_value(v: impl Into<String>) -> Self {
+        Self { value: v.into() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    pub fn set(&mut self, s: impl Into<String>) {
+        self.value = s.into();
+    }
+}
+
+impl fmt::Display for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.value)
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_flagext_secret(&self.value, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self { value: s })
+    }
+}
 
 /// Masked value emitted by `flagext.Secret.MarshalYAML` for non-empty secrets.
 pub const FLAGEXT_SECRET_MASK: &str = "********";

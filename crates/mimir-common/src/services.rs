@@ -65,7 +65,7 @@ pub enum ServiceError {
     #[error("unexpected service state: {0}")]
     UnexpectedState(State),
 
-    #[error("not healthy, {terminated} terminated, {failed} failed: {reasons:?}")]
+    #[error("not healthy, {terminated} terminated, {failed} failed: [{}]", .reasons.join(", "))]
     NotHealthy {
         terminated: usize,
         failed: usize,
@@ -74,6 +74,9 @@ pub enum ServiceError {
 
     #[error("context canceled")]
     Canceled,
+
+    #[error("context deadline exceeded")]
+    DeadlineExceeded,
 
     #[error("{0}")]
     Failure(String),
@@ -94,6 +97,7 @@ pub struct ServiceContext {
 #[derive(Debug)]
 struct CancelNode {
     canceled: AtomicBool,
+    deadline: Option<tokio::time::Instant>,
     notify: Notify,
     children: Mutex<Vec<Weak<CancelNode>>>,
 }
@@ -103,15 +107,48 @@ impl ServiceContext {
         Self {
             inner: Arc::new(CancelNode {
                 canceled: AtomicBool::new(false),
+                deadline: None,
                 notify: Notify::new(),
                 children: Mutex::new(Vec::new()),
             }),
         }
     }
 
+    /// Creates a child context that cancels when the parent cancels or after `timeout` elapses.
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        let dl = tokio::time::Instant::now() + timeout;
+        let effective_dl = match self.inner.deadline {
+            Some(parent_dl) if parent_dl < dl => parent_dl,
+            _ => dl,
+        };
+        let child = Self {
+            inner: Arc::new(CancelNode {
+                canceled: AtomicBool::new(false),
+                deadline: Some(effective_dl),
+                notify: Notify::new(),
+                children: Mutex::new(Vec::new()),
+            }),
+        };
+        let mut children = self.inner.children.lock();
+        if self.inner.canceled.load(Ordering::Acquire) {
+            child.cancel();
+        } else {
+            children.retain(|w| w.strong_count() > 0);
+            children.push(Arc::downgrade(&child.inner));
+        }
+        child
+    }
+
     /// Creates a child context that cancels automatically when this parent cancels.
     pub fn child(&self) -> Self {
-        let child = Self::background();
+        let child = Self {
+            inner: Arc::new(CancelNode {
+                canceled: AtomicBool::new(false),
+                deadline: self.inner.deadline,
+                notify: Notify::new(),
+                children: Mutex::new(Vec::new()),
+            }),
+        };
         let mut children = self.inner.children.lock();
         if self.inner.canceled.load(Ordering::Acquire) {
             child.cancel();
@@ -139,7 +176,19 @@ impl ServiceContext {
     }
 
     pub fn is_canceled(&self) -> bool {
-        self.inner.canceled.load(Ordering::Acquire)
+        self.err().is_some()
+    }
+
+    pub fn err(&self) -> Option<ServiceError> {
+        if self.inner.canceled.load(Ordering::Acquire) {
+            return Some(ServiceError::Canceled);
+        }
+        if let Some(dl) = self.inner.deadline {
+            if tokio::time::Instant::now() >= dl {
+                return Some(ServiceError::DeadlineExceeded);
+            }
+        }
+        None
     }
 
     pub async fn canceled(&self) {
@@ -151,7 +200,17 @@ impl ServiceContext {
             if self.is_canceled() {
                 return;
             }
-            notified.await;
+            match self.inner.deadline {
+                Some(dl) => {
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep_until(dl) => return,
+                    }
+                }
+                None => {
+                    notified.await;
+                }
+            }
         }
     }
 }
@@ -430,7 +489,7 @@ impl BasicService {
             match &ctx {
                 Some(c) => {
                     tokio::select! {
-                        _ = c.canceled() => return Err(ServiceError::Canceled),
+                        _ = c.canceled() => return Err(c.err().unwrap_or(ServiceError::Canceled)),
                         res = rx.changed() => {
                             if res.is_err() {
                                 return Err(ServiceError::Canceled);
@@ -639,6 +698,10 @@ impl ManagedBasicService {
 
     pub fn service_context(&self) -> Option<ServiceContext> {
         self.base.service_context()
+    }
+
+    pub fn listener_count(&self) -> usize {
+        self.base.inner.lock().listeners.len()
     }
 
     async fn run_main_managed(self: Arc<Self>, service_ctx: ServiceContext) {
@@ -1051,7 +1114,7 @@ impl ServiceManager {
             match &ctx {
                 Some(c) => {
                     tokio::select! {
-                        _ = c.canceled() => return Err(ServiceError::Canceled),
+                        _ = c.canceled() => return Err(c.err().unwrap_or(ServiceError::Canceled)),
                         res = rx.changed() => {
                             if res.is_err() {
                                 break;
@@ -1108,7 +1171,7 @@ impl ServiceManager {
             match &ctx {
                 Some(c) => {
                     tokio::select! {
-                        _ = c.canceled() => return Err(ServiceError::Canceled),
+                        _ = c.canceled() => return Err(c.err().unwrap_or(ServiceError::Canceled)),
                         res = rx.changed() => {
                             if res.is_err() {
                                 return Ok(());
@@ -1137,6 +1200,10 @@ impl ServiceManager {
     }
 
     /// Returns `(service_name, state)` pairs for every managed service (helpful for `/services` endpoint).
+    pub fn listener_count(&self) -> usize {
+        self.inner.lock().listeners.len()
+    }
+
     pub fn service_states(&self) -> Vec<(String, State)> {
         let inner = self.inner.lock();
         self.services
@@ -1305,10 +1372,18 @@ pub async fn stop_manager_and_await_stopped(
     manager.await_stopped_ctx(ctx).await
 }
 
+/// Failure notification emitted by [`FailureWatcher`], preserving the underlying `cause`.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("service {service_name} failed: {cause}")]
+pub struct WatchedFailure {
+    pub service_name: String,
+    pub cause: ServiceError,
+}
+
 /// Watches services or managers for failures and sends them on a channel (`FailureWatcher`).
 pub struct FailureWatcher {
-    tx: Mutex<Option<mpsc::UnboundedSender<ServiceError>>>,
-    rx: Mutex<mpsc::UnboundedReceiver<ServiceError>>,
+    tx: Mutex<Option<mpsc::UnboundedSender<WatchedFailure>>>,
+    rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WatchedFailure>>>,
     handles: Mutex<Vec<ListenerHandle>>,
 }
 
@@ -1317,7 +1392,7 @@ impl FailureWatcher {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             tx: Mutex::new(Some(tx)),
-            rx: Mutex::new(rx),
+            rx: Arc::new(tokio::sync::Mutex::new(rx)),
             handles: Mutex::new(Vec::new()),
         }
     }
@@ -1335,9 +1410,10 @@ impl FailureWatcher {
             None,
             None,
             Some(Box::new(move |_, err| {
-                let _ = tx.send(ServiceError::Failure(format!(
-                    "service {name} failed: {err}"
-                )));
+                let _ = tx.send(WatchedFailure {
+                    service_name: name.clone(),
+                    cause: err.clone(),
+                });
             })),
         );
         self.handles.lock().push(service.add_listener(l));
@@ -1349,17 +1425,17 @@ impl FailureWatcher {
             .lock()
             .clone()
             .expect("FailureWatcher has been closed");
-        struct MgrWatch(mpsc::UnboundedSender<ServiceError>);
+        struct MgrWatch(mpsc::UnboundedSender<WatchedFailure>);
         impl ManagerListener for MgrWatch {
             fn failure(&self, service: &Arc<dyn Service>) {
                 let name = describe_service(service.as_ref());
-                let err = service
+                let cause = service
                     .failure_case()
-                    .map(|e| e.to_string())
-                    .unwrap_or_default();
-                let _ = self.0.send(ServiceError::Failure(format!(
-                    "service {name} failed: {err}"
-                )));
+                    .unwrap_or_else(|| ServiceError::Failure(String::new()));
+                let _ = self.0.send(WatchedFailure {
+                    service_name: name,
+                    cause,
+                });
             }
         }
         self.handles
@@ -1368,7 +1444,15 @@ impl FailureWatcher {
     }
 
     pub fn try_recv(&self) -> Option<ServiceError> {
-        self.rx.lock().try_recv().ok()
+        self.rx
+            .try_lock()
+            .ok()
+            .and_then(|mut rx| rx.try_recv().ok())
+            .map(|wf| ServiceError::Failure(wf.to_string()))
+    }
+
+    pub async fn recv(&self) -> Option<WatchedFailure> {
+        self.rx.lock().await.recv().await
     }
 
     pub fn close(&self) {

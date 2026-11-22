@@ -50,6 +50,14 @@ impl ZoneAwareNodeSelection {
         self.joined.store(true, Ordering::Release);
     }
 
+    pub fn select_nodes_calls(&self) -> f64 {
+        self.select_nodes_calls.get()
+    }
+
+    pub fn select_nodes_calls_skipped(&self) -> f64 {
+        self.select_nodes_calls_skipped.get()
+    }
+
     fn skip(&self, n: usize) -> (Vec<usize>, Option<usize>) {
         if self.joined.load(Ordering::Acquire) {
             self.select_nodes_calls_skipped.inc();
@@ -119,6 +127,7 @@ impl ZoneAwareNodeSelection {
                     (false, false)
                 }
             }
+            _ => (false, false),
         }
     }
 }

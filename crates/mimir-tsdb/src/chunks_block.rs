@@ -79,6 +79,15 @@ pub struct ChunkMeta {
     pub chunk: Option<EncodedChunk>,
 }
 
+/// Orders chunk metas by ascending `min_time`, breaking ties by ascending `ref_id`
+/// (Go `lessByMinTimeAndMinRef`).
+#[inline]
+pub fn less_by_min_time_and_min_ref(a: &ChunkMeta, b: &ChunkMeta) -> std::cmp::Ordering {
+    a.min_time
+        .cmp(&b.min_time)
+        .then_with(|| a.ref_id.cmp(&b.ref_id))
+}
+
 impl ChunkMeta {
     #[inline]
     pub const fn overlaps_closed_interval(&self, mint: i64, maxt: i64) -> bool {

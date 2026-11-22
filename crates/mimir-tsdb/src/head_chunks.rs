@@ -98,6 +98,49 @@ impl ChunkDiskMapperRef {
     }
 }
 
+/// Bit 23 of a 24-bit `HeadChunkID` marks an out-of-order chunk reference (Go `oooChunkIDMask`).
+pub const OOO_CHUNK_ID_MASK: u32 = 1 << 23;
+
+/// Exclusive upper bound of a 24-bit `HeadChunkID` (`1 << 24`).
+pub const MAX_HEAD_CHUNK_ID: u32 = 1 << 24;
+
+/// Packs a 40-bit `series_ref` and 24-bit `chunk_id` into a 64-bit `ChunkRef` (Go `chunks.NewHeadChunkRef`).
+#[inline]
+pub const fn pack_head_chunk_ref(series_ref: u64, chunk_id: u32) -> u64 {
+    (series_ref << 24) | ((chunk_id as u64) & 0x00ff_ffff)
+}
+
+/// Unpacks a 64-bit `ChunkRef` into `(series_ref, raw_chunk_id_without_ooo_bit, is_ooo)` (Go `unpackHeadChunkRef`).
+#[inline]
+pub const fn unpack_head_chunk_ref(chunk_ref: u64) -> (u64, u32, bool) {
+    let series_ref = chunk_ref >> 24;
+    let id = (chunk_ref & 0x00ff_ffff) as u32;
+    let is_ooo = (id & OOO_CHUNK_ID_MASK) != 0;
+    let raw_id = id & (OOO_CHUNK_ID_MASK - 1);
+    (series_ref, raw_id, is_ooo)
+}
+
+/// Computes the 24-bit OOO `HeadChunkID` for position `pos` starting at `first_ooo_chunk_id`,
+/// wrapping modularly within `OOO_CHUNK_ID_MASK` and setting the OOO flag bit (Go `memSeries.oooHeadChunkID`).
+#[inline]
+pub const fn ooo_head_chunk_id(first_ooo_chunk_id: u32, pos: usize) -> u32 {
+    let wrapped = (((first_ooo_chunk_id as usize) + pos) % (OOO_CHUNK_ID_MASK as usize)) as u32;
+    wrapped | OOO_CHUNK_ID_MASK
+}
+
+/// Resolves a raw OOO `HeadChunkID` (with `OOO_CHUNK_ID_MASK` stripped) back into an index
+/// into `ooo_mmapped_chunks` of length `len`, handling modular wraparound (Go `memSeries.oooChunk`).
+#[inline]
+pub const fn resolve_ooo_chunk_pos(first_ooo_chunk_id: u32, raw_chunk_id: u32, len: usize) -> Option<usize> {
+    let mask = OOO_CHUNK_ID_MASK as usize;
+    let pos = ((raw_chunk_id as usize) + mask - ((first_ooo_chunk_id as usize) % mask)) % mask;
+    if pos < len {
+        Some(pos)
+    } else {
+        None
+    }
+}
+
 /// Metadata yielded when iterating over all chunks in `chunks_head`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadChunkRecord {

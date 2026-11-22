@@ -1,231 +1,91 @@
 //! Ported from:
 //! - github.com/grafana/mimir/pkg/util/grpcencoding/s2/s2.go
-//! - github.com/klauspost/compress/s2/{s2,decode,decode_other,reader}.go
-//!
-//! Decodes S2 stream-framed gRPC payloads (`grpc-encoding: s2`), which also supports
-//! Snappy stream-framed chunks (`\xff\x06\x00\x00sNaPpY`) as a subset.
+//! - github.com/klauspost/compress/s2/*
 
+use std::fmt;
 use std::io;
+
+pub mod block;
+pub mod dict;
+pub mod index;
+pub mod lz4;
+pub mod stream;
+
+pub use block::{
+    concat_blocks, decode, decode_into_slice, decoded_len, emit_copy, emit_copy_no_repeat,
+    emit_literal, emit_repeat, encode, encode_best, encode_better, encode_block,
+    encode_block_best, encode_block_better, encode_block_better_snappy, encode_block_snappy,
+    encode_snappy, encode_snappy_best, encode_snappy_better, estimate_block_size, match_len,
+    max_encoded_len, s2_decode, s2_decode_dict,
+};
+pub use dict::{Dict, MAX_DICT_SIZE, MIN_DICT_SIZE};
+pub use index::{
+    index_stream, remove_index_headers, restore_index_headers, Index, IndexEntry,
+    S2_INDEX_HEADER, S2_INDEX_TRAILER,
+};
+pub use lz4::{LZ4Converter, LZ4sConverter};
+pub use stream::{ReadSeeker, Reader, ReaderOptions, Writer, WriterLevel, WriterOptions};
 
 /// Name registered for the S2 gRPC compressor (`grpc-encoding: s2`).
 pub const S2_ENCODING_NAME: &str = "s2";
 
-const CHUNK_TYPE_COMPRESSED: u8 = 0x00;
-const CHUNK_TYPE_UNCOMPRESSED: u8 = 0x01;
-const CHUNK_TYPE_STREAM_IDENTIFIER: u8 = 0xff;
-const MAGIC_SNAPPY: &[u8; 6] = b"sNaPpY";
-const MAGIC_S2: &[u8; 6] = b"S2sTwO";
+pub const TAG_LITERAL: u8 = 0x00;
+pub const TAG_COPY1: u8 = 0x01;
+pub const TAG_COPY2: u8 = 0x02;
+pub const TAG_COPY4: u8 = 0x03;
 
-const MAX_BLOCK_SIZE: usize = 4 << 20;
-const MAX_SNAPPY_BLOCK_SIZE: usize = 1 << 16;
+pub const CHECKSUM_SIZE: usize = 4;
+pub const CHUNK_HEADER_SIZE: usize = 4;
+pub const OBUF_HEADER_LEN: usize = CHECKSUM_SIZE + CHUNK_HEADER_SIZE;
+pub const SKIPPABLE_FRAME_HEADER: usize = 4;
+
+pub const CHUNK_TYPE_COMPRESSED: u8 = 0x00;
+pub const CHUNK_TYPE_UNCOMPRESSED: u8 = 0x01;
+pub const CHUNK_TYPE_INDEX: u8 = 0x99;
+pub const CHUNK_TYPE_PADDING: u8 = 0xfe;
+pub const CHUNK_TYPE_STREAM_IDENTIFIER: u8 = 0xff;
+
+pub const MAGIC_SNAPPY: &[u8; 6] = b"sNaPpY";
+pub const MAGIC_S2: &[u8; 6] = b"S2sTwO";
+pub const MAGIC_STREAM_S2: &[u8; 10] = b"\xff\x06\x00\x00S2sTwO";
+pub const MAGIC_STREAM_SNAPPY: &[u8; 10] = b"\xff\x06\x00\x00sNaPpY";
+
+pub const MAX_BLOCK_SIZE: usize = 4 << 20;
+pub const MIN_BLOCK_SIZE: usize = 4 << 10;
+pub const DEFAULT_BLOCK_SIZE: usize = 1 << 20;
+pub const MAX_SNAPPY_BLOCK_SIZE: usize = 1 << 16;
+pub const MAX_CHUNK_SIZE: usize = (1 << 24) - 1;
+pub const MAX_DICT_SRC_OFFSET: usize = 65535;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S2Error {
+    Corrupt,
+    CRC,
+    TooLarge,
+    Unsupported,
+    DstTooSmall,
+    Io(io::ErrorKind),
+}
+
+impl fmt::Display for S2Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Corrupt => f.write_str("s2: corrupt input"),
+            Self::CRC => f.write_str("s2: corrupt input, crc mismatch"),
+            Self::TooLarge => f.write_str("s2: decoded block is too large"),
+            Self::Unsupported => f.write_str("s2: unsupported input"),
+            Self::DstTooSmall => f.write_str("s2: destination too small"),
+            Self::Io(k) => write!(f, "s2: io error: {k:?}"),
+        }
+    }
+}
+
+impl std::error::Error for S2Error {}
 
 #[inline]
 pub fn masked_crc32c(data: &[u8]) -> u32 {
     let c = crc32c::crc32c(data);
     c.rotate_right(15).wrapping_add(0xa282_ead8)
-}
-
-fn decode_varint_u32(src: &[u8]) -> io::Result<(usize, usize)> {
-    let mut v: u64 = 0;
-    let mut shift = 0u32;
-    for (i, &b) in src.iter().take(5).enumerate() {
-        if i == 4 && b > 0x0f {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "s2: corrupt block length varint",
-            ));
-        }
-        v |= u64::from(b & 0x7f) << shift;
-        if b < 0x80 {
-            return Ok((v as usize, i + 1));
-        }
-        shift += 7;
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "s2: truncated block length varint",
-    ))
-}
-
-fn s2_decode(dst: &mut [u8], src: &[u8]) -> io::Result<()> {
-    let mut d = 0usize;
-    let mut s = 0usize;
-    let mut offset = 0usize;
-
-    while s < src.len() {
-        let tag_byte = src[s];
-        match tag_byte & 0x03 {
-            0x00 => {
-                // tagLiteral
-                let mut x = (tag_byte >> 2) as usize;
-                match x {
-                    0..=59 => {
-                        s += 1;
-                    }
-                    60 => {
-                        let b = *src.get(s + 1).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "s2: truncated literal")
-                        })?;
-                        x = b as usize;
-                        s += 2;
-                    }
-                    61 => {
-                        let bytes = src.get(s + 1..s + 3).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "s2: truncated literal")
-                        })?;
-                        x = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-                        s += 3;
-                    }
-                    62 => {
-                        let bytes = src.get(s + 1..s + 4).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "s2: truncated literal")
-                        })?;
-                        x = (bytes[0] as usize)
-                            | ((bytes[1] as usize) << 8)
-                            | ((bytes[2] as usize) << 16);
-                        s += 4;
-                    }
-                    _ => {
-                        // 63
-                        let bytes = src.get(s + 1..s + 5).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "s2: truncated literal")
-                        })?;
-                        x = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-                        s += 5;
-                    }
-                }
-                let length = x + 1;
-                if length > dst.len() - d || length > src.len() - s {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "s2: corrupt literal length",
-                    ));
-                }
-                dst[d..d + length].copy_from_slice(&src[s..s + length]);
-                d += length;
-                s += length;
-                continue;
-            }
-            0x01 => {
-                // tagCopy1 (with S2 repeat-offset extension when toffset == 0)
-                let b1 = *src.get(s + 1).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "s2: truncated copy1")
-                })?;
-                s += 2;
-                let mut length = ((tag_byte >> 2) & 0x07) as usize;
-                let toffset = (((tag_byte as usize) & 0xe0) << 3) | (b1 as usize);
-                if toffset == 0 {
-                    match length {
-                        5 => {
-                            let b = *src.get(s).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "s2: truncated repeat copy",
-                                )
-                            })?;
-                            length = (b as usize) + 4;
-                            s += 1;
-                        }
-                        6 => {
-                            let bytes = src.get(s..s + 2).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "s2: truncated repeat copy",
-                                )
-                            })?;
-                            length = u16::from_le_bytes([bytes[0], bytes[1]]) as usize + (1 << 8);
-                            s += 2;
-                        }
-                        7 => {
-                            let bytes = src.get(s..s + 3).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "s2: truncated repeat copy",
-                                )
-                            })?;
-                            length = ((bytes[0] as usize)
-                                | ((bytes[1] as usize) << 8)
-                                | ((bytes[2] as usize) << 16))
-                                + (1 << 16);
-                            s += 3;
-                        }
-                        _ => {}
-                    }
-                } else {
-                    offset = toffset;
-                }
-                length += 4;
-                if offset == 0 || d < offset || length > dst.len() - d {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "s2: corrupt copy1 offset/length",
-                    ));
-                }
-                if offset >= length {
-                    dst.copy_within(d - offset..d - offset + length, d);
-                } else {
-                    for i in 0..length {
-                        dst[d + i] = dst[d - offset + i];
-                    }
-                }
-                d += length;
-            }
-            0x02 => {
-                // tagCopy2
-                let bytes = src.get(s + 1..s + 3).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "s2: truncated copy2")
-                })?;
-                let length = 1 + (tag_byte >> 2) as usize;
-                offset = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-                s += 3;
-                if offset == 0 || d < offset || length > dst.len() - d {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "s2: corrupt copy2 offset/length",
-                    ));
-                }
-                if offset >= length {
-                    dst.copy_within(d - offset..d - offset + length, d);
-                } else {
-                    for i in 0..length {
-                        dst[d + i] = dst[d - offset + i];
-                    }
-                }
-                d += length;
-            }
-            _ => {
-                // 0x03: tagCopy4
-                let bytes = src.get(s + 1..s + 5).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "s2: truncated copy4")
-                })?;
-                let length = 1 + (tag_byte >> 2) as usize;
-                offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-                s += 5;
-                if offset == 0 || d < offset || length > dst.len() - d {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "s2: corrupt copy4 offset/length",
-                    ));
-                }
-                if offset >= length {
-                    dst.copy_within(d - offset..d - offset + length, d);
-                } else {
-                    for i in 0..length {
-                        dst[d + i] = dst[d - offset + i];
-                    }
-                }
-                d += length;
-            }
-        }
-    }
-
-    if d != dst.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "s2: decoded length mismatch",
-        ));
-    }
-    Ok(())
 }
 
 /// Compresses `input` into S2 stream-framed bytes (`\xff\x06\x00\x00S2sTwO` header + chunks).
@@ -237,7 +97,7 @@ pub fn compress_framed(input: &[u8]) -> io::Result<Vec<u8>> {
 
 /// Compresses `input` into S2 stream-framed bytes, appending into `out`.
 pub fn compress_framed_into(input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
-    out.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+    out.extend_from_slice(MAGIC_STREAM_S2);
     if input.is_empty() {
         return Ok(());
     }
@@ -371,7 +231,8 @@ fn decompress_framed_into_inner(
                 }
                 let checksum = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 let block = &chunk[4..];
-                let (dec_len, var_len) = decode_varint_u32(block)?;
+                let (dec_len, var_len) = block::decode_block_uvarint(block)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let max_block = if snappy_frame {
                     MAX_SNAPPY_BLOCK_SIZE
                 } else {
@@ -393,7 +254,8 @@ fn decompress_framed_into_inner(
                 }
                 let dst_start = out.len();
                 out.resize(dst_start + dec_len, 0);
-                s2_decode(&mut out[dst_start..], &block[var_len..])?;
+                s2_decode(&mut out[dst_start..], &block[var_len..])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if masked_crc32c(&out[dst_start..]) != checksum {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -443,9 +305,7 @@ fn decompress_framed_into_inner(
                     format!("s2: unsupported unskippable chunk 0x{chunk_type:02x}"),
                 ));
             }
-            _ => {
-                // 0x80..=0xfe: padding and reserved skippable chunks (already read above).
-            }
+            _ => {}
         }
     }
 
@@ -464,9 +324,8 @@ mod tests {
         decompress_framed_into(&snappy_stream, &mut out, 1024).unwrap();
         assert_eq!(&out, payload);
 
-        // S2 uncompressed stream: stream id ("S2sTwO") + uncompressed chunk (0x01).
         let mut s2_stream = Vec::new();
-        s2_stream.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+        s2_stream.extend_from_slice(MAGIC_STREAM_S2);
         let chunk_len = 4 + payload.len();
         s2_stream.push(CHUNK_TYPE_UNCOMPRESSED);
         s2_stream.push((chunk_len & 0xff) as u8);
@@ -479,7 +338,6 @@ mod tests {
         decompress_framed_into(&s2_stream, &mut out2, 1024).unwrap();
         assert_eq!(&out2, payload);
 
-        // Limit enforcement.
         let mut too_small = Vec::new();
         let err = decompress_framed_into(&s2_stream, &mut too_small, 10).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -487,20 +345,10 @@ mod tests {
 
     #[test]
     fn decodes_s2_compressed_block_with_repeat_offset() {
-        // Construct an S2 compressed block using literal + copy1 + repeat-offset copy1:
-        // "ABCDABCDABCDABCD" (16 bytes):
-        // - literal 4 bytes "ABCD": tag=0 | ((4-1)<<2) = 0x0c, "ABCD"
-        // - copy1 offset=4, len=4: ((4-4)<<2) | 0x01 | ((4 & 0x700)>>3) = 0x01, 0x04
-        // - repeat copy1 len=8 (tag len=4 -> 4+4=8, toffset=0): (4<<2) | 0x01 = 0x11, 0x00
         let expected = b"ABCDABCDABCDABCD";
-        let block = [
-            16u8, // varint len = 16
-            0x0c, b'A', b'B', b'C', b'D', // literal 4
-            0x01, 0x04, // copy1 len=4, offset=4 -> "ABCD"
-            0x11, 0x00, // repeat copy1 len=8, offset=4 -> "ABCDABCD"
-        ];
+        let block = [16u8, 0x0c, b'A', b'B', b'C', b'D', 0x01, 0x04, 0x11, 0x00];
         let mut s2_stream = Vec::new();
-        s2_stream.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+        s2_stream.extend_from_slice(MAGIC_STREAM_S2);
         let chunk_len = 4 + block.len();
         s2_stream.push(CHUNK_TYPE_COMPRESSED);
         s2_stream.push((chunk_len & 0xff) as u8);
@@ -518,9 +366,8 @@ mod tests {
     fn decompress_framed_into_truncates_out_to_start_len_on_every_error() {
         let prefix = b"keep-prefix-";
 
-        // 1) Valid chunk followed by corrupt CRC in second uncompressed chunk.
         let mut s2_bad_crc = Vec::new();
-        s2_bad_crc.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+        s2_bad_crc.extend_from_slice(MAGIC_STREAM_S2);
         let chunk1 = b"first-chunk";
         let c1_len = 4 + chunk1.len();
         s2_bad_crc.push(CHUNK_TYPE_UNCOMPRESSED);
@@ -544,9 +391,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(out, prefix);
 
-        // 2) Compressed chunk with valid varint length (resizes out), invalid s2 payload.
         let mut s2_bad_comp = Vec::new();
-        s2_bad_comp.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+        s2_bad_comp.extend_from_slice(MAGIC_STREAM_S2);
         let bad_block = [32u8, 0x01, 0xff];
         let bc_len = 4 + bad_block.len();
         s2_bad_comp.push(CHUNK_TYPE_COMPRESSED);
@@ -560,9 +406,8 @@ mod tests {
         assert!(decompress_framed_into(&s2_bad_comp, &mut out2, 1024).is_err());
         assert_eq!(out2, prefix);
 
-        // 3) Compressed chunk with valid s2 payload but bad CRC.
         let mut s2_comp_crc = Vec::new();
-        s2_comp_crc.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+        s2_comp_crc.extend_from_slice(MAGIC_STREAM_S2);
         let valid_block = [4u8, 0x0c, b'A', b'B', b'C', b'D'];
         let vc_len = 4 + valid_block.len();
         s2_comp_crc.push(CHUNK_TYPE_COMPRESSED);
@@ -576,7 +421,6 @@ mod tests {
         assert!(decompress_framed_into(&s2_comp_crc, &mut out3, 1024).is_err());
         assert_eq!(out3, prefix);
 
-        // 4) Truncated header, missing stream identifier, unsupported unskippable chunk.
         for bad_input in [
             &b"\xff\x06"[..],
             &b"\x01\x04\x00\x00\x00\x00\x00\x00"[..],
