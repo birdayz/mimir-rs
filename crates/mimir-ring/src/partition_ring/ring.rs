@@ -263,11 +263,16 @@ fn resolve_ring_tokens(
     let mut ring_tokens = Vec::with_capacity(cap);
     let mut partition_by_token = HashMap::with_capacity(cap);
 
-    for &id in desc.partitions.keys() {
+    let mut ids: Vec<i32> = desc.partitions.keys().copied().collect();
+    ids.sort_unstable();
+
+    for id in ids {
         let tokens = resolve_partition_tokens(desc, id, opts)?;
-        ring_tokens.extend_from_slice(tokens);
         for &tok in tokens {
-            partition_by_token.insert(tok, id);
+            if let std::collections::hash_map::Entry::Vacant(e) = partition_by_token.entry(tok) {
+                e.insert(id);
+                ring_tokens.push(tok);
+            }
         }
     }
     ring_tokens.sort_unstable();

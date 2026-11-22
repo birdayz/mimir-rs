@@ -385,7 +385,7 @@ impl Drop for PairsScratchGuard<'_> {
             let vec = std::mem::take(&mut self.vec);
             PAIRS_SCRATCH.with(|cell| {
                 if let Ok(mut slot) = cell.try_borrow_mut() {
-                    if slot.capacity() < vec.capacity() {
+                    if slot.capacity() < vec.capacity() && vec.capacity() <= 8192 {
                         *slot = vec;
                     }
                 }
@@ -439,7 +439,9 @@ fn rollback_appender(user_id: &str, app: mimir_tsdb::head::HeadAppender<'_>) {
 pub(crate) fn convert_borrowed_histogram(h: &BorrowedHistogramView<'_>) -> ConvertedHistogram {
     let ts = h.timestamp();
     let is_float = matches!(h.count(), Some(cortexpb::histogram::Count::CountFloat(_)));
-    let hint = CounterResetHint::from_u8(h.reset_hint() as u8);
+    let hint = u8::try_from(h.reset_hint())
+        .map(CounterResetHint::from_u8)
+        .unwrap_or(CounterResetHint::UnknownCounterReset);
     let pos_spans: Vec<HistogramSpan> = h
         .positive_spans()
         .iter()
@@ -514,6 +516,52 @@ pub(crate) fn convert_borrowed_histogram(h: &BorrowedHistogramView<'_>) -> Conve
         };
         (ts, false, Some(ih), None, buckets)
     }
+}
+
+struct RawStringLabelsIter<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> RawStringLabelsIter<'a> {
+    #[inline]
+    fn read_part(&mut self) -> Option<&'a [u8]> {
+        let &first = self.data.first()?;
+        let (len, rest) = if first < 255 {
+            (first as usize, &self.data[1..])
+        } else {
+            if self.data.len() < 4 {
+                self.data = &[];
+                return None;
+            }
+            let l = (self.data[1] as usize)
+                | ((self.data[2] as usize) << 8)
+                | ((self.data[3] as usize) << 16);
+            (l, &self.data[4..])
+        };
+        if rest.len() < len {
+            self.data = &[];
+            return None;
+        }
+        let (part, tail) = rest.split_at(len);
+        self.data = tail;
+        Some(part)
+    }
+}
+
+impl<'a> Iterator for RawStringLabelsIter<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let k = self.read_part()?;
+        let v = self.read_part()?;
+        Some((k, v))
+    }
+}
+
+#[inline]
+fn iter_stringlabels_bytes(data: &[u8]) -> RawStringLabelsIter<'_> {
+    RawStringLabelsIter { data }
 }
 
 #[cold]
@@ -634,6 +682,7 @@ pub(crate) fn convert_borrowed_exemplar(
 /// Abstract view over a single time series in either owned `cortexpb::TimeSeries` or zero-copy `BorrowedTimeSeriesView`.
 trait TimeSeriesInput<'a> {
     fn fill_pairs(&self, out: &mut Vec<(&'a str, &'a str)>) -> Result<(), IngesterError>;
+    fn format_raw_labels(&self) -> String;
     fn samples(&self) -> &[cortexpb::Sample];
     fn created_timestamp(&self) -> i64;
     fn histogram_count(&self) -> usize;
@@ -663,6 +712,14 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
         Ok(())
     }
 
+    fn format_raw_labels(&self) -> String {
+        format_raw_bytes_labels(
+            self.labels
+                .iter()
+                .map(|lp| (lp.name.as_ref(), lp.value.as_ref())),
+        )
+    }
+
     fn samples(&self) -> &[cortexpb::Sample] {
         &self.samples
     }
@@ -683,7 +740,9 @@ impl<'a> TimeSeriesInput<'a> for &'a cortexpb::TimeSeries {
         let h = &self.histograms[idx];
         let ts = h.timestamp;
         let is_float = h.is_float_histogram();
-        let hint = CounterResetHint::from_u8(h.reset_hint as u8);
+        let hint = u8::try_from(h.reset_hint)
+            .map(CounterResetHint::from_u8)
+            .unwrap_or(CounterResetHint::UnknownCounterReset);
         let pos_spans: Vec<HistogramSpan> = h
             .positive_spans
             .iter()
@@ -824,6 +883,14 @@ impl<'a, 'v> TimeSeriesInput<'a> for BorrowedTimeSeriesView<'v, 'a> {
             out.push((k, v));
         }
         Ok(())
+    }
+
+    fn format_raw_labels(&self) -> String {
+        if let Some(labels_str) = self.labels_str() {
+            format_labels_string(labels_str)
+        } else {
+            format_raw_bytes_labels(self.labels().map(|lp| (lp.name, lp.value)))
+        }
     }
 
     fn samples(&self) -> &[cortexpb::Sample] {
@@ -1345,9 +1412,9 @@ impl Ingester {
                     }
 
                     let (raw_label_start, raw_label_len) = match series.raw_label_bytes_range {
-                        Some(ref rr) if !series.bad_utf8 => (rr.start, rr.len()),
-                        _ if series.bad_utf8 => (0, 0),
-                        _ => (
+                        Some(ref rr) => (rr.start, rr.len()),
+                        None if series.bad_utf8 => (0, 0),
+                        None => (
                             series.label_bytes_range.start,
                             series.label_bytes_range.len(),
                         ),
@@ -1384,6 +1451,7 @@ impl Ingester {
                 }
             };
 
+            self.check_available_for_push()?;
             let meta_count = self.push_metadata_iter(user_id, wr_scratch.metadata(raw_bytes));
             if meta_count > 0 {
                 self.ingestion_rate.add(meta_count as i64);
@@ -1408,7 +1476,7 @@ impl Ingester {
                     &label_bytes_arena[l_start..l_start + m.label_len]
                 };
                 let r_start = m.raw_label_start;
-                let raw_encoded_labels = if m.bad_utf8 {
+                let raw_encoded_labels = if m.raw_label_len == 0 {
                     &[][..]
                 } else {
                     &label_bytes_arena[r_start..r_start + m.raw_label_len]
@@ -1440,6 +1508,7 @@ impl Ingester {
                 });
             }
 
+            self.check_available_for_push()?;
             if ts_len >= CLASSIC_PUSH_SHARD_THRESHOLD
                 && all_sorted_unique
                 && all_sorted_have_metric_name
@@ -2114,12 +2183,13 @@ impl Ingester {
                     stats.failed_samples += total_bad;
                     stats.failed_exemplars += item.exemplars.len();
                     if total_bad > 0 || !item.exemplars.is_empty() {
+                        let s_str = format_raw_bytes_labels(iter_stringlabels_bytes(raw_labels));
                         record_partial(
                             IngesterError::Validation {
                                 err_id: mimir_common::errors::SERIES_INVALID_LABEL,
                                 message: mimir_common::errors::SERIES_INVALID_LABEL
                                     .message("received a series with invalid UTF-8 in label"),
-                                series: String::new(),
+                                series: s_str,
                             },
                             None,
                         );
@@ -2251,7 +2321,7 @@ impl Ingester {
                                 | HeadError::OutOfOrderSample,
                             ) => {}
                             Err(err) => {
-                                if let Err(e) = handle_head_append_error(
+                                let _ = handle_head_append_error(
                                     err,
                                     created_ts,
                                     raw_labels,
@@ -2261,10 +2331,7 @@ impl Ingester {
                                     &mut stats,
                                     &mut make_series_str,
                                     &mut record_partial,
-                                ) {
-                                    hard_err = Some((orig_idx, e.with_user(user_id, 0)));
-                                    break;
-                                }
+                                );
                             }
                         }
                         ingest_created_ts = false;
@@ -2389,7 +2456,7 @@ impl Ingester {
                                     | HeadError::OutOfOrderSample,
                                 ) => {}
                                 Err(err) => {
-                                    if let Err(e) = handle_head_append_error(
+                                    let _ = handle_head_append_error(
                                         err,
                                         created_ts,
                                         raw_labels,
@@ -2399,10 +2466,7 @@ impl Ingester {
                                         &mut stats,
                                         &mut make_series_str,
                                         &mut record_partial,
-                                    ) {
-                                        hard_err = Some((orig_idx, e.with_user(user_id, 0)));
-                                        break;
-                                    }
+                                    );
                                 }
                             }
                             ingest_created_ts = false;
@@ -2919,12 +2983,13 @@ impl Ingester {
                 stats.failed_samples += total_bad;
                 stats.failed_exemplars += item.exemplars.len();
                 if total_bad > 0 || !item.exemplars.is_empty() {
+                    let s_str = format_raw_bytes_labels(iter_stringlabels_bytes(raw_labels));
                     record_partial(
                         IngesterError::Validation {
                             err_id: mimir_common::errors::SERIES_INVALID_LABEL,
                             message: mimir_common::errors::SERIES_INVALID_LABEL
                                 .message("received a series with invalid UTF-8 in label"),
-                            series: String::new(),
+                            series: s_str,
                         },
                         None,
                     );
@@ -3056,7 +3121,7 @@ impl Ingester {
                             | HeadError::OutOfOrderSample,
                         ) => {}
                         Err(err) => {
-                            if let Err(e) = handle_head_append_error(
+                            let _ = handle_head_append_error(
                                 err,
                                 created_ts,
                                 raw_labels,
@@ -3066,9 +3131,7 @@ impl Ingester {
                                 &mut stats,
                                 &mut make_series_str,
                                 &mut record_partial,
-                            ) {
-                                return Err(e.with_user(user_id, 0));
-                            }
+                            );
                         }
                     }
                     ingest_created_ts = false;
@@ -3188,7 +3251,7 @@ impl Ingester {
                                 | HeadError::OutOfOrderSample,
                             ) => {}
                             Err(err) => {
-                                if let Err(e) = handle_head_append_error(
+                                let _ = handle_head_append_error(
                                     err,
                                     created_ts,
                                     raw_labels,
@@ -3198,9 +3261,7 @@ impl Ingester {
                                     &mut stats,
                                     &mut make_series_str,
                                     &mut record_partial,
-                                ) {
-                                    return Err(e.with_user(user_id, 0));
-                                }
+                                );
                             }
                         }
                         ingest_created_ts = false;
@@ -3584,7 +3645,7 @@ impl Ingester {
                         IngesterError::Validation {
                             err_id: mimir_common::errors::SERIES_INVALID_LABEL,
                             message: mimir_common::errors::SERIES_INVALID_LABEL.message(&detail),
-                            series: String::new(),
+                            series: ts.format_raw_labels(),
                         },
                         None,
                     );
@@ -3749,7 +3810,7 @@ impl Ingester {
                             | HeadError::OutOfOrderSample,
                         ) => {}
                         Err(err) => {
-                            match handle_head_append_error(
+                            let _ = handle_head_append_error(
                                 err,
                                 created_ts,
                                 raw_pairs_if_empty.as_deref().unwrap_or(pairs.as_slice()),
@@ -3759,12 +3820,7 @@ impl Ingester {
                                 &mut stats,
                                 &mut make_series_str,
                                 &mut record_partial,
-                            ) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    return Err(e.with_user(user_id, 0));
-                                }
-                            }
+                            );
                         }
                     }
                     ingest_created_ts = false;
@@ -3862,7 +3918,7 @@ impl Ingester {
                                 | HeadError::OutOfOrderSample,
                             ) => {}
                             Err(err) => {
-                                match handle_head_append_error(
+                                let _ = handle_head_append_error(
                                     err,
                                     created_ts,
                                     raw_pairs_if_empty.as_deref().unwrap_or(pairs.as_slice()),
@@ -3872,12 +3928,7 @@ impl Ingester {
                                     &mut stats,
                                     &mut make_series_str,
                                     &mut record_partial,
-                                ) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    return Err(e.with_user(user_id, 0));
-                                }
-                            }
+                                );
                             }
                         }
                         ingest_created_ts = false;
@@ -5738,6 +5789,7 @@ mod wave3_tests {
             None,
         )
         .unwrap();
+        ing.set_state_for_test(mimir_common::services::State::Running);
 
         let db = ing.get_or_create_tsdb("t-ex-mints").unwrap();
         let (ok, _) = db.change_state_to_forced_compaction(crate::user_tsdb::TsdbState::Active, 100);

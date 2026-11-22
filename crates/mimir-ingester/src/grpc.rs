@@ -670,9 +670,15 @@ impl NonClientStreamingFrameBody {
                                 })?;
                             }
                             FrameDecompressAlgo::Zstd => {
-                                let dec = zstd::stream::read::Decoder::new(compressed).map_err(
+                                let mut dec = zstd::stream::read::Decoder::new(compressed).map_err(
                                     |e| Status::internal(format!("zstd decompression failed: {e}")),
                                 )?;
+                                let window_log_max = (usize::BITS
+                                    - self.max_recv.saturating_sub(1).leading_zeros())
+                                .clamp(22, 23);
+                                dec.window_log_max(window_log_max).map_err(|e| {
+                                    Status::internal(format!("zstd decompression failed: {e}"))
+                                })?;
                                 dec.take(limit).read_to_end(&mut decompressed).map_err(|e| {
                                     Status::internal(format!("zstd decompression failed: {e}"))
                                 })?;
@@ -1252,7 +1258,12 @@ fn decode_single_custom_grpc_frame(
                     "grpc: received message after decompression larger than max {max_decode_len}"
                 )));
             }
-            out[1..5].copy_from_slice(&(dec_len as u32).to_be_bytes());
+            let dec_len_u32 = u32::try_from(dec_len).map_err(|_| {
+                Status::resource_exhausted(format!(
+                    "grpc: received message after decompression larger than max {max_decode_len}"
+                ))
+            })?;
+            out[1..5].copy_from_slice(&dec_len_u32.to_be_bytes());
             Ok(Bytes::copy_from_slice(out))
         }),
         other => Err(Status::internal(format!(

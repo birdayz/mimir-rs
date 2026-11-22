@@ -221,13 +221,10 @@ impl ScopedWorkerPool {
             st.task = Some(&task as *const TaskDescriptor);
             st.generation = st.generation.wrapping_add(1);
         }
-        if workers_to_use >= self.num_workers {
-            self.shared.work_cvar.notify_all();
-        } else {
-            for _ in 0..workers_to_use {
-                self.shared.work_cvar.notify_one();
-            }
-        }
+        // Wake all workers so non-FIFO condvars or spurious/in-flight wakeups
+        // never strand a slot; extra workers see `claimed_workers >= workers_to_use`
+        // and return to wait.
+        self.shared.work_cvar.notify_all();
 
         let caller_res = catch_unwind(AssertUnwindSafe(|| loop {
             let idx = task.next_job.fetch_add(1, Ordering::Relaxed);
@@ -290,35 +287,46 @@ fn worker_loop(shared: Arc<SharedPool>) {
             }
         };
 
-        // SAFETY: `task_ptr` remains valid until `_exit` drops `remaining_workers` to 0.
-        let task = unsafe { &*task_ptr };
         struct WorkerExit<'a> {
-            task: &'a TaskDescriptor,
+            task: *const TaskDescriptor,
             shared: &'a SharedPool,
         }
         impl Drop for WorkerExit<'_> {
             fn drop(&mut self) {
-                if self.task.remaining_workers.fetch_sub(1, Ordering::AcqRel) == 1 {
+                // SAFETY: `task` remains valid until `remaining_workers` reaches 0;
+                // we do not hold any `&TaskDescriptor` reference across or after `fetch_sub`.
+                let prev = unsafe {
+                    let ptr = std::ptr::addr_of!((*self.task).remaining_workers);
+                    (&*ptr).fetch_sub(1, Ordering::AcqRel)
+                };
+                if prev == 1 {
                     let _g = sync_impl::lock(&self.shared.done_mu);
-                    self.shared.done_cvar.notify_one();
+                    self.shared.done_cvar.notify_all();
                 }
             }
         }
         let _exit = WorkerExit {
-            task,
+            task: task_ptr,
             shared: &shared,
         };
 
-        let res = catch_unwind(AssertUnwindSafe(|| loop {
-            let idx = task.next_job.fetch_add(1, Ordering::Relaxed);
-            if idx >= task.num_jobs {
-                break;
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: `_exit` has not decremented `remaining_workers` yet, so `task_ptr`
+            // remains valid for the entire duration of this closure.
+            let task = unsafe { &*task_ptr };
+            loop {
+                let idx = task.next_job.fetch_add(1, Ordering::Relaxed);
+                if idx >= task.num_jobs {
+                    break;
+                }
+                // SAFETY: `func` and `ctx` remain valid while `remaining_workers > 0`.
+                unsafe { (task.func)(task.ctx, idx) };
             }
-            // SAFETY: `func` and `ctx` remain valid while `remaining_workers > 0`.
-            unsafe { (task.func)(task.ctx, idx) };
         }));
         if let Err(payload) = res {
-            let mut p = sync_impl::lock(&task.panic);
+            // SAFETY: `_exit` has not dropped yet, so `remaining_workers > 0`.
+            let panic_mu = unsafe { &*std::ptr::addr_of!((*task_ptr).panic) };
+            let mut p = sync_impl::lock(panic_mu);
             if p.is_none() {
                 *p = Some(payload);
             }

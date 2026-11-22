@@ -32,7 +32,7 @@ use prometheus::{core::Collector, Registry};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use super::gometrics::GoMetrics;
@@ -54,12 +54,13 @@ use crate::kv::KeyDeleted;
 use super::wire::{
     add_label_header, compress_payload, decode_ack_resp, decode_alive, decode_compound_message,
     decode_dead, decode_indirect_ping, decode_nack_resp, decode_ping, decode_push_pull,
-    decode_suspect, decompress_buffer, encode_ack_resp, encode_err_resp, encode_ping,
+    decode_suspect, decompress_buffer_with_limit, encode_ack_resp, encode_err_resp, encode_ping,
     encode_push_pull, encode_user_msg_stream, make_compound_messages, remove_label_header,
     resolve_compression_type, unwrap_crc32, wrap_crc32, AckResp, Alive, CompressionType, ErrResp,
     Dead, MessageType, NackResp, NodeStateType, Ping, PushNodeState, Suspect,
     COMPOUND_HEADER_OVERHEAD,
-    COMPOUND_OVERHEAD, LABEL_MAX_SIZE, META_MAX_SIZE, PROTOCOL_VERSION_2_COMPATIBLE,
+    COMPOUND_OVERHEAD, LABEL_MAX_SIZE, MAX_DECOMPRESS_BYTES, META_MAX_SIZE,
+    PROTOCOL_VERSION_2_COMPATIBLE,
     PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN,
 };
 use super::zone_aware::ZoneAwareNodeSelection;
@@ -302,11 +303,45 @@ struct ValueUpdate {
     update_time: Option<SystemTime>,
 }
 
+const MAX_HANDOFF_BYTES: usize = 64 * 1024 * 1024;
+const MAX_COMPOUND_PARTS: usize = 256;
+const MAX_KEY_WORKERS: usize = 4096;
+const MAX_CONCURRENT_STREAM_TASKS: usize = 256;
+
 /// memberlist `msgHandoff`.
 struct Handoff {
     msg_type: MessageType,
     buf: Vec<u8>,
     from: String,
+}
+
+impl Handoff {
+    fn byte_len(&self) -> usize {
+        self.buf.len().saturating_add(self.from.len())
+    }
+}
+
+#[derive(Default)]
+struct HandoffQueues {
+    high: VecDeque<Handoff>,
+    low: VecDeque<Handoff>,
+    total_bytes: usize,
+}
+
+struct CommandBudget {
+    remaining_decompress_bytes: usize,
+    sub_messages: usize,
+    in_compound: bool,
+}
+
+impl CommandBudget {
+    fn new() -> Self {
+        Self {
+            remaining_decompress_bytes: MAX_DECOMPRESS_BYTES,
+            sub_messages: 0,
+            in_compound: false,
+        }
+    }
 }
 
 /// Go `memberlist.EventDelegate`.
@@ -504,8 +539,9 @@ pub struct MemberlistKv {
     leave: AtomicBool,
     leave_broadcast_tx: mpsc::Sender<()>,
     leave_broadcast_rx: tokio::sync::Mutex<mpsc::Receiver<()>>,
-    handoff: Mutex<(VecDeque<Handoff>, VecDeque<Handoff>)>,
+    handoff: Mutex<HandoffQueues>,
     handoff_notify: Notify,
+    stream_sem: Arc<Semaphore>,
     push_pull_req: AtomicUsize,
     zone_select: Option<ZoneAwareNodeSelection>,
 
@@ -740,8 +776,9 @@ impl MemberlistKv {
                 leave: AtomicBool::new(false),
                 leave_broadcast_tx: leave_tx,
                 leave_broadcast_rx: tokio::sync::Mutex::new(leave_rx),
-                handoff: Mutex::new((VecDeque::new(), VecDeque::new())),
+                handoff: Mutex::new(HandoffQueues::default()),
                 handoff_notify: Notify::new(),
+                stream_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAM_TASKS)),
                 push_pull_req: AtomicUsize::new(0),
                 zone_select,
                 shutdown_ctx: ServiceContext::background(),
@@ -1169,8 +1206,18 @@ impl MemberlistKv {
                         _ = cancel.canceled() => break,
                         conn = stream_rx.recv() => {
                             let Some(conn) = conn else { break };
+                            let permit = tokio::select! {
+                                _ = cancel.canceled() => break,
+                                p = kv.stream_sem.clone().acquire_owned() => match p {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                }
+                            };
                             let kv_conn = Arc::clone(&kv);
-                            tokio::spawn(async move { kv_conn.handle_conn(conn).await });
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                kv_conn.handle_conn(conn).await;
+                            });
                         }
                     }
                 }
@@ -1197,11 +1244,15 @@ impl MemberlistKv {
 
     fn current_node_meta(&self) -> Option<Vec<u8>> {
         if let Some(del) = &self.custom_delegate {
-            let meta = del.node_meta(META_MAX_SIZE);
-            assert!(
-                meta.len() <= META_MAX_SIZE,
-                "Node meta data provided is longer than the limit"
-            );
+            let mut meta = del.node_meta(META_MAX_SIZE);
+            if meta.len() > META_MAX_SIZE {
+                warn!(
+                    len = meta.len(),
+                    max = META_MAX_SIZE,
+                    "memberlist: Node meta data provided is longer than the limit, truncating"
+                );
+                meta.truncate(META_MAX_SIZE);
+            }
             Some(meta)
         } else {
             self.node_meta.clone()
@@ -1224,7 +1275,11 @@ impl MemberlistKv {
 
     fn get_next_message(&self) -> Option<Handoff> {
         let mut q = self.handoff.lock();
-        q.0.pop_back().or_else(|| q.1.pop_back())
+        let msg = q.high.pop_back().or_else(|| q.low.pop_back());
+        if let Some(ref m) = msg {
+            q.total_bytes = q.total_bytes.saturating_sub(m.byte_len());
+        }
+        msg
     }
 
     fn handle_handoff(&self, msg: Handoff) {
@@ -1236,22 +1291,32 @@ impl MemberlistKv {
             MessageType::Alive => {
                 if let Some(cidrs) = self.cidrs_allowed.as_deref() {
                     if msg.from != "pipe" {
-                        if let Some(ip) = msg.from.parse::<SocketAddr>().ok().map(|s| s.ip()).or_else(|| msg.from.parse::<IpAddr>().ok()) {
-                            if let Err(err) = ip_allowed(Some(cidrs), ip) {
-                                debug!(%err, from = %msg.from, "memberlist: Blocked alive message");
-                                return;
-                            }
+                        let Some(ip) = msg
+                            .from
+                            .parse::<SocketAddr>()
+                            .ok()
+                            .map(|s| s.ip())
+                            .or_else(|| msg.from.parse::<IpAddr>().ok())
+                        else {
+                            debug!(from = %msg.from, "memberlist: Blocked alive message from unparseable address");
+                            return;
+                        };
+                        if let Err(err) = ip_allowed(Some(cidrs), ip) {
+                            debug!(%err, from = %msg.from, "memberlist: Blocked alive message");
+                            return;
                         }
                     }
                 }
                 match decode_alive(&msg.buf) {
                     Ok(mut a) => {
                         if let Some(cidrs) = self.cidrs_allowed.as_deref() {
-                            if let Some(inner_ip) = bytes_to_ip(&a.addr) {
-                                if let Err(err) = ip_allowed(Some(cidrs), inner_ip) {
-                                    debug!(%err, from = %msg.from, "memberlist: Blocked alive.Addr message");
-                                    return;
-                                }
+                            let Some(inner_ip) = bytes_to_ip(&a.addr) else {
+                                debug!(from = %msg.from, addr_len = a.addr.len(), "memberlist: Blocked alive message with invalid addr");
+                                return;
+                            };
+                            if let Err(err) = ip_allowed(Some(cidrs), inner_ip) {
+                                debug!(%err, from = %msg.from, "memberlist: Blocked alive.Addr message");
+                                return;
                             }
                         }
                         if self.protocol_version < 2 || a.port == 0 {
@@ -1316,10 +1381,17 @@ impl MemberlistKv {
                 return;
             }
         };
-        self.handle_command(buf, from, 0).await;
+        let mut budget = CommandBudget::new();
+        self.handle_command(buf, from, 0, &mut budget).await;
     }
 
-    fn handle_command<'a>(&'a self, buf: &'a [u8], from: &'a str, depth: usize) -> BoxFuture<'a, ()> {
+    fn handle_command<'a>(
+        &'a self,
+        buf: &'a [u8],
+        from: &'a str,
+        depth: usize,
+        budget: &'a mut CommandBudget,
+    ) -> BoxFuture<'a, ()> {
         const MAX_COMMAND_DEPTH: usize = 4;
         Box::pin(async move {
             if depth > MAX_COMMAND_DEPTH {
@@ -1336,18 +1408,36 @@ impl MemberlistKv {
             };
             let body = &buf[1..];
             match msg_type {
-                MessageType::Compound => match decode_compound_message(body) {
-                    Ok((trunc, parts)) => {
-                        if trunc > 0 {
-                            warn!(trunc, from, "memberlist: Compound request had truncated messages");
-                        }
-                        for part in parts {
-                            self.handle_command(part, from, depth + 1).await;
-                        }
+                MessageType::Compound => {
+                    if budget.in_compound {
+                        warn!(from, "memberlist: rejecting nested Compound message");
+                        return;
                     }
-                    Err(err) => error!(%err, from, "memberlist: Failed to decode compound request"),
-                },
-                MessageType::Compress => self.handle_compressed(body, from, depth).await,
+                    match decode_compound_message(body) {
+                        Ok((trunc, parts)) => {
+                            if trunc > 0 {
+                                warn!(trunc, from, "memberlist: Compound request had truncated messages");
+                            }
+                            let prev_in_compound = budget.in_compound;
+                            budget.in_compound = true;
+                            for part in parts {
+                                if budget.sub_messages >= MAX_COMPOUND_PARTS {
+                                    warn!(
+                                        from,
+                                        limit = MAX_COMPOUND_PARTS,
+                                        "memberlist: Compound sub-message limit exceeded"
+                                    );
+                                    break;
+                                }
+                                budget.sub_messages += 1;
+                                self.handle_command(part, from, depth + 1, budget).await;
+                            }
+                            budget.in_compound = prev_in_compound;
+                        }
+                        Err(err) => error!(%err, from, "memberlist: Failed to decode compound request"),
+                    }
+                }
+                MessageType::Compress => self.handle_compressed(body, from, depth, budget).await,
                 MessageType::Ping => match decode_ping(body) {
                     Ok(p) => self.handle_ping(p, from).await,
                     Err(err) => error!(%err, from, "memberlist: Failed to decode ping request"),
@@ -1365,17 +1455,30 @@ impl MemberlistKv {
                     Err(err) => error!(%err, from, "memberlist: Failed to decode nack response"),
                 },
                 MessageType::Suspect | MessageType::Alive | MessageType::Dead | MessageType::User => {
+                    let item = Handoff {
+                        msg_type,
+                        buf: body.to_vec(),
+                        from: from.to_string(),
+                    };
+                    let item_bytes = item.byte_len();
                     let dropped = {
                         let mut q = self.handoff.lock();
-                        let queue = if msg_type == MessageType::Alive { &mut q.0 } else { &mut q.1 };
-                        if queue.len() >= self.timing.handoff_queue_depth {
+                        let new_total = q.total_bytes.saturating_add(item_bytes);
+                        let queue_len = if msg_type == MessageType::Alive {
+                            q.high.len()
+                        } else {
+                            q.low.len()
+                        };
+                        if queue_len >= self.timing.handoff_queue_depth || new_total > MAX_HANDOFF_BYTES {
                             true
                         } else {
-                            queue.push_back(Handoff {
-                                msg_type,
-                                buf: body.to_vec(),
-                                from: from.to_string(),
-                            });
+                            q.total_bytes = new_total;
+                            let queue = if msg_type == MessageType::Alive {
+                                &mut q.high
+                            } else {
+                                &mut q.low
+                            };
+                            queue.push_back(item);
                             false
                         }
                     };
@@ -1407,14 +1510,28 @@ impl MemberlistKv {
     }
 
     /// memberlist `handleCompressed`.
-    async fn handle_compressed(&self, body: &[u8], from: &str, depth: usize) {
+    async fn handle_compressed(
+        &self,
+        body: &[u8],
+        from: &str,
+        depth: usize,
+        budget: &mut CommandBudget,
+    ) {
         match super::wire::decode_compressed_payload(body) {
             Ok(cp) => {
                 let labels = [("algo", Self::decompress_algo(cp.algo))];
                 self.go_metrics
                     .incr_counter(&["memberlist", "decompress", "attempts_total"], 1.0, &labels);
-                match decompress_buffer(cp.algo, &cp.buf) {
-                    Ok(decomp) => self.handle_command(&decomp, from, depth + 1).await,
+                match decompress_buffer_with_limit(
+                    cp.algo,
+                    &cp.buf,
+                    budget.remaining_decompress_bytes,
+                ) {
+                    Ok(decomp) => {
+                        budget.remaining_decompress_bytes =
+                            budget.remaining_decompress_bytes.saturating_sub(decomp.len());
+                        self.handle_command(&decomp, from, depth + 1, budget).await;
+                    }
                     Err(err) => {
                         self.go_metrics
                             .incr_counter(&["memberlist", "decompress", "errors_total"], 1.0, &labels);
@@ -3080,6 +3197,12 @@ impl MemberlistKv {
         let tx = match workers.get(key) {
             Some(tx) if !tx.is_closed() => tx.clone(),
             _ => {
+                if !workers.contains_key(key) && workers.len() >= MAX_KEY_WORKERS {
+                    workers.retain(|_, existing| !existing.is_closed());
+                    if workers.len() >= MAX_KEY_WORKERS {
+                        return false;
+                    }
+                }
                 let cap = self.cfg.processed_messages_queue_size.max(1) as usize;
                 let (tx, rx) = mpsc::channel(cap);
                 if let Some(kv) = self.self_arc() {
@@ -3519,7 +3642,36 @@ impl MemberlistKv {
     }
 
     pub async fn handle_command_for_test(&self, buf: &[u8], from: &str) {
-        self.handle_command(buf, from, 0).await;
+        let mut budget = CommandBudget::new();
+        self.handle_command(buf, from, 0, &mut budget).await;
+    }
+
+    pub fn handoff_total_bytes_for_test(&self) -> usize {
+        self.handoff.lock().total_bytes
+    }
+
+    pub fn handoff_counts_for_test(&self) -> (usize, usize) {
+        let q = self.handoff.lock();
+        (q.high.len(), q.low.len())
+    }
+
+    pub fn drain_handoff_for_test(&self) -> usize {
+        let mut n = 0;
+        while let Some(msg) = self.get_next_message() {
+            self.handle_handoff(msg);
+            n += 1;
+        }
+        n
+    }
+
+    pub fn current_node_meta_for_test(&self) -> Option<Vec<u8>> {
+        self.current_node_meta()
+    }
+
+
+
+    pub fn available_stream_permits_for_test(&self) -> usize {
+        self.stream_sem.available_permits()
     }
 
     pub fn decrypt_remote_state_for_test(

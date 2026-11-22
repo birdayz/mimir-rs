@@ -705,6 +705,40 @@ impl ManagedBasicService {
     }
 
     async fn run_main_managed(self: Arc<Self>, service_ctx: ServiceContext) {
+        struct ExitGuard<'a> {
+            svc: &'a ManagedBasicService,
+            ctx: &'a ServiceContext,
+            armed: bool,
+        }
+        impl Drop for ExitGuard<'_> {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let fail_err = ServiceError::failure("service task panicked or aborted");
+                {
+                    let mut st = self.svc.base.inner.lock();
+                    let prev = st.state;
+                    if !matches!(prev, State::Failed | State::Terminated) {
+                        st.state = State::Failed;
+                        st.failure_case = Some(fail_err.clone());
+                        BasicService::spawn_pending_listeners_in_runtime(&mut st);
+                        BasicService::notify_listeners(&mut st, true, move || {
+                            let e_inner = fail_err.clone();
+                            Box::new(move |l| l.failed(prev, &e_inner))
+                        });
+                        let _ = self.svc.base.state_tx.send(State::Failed);
+                    }
+                }
+                self.ctx.cancel();
+            }
+        }
+        let mut exit_guard = ExitGuard {
+            svc: &self,
+            ctx: &service_ctx,
+            armed: true,
+        };
+
         let mut err = if let Some(start_fn) = &self.base.start_fn {
             start_fn(service_ctx.clone()).await
         } else {
@@ -726,6 +760,7 @@ impl ManagedBasicService {
                 let _ = self.base.state_tx.send(State::Failed);
             }
             service_ctx.cancel();
+            exit_guard.armed = false;
             return;
         }
 
@@ -789,6 +824,7 @@ impl ManagedBasicService {
             });
             let _ = self.base.state_tx.send(State::Terminated);
         }
+        exit_guard.armed = false;
     }
 }
 

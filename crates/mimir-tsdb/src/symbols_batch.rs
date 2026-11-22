@@ -8,7 +8,9 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::thread::JoinHandle;
 
 use thiserror::Error;
@@ -66,7 +68,7 @@ impl SymbolFlushers {
         let mut failed = false;
         loop {
             let job = {
-                let guard = rx.lock().unwrap();
+                let guard = rx.lock();
                 guard.recv()
             };
             let Ok(job) = job else {
@@ -79,7 +81,7 @@ impl SymbolFlushers {
             scratch.extend(job.symbols);
             scratch.sort();
             if let Err(e) = write_symbols_to_file(&job.output_file, &scratch) {
-                let mut err_guard = err_slot.lock().unwrap();
+                let mut err_guard = err_slot.lock();
                 if err_guard.is_none() {
                     *err_guard = Some(e.to_string());
                 }
@@ -97,11 +99,11 @@ impl SymbolFlushers {
         if symbols.is_empty() {
             return Err(SymbolsBatchError::NoSymbols);
         }
-        if let Some(ref e) = *self.err.lock().unwrap() {
+        if let Some(ref e) = *self.err.lock() {
             return Err(SymbolsBatchError::Io(io::Error::other(e.clone())));
         }
         let sender = {
-            let guard = self.tx.lock().unwrap();
+            let guard = self.tx.lock();
             guard.as_ref().cloned().ok_or(SymbolsBatchError::Closed)?
         };
         sender
@@ -110,7 +112,7 @@ impl SymbolFlushers {
                 symbols,
             })
             .map_err(|_| {
-                if let Some(ref e) = *self.err.lock().unwrap() {
+                if let Some(ref e) = *self.err.lock() {
                     SymbolsBatchError::Io(io::Error::other(e.clone()))
                 } else {
                     SymbolsBatchError::Closed
@@ -121,17 +123,17 @@ impl SymbolFlushers {
     /// Stops and waits until all flusher threads have finished. Idempotent.
     pub fn close(&self) -> Result<(), SymbolsBatchError> {
         {
-            let mut guard = self.tx.lock().unwrap();
+            let mut guard = self.tx.lock();
             guard.take();
         }
         let handles = {
-            let mut w = self.workers.lock().unwrap();
+            let mut w = self.workers.lock();
             std::mem::take(&mut *w)
         };
         for h in handles {
             let _ = h.join();
         }
-        if let Some(ref e) = *self.err.lock().unwrap() {
+        if let Some(ref e) = *self.err.lock() {
             return Err(SymbolsBatchError::Io(io::Error::other(e.clone())));
         }
         Ok(())

@@ -164,15 +164,40 @@ fn create_file_reader(
 }
 
 fn find_20k_series_path() -> Option<PathBuf> {
-    let rel = "github.com/grafana/mimir-prometheus@v1.8.2-0.20261113142535-4819bfb31f7c/tsdb/testdata/20kseries.json";
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ref_mimir = manifest_dir.join("../../.ref/mimir");
+    let vendored = ref_mimir.join("vendor/github.com/prometheus/prometheus/tsdb/testdata/20kseries.json");
+    if vendored.exists() {
+        return Some(vendored);
+    }
+    let go_mod = fs::read_to_string(ref_mimir.join("go.mod")).ok()?;
+    let mut prom_mod_ver: Option<(String, String)> = None;
+    for line in go_mod.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("replace github.com/prometheus/prometheus => ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(mod_path), Some(ver)) = (parts.next(), parts.next()) {
+                prom_mod_ver = Some((mod_path.to_string(), ver.to_string()));
+                break;
+            }
+        }
+    }
+    let (mod_path, ver) = prom_mod_ver?;
+    let rel = format!("{mod_path}@{ver}/tsdb/testdata/20kseries.json");
     if let Ok(gomodcache) = std::env::var("GOMODCACHE") {
-        let p = PathBuf::from(gomodcache).join(rel);
+        let p = PathBuf::from(gomodcache).join(&rel);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(gopath) = std::env::var("GOPATH") {
+        let p = PathBuf::from(gopath).join("pkg/mod").join(&rel);
         if p.exists() {
             return Some(p);
         }
     }
     if let Ok(home) = std::env::var("HOME") {
-        let p = PathBuf::from(home).join("go/pkg/mod").join(rel);
+        let p = PathBuf::from(home).join("go/pkg/mod").join(&rel);
         if p.exists() {
             return Some(p);
         }

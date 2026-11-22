@@ -1963,7 +1963,7 @@ impl GcsClient {
 
                     let headers = resp.headers().clone();
                     let body = resp.text().await.unwrap_or_default();
-                    if is_retryable_status(status) && retries < retry.max_retries {
+                    if idempotent && is_retryable_status(status) && retries < retry.max_retries {
                         let delay = exthttp::parse_retry_after(&headers)
                             .unwrap_or_else(|| next_backoff_delay(&retry.backoff, retries))
                             .min(retry.backoff.max_backoff);

@@ -144,13 +144,15 @@ pub struct IngestWriter {
     metrics: WriterMetrics,
 }
 
-fn ingest_writer_retriable_err(err: &KafkaClientError) -> bool {
+#[doc(hidden)]
+pub fn ingest_writer_retriable_err(err: &KafkaClientError) -> bool {
     match err {
         KafkaClientError::Broker(resp) => super::kgo_retry::is_retriable_response_error(*resp),
         KafkaClientError::Io(_)
         | KafkaClientError::RequestTimeout(_)
         | KafkaClientError::ConnectTimeout { .. }
         | KafkaClientError::ChosenBrokerDead
+        | KafkaClientError::ConnectionClosed
         | KafkaClientError::UnknownController(_)
         | KafkaClientError::UnknownBroker => true,
         _ => false,

@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,8 @@ use dashmap::DashMap;
 use mimir_common::activitytracker::ActivityTracker;
 use mimir_common::limiter::InflightLimiter;
 use mimir_common::services::{
-    describe_service, FnListener, ManagedBasicService, Service, ServiceContext, State,
+    describe_service, FnListener, ListenerHandle, ManagedBasicService, Service, ServiceContext,
+    State,
 };
 use mimir_common::shutdownmarker;
 use mimir_common::usagestats;
@@ -190,7 +191,9 @@ pub struct Ingester {
     _stop_done_rx: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
     pub(crate) shutdown_mtx: tokio::sync::Mutex<()>,
     lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
+    lifecycler_listener: Mutex<Option<ListenerHandle>>,
     partition_lifecycler_svc: Mutex<Option<Arc<ManagedBasicService>>>,
+    shutdown_push_drain_timeout_ms: AtomicU64,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// First failure of a watched subservice (`subservicesWatcher` in Go); makes the
     /// ingester service fail and the whole process stop.
@@ -538,7 +541,9 @@ impl Ingester {
             _stop_done_rx,
             shutdown_mtx: tokio::sync::Mutex::new(()),
             lifecycler_svc: Mutex::new(None),
+            lifecycler_listener: Mutex::new(None),
             partition_lifecycler_svc: Mutex::new(None),
+            shutdown_push_drain_timeout_ms: AtomicU64::new(10_000),
             background_tasks: Mutex::new(Vec::new()),
             subservice_failure: tokio::sync::watch::channel(None).0,
             usage_stats: Mutex::new(UsageStatsSnapshot::default()),
@@ -582,6 +587,8 @@ impl Ingester {
                 let weak = weak.clone();
                 Box::pin(async move {
                     if let Some(ing) = weak.upgrade() {
+                        ing.drain_inflight_pushes(ing.shutdown_push_drain_timeout())
+                            .await;
                         ing.flush().await;
                     }
                 })
@@ -1591,6 +1598,8 @@ impl Ingester {
             for t in tasks {
                 let _ = t.await;
             }
+            let pool = Arc::clone(&self.compute_worker_pool);
+            let _ = tokio::task::spawn_blocking(move || pool.stop()).await;
             let plc_svc_opt = self.partition_lifecycler_svc.lock().take();
             if let Some(svc) = plc_svc_opt {
                 svc.stop_async();
@@ -1600,6 +1609,9 @@ impl Ingester {
             if let Some(svc) = lc_svc_opt {
                 svc.stop_async();
                 let _ = svc.await_terminated().await;
+            }
+            if let Some(h) = self.lifecycler_listener.lock().take() {
+                h.stop();
             }
             let reader_opt = self.ingest_reader.write().take();
             if let Some(r) = reader_opt {
@@ -1719,8 +1731,7 @@ impl Ingester {
                         }
                     })),
                 );
-                // The listener stays registered for the lifetime of the lifecycler service.
-                std::mem::forget(svc.add_listener(listener));
+                *self.lifecycler_listener.lock() = Some(svc.add_listener(listener));
             }
             let lc_ctx = ServiceContext::background();
             svc.start_async(lc_ctx)
@@ -2029,7 +2040,12 @@ impl Ingester {
             let _ = svc.await_terminated().await;
         }
 
-        // 5. Graceful exit from the ring: the lifecycler switches to LEAVING, flushes via the
+        // 5. Drain in-flight push requests (bounded) before shutdown flush so no accepted
+        // pushes append after compaction/shipping starts.
+        self.drain_inflight_pushes(self.shutdown_push_drain_timeout())
+            .await;
+
+        // Graceful exit from the ring: the lifecycler switches to LEAVING, flushes via the
         // Ingester's FlushTransferer (if flush-on-shutdown is set) while heartbeating, sleeps
         // final_sleep and unregisters (dskit `Lifecycler.stopping`).
         // Without a lifecycler (tests only) flush directly.
@@ -2044,6 +2060,9 @@ impl Ingester {
         if let Some(svc) = lc_svc_opt {
             svc.stop_async();
             let _ = svc.await_terminated().await;
+        }
+        if let Some(h) = self.lifecycler_listener.lock().take() {
+            h.stop();
         }
 
         let reader_opt = self.ingest_reader.write().take();
@@ -2080,7 +2099,39 @@ impl Ingester {
     }
 }
 
+impl Drop for Ingester {
+    fn drop(&mut self) {
+        if let Some(h) = self.lifecycler_listener.get_mut().take() {
+            h.stop();
+        }
+    }
+}
+
 impl Ingester {
+    pub fn shutdown_push_drain_timeout(&self) -> Duration {
+        Duration::from_millis(self.shutdown_push_drain_timeout_ms.load(Ordering::Acquire))
+    }
+
+    pub fn set_shutdown_push_drain_timeout(&self, timeout: Duration) {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.shutdown_push_drain_timeout_ms
+            .store(ms, Ordering::Release);
+    }
+
+    pub async fn drain_inflight_pushes(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.inflight_push_requests.load(Ordering::Acquire) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    inflight = self.inflight_push_requests.load(Ordering::Acquire),
+                    "timed out waiting for in-flight push requests to drain before shutdown flush"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn run_initial_owned_series_check(&self) -> Result<(), IngesterError> {
         if let Some(ref strategy) = self.owned_series_strategy {
             match strategy.check_ring_for_changes() {

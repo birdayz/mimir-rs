@@ -691,7 +691,7 @@ impl BucketClient {
     ) -> Result<(), BucketError> {
         let data = data.into();
         let len = data.len() as u64;
-        let _sse = self.tenant_sse_override()?;
+        let sse = self.tenant_sse_override()?;
         if name.trim_start_matches('/').is_empty() {
             let timer = self.timer(metrics::OP_UPLOAD);
             let err = BucketError::InvalidPath(
@@ -718,17 +718,37 @@ impl BucketClient {
                 }
                 return self.upload(name, data).await;
             }
-            Backend::S3(_) => {
-                if opts.condition.is_some() || opts.content_type.is_some() {
-                    let timer = self.timer(metrics::OP_UPLOAD);
-                    if let Some(t) = timer {
-                        t.finish_upload(false, 0);
-                    }
-                    return Err(BucketError::UploadOptionInvalid(
-                        "custom upload options are not supported on S3".into(),
-                    ));
+            Backend::S3(b) => {
+                let timer = self.timer(metrics::OP_UPLOAD);
+                let result: Result<(), BucketError> = async {
+                    let (if_match, if_none_match) = match opts.condition {
+                        None => (None, None),
+                        Some(UploadCondition::IfNotExists) => (None, Some("*".to_string())),
+                        Some(UploadCondition::IfMatch(ObjectVersion::ETag(e))) => (Some(e), None),
+                        Some(UploadCondition::IfNotMatch(ObjectVersion::ETag(e))) => (None, Some(e)),
+                        Some(UploadCondition::IfMatch(ObjectVersion::Generation(_)))
+                        | Some(UploadCondition::IfNotMatch(ObjectVersion::Generation(_))) => {
+                            return Err(BucketError::UploadOptionInvalid(
+                                "S3 conditional uploads require ETag object versions".into(),
+                            ));
+                        }
+                    };
+                    b.upload_with_options(
+                        &self.full_name(name),
+                        s3::UploadSource::Bytes(data),
+                        sse,
+                        opts.content_type,
+                        if_match,
+                        if_none_match,
+                    )
+                    .await?;
+                    Ok(())
                 }
-                return self.upload(name, data).await;
+                .await;
+                if let Some(t) = timer {
+                    t.finish_upload(result.is_ok(), if result.is_ok() { len } else { 0 });
+                }
+                result
             }
             Backend::Store(store) => {
                 let timer = self.timer(metrics::OP_UPLOAD);
@@ -848,8 +868,36 @@ impl BucketClient {
                     let full = self.full_name(name);
                     let r = match range {
                         None => b.get(&full).await,
-                        Some((off, Some(len))) => b.get_range(&full, off as i64, len as i64).await,
-                        Some((off, None)) => b.get_range(&full, off as i64, -1).await,
+                        Some((off, Some(len))) => {
+                            let off_i64 = i64::try_from(off).map_err(|_| {
+                                BucketError::InvalidPath(
+                                    name.to_string(),
+                                    "range offset overflow".into(),
+                                )
+                            })?;
+                            let len_i64 = i64::try_from(len).map_err(|_| {
+                                BucketError::InvalidPath(
+                                    name.to_string(),
+                                    "range length overflow".into(),
+                                )
+                            })?;
+                            let _ = off_i64.checked_add(len_i64).ok_or_else(|| {
+                                BucketError::InvalidPath(
+                                    name.to_string(),
+                                    "range offset + length overflow".into(),
+                                )
+                            })?;
+                            b.get_range(&full, off_i64, len_i64).await
+                        }
+                        Some((off, None)) => {
+                            let off_i64 = i64::try_from(off).map_err(|_| {
+                                BucketError::InvalidPath(
+                                    name.to_string(),
+                                    "range offset overflow".into(),
+                                )
+                            })?;
+                            b.get_range(&full, off_i64, -1).await
+                        }
                     };
                     r.map_err(|e| {
                         if e.is_obj_not_found() {
@@ -1410,8 +1458,19 @@ impl BucketClient {
                     .trim_end_matches('/')
                     .rsplit('/')
                     .next()
-                    .unwrap_or(&name)
+                    .unwrap_or("")
                     .to_string();
+                if base.is_empty()
+                    || base == "."
+                    || base == ".."
+                    || base.contains('/')
+                    || base.contains('\\')
+                {
+                    return Err(BucketError::InvalidPath(
+                        name,
+                        "unsafe basename in download_dir".into(),
+                    ));
+                }
                 let child_dst = dst.join(&base);
                 if name.ends_with(DIR_DELIM) {
                     futs.push(Box::pin(async move {
@@ -1424,9 +1483,7 @@ impl BucketClient {
                         continue;
                     }
                     futs.push(Box::pin(async move {
-                        let data = self.download(&name).await?;
-                        tokio::fs::write(&child_dst, &data).await?;
-                        Ok(())
+                        self.stream_download_to_file(&name, &child_dst).await
                     }));
                 }
                 if futs.len() >= concurrency {
@@ -1440,6 +1497,108 @@ impl BucketClient {
             }
             Ok(())
         })
+    }
+
+    async fn stream_download_to_file(&self, name: &str, dst: &Path) -> Result<(), BucketError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::AsyncWriteExt as _;
+        static DL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+        let timer = self.timer(metrics::OP_GET);
+        let parent = dst.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let file_name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("obj");
+        let pid = std::process::id();
+        let seq = DL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = parent.join(format!(".{file_name}.{pid}.{seq}.tmp"));
+
+        let mut total_bytes = 0u64;
+        let result: Result<(), BucketError> = async {
+            if name.trim_start_matches('/').is_empty() {
+                return Err(BucketError::InvalidPath(
+                    name.to_string(),
+                    "object name cannot be empty".to_string(),
+                ));
+            }
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .await?;
+            let mut writer = tokio::io::BufWriter::new(file);
+
+            match &self.backend {
+                Backend::S3(b) => {
+                    let mut stream = b.get_stream(&self.full_name(name)).await.map_err(|e| {
+                        if e.is_obj_not_found() {
+                            BucketError::NotFound(name.to_string())
+                        } else {
+                            BucketError::S3(e)
+                        }
+                    })?;
+                    while let Some(chunk) = stream.next().await {
+                        let bytes = chunk.map_err(|e| {
+                            if e.is_obj_not_found() {
+                                BucketError::NotFound(name.to_string())
+                            } else {
+                                BucketError::S3(e)
+                            }
+                        })?;
+                        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                        writer.write_all(&bytes).await?;
+                    }
+                }
+                Backend::Store(store) => {
+                    let path = self.object_path(name)?;
+                    let res = match store.get(&path).await {
+                        Ok(r) => r,
+                        Err(object_store::Error::NotFound { .. }) => {
+                            return Err(BucketError::NotFound(name.to_string()));
+                        }
+                        Err(e) => return Err(BucketError::Store(e)),
+                    };
+                    let mut stream = res.into_stream();
+                    while let Some(chunk) = stream.next().await {
+                        let bytes = chunk?;
+                        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                        writer.write_all(&bytes).await?;
+                    }
+                }
+                Backend::Filesystem(fs) => {
+                    let path = self.object_path(name)?;
+                    let Some(store) = fs.get_existing().await? else {
+                        return Err(BucketError::NotFound(name.to_string()));
+                    };
+                    let res = match store.get(&path).await {
+                        Ok(r) => r,
+                        Err(object_store::Error::NotFound { .. }) => {
+                            return Err(BucketError::NotFound(name.to_string()));
+                        }
+                        Err(e) => return Err(map_fs_store_error(e)),
+                    };
+                    let mut stream = res.into_stream();
+                    while let Some(chunk) = stream.next().await {
+                        let bytes = chunk.map_err(map_fs_store_error)?;
+                        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                        writer.write_all(&bytes).await?;
+                    }
+                }
+            }
+            writer.flush().await?;
+            drop(writer);
+            tokio::fs::rename(&tmp_path, dst).await?;
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+        }
+        if let Some(t) = timer {
+            let expected =
+                self.expected_not_found && result.as_ref().is_err_and(BucketError::is_not_found);
+            t.finish_read(result.as_ref().map(|()| total_bytes).map_err(|_| ()), expected);
+        }
+        result
     }
 
     /// Ported from `github.com/thanos-io/objstore/objstore.go::UploadDir`.
@@ -1607,10 +1766,17 @@ async fn store_read_op(
             Err(e) => Err(BucketError::Store(e)),
         },
         Some((off, Some(len))) => {
+            let start = usize::try_from(off).map_err(|_| {
+                BucketError::InvalidPath(name.to_string(), "range offset overflow".into())
+            })?;
+            let end = off
+                .checked_add(len)
+                .and_then(|e| usize::try_from(e).ok())
+                .ok_or_else(|| {
+                    BucketError::InvalidPath(name.to_string(), "range end overflow".into())
+                })?;
             let opts = GetOptions {
-                range: Some(GetRange::Bounded(
-                    (off as usize)..(off.saturating_add(len) as usize),
-                )),
+                range: Some(GetRange::Bounded(start..end)),
                 ..Default::default()
             };
             match store.get_opts(path, opts).await {

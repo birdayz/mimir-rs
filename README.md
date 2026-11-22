@@ -1,6 +1,6 @@
 # mimir-rs
 
-`mimir-rs` is a Rust implementation of [Grafana Mimir](https://github.com/grafana/mimir) (reference commit `06de3ebd`) targeting `-target=ingester` and `-target=memberlist-kv`. It implements the same external wire, disk, configuration, and observability contracts as the Go binary.
+`mimir-rs` is a Rust implementation of [Grafana Mimir](https://github.com/grafana/mimir) (reference commit `06de3ebd`, pinned in [`UPSTREAM_MIMIR`](UPSTREAM_MIMIR)) targeting `-target=ingester` and `-target=memberlist-kv`. It implements the same external wire, disk, configuration, and observability contracts as the Go binary.
 
 A `mimir-rs` ingester runs inside a live Go Mimir cluster without changes to distributors, queriers, query-frontends, store-gateways, compactors, or Helm manifests. It supports both classic gRPC `Push` and Kafka `ingest_storage` ingestion, preserves Go CLI flags, strict YAML parsing, `memberlist`/`etcd`/`consul` ring gossip, WAL/WBL/TSDB/ULID disk layouts, S3/GCS/Azure object layouts, HTTP and gRPC status codes, and Prometheus metrics.
 
@@ -162,12 +162,10 @@ mimir -modules
 ### Prerequisites
 
 - Rust stable toolchain (Workspace Edition 2021).
-- For Go-oracle, conformance, and head-to-head benchmarks: Go toolchain (matching `.ref/mimir/go.mod`) and upstream Go Mimir cloned at `.ref/mimir`:
+- For Go-oracle, conformance, and head-to-head benchmarks: Go toolchain (matching `.ref/mimir/go.mod`) and upstream Go Mimir checked out at `.ref/mimir` (pinned in [`UPSTREAM_MIMIR`](UPSTREAM_MIMIR)):
 
 ```bash
-git clone --depth 1 https://github.com/grafana/mimir.git .ref/mimir
-git -C .ref/mimir fetch --depth 1 origin 06de3ebd2b12aa22861b96e6863b93a162c31e3c
-git -C .ref/mimir checkout 06de3ebd2b12aa22861b96e6863b93a162c31e3c
+./scripts/fetch-upstream-mimir.sh
 ```
 
 - For container and Helm e2e suites: `docker`, `just`, `k3d`, `helm`, `kubectl`, `jq`.

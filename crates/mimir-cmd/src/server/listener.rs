@@ -271,6 +271,16 @@ impl Acceptor {
     }
 }
 
+pub(super) fn is_fatal_accept_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe | io::ErrorKind::Unsupported
+    ) || matches!(
+        e.raw_os_error(),
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EOPNOTSUPP)
+    ) || (e.kind() == io::ErrorKind::Other && e.to_string() == "connection limiter closed")
+}
+
 fn is_transient_accept_error(e: &io::Error) -> bool {
     matches!(
         e.kind(),

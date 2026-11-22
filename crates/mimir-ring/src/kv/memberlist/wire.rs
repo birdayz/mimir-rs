@@ -508,19 +508,34 @@ pub fn decompress_payload(msg: &[u8]) -> (Option<CompressionType>, Result<Vec<u8
 }
 
 pub fn decompress_buffer(algo: CompressionType, buf: &[u8]) -> Result<Vec<u8>, String> {
+    decompress_buffer_with_limit(algo, buf, MAX_DECOMPRESS_BYTES)
+}
+
+pub fn decompress_buffer_with_limit(
+    algo: CompressionType,
+    buf: &[u8],
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     match algo {
-        CompressionType::Lzw => lzw_decompress(buf, MAX_DECOMPRESS_BYTES),
+        CompressionType::Lzw => lzw_decompress(buf, max_bytes),
         CompressionType::Snappy => {
             let decoded_len = snap::raw::decompress_len(buf)
                 .map_err(|e| format!("snappy decompress_len: {e}"))?;
-            if decoded_len > MAX_DECOMPRESS_BYTES {
+            if decoded_len > max_bytes {
                 return Err(format!(
-                    "memberlist: snappy-decompressed payload would exceed {MAX_DECOMPRESS_BYTES} bytes (claimed {decoded_len})"
+                    "memberlist: snappy-decompressed payload would exceed {max_bytes} bytes (claimed {decoded_len})"
                 ));
             }
-            snap::raw::Decoder::new()
+            let out = snap::raw::Decoder::new()
                 .decompress_vec(buf)
-                .map_err(|e| format!("snappy decompress: {e}"))
+                .map_err(|e| format!("snappy decompress: {e}"))?;
+            if out.len() > max_bytes {
+                return Err(format!(
+                    "memberlist: snappy-decompressed payload {} exceeds {max_bytes} bytes",
+                    out.len()
+                ));
+            }
+            Ok(out)
         }
     }
 }

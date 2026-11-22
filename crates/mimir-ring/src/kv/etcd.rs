@@ -1115,6 +1115,7 @@ impl EtcdKv {
                 }
             };
 
+            const MAX_WATCH_LINE_BUF_BYTES: usize = 64 * 1024 * 1024;
             let mut buf = Vec::new();
             let mut compacted_rev: Option<i64> = None;
             'stream: loop {
@@ -1124,10 +1125,26 @@ impl EtcdKv {
                 };
                 match chunk_res {
                     Ok(Some(chunk)) => {
+                        if buf.len().saturating_add(chunk.len()) > MAX_WATCH_LINE_BUF_BYTES {
+                            error!(
+                                key = key_label,
+                                len = buf.len().saturating_add(chunk.len()),
+                                max = MAX_WATCH_LINE_BUF_BYTES,
+                                "etcd watch line buffer exceeded max size; resetting stream"
+                            );
+                            buf.clear();
+                            break 'stream;
+                        }
+                        let old_len = buf.len();
                         buf.extend_from_slice(&chunk);
-                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                            let line = buf.drain(..=pos).collect::<Vec<u8>>();
-                            let trimmed = line.trim_ascii();
+                        let mut start = 0usize;
+                        let mut scan_from = old_len;
+                        let mut stop_after_chunk = false;
+                        while let Some(rel) = buf[scan_from..].iter().position(|&b| b == b'\n') {
+                            let end = scan_from + rel;
+                            scan_from = end + 1;
+                            let trimmed = buf[start..end].trim_ascii();
+                            start = end + 1;
                             if trimmed.is_empty() {
                                 continue;
                             }
@@ -1140,13 +1157,23 @@ impl EtcdKv {
                                 &mut on_event,
                             ) {
                                 LineAction::Continue => {}
-                                LineAction::BreakStream => break 'stream,
+                                LineAction::BreakStream => {
+                                    stop_after_chunk = true;
+                                    break;
+                                }
                                 LineAction::Compacted(rev) => {
                                     compacted_rev = Some(rev);
-                                    break 'stream;
+                                    stop_after_chunk = true;
+                                    break;
                                 }
                                 LineAction::StopWatching => return,
                             }
+                        }
+                        if start > 0 {
+                            buf.drain(..start);
+                        }
+                        if stop_after_chunk {
+                            break 'stream;
                         }
                     }
                     Ok(None) => {

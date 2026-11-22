@@ -22,6 +22,15 @@ build-release:
 build-release-arm64:
     cargo build --release --target aarch64-unknown-linux-gnu -p mimir-cmd -p mimir-conformance --examples
 
+fetch-upstream:
+    ./scripts/fetch-upstream-mimir.sh
+
+check-upstream:
+    ./scripts/fetch-upstream-mimir.sh --check
+
+build-version *args:
+    ./scripts/build-version.sh {{args}}
+
 go-oracle *args:
     ./scripts/build-go-oracle.sh {{args}}
 
@@ -76,7 +85,9 @@ docker-build tag="mimir-rs:local":
         --provenance=false \
         --sbom=false \
         --build-arg SOURCE_DATE_EPOCH=0 \
-        --build-arg revision=$(git rev-parse HEAD) \
+        --build-arg version="$(./scripts/build-version.sh)" \
+        --build-arg branch="$(git rev-parse --abbrev-ref HEAD)" \
+        --build-arg revision="$(git rev-parse --short=7 HEAD)" \
         --build-arg BUILD_JOBS=${CARGO_BUILD_JOBS:-} \
         --load \
         -t {{tag}} \
@@ -94,7 +105,9 @@ docker-build-repro out="target/mimir-rs-oci.tar":
         --provenance=false \
         --sbom=false \
         --build-arg SOURCE_DATE_EPOCH=0 \
-        --build-arg revision=$(git rev-parse HEAD) \
+        --build-arg version="$(./scripts/build-version.sh)" \
+        --build-arg branch="$(git rev-parse --abbrev-ref HEAD)" \
+        --build-arg revision="$(git rev-parse --short=7 HEAD)" \
         --output "type=oci,dest={{out}},rewrite-timestamp=true" \
         .
     sha256sum "{{out}}"

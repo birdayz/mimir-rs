@@ -548,6 +548,7 @@ impl Worker {
             records,
             high_watermark: rp.high_watermark,
             log_start_offset: rp.log_start_offset,
+            next_fetch_offset: cursor.offset,
             fetched_bytes: 0,
             err: None,
         })

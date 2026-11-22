@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use tower::ServiceExt;
 
 use super::body::TrackedBody;
-use super::listener::{finish_accept, Acceptor, PrefixedIo};
+use super::listener::{finish_accept, is_fatal_accept_error, Acceptor, PrefixedIo};
 
 /// Marker inserted into requests served by the HTTP server (as opposed to the httpgrpc bridge,
 /// which dskit serves without the HTTP middleware chain).
@@ -148,6 +148,43 @@ impl ConnState {
             *self.phase.lock() = (Phase::Idle, Instant::now());
         }
     }
+}
+
+struct RequestInflightGuard {
+    state: Option<Arc<ConnState>>,
+}
+
+impl RequestInflightGuard {
+    fn start(state: Arc<ConnState>) -> (Self, Instant) {
+        let started = state.request_started();
+        (Self { state: Some(state) }, started)
+    }
+
+    fn disarm(&mut self) {
+        self.state = None;
+    }
+}
+
+impl Drop for RequestInflightGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            state.request_finished();
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn probe_request_inflight_guard_drop_for_test() -> (usize, usize) {
+    let state = Arc::new(ConnState {
+        inflight: AtomicUsize::new(0),
+        phase: Mutex::new((Phase::Header, Instant::now())),
+        http2: true,
+    });
+    let (guard, _) = RequestInflightGuard::start(Arc::clone(&state));
+    let during = state.inflight.load(Ordering::Acquire);
+    drop(guard);
+    let after = state.inflight.load(Ordering::Acquire);
+    (during, after)
 }
 
 /// dskit `zeroResponseConn`: remembers the first bytes read from a connection until anything is
@@ -387,12 +424,31 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TimedIo<T> {
 /// within `graceful_shutdown_timeout` (Go `http.Server.Shutdown(ctx)`).
 pub async fn serve(acceptor: Acceptor, cfg: HttpServerConfig, router: Router, mut shutdown: watch::Receiver<bool>) {
     let mut conns: JoinSet<()> = JoinSet::new();
+    let mut accept_backoff = Duration::from_millis(5);
     loop {
+        while conns.try_join_next().is_some() {}
         tokio::select! {
             biased;
             _ = super::wait_shutdown(&mut shutdown) => break,
             res = acceptor.accept() => {
-                let Ok((stream, addr, guard)) = res else { continue };
+                let (stream, addr, guard) = match res {
+                    Ok(v) => {
+                        accept_backoff = Duration::from_millis(5);
+                        v
+                    }
+                    Err(err) => {
+                        tracing::error!(err = %err, "http server accept error");
+                        if is_fatal_accept_error(&err) {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = super::wait_shutdown(&mut shutdown) => break,
+                            _ = tokio::time::sleep(accept_backoff) => {}
+                        }
+                        accept_backoff = (accept_backoff * 2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                };
                 let opts = acceptor.options_arc();
                 let cfg = cfg.clone();
                 let router = router.clone();
@@ -509,7 +565,8 @@ async fn serve_conn<T>(
         let state = Arc::clone(&state);
         let router = router.clone();
         async move {
-            let header_start = state.request_started();
+            let (mut inflight_guard, header_start) =
+                RequestInflightGuard::start(Arc::clone(&state));
             let read_deadline = (!read_timeout.is_zero())
                 .then(|| header_start.checked_add(read_timeout))
                 .flatten();
@@ -531,7 +588,6 @@ async fn serve_conn<T>(
             let resp = match run_with_dynamic_deadline(fut, &shared_write_deadline).await {
                 Ok(r) => r,
                 Err(_) => {
-                    state.request_finished();
                     return Err::<hyper::Response<axum::body::Body>, std::io::Error>(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "http: write timeout",
@@ -551,13 +607,15 @@ async fn serve_conn<T>(
             }
             let final_write_deadline = shared_write_deadline.current();
             let st = Arc::clone(&state);
-            Ok(resp.map(|b| {
+            let resp = resp.map(|b| {
                 axum::body::Body::new(
                     TrackedBody::new(b)
                         .deadline(final_write_deadline, "http: write timeout")
                         .on_done(Box::new(move |_| st.request_finished())),
                 )
-            }))
+            });
+            inflight_guard.disarm();
+            Ok(resp)
         }
     });
 

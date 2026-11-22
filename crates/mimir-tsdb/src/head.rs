@@ -2541,16 +2541,12 @@ impl SeriesState {
         Ok((inserted, chunk_created, mmap_refs, write_epoch))
     }
 
-    fn write_sealed_head_chunks(
-        &mut self,
-        ref_id: u64,
-        writer: &mut HeadChunksWriter,
-    ) -> Result<Vec<MmappedChunk>, HeadChunksError> {
+    fn clone_compacted_sealed_head_chunks(&mut self) -> Vec<(i64, i64, EncodedChunk)> {
         let Some(ref mut cold) = self.cold else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         if cold.extra_head_chunks.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let mut out = Vec::with_capacity(cold.extra_head_chunks.len());
         for mc in &mut cold.extra_head_chunks {
@@ -2562,16 +2558,9 @@ impl SeriesState {
                 EncodedChunk::FloatHistogram(ref mut c) => c.compact(),
                 EncodedChunk::FloatHistogramSt(ref mut c) => c.compact(),
             }
-            let r = writer.write_chunk(ref_id, mc.min_time, mc.max_time, &mc.chunk, false)?;
-            out.push(MmappedChunk {
-                ref_id: r,
-                min_time: mc.min_time,
-                max_time: mc.max_time,
-                num_samples: mc.chunk.num_samples() as u16,
-                encoding: mc.chunk.encoding(),
-            });
+            out.push((mc.min_time, mc.max_time, mc.chunk.clone()));
         }
-        Ok(out)
+        out
     }
 
     fn promote_sealed_head_chunks(&mut self, mmapped: Vec<MmappedChunk>) {
@@ -4097,6 +4086,7 @@ pub struct Head {
     min_time: Arc<AtomicI64>,
     max_time: Arc<AtomicI64>,
     min_valid_time: AtomicI64,
+    gc_concurrent_mint: AtomicI64,
     min_ooo_time: AtomicI64,
     max_ooo_time: AtomicI64,
     ooo_time_window_ms: AtomicI64,
@@ -4539,6 +4529,7 @@ impl Head {
             min_time,
             max_time,
             min_valid_time: AtomicI64::new(min_valid_time),
+            gc_concurrent_mint: AtomicI64::new(i64::MAX),
             min_ooo_time: AtomicI64::new(i64::MAX),
             max_ooo_time: AtomicI64::new(i64::MIN),
             ooo_time_window_ms: AtomicI64::new(opts.ooo_time_window_ms),
@@ -4719,6 +4710,7 @@ impl Head {
             min_time: Arc::new(AtomicI64::new(i64::MAX)),
             max_time: Arc::new(AtomicI64::new(i64::MIN)),
             min_valid_time: AtomicI64::new(min_valid_time),
+            gc_concurrent_mint: AtomicI64::new(i64::MAX),
             min_ooo_time: AtomicI64::new(i64::MAX),
             max_ooo_time: AtomicI64::new(i64::MIN),
             ooo_time_window_ms: AtomicI64::new(0),
@@ -4803,6 +4795,7 @@ impl Head {
     ) -> Result<usize, HeadError> {
         let replay_start = Instant::now();
         let mut snapshot_pos: Option<(usize, usize)> = None;
+        let mut snapshot_ref_series: HashMap<u64, Arc<SeriesEntry>> = HashMap::new();
         if self.enable_memory_snapshot_on_shutdown.load(Ordering::Acquire) {
             if let Ok(Some((snap_dir, snap_idx, snap_offset))) = Self::last_chunk_snapshot(&self.dir) {
                 // In Go Prometheus, wlog.NewSize creates empty segment 00000000 before Head.Init
@@ -4813,8 +4806,9 @@ impl Head {
                     let _ = Self::delete_chunk_snapshots(&self.dir, usize::MAX, usize::MAX);
                 } else {
                     match self.load_chunk_snapshot(&snap_dir) {
-                        Ok(()) => {
+                        Ok(ref_series) => {
                             snapshot_pos = Some((snap_idx, snap_offset));
+                            snapshot_ref_series = ref_series;
                         }
                         Err(e) => {
                             tracing::error!(err = %e, "Failed to load chunk snapshot");
@@ -4833,7 +4827,7 @@ impl Head {
             in_order: mut mmapped_map,
             ooo: mut ooo_mmapped_map,
             last_ref: last_mmap_ref,
-        } = match self.load_mmapped_chunks(&reader) {
+        } = match self.load_mmapped_chunks(&reader, &snapshot_ref_series) {
             Ok(load) => load,
             Err((err, _)) => {
                 tracing::error!(err = %err, "Loading on-disk chunks failed");
@@ -4841,11 +4835,13 @@ impl Head {
                     self.metrics.mmap_chunk_corruptions_total.inc();
                 }
                 if snapshot_pos.take().is_some() {
+                    snapshot_ref_series.clear();
                     self.reset_in_memory_state_after_snapshot_err();
                 }
                 self.remove_corrupted_mmapped_chunks(&mut reader, &err)
             }
         };
+        drop(snapshot_ref_series);
         let post_repair_chunk_seq = reader.max_seq();
         *self.chunk_reader.write() = Some(reader);
 
@@ -5038,13 +5034,14 @@ impl Head {
         }
     }
 
-    /// Port of Go `Head.loadMmappedChunks` (no chunk snapshot: every chunk is collected
-    /// per series ref and attached during WAL replay). On error the partially collected
-    /// maps are returned together with `secondLastRef` as `last_ref`, like Go.
+    /// Port of Go `Head.loadMmappedChunks` (`head.go:1168-1261`): attaches chunks
+    /// directly to `ref_series` entries loaded from a chunk snapshot, or collects them
+    /// in `MmappedLoad` for WAL replay when not present in `ref_series`.
     #[allow(clippy::result_large_err)]
     fn load_mmapped_chunks(
         &self,
         reader: &HeadChunksReader,
+        ref_series: &HashMap<u64, Arc<SeriesEntry>>,
     ) -> Result<MmappedLoad, (HeadChunksError, MmappedLoad)> {
         let min_valid_time = self.min_valid_time.load(Ordering::Relaxed);
         let mut load = MmappedLoad::default();
@@ -5066,6 +5063,56 @@ impl Head {
                 num_samples: rec.num_samples,
                 encoding: rec.encoding,
             };
+            if let Some(entry) = ref_series.get(&rec.series_ref) {
+                if rec.is_ooo {
+                    self.metrics.chunks_created(1);
+                    {
+                        let mut st = entry.inner.lock();
+                        push_mmapped_chunk(&mut st.ooo_or_insert().ooo_mmapped_chunks, mc);
+                    }
+                    self.update_min_ooo_max_ooo_time(rec.mint, rec.maxt);
+                    return Ok(());
+                }
+                let mut st = entry.inner.lock();
+                if let Some(last) = st.mmapped().last() {
+                    if last.max_time >= rec.mint {
+                        self.metrics.mmap_chunk_corruptions_total.inc();
+                        return Err(HeadChunksError::OutOfSequenceChunk {
+                            series_ref: rec.series_ref,
+                            last_mint: last.min_time,
+                            last_maxt: last.max_time,
+                            mint: rec.mint,
+                            maxt: rec.maxt,
+                        });
+                    }
+                }
+                self.metrics.chunks_created(1);
+                push_mmapped_chunk(&mut st.mmapped_chunks, mc);
+                if st.has_active_chunk() && rec.maxt >= st.active_min_time {
+                    // The most recent head chunk was completed and m-mapped after the
+                    // snapshot was taken, so its samples are now covered by the mmapped
+                    // chunk we just loaded. Drop the snapshot active chunk.
+                    let (was_stale, was_hist, old_buckets) = st.sample_state();
+                    if was_stale {
+                        self.update_stale_series_metric_on_append(true, false);
+                    }
+                    if was_hist {
+                        self.update_native_histogram_metrics_on_append(true, false, old_buckets, 0);
+                    }
+                    st.clear_head_chunks();
+                    st.invalidate_xor_state();
+                    st.invalidate_xor2_state();
+                    st.clear_hist_state();
+                    st.clear_last_sample();
+                    self.metrics.chunks_removed(1);
+                }
+                entry
+                    .in_order_max_time
+                    .store(st.max_time(), Ordering::Release);
+                drop(st);
+                self.update_min_max_time(rec.mint, rec.maxt);
+                return Ok(());
+            }
             if rec.is_ooo {
                 load.ooo.entry(rec.series_ref).or_default().push(mc);
                 return Ok(());
@@ -5119,7 +5166,7 @@ impl Head {
         tracing::info!(
             "Deletion of mmap chunk files successful, reattempting m-mapping the on-disk chunks"
         );
-        match self.load_mmapped_chunks(reader) {
+        match self.load_mmapped_chunks(reader, &HashMap::new()) {
             Ok(load) => load,
             Err((load_err, mut partial)) => {
                 tracing::error!(
@@ -5140,15 +5187,43 @@ impl Head {
     }
 
     fn refresh_chunk_reader(&self) -> Result<(), HeadChunksError> {
+        // Hold `chunk_writer` across `chunk_reader.write()` (lock order: chunk_writer -> chunk_reader)
+        // so an active writable segment is never mapped as Mmap while concurrently written/rolled back.
+        let wg = self.chunk_writer.lock();
+        let active_seq = wg.as_ref().and_then(|w| w.active_file_seq());
+        self.refresh_chunk_reader_with_active(active_seq)
+    }
+
+    fn refresh_chunk_reader_with_active(
+        &self,
+        active_seq: Option<usize>,
+    ) -> Result<(), HeadChunksError> {
         let mut guard = self.chunk_reader.write();
         match *guard {
-            Some(ref mut reader) => reader.refresh_in_place(),
+            Some(ref mut reader) => reader.refresh_in_place_with_active(active_seq),
             None => {
-                let reader = HeadChunksReader::open_no_repair(&self.chunks_dir)?;
+                let reader = HeadChunksReader::open_no_repair_with_active(&self.chunks_dir, active_seq)?;
                 *guard = Some(reader);
                 Ok(())
             }
         }
+    }
+
+    fn rollback_chunk_writer(
+        &self,
+        writer: &mut HeadChunksWriter,
+        snap: crate::head_chunks::HeadChunksSnapshot,
+    ) {
+        // Drop snap.seq itself as well as all subsequent segments before rollback_snapshot
+        // truncates snap.seq via set_len, so no live Mmap can ever hit SIGBUS.
+        {
+            let mut guard = self.chunk_reader.write();
+            if let Some(ref mut reader) = *guard {
+                reader.drop_segments_from(snap.seq.max(1));
+            }
+        }
+        writer.rollback_snapshot(snap);
+        let _ = self.refresh_chunk_reader_with_active(writer.active_file_seq());
     }
 
     /// Returns `(num_symbols, arena_bytes)` for the Head's interned symbol table.
@@ -7680,7 +7755,7 @@ impl Head {
         let mut w = self.chunk_writer.lock();
         if let Some(ref mut wr) = *w {
             wr.cut_new_file()?;
-            self.refresh_chunk_reader()?;
+            self.refresh_chunk_reader_with_active(wr.active_file_seq())?;
         }
         Ok(())
     }
@@ -7738,6 +7813,19 @@ impl Head {
             .txs_stripe(ref_id)
             .map_or(0, |s| s.lock().get(&ref_id).map_or(0, TxRing::len));
         Some(len)
+    }
+
+    #[doc(hidden)]
+    pub fn txs_contains_for_test(&self, ref_id: u64) -> bool {
+        self.txs_stripe(ref_id)
+            .is_some_and(|s| s.lock().contains_key(&ref_id))
+    }
+
+    #[doc(hidden)]
+    pub fn delete_series_entry_for_test(&self, ref_id: u64) {
+        if let Some(entry) = self.series.get_by_id(ref_id) {
+            self.delete_series_entries_owned(vec![entry]);
+        }
     }
 
     #[doc(hidden)]
@@ -8090,12 +8178,13 @@ impl Head {
             self.init_time(mint);
         }
         if mint != i64::MAX {
+            self.gc_concurrent_mint.fetch_min(mint, Ordering::SeqCst);
             let mut cur = self.min_time.load(Ordering::Relaxed);
             while mint < cur {
                 match self.min_time.compare_exchange_weak(
                     cur,
                     mint,
-                    Ordering::AcqRel,
+                    Ordering::SeqCst,
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => break,
@@ -8636,6 +8725,7 @@ impl Head {
 
         let mut chunks_removed = 0u64;
         for e in entries {
+            self.txs_remove(e.ref_id);
             self.series.remove(&e);
             e.mark_gced();
             deleted.insert(e.ref_id);
@@ -8929,48 +9019,77 @@ impl Head {
         let _mmap_guard = self.mmap_mtx.lock();
         let mut count = 0usize;
         let mut max_mmapped_chunks = 0usize;
-        let mut pending: Vec<(Arc<SeriesEntry>, Vec<MmappedChunk>)> = Vec::new();
-        let mut cw_start_epoch: Option<u64> = None;
+        // Stage 1: Compact and collect sealed head chunks under `entry.inner` ONLY (without
+        // holding `chunk_writer`), preserving lock order and keeping `chunk_writer` contention
+        // strictly bounded to disk I/O.
+        type StagedSealedChunks = (Arc<SeriesEntry>, Vec<(i64, i64, EncodedChunk)>);
+        let mut staged: Vec<StagedSealedChunks> = Vec::new();
         let mut entries = Vec::with_capacity(256);
         for stripe in &self.series.stripes {
             entries.clear();
             StripeSeries::collect_stripe_into(stripe, &mut entries);
             for entry in entries.drain(..) {
-                // Lock order: entry.inner -> chunk_writer (matching commit()).
                 let mut st = entry.inner.lock();
                 if st.head_chunks_len() > 1 {
-                    let mut writer_guard = self.chunk_writer.lock();
-                    let Some(ref mut writer) = *writer_guard else {
-                        return Ok(count);
-                    };
-                    cw_start_epoch.get_or_insert_with(|| writer.discard_epoch());
-                    let mmapped = st.write_sealed_head_chunks(entry.ref_id, writer)?;
-                    drop(writer_guard);
+                    let sealed = st.clone_compacted_sealed_head_chunks();
                     drop(st);
-                    if !mmapped.is_empty() {
-                        count += mmapped.len();
-                        max_mmapped_chunks = max_mmapped_chunks.max(mmapped.len());
-                        pending.push((entry, mmapped));
+                    if !sealed.is_empty() {
+                        staged.push((entry, sealed));
                     }
                 }
             }
         }
 
-        if count > 0 {
+        if !staged.is_empty() {
+            // Stage 2: Hold `chunk_writer` continuously across flush -> take_snapshot ->
+            // write all staged chunks -> flush -> refresh_chunk_reader so concurrent OOO
+            // appenders cannot interleave writes inside the rollback snapshot window.
+            let mut pending: Vec<(Arc<SeriesEntry>, Vec<MmappedChunk>)> =
+                Vec::with_capacity(staged.len());
             {
                 let mut writer_guard = self.chunk_writer.lock();
-                if let Some(ref mut writer) = *writer_guard {
-                    if cw_start_epoch.is_some_and(|e| writer.discard_epoch() != e) {
-                        return Err(HeadChunksError::Io(io::Error::other(
-                            "unflushed head chunks discarded by prior flush error",
-                        )));
+                let Some(ref mut writer) = *writer_guard else {
+                    return Ok(0);
+                };
+                writer.flush()?;
+                let snap = writer.take_snapshot();
+
+                for (entry, sealed) in staged {
+                    let mut mmapped = Vec::with_capacity(sealed.len());
+                    for (mint, maxt, chunk) in sealed {
+                        let r = match writer.write_chunk(entry.ref_id, mint, maxt, &chunk, false) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                self.rollback_chunk_writer(writer, snap);
+                                return Err(e);
+                            }
+                        };
+                        mmapped.push(MmappedChunk {
+                            ref_id: r,
+                            min_time: mint,
+                            max_time: maxt,
+                            num_samples: chunk.num_samples() as u16,
+                            encoding: chunk.encoding(),
+                        });
                     }
-                    writer.flush()?;
+                    count += mmapped.len();
+                    max_mmapped_chunks = max_mmapped_chunks.max(mmapped.len());
+                    pending.push((entry, mmapped));
+                }
+
+                if let Err(e) = writer.flush() {
+                    self.rollback_chunk_writer(writer, snap);
+                    return Err(e);
+                }
+                // Refresh chunk_reader BEFORE releasing chunk_writer and BEFORE exposing
+                // mmapped_chunks on series state (lock order: chunk_writer -> chunk_reader.write).
+                if let Err(e) = self.refresh_chunk_reader_with_active(writer.active_file_seq()) {
+                    self.rollback_chunk_writer(writer, snap);
+                    return Err(e);
                 }
             }
-            // Refresh mmap reader BEFORE exposing new mmapped_chunks on series state,
-            // so concurrent readers never observe a ChunkDiskMapperRef not yet in chunk_reader.
-            self.refresh_chunk_reader()?;
+
+            // Stage 3: Expose newly mmapped chunks on each series.
             for (entry, mmapped) in pending {
                 let mut st = entry.inner.lock();
                 st.promote_sealed_head_chunks(mmapped);
@@ -9291,7 +9410,7 @@ impl Head {
                                         ) {
                                             Ok(r) => r,
                                             Err(e) => {
-                                                writer.rollback_snapshot(snap);
+                                                self.rollback_chunk_writer(writer, snap);
                                                 return Err(e.into());
                                             }
                                         };
@@ -9869,7 +9988,7 @@ impl Head {
                                     ) {
                                         Ok(r) => r,
                                         Err(e) => {
-                                            writer.rollback_snapshot(snap);
+                                            self.rollback_chunk_writer(writer, snap);
                                             return Err(e.into());
                                         }
                                     };
@@ -10924,6 +11043,7 @@ impl Head {
         let gc_start = Instant::now();
         let head_maxt = self.max_time();
         let _mmap_guard = self.mmap_mtx.lock();
+        self.gc_concurrent_mint.store(i64::MAX, Ordering::SeqCst);
         let (to_delete, actual_mint, mut min_ooo_time, min_mmap_seq) =
             self.gc_collect_and_unlink(mint);
 
@@ -10939,10 +11059,17 @@ impl Head {
 
         self.tombstones.truncate_before(mint);
 
-        if actual_mint > self.min_time() {
-            let clamped = actual_mint.min(self.appendable_min_valid_time());
-            self.min_time.store(clamped, Ordering::Release);
-            self.min_valid_time.store(clamped, Ordering::Release);
+        let concurrent_mint = self.gc_concurrent_mint.load(Ordering::SeqCst);
+        let effective_actual_mint = actual_mint.min(concurrent_mint);
+        if effective_actual_mint > self.min_time() {
+            let clamped = effective_actual_mint.min(self.appendable_min_valid_time());
+            self.min_time.store(clamped, Ordering::SeqCst);
+            let post_concurrent = self.gc_concurrent_mint.load(Ordering::SeqCst);
+            let final_mint = clamped.min(post_concurrent);
+            if post_concurrent < clamped {
+                self.min_time.fetch_min(post_concurrent, Ordering::AcqRel);
+            }
+            self.min_valid_time.store(final_mint, Ordering::Release);
         }
         // Go `Head.truncateSeriesAndChunkDiskMapper` (`prometheus/tsdb/head.go:1994-2000`):
         // if the allowed OOO window is lower than the min OOO time seen during GC, clamp
@@ -12625,6 +12752,12 @@ impl Head {
 
     /// Writes a chunk snapshot directory `chunk_snapshot.NNNNNN.OOOOOOOOOO` (Go `Head.ChunkSnapshot`).
     pub fn chunk_snapshot(&self) -> Result<Option<PathBuf>, HeadError> {
+        let _snap_guard = self.chunk_snapshot_mtx.lock();
+        // Flush sealed head chunks first (when called on an open Head) so `cold.extra_head_chunks`
+        // are persisted in `chunks_head/` before recording only the active chunk per series.
+        if !self.closed.load(Ordering::Acquire) {
+            self.mmap_head_chunks()?;
+        }
         let (wlast, woffset) = {
             let wal_guard = self.wal.lock();
             let Some(ref wal) = *wal_guard else {
@@ -12633,7 +12766,6 @@ impl Head {
             let (seg_opt, off) = wal.last_segment_and_offset()?;
             (seg_opt.unwrap_or(0), off)
         };
-        let _snap_guard = self.chunk_snapshot_mtx.lock();
         if let Some((existing_dir, cslast, csoffset)) = Self::last_chunk_snapshot(&self.dir)? {
             if wlast == cslast && woffset == csoffset {
                 return Ok(Some(existing_dir));
@@ -12759,7 +12891,10 @@ impl Head {
         Ok(Some(cpdir))
     }
 
-    fn load_chunk_snapshot(&self, snap_dir: &Path) -> Result<(), HeadError> {
+    fn load_chunk_snapshot(
+        &self,
+        snap_dir: &Path,
+    ) -> Result<HashMap<u64, Arc<SeriesEntry>>, HeadError> {
         let mut r = WlogReader::open_dir(snap_dir)?;
         let rec_dec = RecordDecoder::new();
         let mut mint = i64::MAX;
@@ -12892,7 +13027,7 @@ impl Head {
         if mint <= maxt {
             self.update_min_max_time(mint, maxt);
         }
-        Ok(())
+        Ok(series_by_ref)
     }
 
     fn reset_in_memory_state_after_snapshot_err(&self) {
@@ -19598,6 +19733,7 @@ mod tests {
                 min_time: Arc::new(AtomicI64::new(i64::MAX)),
                 max_time: Arc::new(AtomicI64::new(i64::MIN)),
                 min_valid_time: AtomicI64::new(i64::MIN),
+                gc_concurrent_mint: AtomicI64::new(i64::MAX),
                 min_ooo_time: AtomicI64::new(i64::MAX),
                 max_ooo_time: AtomicI64::new(i64::MIN),
                 ooo_time_window_ms: AtomicI64::new(0),

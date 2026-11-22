@@ -272,14 +272,19 @@ impl<W: Write> Writer<W> {
                 for ch in &chunks {
                     let ch = *ch;
                     handles.push(scope.spawn(move || {
-                        (ch.len(), Self::encode_one_chunk(ch, level, snappy, custom))
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            (ch.len(), Self::encode_one_chunk(ch, level, snappy, custom))
+                        }))
                     }));
                 }
                 handles
                     .into_iter()
-                    .map(|h| h.join().expect("s2 worker thread"))
-                    .collect()
-            })
+                    .map(|h| match h.join() {
+                        Ok(Ok(res)) => Ok(res),
+                        Ok(Err(_)) | Err(_) => Err(io::Error::other("s2 worker thread panicked")),
+                    })
+                    .collect::<io::Result<Vec<_>>>()
+            })?
         } else {
             chunks
                 .iter()

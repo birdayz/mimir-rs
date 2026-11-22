@@ -57,6 +57,7 @@ case $KV_MODE in memberlist|etcd) ;; *) echo "KV_MODE must be memberlist|etcd, g
 for t in "$K3D" "$HELM" "$KUBECTL" docker jq awk; do
   command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 2; }
 done
+"$ROOT/scripts/fetch-upstream-mimir.sh" --check
 [[ -d $CHART_SRC ]] || { echo "chart not found at $CHART_SRC (is .ref/mimir present?)" >&2; exit 2; }
 
 mkdir -p "$OUT_DIR"

@@ -1592,6 +1592,8 @@ impl Lifecycler {
             ring = %self.ring_name,
             "changing instance state from"
         );
+        // Note: per upstream dskit/ring/lifecycler.go (W18-SR-02), local state is NOT rolled
+        // back on CAS failure so the periodic heartbeat loop continues publishing the target state.
         self.state.write().state = target;
         self.update_consul_locked().await
     }
@@ -1609,6 +1611,8 @@ impl Lifecycler {
             return Ok(());
         }
         info!(readOnly = read_only, ring = %self.ring_name, "changing read-only state of instance in the ring");
+        // Note: per upstream dskit/ring/lifecycler.go (W18-SR-02), local read_only is NOT rolled
+        // back on CAS failure so the heartbeat loop publishes it on recovery.
         self.set_read_only_internal(read_only, Some(SystemTime::now()));
         self.update_consul_locked().await
     }

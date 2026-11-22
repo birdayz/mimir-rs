@@ -1131,13 +1131,12 @@ fn test_amlabel_matchers_to_prom_match_type_values() {
     let last_type = AmMatchType::RegexNotMatch;
     // just checking that our assumption on that MatchType enums are the same is correct
     for v in (AmMatchType::Equal as u8)..=(last_type as u8) {
-        let mt = AmMatchType::from_u8(v);
+        let mt = AmMatchType::from_u8(v).expect("valid AmMatchType value");
         assert_eq!(mt.to_string(), mt.to_prom().to_string());
     }
     // and that nobody just added more match types in amlabels,
-    let res = std::panic::catch_unwind(|| AmMatchType::from_u8(last_type as u8 + 1).to_string());
     assert!(
-        res.is_err(),
+        AmMatchType::from_u8(last_type as u8 + 1).is_none(),
         "amlabels.MatchNotRegexp is expected to be the last enum value, update the test and check mapping"
     );
 }
