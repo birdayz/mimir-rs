@@ -18,7 +18,7 @@ use mimir_proto::s2::{
 };
 use rand::{Rng, RngCore, SeedableRng};
 
-const S2_TESTDATA: &str = "/home/birdy/go/pkg/mod/github.com/klauspost/compress@v1.20.4/s2/testdata";
+const S2_TESTDATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/testdata/s2");
 
 fn read_zip_entries(zip_name: &str) -> Vec<(String, Vec<u8>)> {
     let zip_path = Path::new(S2_TESTDATA).join(zip_name);
