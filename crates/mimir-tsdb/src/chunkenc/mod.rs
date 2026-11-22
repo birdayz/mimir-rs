@@ -371,6 +371,15 @@ impl EncodedChunk {
     }
 }
 
+const MAX_POOLED_CHUNKS: usize = 64;
+
+fn push_capped<T>(pool: &parking_lot::Mutex<Vec<T>>, item: T) {
+    let mut guard = pool.lock();
+    if guard.len() < MAX_POOLED_CHUNKS {
+        guard.push(item);
+    }
+}
+
 /// Chunk object pool matching Prometheus `tsdb/chunkenc.Pool`.
 #[derive(Default)]
 pub struct Pool {
@@ -426,13 +435,28 @@ impl Pool {
     pub fn put(&self, c: &mut EncodedChunk) -> Result<(), ChunkError> {
         c.reset(Vec::new());
         match c {
-            EncodedChunk::Xor(_) => self.xor.lock().push(XorChunk::from_bytes(Vec::new())),
-            EncodedChunk::Xor2(_) => self.xor2.lock().push(Xor2Chunk::from_bytes(Vec::new())),
-            EncodedChunk::Histogram(_) => self.histogram.lock().push(HistogramChunk::from_bytes(Vec::new())),
-            EncodedChunk::HistogramSt(_) => self.histogram_st.lock().push(HistogramStChunk::from_bytes(Vec::new())),
-            EncodedChunk::FloatHistogram(_) => self.float_histogram.lock().push(FloatHistogramChunk::from_bytes(Vec::new())),
-            EncodedChunk::FloatHistogramSt(_) => self.float_histogram_st.lock().push(FloatHistogramStChunk::from_bytes(Vec::new())),
+            EncodedChunk::Xor(_) => push_capped(&self.xor, XorChunk::from_bytes(Vec::new())),
+            EncodedChunk::Xor2(_) => push_capped(&self.xor2, Xor2Chunk::from_bytes(Vec::new())),
+            EncodedChunk::Histogram(_) => push_capped(&self.histogram, HistogramChunk::from_bytes(Vec::new())),
+            EncodedChunk::HistogramSt(_) => push_capped(&self.histogram_st, HistogramStChunk::from_bytes(Vec::new())),
+            EncodedChunk::FloatHistogram(_) => push_capped(&self.float_histogram, FloatHistogramChunk::from_bytes(Vec::new())),
+            EncodedChunk::FloatHistogramSt(_) => push_capped(&self.float_histogram_st, FloatHistogramStChunk::from_bytes(Vec::new())),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_put_caps_capacity_at_64() {
+        let pool = Pool::new();
+        for _ in 0..128 {
+            let mut c = pool.get(Encoding::Xor, Vec::new()).unwrap();
+            pool.put(&mut c).unwrap();
+        }
+        assert!(pool.xor.lock().len() <= MAX_POOLED_CHUNKS);
     }
 }

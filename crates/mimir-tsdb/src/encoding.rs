@@ -479,65 +479,29 @@ pub mod fileutil {
     #[cfg(all(target_os = "linux", not(miri)))]
     mod linux_dio {
         use super::*;
-        use std::os::raw::{c_char, c_int, c_uint};
         use std::os::unix::io::AsRawFd;
 
-        const F_GETFL: c_int = 3;
-        const F_SETFL: c_int = 4;
-        const STATX_DIOALIGN: c_uint = 0x2000;
-        const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
-        const AT_EMPTY_PATH: c_int = 0x1000;
-        const AT_STATX_DONT_SYNC: c_int = 0x4000;
-
-        #[cfg(any(
-            target_arch = "x86_64",
-            target_arch = "x86",
-            target_arch = "riscv64",
-            target_arch = "s390x",
-            target_arch = "loongarch64"
-        ))]
-        const O_DIRECT: c_int = 0o40000;
-        #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-        const O_DIRECT: c_int = 0o200000;
-        #[cfg(not(any(
-            target_arch = "x86_64",
-            target_arch = "x86",
-            target_arch = "riscv64",
-            target_arch = "s390x",
-            target_arch = "loongarch64",
-            target_arch = "aarch64",
-            target_arch = "arm"
-        )))]
-        const O_DIRECT: c_int = 0o40000;
+        // Kernel ABI constants (identical across all Linux architectures, independent of musl/glibc version).
+        const STATX_DIOALIGN: libc::c_uint = 0x2000;
+        const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
 
         #[repr(C, align(8))]
         struct RawStatx {
             data: [u8; 256],
         }
 
-        extern "C" {
-            fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-            fn statx(
-                dirfd: c_int,
-                pathname: *const c_char,
-                flags: c_int,
-                mask: c_uint,
-                statxbuf: *mut RawStatx,
-            ) -> c_int;
-        }
-
         pub fn enable_direct_io(f: &File) -> io::Result<()> {
             let fd = f.as_raw_fd();
             // SAFETY: valid fd and F_GETFL takes no extra argument.
-            let flags = unsafe { fcntl(fd, F_GETFL) };
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if (flags & O_DIRECT) == O_DIRECT {
+            if (flags & libc::O_DIRECT) == libc::O_DIRECT {
                 return Ok(());
             }
             // SAFETY: valid fd and integer flag argument for F_SETFL.
-            let rc = unsafe { fcntl(fd, F_SETFL, flags | O_DIRECT) };
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_DIRECT) };
             if rc < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -546,13 +510,14 @@ pub mod fileutil {
 
         pub fn file_direct_io_rqmts(f: &File) -> io::Result<DirectIORqmts> {
             let mut stx = RawStatx { data: [0u8; 256] };
-            let flags = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_STATX_DONT_SYNC;
+            let flags = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH | AT_STATX_DONT_SYNC;
             let empty = b"\0";
-            // SAFETY: valid fd, NUL-terminated empty path, and 256-byte aligned statx buffer.
+            // SAFETY: SYS_statx with valid fd, NUL-terminated empty path, and 256-byte aligned statx buffer.
             let rc = unsafe {
-                statx(
+                libc::syscall(
+                    libc::SYS_statx,
                     f.as_raw_fd(),
-                    empty.as_ptr().cast::<c_char>(),
+                    empty.as_ptr().cast::<libc::c_char>(),
                     flags,
                     STATX_DIOALIGN,
                     &mut stx,
@@ -560,8 +525,7 @@ pub mod fileutil {
             };
             if rc < 0 {
                 let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(38) {
-                    // ENOSYS
+                if err.raw_os_error() == Some(libc::ENOSYS) {
                     return Ok(DirectIORqmts::default());
                 }
                 return Err(err);
@@ -707,28 +671,61 @@ pub mod fileutil {
             }
         }
 
-        fn direct_io_write(&mut self, p: &[u8], padding: usize) -> io::Result<usize> {
-            let relevant = p.len() - padding;
-            let n = self.f.write(p)?;
-            let written_relevant = if n < relevant {
-                let mut err = io::Error::new(io::ErrorKind::WriteZero, "short write");
-                if !n.is_multiple_of(self.alignment_rqmts.offset_align) {
-                    self.invalid = true;
+        fn direct_io_write_to(
+            f: &mut File,
+            rqmts: &DirectIORqmts,
+            invalid: &mut bool,
+            writer_err: &mut Option<io::Error>,
+            p: &[u8],
+            padding: usize,
+        ) -> (usize, Option<io::Error>) {
+            let mut relevant = p.len() - padding;
+            let mut err: Option<io::Error> = None;
+            match f.write(p) {
+                Ok(n) => {
+                    if n < relevant {
+                        relevant = n;
+                        err = Some(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            format!("short write (wrote {n} < {})", p.len() - padding),
+                        ));
+                    } else if n > relevant {
+                        let written_padding = (n - relevant) as i64;
+                        if let Err(seek_err) = f.seek(SeekFrom::Current(-written_padding)) {
+                            let wrapped = io::Error::new(
+                                seek_err.kind(),
+                                format!("seek to discard written padding {written_padding}: {seek_err}"),
+                            );
+                            if writer_err.is_none() {
+                                *writer_err = Some(wrapped);
+                            }
+                        }
+                    }
                 }
-                err = io::Error::new(err.kind(), format!("{err} (wrote {n} < {relevant})"));
-                return Err(err);
-            } else {
-                if n > relevant {
-                    let written_padding = (n - relevant) as i64;
-                    self.f.seek(SeekFrom::Current(-written_padding))?;
+                Err(e) => {
+                    relevant = 0;
+                    err = Some(e);
                 }
-                relevant
-            };
-
-            if !written_relevant.is_multiple_of(self.alignment_rqmts.offset_align) {
-                self.invalid = true;
             }
-            Ok(written_relevant)
+            if !relevant.is_multiple_of(rqmts.offset_align) {
+                *invalid = true;
+            }
+            (relevant, err)
+        }
+
+        fn direct_io_write(&mut self, p: &[u8], padding: usize) -> io::Result<usize> {
+            let (written, err) = Self::direct_io_write_to(
+                &mut self.f,
+                &self.alignment_rqmts,
+                &mut self.invalid,
+                &mut self.err,
+                p,
+                padding,
+            );
+            match err {
+                Some(e) => Err(e),
+                None => Ok(written),
+            }
         }
 
         fn can_direct_io_write(&self, p: &[u8]) -> bool {
@@ -753,19 +750,26 @@ pub mod fileutil {
                 self.buf[self.n..u_offset].fill(0);
             }
             let padding = u_offset - self.n;
-            let aligned_ptr = self.buf[..u_offset].to_vec();
-            let mut tmp = aligned_block(u_offset, &self.alignment_rqmts);
-            tmp.copy_from_slice(&aligned_ptr);
-            match self.direct_io_write(&tmp, padding) {
-                Ok(_n) => {
-                    self.n = 0;
-                    Ok(())
+            let (written, err) = Self::direct_io_write_to(
+                &mut self.f,
+                &self.alignment_rqmts,
+                &mut self.invalid,
+                &mut self.err,
+                &self.buf[..u_offset],
+                padding,
+            );
+            if let Some(e) = err {
+                if written > 0 && written < self.n {
+                    self.buf.copy_within(written..self.n, 0);
                 }
-                Err(e) => {
+                self.n = self.n.saturating_sub(written);
+                if self.err.is_none() {
                     self.err = Some(Self::clone_err(&e));
-                    Err(e)
                 }
+                return Err(e);
             }
+            self.n = 0;
+            Ok(())
         }
 
         pub fn write_bytes(&mut self, mut p: &[u8]) -> io::Result<usize> {
@@ -825,8 +829,21 @@ pub mod fileutil {
             self.flush_internal()
         }
 
-        pub fn reset(&mut self, mut f: File) -> io::Result<()> {
+        pub fn reset(&mut self, f: File) -> io::Result<()> {
             let rqmts = file_direct_io_rqmts(&f)?;
+            self.reset_with_rqmts(f, rqmts)
+        }
+
+        fn reset_with_rqmts(&mut self, mut f: File, rqmts: DirectIORqmts) -> io::Result<()> {
+            if !is_aligned(&self.buf, &rqmts) {
+                let new_len = self
+                    .buf
+                    .len()
+                    .max(DEFAULT_BUF_SIZE)
+                    .div_ceil(rqmts.offset_align)
+                    * rqmts.offset_align;
+                self.buf = aligned_block(new_len, &rqmts);
+            }
             self.alignment_rqmts = rqmts;
             let gap = check_initial_unaligned_offset(&mut f, &rqmts)?;
             self.offset_alignment_gap = gap;
@@ -845,6 +862,58 @@ pub mod fileutil {
 
         fn flush(&mut self) -> io::Result<()> {
             self.flush_writer()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn direct_io_writer_reset_reallocates_for_larger_alignment() {
+            let dir = tempfile::tempdir().unwrap();
+            let p1 = dir.path().join("f1");
+            let p2 = dir.path().join("f2");
+            let f1 = OpenOptions::new().create(true).write(true).truncate(true).open(&p1).unwrap();
+            let f2 = OpenOptions::new().create(true).write(true).truncate(true).open(&p2).unwrap();
+
+            let small_rqmts = DirectIORqmts {
+                memory_align: 512,
+                offset_align: 512,
+            };
+            let large_rqmts = DirectIORqmts {
+                memory_align: 4096,
+                offset_align: 4096,
+            };
+            let mut w = DirectIOWriter {
+                buf: aligned_block(512, &small_rqmts),
+                n: 0,
+                f: f1,
+                offset_alignment_gap: 0,
+                alignment_rqmts: small_rqmts,
+                err: None,
+                invalid: false,
+            };
+
+            w.write_bytes(&[0xAB; 100]).unwrap();
+            w.flush_writer().unwrap();
+            assert!(w.is_invalid());
+
+            // Transition to a file with larger memory/offset alignment.
+            w.reset_with_rqmts(f2, large_rqmts).unwrap();
+            assert!(!w.is_invalid());
+            assert!(is_aligned(&w.buf, &large_rqmts));
+            assert!(w.buf.len() >= 4096);
+            assert!(w.buf.len().is_multiple_of(large_rqmts.offset_align));
+
+            // Writing 500 bytes (< 4096 offset_align) and flushing pads up to 4096 without OOB panic.
+            let payload = vec![0xCD; 500];
+            w.write_bytes(&payload).unwrap();
+            w.flush_writer().unwrap();
+            assert!(w.is_invalid());
+            let disk = fs::read(&p2).unwrap();
+            assert_eq!(disk.len(), 4096);
+            assert_eq!(&disk[..500], payload.as_slice());
         }
     }
 }
