@@ -342,20 +342,19 @@ impl ClientCertVerifier for PinnedSelfSignedFallbackVerifier {
         match self.inner.verify_client_cert(end_entity, intermediates, now) {
             Ok(v) => Ok(v),
             Err(err) => {
-                if intermediates.is_empty()
+                let is_ca_used_as_ee = matches!(
+                    &err,
+                    rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other))
+                        if format!("{other:?}").contains("CaUsedAsEndEntity")
+                );
+                if is_ca_used_as_ee
+                    && intermediates.is_empty()
                     && self
                         .pinned_ders
                         .iter()
                         .any(|d| d.as_slice() == end_entity.as_ref())
-                    && !matches!(
-                        err,
-                        rustls::Error::InvalidCertificate(
-                            rustls::CertificateError::Expired
-                                | rustls::CertificateError::NotValidYet
-                                | rustls::CertificateError::Revoked
-                        )
-                    )
                 {
+                    verify_der_cert_validity_and_client_eku(end_entity.as_ref(), now)?;
                     return Ok(ClientCertVerified::assertion());
                 }
                 Err(err)
@@ -628,6 +627,129 @@ impl ClientCertVerifier for SanCheckingClientCertVerifier {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.inner.supported_verify_schemes()
     }
+}
+
+/// Validates X.509 DER `Validity` (`notBefore <= now <= notAfter`) and optional EKU
+/// extension (`id-kp-clientAuth` or `anyExtendedKeyUsage`) for pinned self-signed CA certs
+/// rejected by `rustls-webpki` with `CaUsedAsEndEntity`.
+fn verify_der_cert_validity_and_client_eku(
+    der: &[u8],
+    now: UnixTime,
+) -> Result<(), rustls::Error> {
+    let parse_err = || rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding);
+    let (tag, cert_seq, _) = read_der_tlv(der).ok_or_else(parse_err)?;
+    if tag != 0x30 {
+        return Err(parse_err());
+    }
+    let (tbs_tag, mut rest, _) = read_der_tlv(cert_seq).ok_or_else(parse_err)?;
+    if tbs_tag != 0x30 {
+        return Err(parse_err());
+    }
+    // Optional [0] version
+    if rest.first() == Some(&0xa0) {
+        let (_, _, next) = read_der_tlv(rest).ok_or_else(parse_err)?;
+        rest = next;
+    }
+    // serialNumber, signature, issuer
+    for _ in 0..3 {
+        let (_, _, next) = read_der_tlv(rest).ok_or_else(parse_err)?;
+        rest = next;
+    }
+    // validity SEQUENCE { notBefore, notAfter }
+    let (val_tag, val_body, mut after_val) = read_der_tlv(rest).ok_or_else(parse_err)?;
+    if val_tag != 0x30 {
+        return Err(parse_err());
+    }
+    let (nb_tag, nb_bytes, nb_rest) = read_der_tlv(val_body).ok_or_else(parse_err)?;
+    let (na_tag, na_bytes, _) = read_der_tlv(nb_rest).ok_or_else(parse_err)?;
+    let not_before = parse_x509_time(nb_tag, nb_bytes).ok_or_else(parse_err)?;
+    let not_after = parse_x509_time(na_tag, na_bytes).ok_or_else(parse_err)?;
+    let now_secs = now.as_secs();
+    if now_secs < not_before {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::NotValidYet,
+        ));
+    }
+    if now_secs > not_after {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired,
+        ));
+    }
+    // Check optional EKU extension (OID 2.5.29.37 = 0x55 0x1d 0x25)
+    const EKU_OID: &[u8] = &[0x55, 0x1d, 0x25];
+    const CLIENT_AUTH_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+    const ANY_EKU_OID: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+    while !after_val.is_empty() {
+        let (t, v, next) = read_der_tlv(after_val).ok_or_else(parse_err)?;
+        after_val = next;
+        if t == 0xa3 {
+            let (exts_tag, mut exts, _) = read_der_tlv(v).ok_or_else(parse_err)?;
+            if exts_tag != 0x30 {
+                return Err(parse_err());
+            }
+            while !exts.is_empty() {
+                let (et, mut ev, enext) = read_der_tlv(exts).ok_or_else(parse_err)?;
+                exts = enext;
+                if et != 0x30 {
+                    continue;
+                }
+                let (oid_t, oid_v, after_oid) = read_der_tlv(ev).ok_or_else(parse_err)?;
+                if oid_t != 0x06 || oid_v != EKU_OID {
+                    continue;
+                }
+                ev = after_oid;
+                if ev.first() == Some(&0x01) {
+                    let (_, _, after_crit) = read_der_tlv(ev).ok_or_else(parse_err)?;
+                    ev = after_crit;
+                }
+                let (oct_t, oct_v, _) = read_der_tlv(ev).ok_or_else(parse_err)?;
+                if oct_t != 0x04 {
+                    return Err(parse_err());
+                }
+                let (seq_t, mut oids, _) = read_der_tlv(oct_v).ok_or_else(parse_err)?;
+                if seq_t != 0x30 {
+                    return Err(parse_err());
+                }
+                let mut client_ok = false;
+                while !oids.is_empty() {
+                    let (ot, ov, onext) = read_der_tlv(oids).ok_or_else(parse_err)?;
+                    oids = onext;
+                    if ot == 0x06 && (ov == CLIENT_AUTH_OID || ov == ANY_EKU_OID) {
+                        client_ok = true;
+                    }
+                }
+                if !client_ok {
+                    return Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::InvalidPurpose,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_x509_time(tag: u8, bytes: &[u8]) -> Option<u64> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    let s = s.strip_suffix('Z')?;
+    let (year, rest): (i32, &str) = match tag {
+        // UTCTime: YYMMDDHHMMSSZ
+        0x17 if s.len() == 12 => {
+            let yy: i32 = s[0..2].parse().ok()?;
+            (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &s[2..])
+        }
+        // GeneralizedTime: YYYYMMDDHHMMSSZ
+        0x18 if s.len() == 14 => (s[0..4].parse().ok()?, &s[4..]),
+        _ => return None,
+    };
+    let month: u32 = rest[0..2].parse().ok()?;
+    let day: u32 = rest[2..4].parse().ok()?;
+    let hour: u32 = rest[4..6].parse().ok()?;
+    let min: u32 = rest[6..8].parse().ok()?;
+    let sec: u32 = rest[8..10].parse().ok()?;
+    let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_opt(hour, min, sec)?;
+    u64::try_from(dt.and_utc().timestamp()).ok()
 }
 
 fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {

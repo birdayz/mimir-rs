@@ -496,7 +496,8 @@ impl WebAuthHandler {
                 Some(cached) => cached,
                 None => {
                     let _g = self.bcrypt_mtx.lock();
-                    let ok = valid_user && bcrypt_verify(hashed, pass.as_bytes());
+                    let pw_ok = bcrypt_verify(hashed, pass.as_bytes());
+                    let ok = valid_user && pw_ok;
                     self.cache.set(cache_key, ok);
                     ok
                 }
@@ -610,7 +611,11 @@ pub fn bcrypt_verify(hash: &str, password: &[u8]) -> bool {
         return false;
     };
     let actual = eksblowfish_crypt(cost, &salt, password);
-    actual[..23] == expected[..23]
+    let mut diff = 0u8;
+    for i in 0..23 {
+        diff |= actual[i] ^ expected[i];
+    }
+    diff == 0
 }
 
 fn bcrypt_decode_base64(input: &[u8], out_len: usize) -> Option<Vec<u8>> {

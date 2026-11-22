@@ -61,7 +61,7 @@ const NUM_THREADS: usize = 4;
 pub use mimir_config::S3_SUPPORTED_STORAGE_CLASSES as SUPPORTED_STORAGE_CLASSES;
 
 /// minio-go `encrypt.ServerSide`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ServerSideEncryption {
     /// `encrypt.NewSSE()`.
     S3,
@@ -69,6 +69,20 @@ pub enum ServerSideEncryption {
     Kms { key_id: String, context: Option<Vec<u8>> },
     /// `encrypt.NewSSEC(key)`: 256-bit (32-byte) customer-provided AES256 key.
     C([u8; 32]),
+}
+
+impl std::fmt::Debug for ServerSideEncryption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::S3 => f.write_str("S3"),
+            Self::Kms { key_id, context } => f
+                .debug_struct("Kms")
+                .field("key_id", key_id)
+                .field("context", context)
+                .finish(),
+            Self::C(_) => f.write_str("C([REDACTED])"),
+        }
+    }
 }
 
 impl ServerSideEncryption {

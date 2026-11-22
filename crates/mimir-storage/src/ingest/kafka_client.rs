@@ -3411,6 +3411,12 @@ fn decode_mixed_or_legacy_batches(
         let slice = raw_records.slice(pos..pos + frame_len);
         pos += frame_len;
         if magic == 2 {
+            if slice.len() < 61 {
+                return Err(KafkaClientError::UnexpectedResponse(format!(
+                    "truncated v2 RecordBatch: len {} < 61",
+                    slice.len()
+                )));
+            }
             let base_offset = be_i64(&slice, 0);
             let last_offset_delta = i32::from_be_bytes([slice[23], slice[24], slice[25], slice[26]]);
             let batch_end = base_offset.saturating_add(last_offset_delta as i64);
@@ -3506,7 +3512,9 @@ fn decode_legacy_message_set(
             0
         };
         for im in inner {
-            let abs_offset = base_offset + im.offset;
+            let abs_offset = base_offset.checked_add(im.offset).ok_or_else(|| {
+                KafkaClientError::UnexpectedResponse("legacy message offset overflow".to_string())
+            })?;
             if abs_offset >= fetch_offset {
                 last_batch_end_offset = Some(
                     last_batch_end_offset.map_or(abs_offset, |prev| prev.max(abs_offset)),
