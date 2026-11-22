@@ -4937,11 +4937,16 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
                     err: None,
                 })
             }
-            Err(e) => Box::new(VecChunkSeriesSet {
-                items: Vec::new(),
-                pos: 0,
-                err: Some(QuerierError::Other(e.to_string())),
-            }),
+            Err(e) => {
+                if let (Some((sink, _)), Some(before)) = (&self.select_stats, stats_len_before) {
+                    sink.lock().truncate(before);
+                }
+                Box::new(VecChunkSeriesSet {
+                    items: Vec::new(),
+                    pos: 0,
+                    err: Some(QuerierError::Other(e.to_string())),
+                })
+            }
         }
     }
 
