@@ -228,6 +228,75 @@ fn s2_decode(dst: &mut [u8], src: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Compresses `input` into S2 stream-framed bytes (`\xff\x06\x00\x00S2sTwO` header + chunks).
+pub fn compress_framed(input: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 2 + 32);
+    compress_framed_into(input, &mut out)?;
+    Ok(out)
+}
+
+/// Compresses `input` into S2 stream-framed bytes, appending into `out`.
+pub fn compress_framed_into(input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    out.extend_from_slice(b"\xff\x06\x00\x00S2sTwO");
+    if input.is_empty() {
+        return Ok(());
+    }
+    let mut enc = snap::raw::Encoder::new();
+    let mut scratch = Vec::new();
+    for chunk in input.chunks(MAX_SNAPPY_BLOCK_SIZE) {
+        let crc = masked_crc32c(chunk);
+        let max_comp = snap::raw::max_compress_len(chunk.len());
+        if scratch.len() < max_comp {
+            scratch.resize(max_comp, 0);
+        }
+        let comp_len = enc
+            .compress(chunk, &mut scratch)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if comp_len < chunk.len() - (chunk.len() / 8) {
+            let payload_len = 4 + comp_len;
+            out.push(CHUNK_TYPE_COMPRESSED);
+            out.push((payload_len & 0xff) as u8);
+            out.push(((payload_len >> 8) & 0xff) as u8);
+            out.push(((payload_len >> 16) & 0xff) as u8);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&scratch[..comp_len]);
+        } else {
+            let payload_len = 4 + chunk.len();
+            out.push(CHUNK_TYPE_UNCOMPRESSED);
+            out.push((payload_len & 0xff) as u8);
+            out.push(((payload_len >> 8) & 0xff) as u8);
+            out.push(((payload_len >> 16) & 0xff) as u8);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+    }
+    Ok(())
+}
+
+/// S2 gRPC compressor matching `pkg/util/grpcencoding/s2/s2.go`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct S2Compressor;
+
+impl S2Compressor {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn name(&self) -> &'static str {
+        S2_ENCODING_NAME
+    }
+
+    pub fn compress(&self, input: &[u8]) -> io::Result<Vec<u8>> {
+        compress_framed(input)
+    }
+
+    pub fn decompress(&self, input: &[u8], max_out_len: usize) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        decompress_framed_into(input, &mut out, max_out_len)?;
+        Ok(out)
+    }
+}
+
 /// Decompresses S2 (or Snappy) stream-framed bytes into `out`, enforcing `max_out_len` on the
 /// number of decompressed bytes appended.
 pub fn decompress_framed_into(

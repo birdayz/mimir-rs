@@ -20,7 +20,9 @@
 //! - github.com/prometheus/client_golang/prometheus/histogram.go (native histograms)
 
 pub mod activitytracker;
+pub mod atomicfs;
 pub mod backoff;
+pub mod compartments;
 pub mod errors;
 pub mod gosort;
 pub mod grpc_deadline;
