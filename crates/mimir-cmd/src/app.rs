@@ -333,9 +333,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             modules.add("activity-tracker", st.state_fn());
         }
 
-        // Install SIGTERM/SIGINT listeners before any module starts: Go's signal handler runs for
-        // the whole lifetime of the service manager, including module startup.
-        let (shutdown_sig, _second_signal_guard) = install_shutdown_signal(Arc::clone(&logger))?;
+        // Install SIGTERM/SIGINT/SIGQUIT listeners before any module starts: Go's signal handler
+        // runs for the whole lifetime of the service manager, including module startup.
+        let (shutdown_sig, second_signal_guard) = install_shutdown_signal(Arc::clone(&logger))?;
         server.set_shutdown_requested(Arc::clone(&shutdown_requested));
 
         // Active groups cleanup service (pkg/mimir/modules.go initActiveGroupsCleanupService): a
@@ -395,11 +395,25 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             usage_stats_svc = Some(svc);
         }
 
-        Ok::<_, anyhow::Error>((overrides, server, bound_grpc_addr, shutdown_sig, active_groups))
+        Ok::<_, anyhow::Error>((
+            overrides,
+            server,
+            bound_grpc_addr,
+            shutdown_sig,
+            second_signal_guard,
+            active_groups,
+        ))
     }
     .await;
 
-    let (overrides, mut server, bound_grpc_addr, mut shutdown_sig, active_groups) = match pre_sanity {
+    let (
+        overrides,
+        mut server,
+        bound_grpc_addr,
+        mut shutdown_sig,
+        _second_signal_guard,
+        active_groups,
+    ) = match pre_sanity {
         Ok(v) => v,
         Err(e) => {
             cleanup_pre_server_modules(
@@ -463,6 +477,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         )
         .await;
         logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
+        sd_notify("STOPPING=1");
         if signaled {
             return Ok(());
         }
@@ -1089,6 +1104,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     if !signaled && startup_err.is_none() && runtime_failure.is_none() {
         logger.log(LogLevel::Info, &[("msg", "Application started")]);
+        sd_notify("READY=1");
         // 9. Wait for SIGTERM / SIGINT, or for any module to fail (POST /ingester/shutdown stops
         // only the Ingester service, keeping HTTP/gRPC alive until SIGTERM, matching Go Mimir).
         let ingester_failure = async {
@@ -1285,9 +1301,10 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
 
     logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
-    // A shutdown signal received while services are still starting is a requested shutdown,
-    // not a failure (exit 0); any other module failure makes the process exit non-zero.
-    if signaled {
+    sd_notify("STOPPING=1");
+    // Go Mimir.Run suppresses "failed services" whenever a shutdown signal was received
+    // (shutdownRequested == true), exiting 0 instead of 1.
+    if signaled || shutdown_requested.load(Ordering::Acquire) {
         return Ok(());
     }
     if startup_err.is_some() || runtime_failure.is_some() || ingester_failed {
@@ -1479,11 +1496,48 @@ fn stop_timer_module(
     log_module_stopped(logger, module);
 }
 
-struct SecondSignalGuard(Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>);
+/// Sends a systemd `sd_notify` datagram (e.g. `READY=1`, `STOPPING=1`) to `NOTIFY_SOCKET`,
+/// matching `github.com/okzk/sdnotify.SdNotify` called in `pkg/mimir/mimir.go`.
+/// Best-effort: silently no-ops if `NOTIFY_SOCKET` is unset or unreachable.
+fn sd_notify(state: &str) {
+    #[cfg(unix)]
+    {
+        let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
+            return;
+        };
+        if socket_path.is_empty() {
+            return;
+        }
+        let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else {
+            return;
+        };
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(abstract_name) = socket_path.strip_prefix('@') {
+            use std::os::linux::net::SocketAddrExt;
+            if let Ok(addr) = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name) {
+                let _ = sock.send_to_addr(state.as_bytes(), &addr);
+            }
+            return;
+        }
+        let _ = sock.send_to(state.as_bytes(), &socket_path);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = state;
+    }
+}
+
+struct SecondSignalGuard {
+    second_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    sigquit_task: Option<tokio::task::JoinHandle<()>>,
+}
 
 impl Drop for SecondSignalGuard {
     fn drop(&mut self) {
-        if let Some(h) = self.0.lock().take() {
+        if let Some(h) = self.second_task.lock().take() {
+            h.abort();
+        }
+        if let Some(h) = self.sigquit_task.take() {
             h.abort();
         }
     }
@@ -1493,7 +1547,6 @@ type ShutdownSignalFuture = std::pin::Pin<Box<dyn std::future::Future<Output = (
 
 fn install_shutdown_signal(logger: Arc<LogSink>) -> Result<(ShutdownSignalFuture, SecondSignalGuard)> {
     let second_task = Arc::new(parking_lot::Mutex::new(None));
-    let guard = SecondSignalGuard(Arc::clone(&second_task));
 
     #[cfg(unix)]
     {
@@ -1502,6 +1555,26 @@ fn install_shutdown_signal(logger: Arc<LogSink>) -> Result<(ShutdownSignalFuture
                 .context("install SIGTERM handler")?;
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("install SIGINT handler")?;
+        // dskit signals/signals.go Handler.Loop(): catch SIGQUIT, log, and continue running
+        // instead of terminating the process with a core dump.
+        let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
+            .context("install SIGQUIT handler")?;
+        let quit_logger = Arc::clone(&logger);
+        let sigquit_task = Some(tokio::spawn(async move {
+            while sigquit.recv().await.is_some() {
+                quit_logger.log(
+                    LogLevel::Info,
+                    &[(
+                        "msg",
+                        "=== received SIGQUIT ===\n*** goroutine dump...\n(rust process; see /debug/pprof/profile for stack profiles)\n*** end",
+                    )],
+                );
+            }
+        }));
+        let guard = SecondSignalGuard {
+            second_task: Arc::clone(&second_task),
+            sigquit_task,
+        };
         let fut = Box::pin(async move {
             tokio::select! {
                 _ = sigterm.recv() => {}
@@ -1535,7 +1608,10 @@ fn install_shutdown_signal(logger: Arc<LogSink>) -> Result<(ShutdownSignalFuture
 
     #[cfg(not(unix))]
     {
-        let _ = second_task;
+        let guard = SecondSignalGuard {
+            second_task: Arc::clone(&second_task),
+            sigquit_task: None,
+        };
         let fut = Box::pin(async move {
             let _ = tokio::signal::ctrl_c().await;
             logger.log(
@@ -2437,5 +2513,32 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("no active tokio runtime"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sd_notify_sends_ready_and_stopping_to_notify_socket() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("notify.sock");
+        let receiver = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let prev = std::env::var("NOTIFY_SOCKET").ok();
+        std::env::set_var("NOTIFY_SOCKET", &sock_path);
+        sd_notify("READY=1");
+        sd_notify("STOPPING=1");
+        match prev {
+            Some(v) => std::env::set_var("NOTIFY_SOCKET", v),
+            None => std::env::remove_var("NOTIFY_SOCKET"),
+        }
+
+        let mut buf = [0u8; 64];
+        let n1 = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"READY=1");
+        let n2 = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n2], b"STOPPING=1");
     }
 }

@@ -398,24 +398,38 @@ impl Server {
             .name("mimir-rpc-rt".to_string())
             .spawn(move || {
                 rt.block_on(async move {
-                    let http = tokio::spawn(http_server::serve(
+                    let mut http = tokio::spawn(http_server::serve(
                         Acceptor::new(http_l, http_accept),
                         http_cfg,
                         http_router,
                         shutdown_rx.clone(),
                     ));
-                    let grpc = tokio::spawn(grpc_server::serve(
+                    let mut grpc = tokio::spawn(grpc_server::serve(
                         Acceptor::new(grpc_l, grpc_accept),
                         grpc_cfg,
                         grpc_routes,
                         grpc_ctx,
-                        shutdown_rx,
+                        shutdown_rx.clone(),
                     ));
-                    // dskit Shutdown: HTTP first (bounded), then gRPC GracefulStop.
-                    let _ = http.await;
-                    let _ = grpc.await;
+                    // Match dskit Server.Run: if EITHER listener exits or panics before shutdown
+                    // was requested, notify stopped_tx immediately so the service manager fails
+                    // the server module instead of leaving the process half-dead.
+                    tokio::select! {
+                        _ = &mut http => {
+                            if !*shutdown_rx.borrow() {
+                                let _ = stopped_tx.send(true);
+                            }
+                            let _ = grpc.await;
+                        }
+                        _ = &mut grpc => {
+                            if !*shutdown_rx.borrow() {
+                                let _ = stopped_tx.send(true);
+                            }
+                            let _ = http.await;
+                        }
+                    }
+                    let _ = stopped_tx.send(true);
                 });
-                let _ = stopped_tx.send(true);
             })
             .context("spawning mimir-rpc runtime thread")?;
 

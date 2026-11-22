@@ -1780,6 +1780,12 @@ impl SingleClusterPartitionReader {
     }
 
     pub async fn stop(&self) {
+        // Idempotent: a reader already terminated (or already torn down via fail_and_stop
+        // after tasks exited) must not re-run stop_dependencies() and re-dial Kafka or repeat
+        // the pre-commit fsync.
+        if self.state() == ReaderState::Terminated {
+            return;
+        }
         let was_failed = self.state() == ReaderState::Failed;
         if !was_failed {
             self.state
@@ -1793,7 +1799,9 @@ impl SingleClusterPartitionReader {
         if let Some(handle) = self.task.lock().await.take() {
             let _ = handle.await;
         }
-        self.stop_dependencies().await;
+        if !was_failed && !self.client.is_closed() {
+            self.stop_dependencies().await;
+        }
         if !was_failed && self.state() != ReaderState::Failed {
             self.state
                 .store(ReaderState::Terminated as u8, Ordering::SeqCst);

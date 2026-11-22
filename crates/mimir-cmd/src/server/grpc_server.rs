@@ -593,6 +593,8 @@ async fn serve_conn<T>(
             _ = conn.as_mut() => return,
             _ = super::wait_shutdown(&mut shutdown) => {
                 conn.as_mut().graceful_shutdown();
+                // grpc-go GracefulStop waits up to 5s on an idle transport after GOAWAY
+                // (default keepalive_timeout is 20s -> 5s; smaller values allow fast shutdown/tests).
                 let idle_grace = if cfg.keepalive_timeout.is_zero() {
                     Duration::from_secs(5)
                 } else {

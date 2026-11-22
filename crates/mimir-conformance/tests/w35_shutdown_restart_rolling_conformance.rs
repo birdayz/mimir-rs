@@ -541,7 +541,9 @@ fn w35_shutdown_delay_ready_503_inflight_rpc_and_unprefaced_grpc_tcp() {
 }
 
 // =============================================================================================
-// 3. SIGKILL mid-write + snapshot + WAL checkpoint + .tmp debris crash recovery (TSDB-1..10)
+// 3. SIGKILL mid-write + flush + OOO + .tmp debris crash recovery (TSDB-1..10; memory-snapshot
+//    & checkpoint edge cases are covered by Head unit tests since memory_snapshot_on_shutdown
+//    is explicitly rejected at config validation)
 // =============================================================================================
 
 #[test]
@@ -598,7 +600,7 @@ fn w35_sigkill_mid_write_and_dirty_tmp_crash_recovery() {
             proc1.sigterm();
             assert_exit_ok(&mut proc1, Duration::from_secs(30));
 
-            // Boot #2: write wave 2 -> flush (compacts block + WAL checkpoint!) -> write wave 3
+            // Boot #2: write wave 2 -> flush (compacts block) -> write wave 3
             // (including an OOO sample) -> plant simulated SIGKILL crash debris -> SIGKILL!
             let mut proc2 = start_mimir(which, "crash-2", &dir, &yaml, &[]);
             wait_ready(&client, &mut proc2, ports[0], Duration::from_secs(30)).await;
@@ -1058,12 +1060,16 @@ activity_tracker:
 
         // Start continuous RF=3 quorum writer pushing numbered samples to all 3 nodes.
         let stop_writer = Arc::new(AtomicBool::new(false));
-        let acked: Arc<Mutex<Vec<(i64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+        type SampleList = Vec<(i64, f64)>;
+        let acked: Arc<Mutex<SampleList>> = Arc::new(Mutex::new(Vec::new()));
+        let per_node_acked: Arc<Mutex<Vec<SampleList>>> =
+            Arc::new(Mutex::new(vec![Vec::new(); nodes.len()]));
         let grpc_ports: Vec<u16> = nodes.iter().map(|n| n.grpc).collect();
         let base_ts = now_ms() - 60_000;
         let writer_handle = {
             let stop = Arc::clone(&stop_writer);
             let acked = Arc::clone(&acked);
+            let per_node_acked = Arc::clone(&per_node_acked);
             tokio::spawn(async move {
                 let mut seq: i64 = 0;
                 while !stop.load(Ordering::Acquire) {
@@ -1071,8 +1077,8 @@ activity_tracker:
                     // or cross creation_grace_period on slow 2-core CI runners.
                     let ts = base_ts + seq * 50;
                     let val = seq as f64 + 0.5;
-                    let mut ok_count = 0usize;
-                    for &gp in &grpc_ports {
+                    let mut ok_nodes = Vec::with_capacity(grpc_ports.len());
+                    for (node_idx, &gp) in grpc_ports.iter().enumerate() {
                         let ch_res = Channel::from_shared(format!("http://127.0.0.1:{gp}"))
                             .unwrap()
                             .connect_timeout(Duration::from_millis(500))
@@ -1098,12 +1104,18 @@ activity_tracker:
                             )
                             .await;
                             if res.is_ok() {
-                                ok_count += 1;
+                                ok_nodes.push(node_idx);
                             }
                         }
                     }
+                    if !ok_nodes.is_empty() {
+                        let mut per_node = per_node_acked.lock().unwrap();
+                        for idx in &ok_nodes {
+                            per_node[*idx].push((ts, val));
+                        }
+                    }
                     // RF=3 quorum = at least 2 of 3 replicas acknowledged.
-                    if ok_count >= 2 {
+                    if ok_nodes.len() >= 2 {
                         acked.lock().unwrap().push((ts, val));
                     }
                     seq += 1;
@@ -1152,10 +1164,13 @@ activity_tracker:
             expected.len()
         );
 
-        // Union query results across all 3 replicas (matching Mimir Querier RF=3 read path).
+        // Verify BOTH per-replica WAL durability (each individual node — including both Rust
+        // nodes — must still serve every sample it individually acknowledged, so Go cannot mask
+        // a Rust WAL loss) AND RF=3 quorum union durability across all 3 replicas.
+        let per_node_expected: Vec<Vec<(i64, f64)>> = per_node_acked.lock().unwrap().clone();
         let mut union_samples: BTreeSet<(i64, u64)> = BTreeSet::new();
         let series_key = vec![("__name__".to_string(), "rolling_counter".to_string())];
-        for n in &nodes {
+        for (node_idx, n) in nodes.iter().enumerate() {
             let mut grpc = connect_ingester(n.grpc).await;
             let got = query_all_series(
                 &mut grpc,
@@ -1164,13 +1179,34 @@ activity_tracker:
                 base_ts + 3_600_000,
             )
             .await;
+            let mut node_samples: BTreeSet<(i64, u64)> = BTreeSet::new();
             if let Some(vals) = got.get(&series_key) {
                 for v in vals {
                     if let DecodedVal::Float(t, f) = *v {
+                        node_samples.insert((t, f.to_bits()));
                         union_samples.insert((t, f.to_bits()));
                     }
                 }
             }
+            assert!(
+                !per_node_expected[node_idx].is_empty(),
+                "node {} acknowledged 0 samples during rolling restart",
+                n.id
+            );
+            let node_missing: Vec<_> = per_node_expected[node_idx]
+                .iter()
+                .copied()
+                .filter(|(ts, val)| !node_samples.contains(&(*ts, val.to_bits())))
+                .collect();
+            assert!(
+                node_missing.is_empty(),
+                "node {} ({}) lost {} / {} individually-acked samples across restart: {:?}",
+                n.id,
+                n.which.name(),
+                node_missing.len(),
+                per_node_expected[node_idx].len(),
+                &node_missing[..node_missing.len().min(10)]
+            );
         }
 
         let mut missing = Vec::new();
@@ -1575,9 +1611,26 @@ activity_tracker:
                 proc1.name,
                 offset_file.display()
             );
+            let offset_json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&offset_file).unwrap())
+                    .expect("valid kafka-offset.json");
+            assert!(
+                offset_json
+                    .get("offset")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|o| o >= 0),
+                "{}: expected non-negative persisted offset in kafka-offset.json, got {offset_json}",
+                proc1.name
+            );
 
-            // Restart on the same PVC against the same broker -> must resume cleanly & retain data!
-            let mut proc2 = start_mimir(which, "kafka-2", &dir, &yaml, &[]);
+            // Restart on the same PVC with `consume_from_position_at_startup: last-offset` so
+            // Boot #2 resumes strictly AFTER the committed offset and MUST serve the earlier
+            // sample via TSDB WAL replay (not by re-reading offset 0 from Kafka).
+            let yaml_boot2 = yaml.replace(
+                "consume_from_position_at_startup: start",
+                "consume_from_position_at_startup: last-offset",
+            );
+            let mut proc2 = start_mimir(which, "kafka-2", &dir, &yaml_boot2, &[]);
             wait_ready(&client, &mut proc2, http, Duration::from_secs(45)).await;
 
             let mut grpc_c = connect_ingester(grpc).await;
