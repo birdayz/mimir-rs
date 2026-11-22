@@ -163,7 +163,7 @@ fn gen_ca_and_certs(dir: &Path, serial: u32) -> (PathBuf, PathBuf, PathBuf, Path
 }
 
 fn et_testdata_dir() -> PathBuf {
-    PathBuf::from("/home/birdy/go/pkg/mod/github.com/prometheus/exporter-toolkit@v0.20.0/web/testdata")
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/testdata/exporter_toolkit_web"))
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) {
