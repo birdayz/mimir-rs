@@ -49,7 +49,7 @@ impl TraceContext {
     }
 
     pub fn to_traceparent(&self) -> String {
-        let mut flags = self.trace_flags & 0x03;
+        let mut flags = self.trace_flags;
         if self.sampled {
             flags |= 0x01;
         } else {
@@ -719,11 +719,7 @@ pub fn parse_traceparent(header: &str) -> Option<TraceContext> {
     if parts[3].len() != 2 || !parts[3].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
         return None;
     }
-    let flags = u8::from_str_radix(parts[3], 16).ok()?;
-    if version == "00" && flags > 3 {
-        return None;
-    }
-    let trace_flags = flags & 0x03;
+    let trace_flags = u8::from_str_radix(parts[3], 16).ok()?;
     let sc = TraceContext {
         trace_id,
         span_id,
@@ -2126,8 +2122,16 @@ mod tests {
         assert!(j_dbg.jaeger_debug_id.is_some());
 
         assert!(parse_traceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
-        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff").is_none());
-        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04").is_none());
+        // W3C Trace Context §3.2.2.3: all 8-bit lowercase hex flags 00..=ff are valid,
+        // preserving all 8 bits while bit 0 determines sampled.
+        let tp_ff = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff").unwrap();
+        assert!(tp_ff.is_sampled());
+        assert_eq!(tp_ff.trace_flags, 0xff);
+        assert_eq!(tp_ff.to_traceparent(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff");
+        let tp_04 = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04").unwrap();
+        assert!(!tp_04.is_sampled());
+        assert_eq!(tp_04.trace_flags, 0x04);
+        assert_eq!(tp_04.to_traceparent(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04");
         assert!(parse_uber_trace_id("0:70e8b02d28e4337b:0:1").is_none());
 
         let tp_random_sampled = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03").unwrap();

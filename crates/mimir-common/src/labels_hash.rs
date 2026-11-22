@@ -27,8 +27,8 @@ pub const ALERT_NAME_LABEL: &str = "alertname";
 /// Separator byte used in `HashForLabels` and `HashWithoutLabels`.
 pub const HASH_SEP: u8 = 0xff;
 
-/// Maximum encodable label name/value length in Prometheus stringlabels (2^24).
-pub const MAX_STRINGLABELS_STRING_LEN: usize = 1 << 24;
+/// Maximum encodable label name/value length in Prometheus stringlabels (2^24 - 1 = 0x00ff_ffff).
+pub const MAX_STRINGLABELS_STRING_LEN: usize = (1 << 24) - 1;
 
 /// Normal quiet NaN bit pattern in Prometheus.
 pub const NORMAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0001;

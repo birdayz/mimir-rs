@@ -1022,20 +1022,27 @@ pub async fn delete_no_compact_marker(
     bucket.delete_strict(&marker_file).await
 }
 
-pub(crate) fn atomic_write_file(target: &Path, data: &[u8]) -> std::io::Result<()> {
+#[doc(hidden)]
+pub fn atomic_write_file(target: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let parent = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let tmp = target.with_extension(format!(
-        "{}.tmp",
-        target
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("file")
-    ));
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.{pid}.{seq}.tmp"));
     let write_res = (|| -> std::io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
         drop(f);

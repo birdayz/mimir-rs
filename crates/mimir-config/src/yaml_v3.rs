@@ -123,6 +123,7 @@ struct Parser {
     event: Option<Event>,
     anchors: HashMap<String, usize>,
     nodes: Vec<Node>,
+    depth: usize,
     _input: Vec<u8>,
 }
 
@@ -163,6 +164,7 @@ impl Parser {
             event: None,
             anchors: HashMap::new(),
             nodes: Vec::new(),
+            depth: 0,
             _input: input,
         })
     }
@@ -306,8 +308,16 @@ impl Parser {
     }
 
     fn parse_child(&mut self, parent: usize) -> Result<usize, String> {
-        let child = self
-            .parse()?
+        const MAX_PARSE_DEPTH: usize = 256;
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(format!(
+                "yaml: exceeded maximum nesting depth of {MAX_PARSE_DEPTH}"
+            ));
+        }
+        self.depth += 1;
+        let res = self.parse();
+        self.depth -= 1;
+        let child = res?
             .ok_or_else(|| "yaml: attempted to go past the end of stream; corrupted value?".to_string())?;
         self.nodes[parent].content.push(child);
         Ok(child)
@@ -784,6 +794,20 @@ fn load_types() -> Result<Types, String> {
 #[derive(Debug)]
 struct Fail(String);
 
+const ALIAS_RATIO_RANGE_LOW: usize = 400_000;
+const ALIAS_RATIO_RANGE_HIGH: usize = 4_000_000;
+const ALIAS_RATIO_RANGE: f64 = (ALIAS_RATIO_RANGE_HIGH - ALIAS_RATIO_RANGE_LOW) as f64;
+
+fn allowed_alias_ratio(decode_count: usize) -> f64 {
+    if decode_count <= ALIAS_RATIO_RANGE_LOW {
+        0.99
+    } else if decode_count >= ALIAS_RATIO_RANGE_HIGH {
+        0.10
+    } else {
+        0.99 - 0.89 * ((decode_count - ALIAS_RATIO_RANGE_LOW) as f64 / ALIAS_RATIO_RANGE)
+    }
+}
+
 struct Decoder<'a> {
     doc: &'a Document,
     types: &'static Types,
@@ -792,6 +816,9 @@ struct Decoder<'a> {
     aliases: HashSet<usize>,
     merge_visited: HashSet<usize>,
     merged_fields: Option<HashSet<String>>,
+    decode_count: usize,
+    alias_count: usize,
+    alias_depth: usize,
 }
 
 /// `TypeError.Error()`.
@@ -809,14 +836,38 @@ impl<'a> Decoder<'a> {
             aliases: HashSet::new(),
             merge_visited: HashSet::new(),
             merged_fields: None,
+            decode_count: 0,
+            alias_count: 0,
+            alias_depth: 0,
         }
+    }
+
+    fn count_and_check_aliases(&mut self) -> Result<(), Fail> {
+        self.decode_count += 1;
+        if self.alias_depth > 0 {
+            self.alias_count += 1;
+        }
+        if self.alias_count > 100
+            && self.decode_count > 1000
+            && (self.alias_count as f64) / (self.decode_count as f64)
+                > allowed_alias_ratio(self.decode_count)
+        {
+            return Err(Fail("yaml: document contains excessive aliasing".to_string()));
+        }
+        Ok(())
     }
 
     /// `node.DecodeWithOptions(out, opts)` / `node.Decode(out)` from inside an unmarshaler:
     /// a fresh decoder whose `TypeError` is merged into ours by `callUnmarshaler`.
     fn sub_decode(&mut self, n: usize, ty: usize, known_fields: bool) -> Result<bool, Fail> {
         let mut sub = Decoder::new(self.doc, self.types, known_fields);
-        sub.unmarshal(n, ty)?;
+        sub.decode_count = self.decode_count;
+        sub.alias_count = self.alias_count;
+        sub.alias_depth = self.alias_depth;
+        let res = sub.unmarshal(n, ty);
+        self.decode_count = sub.decode_count;
+        self.alias_count = sub.alias_count;
+        res?;
         let good = sub.terrors.is_empty();
         self.terrors.append(&mut sub.terrors);
         Ok(good)
@@ -845,6 +896,7 @@ impl<'a> Decoder<'a> {
     }
 
     fn unmarshal(&mut self, n: usize, ty: usize) -> Result<bool, Fail> {
+        self.count_and_check_aliases()?;
         let node = self.doc.node(n);
         match node.kind {
             Kind::Document => {
@@ -858,8 +910,12 @@ impl<'a> Decoder<'a> {
                 if !self.aliases.insert(n) {
                     return Err(Fail(format!("yaml: anchor '{}' value contains itself", node.value)));
                 }
-                let target = node.alias.expect("resolved alias");
+                let target = node.alias.ok_or_else(|| {
+                    Fail(format!("yaml: unknown anchor '{}' referenced", node.value))
+                })?;
+                self.alias_depth += 1;
                 let good = self.unmarshal(target, ty);
+                self.alias_depth -= 1;
                 self.aliases.remove(&n);
                 return good;
             }
@@ -1347,23 +1403,31 @@ impl<'a> Decoder<'a> {
                 };
                 return Err(Fail(msg));
             }
-            let res = match &strukt {
-                Some((ty, name)) => {
-                    if self.check_unique_keys(tn) {
-                        self.mapping_struct(tn, *ty, name)
-                    } else {
-                        Ok(true)
+            if is_alias {
+                self.alias_depth += 1;
+            }
+            let count_res = self.count_and_check_aliases();
+            let res = match count_res {
+                Err(e) => Err(e),
+                Ok(()) => match &strukt {
+                    Some((ty, name)) => {
+                        if self.check_unique_keys(tn) {
+                            self.mapping_struct(tn, *ty, name)
+                        } else {
+                            Ok(true)
+                        }
                     }
-                }
-                None => {
-                    if self.check_unique_keys(tn) {
-                        self.mapping_entries(tn, key, elem)
-                    } else {
-                        Ok(true)
+                    None => {
+                        if self.check_unique_keys(tn) {
+                            self.mapping_entries(tn, key, elem)
+                        } else {
+                            Ok(true)
+                        }
                     }
-                }
+                },
             };
             if is_alias {
+                self.alias_depth -= 1;
                 self.aliases.remove(&tgt);
             }
             res?;

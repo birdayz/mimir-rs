@@ -58,16 +58,24 @@ pub(crate) trait Provider: Send + Sync {
 /// minio-go `credentials.Expiry` (`DefaultExpiryWindow` = -1: refresh after 80% of the
 /// remaining lifetime).
 #[derive(Clone, Debug, Default)]
-struct Expiry {
+#[doc(hidden)]
+pub struct Expiry {
     expiration: Option<DateTime<Utc>>,
 }
 
 impl Expiry {
-    fn set_expiration(&mut self, expiration: DateTime<Utc>) {
+    #[doc(hidden)]
+    pub fn set_expiration(&mut self, expiration: DateTime<Utc>) {
         let now = Utc::now();
-        let expire_in = expiration - now;
+        let expire_in = (expiration - now).max(chrono::Duration::zero());
         let cut_ns = (expire_in.num_nanoseconds().unwrap_or(i64::MAX) as f64 * (1.0 - 0.8)) as i64;
         self.expiration = Some(expiration - chrono::Duration::nanoseconds(cut_ns));
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn effective_expiration(&self) -> Option<DateTime<Utc>> {
+        self.expiration
     }
 
     fn is_expired(&self) -> bool {
@@ -207,15 +215,81 @@ fn home_dir(env: &Env) -> Result<String, String> {
     Ok(h)
 }
 
-/// `credential_process` output (`externalProcessCredentials`).
-async fn run_credential_process(command: &str) -> Result<Value, String> {
-    let args: Vec<&str> = command.split_whitespace().collect();
-    if args.len() <= 1 {
+#[doc(hidden)]
+pub fn split_credential_process_args(command: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            Some('"') => {
+                if c == '"' {
+                    quote = None;
+                } else if c == '\\' {
+                    if let Some(&next) = chars.peek() {
+                        if matches!(next, '"' | '\\' | '$' | '`') {
+                            cur.push(next);
+                            chars.next();
+                        } else {
+                            cur.push(c);
+                        }
+                    } else {
+                        return Err("unterminated escape in credential process command".to_string());
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+            Some(_) => unreachable!(),
+            None => {
+                if c.is_whitespace() {
+                    if in_token {
+                        args.push(std::mem::take(&mut cur));
+                        in_token = false;
+                    }
+                } else if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    in_token = true;
+                } else if c == '\\' {
+                    let next = chars
+                        .next()
+                        .ok_or_else(|| "trailing backslash in credential process command".to_string())?;
+                    cur.push(next);
+                    in_token = true;
+                } else {
+                    cur.push(c);
+                    in_token = true;
+                }
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err("unterminated quote in credential process command".to_string());
+    }
+    if in_token {
+        args.push(cur);
+    }
+    if args.is_empty() {
         return Err("invalid credential process args".to_string());
     }
+    Ok(args)
+}
+
+/// `credential_process` output (`externalProcessCredentials`).
+async fn run_credential_process(command: &str) -> Result<Value, String> {
+    let args = split_credential_process_args(command)?;
     let out = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::process::Command::new(args[0])
+        tokio::process::Command::new(&args[0])
             .args(&args[1..])
             .output(),
     )

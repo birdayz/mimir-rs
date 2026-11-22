@@ -615,14 +615,14 @@ impl MimirConfig {
                         common_map.get(Value::String("storage".to_string()))
                     {
                         if !common_storage.is_null() {
-                            apply_common_storage_yaml(root_map, common_storage);
+                            apply_common_storage_yaml(root_map, common_storage)?;
                         }
                     }
                     if let Some(common_ccv) =
                         common_map.get(Value::String("client_cluster_validation".to_string()))
                     {
                         if !common_ccv.is_null() {
-                            apply_common_cluster_validation_yaml(root_map, common_ccv);
+                            apply_common_cluster_validation_yaml(root_map, common_ccv)?;
                         }
                     }
                 }
@@ -1858,7 +1858,15 @@ fn merge_yaml_underneath(overlay: &mut Value, base: &Value) {
     }
 }
 
-fn ensure_mapping_at<'a>(map: &'a mut Mapping, path: &[&str]) -> &'a mut Value {
+fn ensure_mapping_at<'a>(
+    map: &'a mut Mapping,
+    path: &[&str],
+) -> Result<&'a mut Value, ConfigError> {
+    if path.is_empty() {
+        return Err(ConfigError::Yaml(
+            "common config inheritance target path cannot be empty".to_string(),
+        ));
+    }
     let mut cur_map = map;
     for (idx, seg) in path.iter().enumerate() {
         let key = Value::String((*seg).to_string());
@@ -1866,18 +1874,28 @@ fn ensure_mapping_at<'a>(map: &'a mut Mapping, path: &[&str]) -> &'a mut Value {
             cur_map.insert(key.clone(), Value::Mapping(Mapping::new()));
         }
         if idx + 1 == path.len() {
-            return cur_map.get_mut(&key).unwrap();
+            return cur_map.get_mut(&key).ok_or_else(|| {
+                ConfigError::Yaml(format!("missing target key {seg:?} after insertion"))
+            });
         }
         cur_map = cur_map
             .get_mut(&key)
-            .unwrap()
-            .as_mapping_mut()
-            .expect("path segment created as mapping");
+            .and_then(Value::as_mapping_mut)
+            .ok_or_else(|| {
+                ConfigError::Yaml(format!(
+                    "cannot apply common config: expected mapping at {seg:?}"
+                ))
+            })?;
     }
-    unreachable!()
+    Err(ConfigError::Yaml(
+        "common config inheritance failed to resolve target path".to_string(),
+    ))
 }
 
-fn apply_common_storage_yaml(root_map: &mut Mapping, common_storage: &Value) {
+fn apply_common_storage_yaml(
+    root_map: &mut Mapping,
+    common_storage: &Value,
+) -> Result<(), ConfigError> {
     let targets: &[&[&str]] = &[
         &["blocks_storage"],
         &["ruler_storage"],
@@ -1885,12 +1903,16 @@ fn apply_common_storage_yaml(root_map: &mut Mapping, common_storage: &Value) {
         &["usage_tracker", "snapshots_storage"],
     ];
     for path in targets {
-        let target_val = ensure_mapping_at(root_map, path);
+        let target_val = ensure_mapping_at(root_map, path)?;
         merge_yaml_underneath(target_val, common_storage);
     }
+    Ok(())
 }
 
-fn apply_common_cluster_validation_yaml(root_map: &mut Mapping, common_ccv: &Value) {
+fn apply_common_cluster_validation_yaml(
+    root_map: &mut Mapping,
+    common_ccv: &Value,
+) -> Result<(), ConfigError> {
     let targets: &[&[&str]] = &[
         &["ingester_client", "grpc_client_config", "cluster_validation"],
         &["frontend_worker", "grpc_client_config", "cluster_validation"],
@@ -1934,9 +1956,10 @@ fn apply_common_cluster_validation_yaml(root_map: &mut Mapping, common_ccv: &Val
     ];
 
     for path in targets {
-        let target_val = ensure_mapping_at(root_map, path);
+        let target_val = ensure_mapping_at(root_map, path)?;
         merge_yaml_underneath(target_val, common_ccv);
     }
+    Ok(())
 }
 
 /// Result of parsing CLI arguments and loading `-config.file`.

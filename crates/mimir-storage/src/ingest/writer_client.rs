@@ -269,6 +269,12 @@ struct QueuedItem {
     on_done: Box<dyn FnOnce(WriterRecord, Result<i64, ProducerError>) + Send>,
 }
 
+#[derive(Default)]
+struct PartitionQueue {
+    batches: VecDeque<(Vec<QueuedItem>, Option<tokio::sync::OwnedSemaphorePermit>)>,
+    worker_active: bool,
+}
+
 /// Async Kafka writer client with batching, linger, max in-flight requests, delivery timeouts,
 /// SASL authentication, and extended Kafka client metrics.
 pub struct KafkaWriterClient {
@@ -281,6 +287,7 @@ pub struct KafkaWriterClient {
     buffered_bytes: Arc<AtomicI64>,
     buffered_records: Arc<AtomicI64>,
     queue: Arc<SyncMutex<VecDeque<QueuedItem>>>,
+    partition_queues: Arc<SyncMutex<HashMap<(String, i32), PartitionQueue>>>,
     inflight_sem: Arc<Semaphore>,
     notify: Arc<Notify>,
     closed: Arc<AtomicBool>,
@@ -348,6 +355,7 @@ impl KafkaWriterClient {
             buffered_bytes: Arc::new(AtomicI64::new(0)),
             buffered_records: Arc::new(AtomicI64::new(0)),
             queue: Arc::new(SyncMutex::new(VecDeque::new())),
+            partition_queues: Arc::new(SyncMutex::new(HashMap::new())),
             inflight_sem: Arc::new(Semaphore::new(max_inflight)),
             notify: Arc::new(Notify::new()),
             closed: Arc::new(AtomicBool::new(false)),
@@ -433,11 +441,19 @@ impl KafkaWriterClient {
     }
 
     fn drain_closed(&self) {
-        let drained: Vec<QueuedItem> = {
+        let mut drained: Vec<QueuedItem> = {
             let mut q = self.queue.lock();
             self.closed.store(true, Ordering::SeqCst);
             q.drain(..).collect()
         };
+        {
+            let mut pqs = self.partition_queues.lock();
+            for pq in pqs.values_mut() {
+                for (items, _permit) in pq.batches.drain(..) {
+                    drained.extend(items);
+                }
+            }
+        }
         let _ = self.close_tx.send(true);
         self.inflight_sem.close();
         self.notify.notify_waiters();
@@ -563,73 +579,88 @@ impl KafkaWriterClient {
             let mut first_permit_opt = Some(first_permit);
             for ((topic, partition), items) in groups {
                 let pre_permit = first_permit_opt.take();
-                let sem = Arc::clone(&inflight_sem);
-                let weak_this = Arc::downgrade(&this_strong);
-                tokio::spawn(async move {
-                    let _permit = match pre_permit {
-                        Some(p) => p,
-                        None => {
-                            let earliest_enqueue = items
-                                .iter()
-                                .map(|i| i.enqueued_at)
-                                .min()
-                                .unwrap_or_else(Instant::now);
-                            let Some(write_timeout) = weak_this.upgrade().map(|t| t.write_timeout)
-                            else {
-                                for item in items {
-                                    (item.on_done)(item.record, Err(ProducerError::Closed));
-                                }
-                                return;
-                            };
-                            let deadline = earliest_enqueue + write_timeout;
-                            tokio::select! {
-                                res = sem.acquire_owned() => match res {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        if let Some(this) = weak_this.upgrade() {
-                                            this.fail_items_with_err(items, ProducerError::Closed);
-                                        } else {
-                                            for item in items {
-                                                (item.on_done)(
-                                                    item.record,
-                                                    Err(ProducerError::Closed),
-                                                );
-                                            }
-                                        }
-                                        return;
-                                    }
-                                },
-                                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                                    if let Some(this) = weak_this.upgrade() {
-                                        this.fail_items_with_err(
-                                            items,
-                                            ProducerError::RecordTimeout,
-                                        );
-                                    } else {
-                                        for item in items {
-                                            (item.on_done)(
-                                                item.record,
-                                                Err(ProducerError::RecordTimeout),
-                                            );
-                                        }
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                    };
-                    if let Some(this) = weak_this.upgrade() {
-                        if this.closed.load(Ordering::SeqCst) {
-                            this.fail_items_with_err(items, ProducerError::Closed);
-                        } else {
-                            this.send_partition_batch(topic, partition, items).await;
-                        }
+                let should_spawn = {
+                    let mut pqs = this_strong.partition_queues.lock();
+                    let pq = pqs.entry((topic.clone(), partition)).or_default();
+                    pq.batches.push_back((items, pre_permit));
+                    if pq.worker_active {
+                        false
                     } else {
-                        for item in items {
-                            (item.on_done)(item.record, Err(ProducerError::Closed));
+                        pq.worker_active = true;
+                        true
+                    }
+                };
+                if should_spawn {
+                    let sem = Arc::clone(&inflight_sem);
+                    let weak_this = Arc::downgrade(&this_strong);
+                    tokio::spawn(async move {
+                        Self::run_partition_worker(weak_this, sem, topic, partition).await;
+                    });
+                }
+            }
+        }
+    }
+
+    async fn run_partition_worker(
+        weak_this: Weak<Self>,
+        sem: Arc<Semaphore>,
+        topic: String,
+        partition: i32,
+    ) {
+        loop {
+            let Some(this) = weak_this.upgrade() else {
+                return;
+            };
+            let next = {
+                let mut pqs = this.partition_queues.lock();
+                let key = (topic.clone(), partition);
+                match pqs.get_mut(&key) {
+                    Some(pq) => match pq.batches.pop_front() {
+                        Some(batch) => Some(batch),
+                        None => {
+                            pq.worker_active = false;
+                            pqs.remove(&key);
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+            let Some((items, pre_permit)) = next else {
+                return;
+            };
+            if this.closed.load(Ordering::SeqCst) {
+                this.fail_items_with_err(items, ProducerError::Closed);
+                continue;
+            }
+            let _permit = match pre_permit {
+                Some(p) => p,
+                None => {
+                    let earliest_enqueue = items
+                        .iter()
+                        .map(|i| i.enqueued_at)
+                        .min()
+                        .unwrap_or_else(Instant::now);
+                    let deadline = earliest_enqueue + this.write_timeout;
+                    tokio::select! {
+                        res = sem.clone().acquire_owned() => match res {
+                            Ok(p) => p,
+                            Err(_) => {
+                                this.fail_items_with_err(items, ProducerError::Closed);
+                                continue;
+                            }
+                        },
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                            this.fail_items_with_err(items, ProducerError::RecordTimeout);
+                            continue;
                         }
                     }
-                });
+                }
+            };
+            if this.closed.load(Ordering::SeqCst) {
+                this.fail_items_with_err(items, ProducerError::Closed);
+            } else {
+                this.send_partition_batch(topic.clone(), partition, items).await;
             }
         }
     }
@@ -804,16 +835,34 @@ impl KafkaWriterClient {
                     }
                     retry_backoff = (retry_backoff * 2).min(Duration::from_millis(250));
                 }
-                Ok(Err(KafkaClientError::Broker(resp_err)))
-                    if !super::kgo_retry::is_retriable_response_error(resp_err) =>
-                {
-                    last_err = Some(ProducerError::Other(
-                        KafkaClientError::Broker(resp_err).to_string(),
-                    ));
-                    break;
-                }
                 Ok(Err(e)) => {
+                    let retriable = match &e {
+                        KafkaClientError::Broker(resp_err) => {
+                            super::kgo_retry::is_retriable_response_error(*resp_err)
+                        }
+                        KafkaClientError::Io(_)
+                        | KafkaClientError::RequestTimeout(_)
+                        | KafkaClientError::ConnectTimeout { .. }
+                        | KafkaClientError::ChosenBrokerDead
+                        | KafkaClientError::ConnectionClosed
+                        | KafkaClientError::UnknownController(_)
+                        | KafkaClientError::UnknownBroker
+                        | KafkaClientError::UnexpectedResponse(_) => true,
+                        KafkaClientError::Dial(d) => matches!(
+                            d.kind,
+                            super::kgo_retry::DialErrorKind::TimedOut
+                                | super::kgo_retry::DialErrorKind::DnsTemporary
+                        ),
+                        KafkaClientError::Sasl(_)
+                        | KafkaClientError::Config(_)
+                        | KafkaClientError::FirstReadEof(_)
+                        | KafkaClientError::NoSeedBrokers
+                        | KafkaClientError::Protocol(_) => false,
+                    };
                     last_err = Some(ProducerError::Other(e.to_string()));
+                    if !retriable {
+                        break;
+                    }
                     retry_backoff = Duration::from_millis(25);
                 }
                 Err(_) => {
@@ -871,6 +920,14 @@ impl KafkaWriterClient {
                 }
             }
             *q = remaining;
+        }
+        {
+            let mut pqs = self.partition_queues.lock();
+            if let Some(pq) = pqs.get_mut(&(topic.to_string(), partition)) {
+                for (items, _permit) in pq.batches.drain(..) {
+                    same_partition_items.extend(items);
+                }
+            }
         }
         self.fail_items_with_err(same_partition_items, err);
     }
