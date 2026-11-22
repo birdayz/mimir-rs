@@ -40,21 +40,31 @@ pub fn temp_path(final_path: impl AsRef<Path>) -> PathBuf {
 }
 
 fn clean_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
+    let mut comps: Vec<Component<'_>> = Vec::new();
     for comp in path.components() {
         match comp {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push(Component::ParentDir);
+            Component::ParentDir => match comps.last() {
+                Some(Component::Normal(_)) => {
+                    comps.pop();
                 }
-            }
-            c => out.push(c),
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {
+                    // Above root stays at root, matching Go filepath.Clean("/../foo") == "/foo".
+                }
+                _ => {
+                    comps.push(Component::ParentDir);
+                }
+            },
+            c => comps.push(c),
         }
     }
-    if out.as_os_str().is_empty() {
+    if comps.is_empty() {
         PathBuf::from(".")
     } else {
+        let mut out = PathBuf::new();
+        for c in comps {
+            out.push(c.as_os_str());
+        }
         out
     }
 }
@@ -155,4 +165,17 @@ pub fn create_file(file_path: impl AsRef<Path>, mut data: impl Read) -> io::Resu
     let close_res = f.close();
     copy_res?;
     close_res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_path_preserves_leading_parent_dirs_and_clamps_root() {
+        assert_eq!(temp_path(Path::new("../../foo")), Path::new("../../foo.tmp"));
+        assert_eq!(temp_path(Path::new("/../foo")), Path::new("/foo.tmp"));
+        assert_eq!(temp_path(Path::new("/a/b/../c/file.txt")), Path::new("/a/c/file.txt.tmp"));
+        assert_eq!(temp_path(Path::new("a/../b")), Path::new("b.tmp"));
+    }
 }

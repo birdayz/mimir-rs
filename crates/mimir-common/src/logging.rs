@@ -671,6 +671,10 @@ impl StructuredLogger {
 }
 
 impl Logger for StructuredLogger {
+    fn probe_level(&self) -> Option<LogLevel> {
+        Some(self.min_level)
+    }
+
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
         let pairs: Vec<(&str, LogValue<'_>)> = kvs.iter().map(|&(k, v)| (k, v.into())).collect();
         self.log_values(level, &pairs);
@@ -851,6 +855,10 @@ impl LogSink {
 }
 
 impl Logger for LogSink {
+    fn probe_level(&self) -> Option<LogLevel> {
+        Some(self.min_level)
+    }
+
     #[track_caller]
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
         if !self.enabled(level) {

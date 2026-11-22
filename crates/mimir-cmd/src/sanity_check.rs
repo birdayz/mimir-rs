@@ -235,26 +235,31 @@ async fn check_object_stores_config_with_retries(
     Err(last_err)
 }
 
-fn extra_bucket_config(cfg: &MimirConfig, section: &str) -> BucketConfig {
+fn extra_bucket_config(cfg: &MimirConfig, section: &str) -> Result<BucketConfig, String> {
     let mut b = BucketConfig::default();
     b.backend_cfg.backend = "local".to_string();
     let Some(val) = cfg.extra_sections.get(section) else {
-        return b;
+        return Ok(b);
     };
-    if let Some(map) = val.as_mapping() {
-        let mut filtered = serde_yaml::Mapping::new();
-        for (k, v) in map {
-            if let Some(ks) = k.as_str() {
-                if matches!(ks, "backend" | "storage_prefix" | "s3" | "gcs" | "azure" | "swift" | "filesystem") {
-                    filtered.insert(k.clone(), v.clone());
-                }
+    let Some(map) = val.as_mapping() else {
+        return Ok(b);
+    };
+    let has_backend = map.iter().any(|(k, v)| {
+        k.as_str() == Some("backend") && !v.is_null() && v.as_str() != Some("")
+    });
+    if !has_backend {
+        return Ok(b);
+    }
+    let mut filtered = serde_yaml::Mapping::new();
+    for (k, v) in map {
+        if let Some(ks) = k.as_str() {
+            if matches!(ks, "backend" | "storage_prefix" | "s3" | "gcs" | "azure" | "swift" | "filesystem") {
+                filtered.insert(k.clone(), v.clone());
             }
         }
-        if let Ok(parsed) = serde_yaml::from_value::<BucketConfig>(serde_yaml::Value::Mapping(filtered)) {
-            return parsed;
-        }
     }
-    b
+    serde_yaml::from_value::<BucketConfig>(serde_yaml::Value::Mapping(filtered))
+        .map_err(|e| format!("invalid {section} bucket config: {e}"))
 }
 
 /// `checkObjectStoresConfig` (ported from `pkg/mimir/sanity_check.go`).
@@ -271,19 +276,25 @@ pub async fn check_object_stores_config(cfg: &MimirConfig) -> Result<(), String>
         }
     }
     if is_alertmanager_enabled(cfg) {
-        let am_bucket = extra_bucket_config(cfg, "alertmanager_storage");
-        if am_bucket.backend_cfg.backend != "local" {
-            if let Err(e) = check_object_store_config(&am_bucket).await {
-                errs.push(format!("alertmanager storage: {e}"));
+        match extra_bucket_config(cfg, "alertmanager_storage") {
+            Ok(am_bucket) if am_bucket.backend_cfg.backend != "local" => {
+                if let Err(e) = check_object_store_config(&am_bucket).await {
+                    errs.push(format!("alertmanager storage: {e}"));
+                }
             }
+            Ok(_) => {}
+            Err(e) => errs.push(format!("alertmanager storage: {e}")),
         }
     }
     if cfg.is_ruler_enabled() {
-        let ruler_bucket = extra_bucket_config(cfg, "ruler_storage");
-        if ruler_bucket.backend_cfg.backend != "local" {
-            if let Err(e) = check_object_store_config(&ruler_bucket).await {
-                errs.push(format!("ruler storage: {e}"));
+        match extra_bucket_config(cfg, "ruler_storage") {
+            Ok(ruler_bucket) if ruler_bucket.backend_cfg.backend != "local" => {
+                if let Err(e) = check_object_store_config(&ruler_bucket).await {
+                    errs.push(format!("ruler storage: {e}"));
+                }
             }
+            Ok(_) => {}
+            Err(e) => errs.push(format!("ruler storage: {e}")),
         }
     }
     multi_error(errs)

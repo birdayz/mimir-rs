@@ -416,7 +416,7 @@ pub struct MemoryConsumptionTracker {
     rejections: Option<Counter>,
     query_description: String,
     trace_id: String,
-    producer: Option<Arc<InflightMemoryConsumptionTracker>>,
+    producer: Option<std::sync::Weak<InflightMemoryConsumptionTracker>>,
     parent: Option<Arc<MemoryConsumptionTracker>>,
     start_time: Option<SystemTime>,
 }
@@ -583,6 +583,7 @@ impl MemoryConsumptionTracker {
         let producer = self
             .producer
             .as_ref()
+            .and_then(std::sync::Weak::upgrade)
             .expect("cannot nest a tracker not created via a InflightMemoryConsumptionTracker");
         Arc::new(Self {
             max_estimated_memory_bytes: self.max_estimated_memory_bytes,
@@ -704,7 +705,7 @@ impl InflightMemoryConsumptionTracker {
             rejections: self.queries_rejected.clone(),
             query_description: query_description.into(),
             trace_id: trace_id.unwrap_or_default(),
-            producer: Some(Arc::clone(self)),
+            producer: Some(Arc::downgrade(self)),
             parent: None,
             start_time: Some(start),
         });
@@ -718,7 +719,7 @@ impl InflightMemoryConsumptionTracker {
             return;
         }
         if let Some(ref prod) = tracker.producer {
-            if !Arc::ptr_eq(prod, self) {
+            if !std::ptr::eq(prod.as_ptr(), Arc::as_ptr(self)) {
                 panic!("cannot deregister inflight memory consumption tracker - the given tracker was allocated by another InflightMemoryConsumptionTracker");
             }
         }
@@ -728,7 +729,7 @@ impl InflightMemoryConsumptionTracker {
 
     pub fn is_tracking(self: &Arc<Self>, tracker: &Arc<MemoryConsumptionTracker>) -> bool {
         match tracker.producer {
-            Some(ref prod) if Arc::ptr_eq(prod, self) => {
+            Some(ref prod) if std::ptr::eq(prod.as_ptr(), Arc::as_ptr(self)) => {
                 let key = Arc::as_ptr(tracker) as usize;
                 self.inflight.lock().contains_key(&key)
             }

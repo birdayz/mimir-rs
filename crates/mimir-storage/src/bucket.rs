@@ -703,34 +703,60 @@ impl BucketClient {
             }
             return Err(err);
         }
-        if let Some(cond) = &opts.condition {
-            if self.provider == "GCS" {
-                let ver = match cond {
-                    UploadCondition::IfNotExists => None,
-                    UploadCondition::IfMatch(v) | UploadCondition::IfNotMatch(v) => Some(v),
-                };
-                if let Some(v) = ver {
-                    match v {
-                        ObjectVersion::Generation(s) => {
-                            if s.parse::<i64>().is_err() {
-                                return Err(BucketError::UploadOptionInvalid(format!(
-                                    "GCS conditional upload generation {s:?} is invalid"
-                                )));
+        // Delegate directly to self.upload() on backends that don't support custom options so
+        // OP_UPLOAD metrics are recorded once (not double-counted).
+        match &self.backend {
+            Backend::Filesystem(_) => {
+                if opts.condition.is_some() {
+                    let timer = self.timer(metrics::OP_UPLOAD);
+                    if let Some(t) = timer {
+                        t.finish_upload(false, 0);
+                    }
+                    return Err(BucketError::UploadOptionInvalid(
+                        "conditional upload is not supported on filesystem".into(),
+                    ));
+                }
+                return self.upload(name, data).await;
+            }
+            Backend::S3(_) => {
+                if opts.condition.is_some() || opts.content_type.is_some() {
+                    let timer = self.timer(metrics::OP_UPLOAD);
+                    if let Some(t) = timer {
+                        t.finish_upload(false, 0);
+                    }
+                    return Err(BucketError::UploadOptionInvalid(
+                        "custom upload options are not supported on S3".into(),
+                    ));
+                }
+                return self.upload(name, data).await;
+            }
+            Backend::Store(store) => {
+                let timer = self.timer(metrics::OP_UPLOAD);
+                let result: Result<(), BucketError> = async {
+                    if let Some(cond) = &opts.condition {
+                        if self.provider == "GCS" {
+                            let ver = match cond {
+                                UploadCondition::IfNotExists => None,
+                                UploadCondition::IfMatch(v) | UploadCondition::IfNotMatch(v) => Some(v),
+                            };
+                            if let Some(v) = ver {
+                                match v {
+                                    ObjectVersion::Generation(s) => {
+                                        if s.parse::<i64>().is_err() {
+                                            return Err(BucketError::UploadOptionInvalid(format!(
+                                                "GCS conditional upload generation {s:?} is invalid"
+                                            )));
+                                        }
+                                    }
+                                    ObjectVersion::ETag(_) => {
+                                        return Err(BucketError::UploadOptionInvalid(
+                                            "GCS conditional uploads require generation object versions".into(),
+                                        ));
+                                    }
+                                }
                             }
                         }
-                        ObjectVersion::ETag(_) => {
-                            return Err(BucketError::UploadOptionInvalid(
-                                "GCS conditional uploads require generation object versions".into(),
-                            ));
-                        }
                     }
-                }
-            }
-        }
-        let timer = self.timer(metrics::OP_UPLOAD);
-        let result: Result<(), BucketError> = async {
-            match &self.backend {
-                Backend::Store(store) => {
                     let path = self.object_path(name)?;
                     let mut put_opts = object_store::PutOptions::default();
                     if let Some(ct) = opts.content_type {
@@ -776,30 +802,14 @@ impl BucketClient {
                         .await?;
                     Ok(())
                 }
-                Backend::Filesystem(_) => {
-                    if opts.condition.is_some() {
-                        return Err(BucketError::UploadOptionInvalid(
-                            "conditional upload is not supported on filesystem".into(),
-                        ));
-                    }
-                    return self.upload(name, data).await;
+                .await;
+                if let Some(t) = timer {
+                    let transferred = if result.is_ok() { len } else { 0 };
+                    t.finish_upload(result.is_ok(), transferred);
                 }
-                Backend::S3(_) => {
-                    if opts.condition.is_some() || opts.content_type.is_some() {
-                        return Err(BucketError::UploadOptionInvalid(
-                            "custom upload options are not supported on S3".into(),
-                        ));
-                    }
-                    return self.upload(name, data).await;
-                }
+                result
             }
         }
-        .await;
-        if let Some(t) = timer {
-            let transferred = if result.is_ok() { len } else { 0 };
-            t.finish_upload(result.is_ok(), transferred);
-        }
-        result
     }
 
     /// Uploads a local file at `src_path` as object `name` (objstore `UploadFile`).
