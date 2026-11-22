@@ -599,16 +599,34 @@ impl HeadChunksWriter {
         chunk: &EncodedChunk,
         is_ooo: bool,
     ) -> Result<ChunkDiskMapperRef, HeadChunksError> {
+        self.write_raw_chunk_bytes(
+            series_ref,
+            mint,
+            maxt,
+            chunk.encoding().as_u8(),
+            chunk.as_bytes(),
+            is_ooo,
+        )
+    }
+
+    pub fn write_raw_chunk_bytes(
+        &mut self,
+        series_ref: u64,
+        mint: i64,
+        maxt: i64,
+        encoding: u8,
+        data: &[u8],
+        is_ooo: bool,
+    ) -> Result<ChunkDiskMapperRef, HeadChunksError> {
         if self.closed {
             return Err(HeadChunksError::Closed);
         }
 
-        let data = chunk.as_bytes();
         let mut meta_buf = [0u8; MAX_HEAD_CHUNK_META_SIZE];
         meta_buf[0..8].copy_from_slice(&series_ref.to_be_bytes());
         meta_buf[8..16].copy_from_slice(&mint.to_be_bytes());
         meta_buf[16..24].copy_from_slice(&maxt.to_be_bytes());
-        let mut enc_byte = chunk.encoding().as_u8();
+        let mut enc_byte = encoding;
         if is_ooo {
             enc_byte |= OUT_OF_ORDER_MASK;
         }
