@@ -339,7 +339,11 @@ impl OwnedSeriesService {
     }
 
     pub async fn start_and_await_running(&self) -> Result<(), String> {
-        let svc = self.service.lock().clone().expect("service initialized");
+        let svc = self
+            .service
+            .lock()
+            .clone()
+            .ok_or_else(|| "owned series service not initialized".to_string())?;
         let ctx = ServiceContext::background();
         start_and_await_running(ctx, svc.as_ref())
             .await
@@ -347,7 +351,11 @@ impl OwnedSeriesService {
     }
 
     pub async fn stop_and_await_terminated(&self) -> Result<(), String> {
-        let svc = self.service.lock().clone().expect("service initialized");
+        let svc = self
+            .service
+            .lock()
+            .clone()
+            .ok_or_else(|| "owned series service not initialized".to_string())?;
         let ctx = ServiceContext::background();
         stop_and_await_terminated(ctx, svc.as_ref())
             .await
@@ -427,6 +435,48 @@ impl OwnedSeriesService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn uninitialized_service_returns_error_instead_of_panicking() {
+        struct DummyStrategy;
+        impl OwnedSeriesRingStrategy for DummyStrategy {
+            fn check_ring_for_changes(&self) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn shard_size_for_user(&self, _tenant: &str) -> usize {
+                1
+            }
+            fn token_ranges_for_user(
+                &self,
+                _user_id: &str,
+                _shard_size: usize,
+            ) -> Result<Vec<u32>, String> {
+                Ok(Vec::new())
+            }
+            fn owner_key_and_value(&self) -> (&'static str, String) {
+                ("instance", "dummy".to_string())
+            }
+        }
+
+        let svc = OwnedSeriesService {
+            ring_strategy: Arc::new(DummyStrategy),
+            get_tsdb_users: Arc::new(Vec::new),
+            get_tsdb: Arc::new(|_| None),
+            metrics: OwnedSeriesMetrics::new(None),
+            interval: Duration::from_secs(60),
+            initial_ring_check_succeeded: AtomicBool::new(false),
+            last_reasons: Mutex::new(Vec::new()),
+            service: Mutex::new(None),
+        };
+        assert_eq!(
+            svc.start_and_await_running().await.unwrap_err(),
+            "owned series service not initialized"
+        );
+        assert_eq!(
+            svc.stop_and_await_terminated().await.unwrap_err(),
+            "owned series service not initialized"
+        );
+    }
 
     #[test]
     fn token_ranges_include_key_exact() {
