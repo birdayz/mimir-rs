@@ -78,6 +78,10 @@ impl SharedWriteDeadline {
         }
     }
 
+    pub fn disable(&self) {
+        *self.deadline.lock() = None;
+    }
+
     pub fn current(&self) -> Option<Instant> {
         *self.deadline.lock()
     }

@@ -156,6 +156,57 @@ pub struct Acceptor {
     limit: Option<Arc<Semaphore>>,
 }
 
+/// Minimal listener/conn traits mirroring Go `net.Listener` / `net.Conn` for [`CountingListener`].
+pub trait NetConn: Send {
+    fn close(&mut self) -> io::Result<()>;
+}
+
+pub trait NetListener: Send {
+    type Conn: NetConn;
+    fn accept_conn(&mut self) -> io::Result<Self::Conn>;
+}
+
+/// Ported from `github.com/grafana/dskit/middleware/counting_listener.go`.
+pub struct CountingListener<L> {
+    inner: L,
+    gauge: Gauge,
+}
+
+impl<L> CountingListener<L> {
+    pub fn new(inner: L, gauge: Gauge) -> Self {
+        Self { inner, gauge }
+    }
+
+    pub fn accept(&mut self) -> io::Result<CountingConn<L::Conn>>
+    where
+        L: NetListener,
+    {
+        let conn = self.inner.accept_conn()?;
+        self.gauge.inc();
+        Ok(CountingConn {
+            inner: conn,
+            gauge: self.gauge.clone(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+pub struct CountingConn<C> {
+    inner: C,
+    gauge: Gauge,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl<C: NetConn> CountingConn<C> {
+    pub fn close(&mut self) -> io::Result<()> {
+        let res = self.inner.close();
+        if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.gauge.dec();
+        }
+        res
+    }
+}
+
 impl Acceptor {
     pub fn new(listener: TcpListener, opts: AcceptOptions) -> Self {
         let limit = (opts.conn_limit > 0).then(|| Arc::new(Semaphore::new(opts.conn_limit)));

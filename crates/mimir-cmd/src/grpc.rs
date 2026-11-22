@@ -248,6 +248,132 @@ impl tower::Service<http::Request<tonic::body::BoxBody>> for HealthService {
 #[derive(Clone)]
 struct CapturedMatchedRoute(Arc<parking_lot::Mutex<Option<String>>>);
 
+/// Marker extension inserted onto requests dispatched by [`HttpGrpcBridge`].
+#[derive(Clone, Copy, Debug)]
+pub struct HandledByHttpgrpcServer;
+
+/// Sentinel panic payload mirroring Go `net/http.ErrAbortHandler` in [`HttpGrpcBridge`].
+#[derive(Debug)]
+pub struct ErrAbortHandler;
+
+tokio::task_local! {
+    static HANDLED_BY_HTTPGRPC_TASK: bool;
+}
+
+/// Ported from `github.com/grafana/dskit/httpgrpc/server/server.go` (`IsHandledByHttpgrpcServer`).
+pub fn is_handled_by_httpgrpc_server(req: Option<&axum::extract::Request>) -> bool {
+    if HANDLED_BY_HTTPGRPC_TASK.try_with(|v| *v).unwrap_or(false) {
+        return true;
+    }
+    req.is_some_and(|r| r.extensions().get::<HandledByHttpgrpcServer>().is_some())
+}
+
+/// Ported from `github.com/grafana/dskit/httpgrpc/httpgrpc.go` (`ToHeader`).
+pub fn httpgrpc_to_headers(
+    headers: &[httpgrpcpb::Header],
+    out: &mut HeaderMap,
+) -> Option<mimir_ingester::http::RawScopeOrgId> {
+    let mut raw_org_id: Option<mimir_ingester::http::RawScopeOrgId> = None;
+    for h in headers {
+        let Ok(name) = HeaderName::from_bytes(h.key.as_bytes()) else {
+            continue;
+        };
+        let is_org_id = name.as_str().eq_ignore_ascii_case("x-scope-orgid");
+        if is_org_id {
+            raw_org_id = None;
+        }
+        out.remove(&name);
+        for (idx, v) in h.values.iter().enumerate() {
+            match HeaderValue::from_bytes(v.as_bytes()) {
+                Ok(val) => {
+                    out.append(name.clone(), val);
+                }
+                Err(_) if is_org_id && idx == 0 => {
+                    raw_org_id = Some(mimir_ingester::http::RawScopeOrgId(v.as_bytes().to_vec()));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    raw_org_id
+}
+
+/// Ported from `github.com/grafana/dskit/httpgrpc/httpgrpc.go` (`Error`).
+pub fn httpgrpc_error(code: i32, msg: &str) -> Status {
+    let resp = httpgrpcpb::HttpResponse {
+        code,
+        headers: Vec::new(),
+        body: Bytes::copy_from_slice(msg.as_bytes()),
+    };
+    status_with_http_response(&resp, msg)
+}
+
+/// Ported from `github.com/grafana/dskit/httpgrpc/httpgrpc.go` (`ErrorFromHTTPResponse`).
+pub fn httpgrpc_error_from_response(resp: &httpgrpcpb::HttpResponse) -> Status {
+    let msg = String::from_utf8_lossy(&resp.body).into_owned();
+    status_with_http_response(resp, msg)
+}
+
+/// Ported from `github.com/grafana/dskit/httpgrpc/httpgrpc.go` (`HTTPResponseFromError`).
+pub fn httpgrpc_response_from_error(status: &Status) -> Option<httpgrpcpb::HttpResponse> {
+    extract_http_response(status)
+}
+
+/// Ported from `github.com/grafana/dskit/httpgrpc/server/server.go` (`ParseURL`).
+pub fn parse_httpgrpc_url(unparsed: &str) -> Result<String, String> {
+    if unparsed.contains(":///") {
+        return Ok(unparsed.to_string());
+    }
+    let (scheme, host) = match unparsed.split_once("://") {
+        Some((s, rest)) => {
+            let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+            (s, host)
+        }
+        None => ("kubernetes", unparsed),
+    };
+    match scheme {
+        "direct" => Ok(host.to_string()),
+        "kubernetes" => {
+            let (h, port) = split_host_port_like_go(host)?;
+            let mut parts = h.splitn(3, '.');
+            let service = parts.next().unwrap_or("");
+            let mut domain = String::new();
+            if let Some(ns) = parts.next() {
+                domain.push('.');
+                domain.push_str(ns);
+            }
+            if let Some(rest) = parts.next() {
+                domain.push('.');
+                domain.push_str(rest);
+            }
+            let combined = format!("{service}{domain}");
+            let joined = if combined.contains(':') {
+                format!("[{combined}]:{port}")
+            } else {
+                format!("{combined}:{port}")
+            };
+            Ok(format!("kubernetes:///{joined}"))
+        }
+        other => Err(format!("unrecognised scheme: {other}")),
+    }
+}
+
+fn split_host_port_like_go(hostport: &str) -> Result<(&str, &str), String> {
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let Some((h, after)) = rest.split_once("]:") else {
+            return Err(format!("address {hostport}: missing port in address"));
+        };
+        return Ok((h, after));
+    }
+    let Some((h, port)) = hostport.rsplit_once(':') else {
+        return Err(format!("address {hostport}: missing port in address"));
+    };
+    if h.contains(':') {
+        return Err(format!("address {hostport}: too many colons in address"));
+    }
+    Ok((h, port))
+}
+
 #[derive(Clone)]
 pub struct HttpGrpcBridge {
     router: Router,
@@ -283,6 +409,15 @@ impl HttpGrpcBridge {
             router,
             return_4xx_errors: true,
         }
+    }
+
+    pub fn with_return_4xx_errors(mut self, enabled: bool) -> Self {
+        self.return_4xx_errors = enabled;
+        self
+    }
+
+    pub fn return_4xx_errors(&self) -> bool {
+        self.return_4xx_errors
     }
 }
 
@@ -328,30 +463,7 @@ impl Http for HttpGrpcBridge {
         };
 
         let mut req_headers = HeaderMap::new();
-        let mut raw_org_id: Option<mimir_ingester::http::RawScopeOrgId> = None;
-        for h in req.headers {
-            let Ok(name) = HeaderName::from_bytes(h.key.as_bytes()) else {
-                continue;
-            };
-            let is_org_id = name.as_str().eq_ignore_ascii_case("x-scope-orgid");
-            if is_org_id {
-                raw_org_id = None;
-            }
-            // Go `httpgrpc.ToHeader`: `header[http.CanonicalHeaderKey(h.Key)] = h.Values` overwrites
-            // any prior entry for the same canonical header name.
-            req_headers.remove(&name);
-            for (idx, v) in h.values.into_iter().enumerate() {
-                match HeaderValue::from_bytes(v.as_bytes()) {
-                    Ok(val) => {
-                        req_headers.append(name.clone(), val);
-                    }
-                    Err(_) if is_org_id && idx == 0 => {
-                        raw_org_id = Some(mimir_ingester::http::RawScopeOrgId(v.into_bytes()));
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
+        let raw_org_id = httpgrpc_to_headers(&req.headers, &mut req_headers);
 
         let (effective_trace, parent_span_id) = match outer_trace {
             Some(ref t) if t.is_valid() => {
@@ -381,6 +493,9 @@ impl Http for HttpGrpcBridge {
         *http_req.headers_mut() = req_headers;
         http_req
             .extensions_mut()
+            .insert(HandledByHttpgrpcServer);
+        http_req
+            .extensions_mut()
             .insert(CapturedMatchedRoute(Arc::clone(&matched_route_cell)));
         if let Some(ref loc) = pending_redirect {
             http_req
@@ -395,12 +510,24 @@ impl Http for HttpGrpcBridge {
         }
 
         let span_start = mimir_common::tracing::now_unix_nanos();
-        let mut resp = mimir_common::tracing::with_trace_context(
-            effective_trace.clone(),
-            self.router.clone().oneshot(http_req),
-        )
-        .await
-        .map_err(|e| Status::internal(format!("router error: {e}")))?;
+        use futures::FutureExt as _;
+        let call_fut = HANDLED_BY_HTTPGRPC_TASK.scope(
+            true,
+            mimir_common::tracing::with_trace_context(
+                effective_trace.clone(),
+                self.router.clone().oneshot(http_req),
+            ),
+        );
+        let mut resp = match std::panic::AssertUnwindSafe(call_fut).catch_unwind().await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(Status::internal(format!("router error: {e}"))),
+            Err(payload) => {
+                if payload.is::<ErrAbortHandler>() {
+                    return Err(httpgrpc_error(500, "response body truncated"));
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
         if let Some(ref loc) = pending_redirect {
             if resp.extensions().get::<crate::http::CleanPathHandled>().is_none() {
                 resp = crate::http::clean_path_redirect_response(loc);
