@@ -4,10 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REF="$ROOT/.ref/mimir"
 
-if [[ ! -d "$REF" ]]; then
-  echo "ERROR: $REF not found" >&2
-  exit 1
-fi
+"$ROOT/scripts/fetch-upstream-mimir.sh" --check
 
 # Opt-in dependency scope: ./scripts/verify-test-parity.sh --deps [--list] [--strict] [FILTER]
 # Reports upstream Test* functions of the dskit / memberlist / prometheus-tsdb packages that

@@ -4,6 +4,7 @@
 set -euo pipefail
 CRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
+"$ROOT_DIR/scripts/fetch-upstream-mimir.sh" --check
 REF_DIR="$ROOT_DIR/.ref/mimir"
 TMP_CMD="$REF_DIR/cmd/mimir-rs-yamltypes-$$"
 mkdir -p "$TMP_CMD"

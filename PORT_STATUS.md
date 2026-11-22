@@ -1,6 +1,6 @@
 # `mimir-rs` Port Status
 
-Upstream reference: `grafana/mimir` `main` @ `06de3ebd` (`.ref/mimir`)
+Upstream reference: `grafana/mimir` `main` @ `06de3ebd` (pinned in [`UPSTREAM_MIMIR`](UPSTREAM_MIMIR), checked out at `.ref/mimir`)
 
 | Wave | Task | Crate / Scope | Status | Notes |
 |------|------|---------------|--------|-------|

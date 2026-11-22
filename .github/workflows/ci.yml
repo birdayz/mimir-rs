@@ -19,7 +19,6 @@ permissions:
   contents: read
 
 env:
-  MIMIR_REF: 06de3ebd2b12aa22861b96e6863b93a162c31e3c
   REDPANDA_IMAGE: redpandadata/redpanda:v26.2.7@sha256:43545ee03966431f5451e0b3c1e651b39fbe3eb383360220311021f50133b649
   DISTROLESS_IMAGE: gcr.io/distroless/cc-debian13@sha256:809d04afa1be033c441f76bb0051878c342fb76d0ea236bc6dc94b655fa0fbd6
   # Tag must match ETCD_IMAGE / ETCD_TAG in crates/mimir-conformance/tests/w8_kv_etcd_tls_testcontainers.rs.
@@ -56,11 +55,7 @@ jobs:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Fetch upstream Go reference (.ref/mimir)
-        run: |
-          git init -q .ref/mimir
-          git -C .ref/mimir remote add origin https://github.com/grafana/mimir.git
-          git -C .ref/mimir fetch -q --depth 1 origin "$MIMIR_REF"
-          git -C .ref/mimir checkout -q FETCH_HEAD
+        run: ./scripts/fetch-upstream-mimir.sh
       - name: Set up Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
@@ -100,13 +95,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Fetch upstream Go reference (.ref/mimir)
-        run: |
-          git init -q .ref/mimir
-          git -C .ref/mimir remote add origin https://github.com/grafana/mimir.git
-          git -C .ref/mimir fetch -q --depth 1 origin "$MIMIR_REF"
-          git -C .ref/mimir checkout -q FETCH_HEAD
+        run: ./scripts/fetch-upstream-mimir.sh
       - name: Install ripgrep
         run: sudo apt-get update -q && sudo apt-get install -y -q ripgrep
+      - name: Check upstream pin
+        run: ./scripts/fetch-upstream-mimir.sh --check
       - name: verify-test-parity
         run: ./scripts/verify-test-parity.sh
 
@@ -123,11 +116,7 @@ jobs:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Fetch upstream Go reference (.ref/mimir)
-        run: |
-          git init -q .ref/mimir
-          git -C .ref/mimir remote add origin https://github.com/grafana/mimir.git
-          git -C .ref/mimir fetch -q --depth 1 origin "$MIMIR_REF"
-          git -C .ref/mimir checkout -q FETCH_HEAD
+        run: ./scripts/fetch-upstream-mimir.sh
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
