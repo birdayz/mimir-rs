@@ -111,6 +111,72 @@ pub fn ring_router(ring: Arc<Ring>, config: StatusPageConfig) -> Router {
         .with_state(state)
 }
 
+#[derive(Clone)]
+pub struct RingPageHandler {
+    access: Arc<dyn RingAccess>,
+    heartbeat_timeout: Duration,
+    config: StatusPageConfig,
+}
+
+impl RingPageHandler {
+    pub fn new(
+        access: Arc<dyn RingAccess>,
+        heartbeat_timeout: Duration,
+        config: StatusPageConfig,
+    ) -> Self {
+        Self {
+            access,
+            heartbeat_timeout,
+            config,
+        }
+    }
+
+    pub async fn handle_get(&self, headers: &HeaderMap, raw_query: Option<&str>) -> Response {
+        let desc = self.access.get_ring_desc();
+        render_ring_response(&desc, self.heartbeat_timeout, &self.config, headers, raw_query)
+    }
+
+    pub async fn handle_post(&self, req: Request) -> Response {
+        let form = parse_go_form(req).await;
+        let forget = form.value("forget").to_string();
+        let Some(kv) = self.access.kv_client() else {
+            return go_http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("error forgetting instance '{forget}': ring has no KV client configured"),
+            );
+        };
+        let forget_id = forget.clone();
+        let res = kv
+            .cas(
+                self.access.ring_key(),
+                Box::new(move |cur| {
+                    let Some(any) = cur else {
+                        return Err(CasCallbackError::fatal(KvError::Other(
+                            "found empty ring when trying to unregister".to_string(),
+                        )));
+                    };
+                    let mut desc = any
+                        .downcast_ref::<Desc>()
+                        .ok_or_else(|| {
+                            CasCallbackError::fatal(KvError::InvalidType("expected Desc".to_string()))
+                        })?
+                        .clone();
+                    desc.remove_ingester(&forget_id);
+                    Ok(CasOutcome::Update(Box::new(desc)))
+                }),
+            )
+            .await;
+
+        match res {
+            Ok(()) => (StatusCode::FOUND, [(header::LOCATION, "#")], "").into_response(),
+            Err(err) => go_http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("error forgetting instance '{forget}': {err}"),
+            ),
+        }
+    }
+}
+
 pub async fn handle_ring_get(
     State(state): State<RingPageState>,
     headers: HeaderMap,
@@ -118,6 +184,16 @@ pub async fn handle_ring_get(
 ) -> Response {
     let desc = state.ring.desc_snapshot();
     let hb_timeout = state.ring.heartbeat_timeout();
+    render_ring_response(&desc, hb_timeout, &state.config, &headers, raw_query.as_deref())
+}
+
+fn render_ring_response(
+    desc: &Desc,
+    hb_timeout: Duration,
+    config: &StatusPageConfig,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
     let now = SystemTime::now();
     let now_local = chrono::DateTime::<Utc>::from(now)
         .with_timezone(&chrono::Local)
@@ -173,13 +249,13 @@ pub async fn handle_ring_get(
     }
 
     let mut query_values = HashMap::new();
-    let _ = go_parse_query(&mut query_values, raw_query.as_deref().unwrap_or(""));
+    let _ = go_parse_query(&mut query_values, raw_query.unwrap_or(""));
     let show_tokens = query_values
         .get("tokens")
         .and_then(|v| v.first())
         .map(String::as_str)
         == Some("true");
-    let html = render_ring_html(&shards, &owned_tokens, now, now_local, show_tokens, &state.config, &desc);
+    let html = render_ring_html(&shards, &owned_tokens, now, now_local, show_tokens, config, desc);
     ([(header::CONTENT_TYPE, "text/html")], html).into_response()
 }
 

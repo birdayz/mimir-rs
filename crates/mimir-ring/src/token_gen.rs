@@ -90,6 +90,32 @@ struct TokensJson {
     tokens: Vec<u32>,
 }
 
+/// Encodes tokens into JSON (`{"tokens":[...]}`), matching `dskit/ring.Tokens.Marshal`.
+pub fn marshal_tokens(tokens: &[u32]) -> Result<Vec<u8>, TokenGenError> {
+    Ok(serde_json::to_vec(&TokensJson {
+        tokens: tokens.to_vec(),
+    })?)
+}
+
+/// Decodes tokens from a JSON byte slice, matching `dskit/ring.Tokens.Unmarshal`.
+pub fn unmarshal_tokens(bytes: &[u8]) -> Result<Vec<u32>, TokenGenError> {
+    let parsed: TokensJson = serde_json::from_slice(bytes)?;
+    Ok(parsed.tokens)
+}
+
+/// Returns `true` if both token lists contain the same multiset of tokens (order-independent),
+/// matching `dskit/ring.Tokens.Equals`.
+pub fn tokens_equals(a: &[u32], b: &[u32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut sa = a.to_vec();
+    let mut sb = b.to_vec();
+    sa.sort_unstable();
+    sb.sort_unstable();
+    sa == sb
+}
+
 /// Stores sorted tokens to a JSON file atomically via `.tmp` + rename.
 pub fn store_tokens_to_file(tokens: &[u32], path: &Path) -> Result<(), TokenGenError> {
     if path.as_os_str().is_empty() {
@@ -197,19 +223,19 @@ impl TokenGenerator for RandomTokenGenerator {
 
 // --- Ownership Priority Queue (exact Go container/heap port) ---
 
-#[derive(Clone, Copy, Debug)]
-struct RingToken {
-    token: u32,
-    prev_token: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingToken {
+    pub token: u32,
+    pub prev_token: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct OwnershipInfo<T> {
-    item: T,
-    ownership: f64,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OwnershipInfo<T> {
+    pub item: T,
+    pub ownership: f64,
 }
 
-trait RingItem {
+pub trait RingItem {
     fn key(&self) -> usize;
 }
 
@@ -227,14 +253,14 @@ impl RingItem for RingToken {
     }
 }
 
-fn new_ring_token_ownership_info(token: u32, prev_token: u32) -> OwnershipInfo<RingToken> {
+pub fn new_ring_token_ownership_info(token: u32, prev_token: u32) -> OwnershipInfo<RingToken> {
     OwnershipInfo {
         ownership: token_distance(prev_token, token) as f64,
         item: RingToken { token, prev_token },
     }
 }
 
-fn new_ring_instance_ownership_info(instance_id: usize, ownership: f64) -> OwnershipInfo<usize> {
+pub fn new_ring_instance_ownership_info(instance_id: usize, ownership: f64) -> OwnershipInfo<usize> {
     OwnershipInfo {
         ownership,
         item: instance_id,
@@ -242,15 +268,23 @@ fn new_ring_instance_ownership_info(instance_id: usize, ownership: f64) -> Owner
 }
 
 #[derive(Clone, Debug)]
-struct OwnershipPriorityQueue<T> {
+pub struct OwnershipPriorityQueue<T> {
     items: Vec<OwnershipInfo<T>>,
 }
 
 impl<T: RingItem> OwnershipPriorityQueue<T> {
-    fn with_capacity(cap: usize) -> Self {
+    pub fn with_capacity(cap: usize) -> Self {
         Self {
             items: Vec::with_capacity(cap),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     fn less(&self, i: usize, j: usize) -> bool {
@@ -294,13 +328,13 @@ impl<T: RingItem> OwnershipPriorityQueue<T> {
         i > i0
     }
 
-    fn push(&mut self, item: OwnershipInfo<T>) {
+    pub fn push(&mut self, item: OwnershipInfo<T>) {
         self.items.push(item);
         let idx = self.items.len() - 1;
         self.up(idx);
     }
 
-    fn pop(&mut self) -> Option<OwnershipInfo<T>> {
+    pub fn pop(&mut self) -> Option<OwnershipInfo<T>> {
         if self.items.is_empty() {
             return None;
         }
@@ -310,15 +344,15 @@ impl<T: RingItem> OwnershipPriorityQueue<T> {
         self.items.pop()
     }
 
-    fn peek(&self) -> Option<&OwnershipInfo<T>> {
+    pub fn peek(&self) -> Option<&OwnershipInfo<T>> {
         self.items.first()
     }
 
-    fn peek_mut(&mut self) -> Option<&mut OwnershipInfo<T>> {
+    pub fn peek_mut(&mut self) -> Option<&mut OwnershipInfo<T>> {
         self.items.first_mut()
     }
 
-    fn fix(&mut self, i: usize) {
+    pub fn fix(&mut self, i: usize) {
         let n = self.items.len();
         if !self.down(i, n) {
             self.up(i);
@@ -332,7 +366,14 @@ pub struct SpreadMinimizingTokenGenerator {
     instance_id: usize,
     instance_prefix: String,
     zone_id: usize,
-    can_join_enabled: bool,
+    pub can_join_enabled: bool,
+}
+
+pub fn find_zone_id(zone: &str, sorted_zones: &[String]) -> Result<usize, TokenGenError> {
+    sorted_zones
+        .iter()
+        .position(|z| z == zone)
+        .ok_or_else(|| TokenGenError::ZoneNotValid(zone.to_string()))
 }
 
 impl SpreadMinimizingTokenGenerator {
@@ -350,10 +391,7 @@ impl SpreadMinimizingTokenGenerator {
         let mut sorted_zones = spread_minimizing_zones.to_vec();
         sorted_zones.sort();
 
-        let zone_id = sorted_zones
-            .iter()
-            .position(|z| z == zone)
-            .ok_or_else(|| TokenGenError::ZoneNotValid(zone.to_string()))?;
+        let zone_id = find_zone_id(zone, &sorted_zones)?;
 
         let (prefix, instance_id) = parse_instance_id(instance)?;
         Ok(Self::for_instance_and_zone_id(
@@ -378,7 +416,7 @@ impl SpreadMinimizingTokenGenerator {
         }
     }
 
-    fn generate_first_instance_tokens(&self) -> Vec<u32> {
+    pub fn generate_first_instance_tokens(&self) -> Vec<u32> {
         let token_distance =
             ((TOTAL_TOKENS_COUNT / OPTIMAL_TOKENS_PER_INSTANCE as u64 / MAX_ZONES_COUNT as u64)
                 * MAX_ZONES_COUNT as u64) as u32;
@@ -390,7 +428,7 @@ impl SpreadMinimizingTokenGenerator {
         tokens
     }
 
-    fn calculate_new_token(
+    pub fn calculate_new_token(
         &self,
         token: RingToken,
         optimal_token_ownership: u32,
@@ -398,19 +436,20 @@ impl SpreadMinimizingTokenGenerator {
         let max_zones = MAX_ZONES_COUNT as u32;
         if optimal_token_ownership < max_zones || !optimal_token_ownership.is_multiple_of(max_zones) {
             return Err(TokenGenError::SpreadMinimizing(format!(
-                "optimal token ownership {optimal_token_ownership} must be a positive multiple of {max_zones}"
+                "calculation of a new token between {} and {} with optimal token ownership {optimal_token_ownership} was impossible: optimal token ownership must be a positive multiple of maximal allowed number of zones {max_zones}",
+                token.prev_token, token.token
             )));
         }
         if token.prev_token % max_zones != token.token % max_zones {
             return Err(TokenGenError::SpreadMinimizing(format!(
-                "lower {} and upper {} bounds must be congruent modulo {max_zones}",
+                "calculation of a new token between {} and {} with optimal token ownership {optimal_token_ownership} was impossible: lower and upper bounds must be congruent modulo maximal allowed number of zones {max_zones}",
                 token.prev_token, token.token
             )));
         }
         let ownership = token_distance(token.prev_token, token.token);
         if ownership <= optimal_token_ownership as i64 {
             return Err(TokenGenError::SpreadMinimizing(format!(
-                "distance {ownership} between {} and {} not big enough for {optimal_token_ownership}",
+                "calculation of a new token between {} and {} with optimal token ownership {optimal_token_ownership} was impossible: distance between lower and upper bound {ownership} is not big enough",
                 token.prev_token, token.token
             )));
         }
@@ -425,7 +464,7 @@ impl SpreadMinimizingTokenGenerator {
         }
     }
 
-    fn optimal_token_ownership(
+    pub fn optimal_token_ownership(
         &self,
         optimal_instance_ownership: f64,
         curr_instance_ownership: f64,
@@ -560,7 +599,7 @@ impl SpreadMinimizingTokenGenerator {
     }
 }
 
-fn parse_instance_id(instance_id: &str) -> Result<(String, usize), TokenGenError> {
+pub fn parse_instance_id(instance_id: &str) -> Result<(String, usize), TokenGenError> {
     let Some((prefix_no_dash, num_str)) = instance_id.rsplit_once('-') else {
         return Err(TokenGenError::BadInstanceIdFormat(instance_id.to_string()));
     };
