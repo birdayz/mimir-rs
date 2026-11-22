@@ -935,8 +935,8 @@ impl IngesterShardedBatchConsumer {
                                 ts.label_bytes_range.end - ts.label_bytes_range.start;
                             let (raw_label_bytes_start, raw_label_bytes_len) =
                                 match ts.raw_label_bytes_range {
-                                    Some(ref rr) if !ts.bad_utf8 => (rr.start, rr.len()),
-                                    _ => (label_bytes_start, label_bytes_len),
+                                    Some(ref rr) => (rr.start, rr.len()),
+                                    None => (label_bytes_start, label_bytes_len),
                                 };
                             let prom_hash = if !ts.bad_utf8
                                 && ts.labels_sorted_unique
@@ -1161,6 +1161,33 @@ impl IngesterShardedBatchConsumer {
                     let mut raw_range: Option<(usize, usize)> = None;
                     let label_bytes_end = if bad_utf8 {
                         label_bytes_arena.truncate(label_bytes_start);
+                        if let Some(ts_labels_str) = ts.labels_str() {
+                            for (k, v) in ts_labels_str {
+                                if let Err(e) = try_append_stringlabel_pair(
+                                    label_bytes_arena,
+                                    k.as_bytes(),
+                                    v.as_bytes(),
+                                ) {
+                                    label_encode_err = Some(e);
+                                    break;
+                                }
+                            }
+                        } else {
+                            for lp in ts.labels() {
+                                if let Err(e) = try_append_stringlabel_pair(
+                                    label_bytes_arena,
+                                    lp.name,
+                                    lp.value,
+                                ) {
+                                    label_encode_err = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        if label_encode_err.is_some() {
+                            break;
+                        }
+                        raw_range = Some((label_bytes_start, label_bytes_arena.len()));
                         label_bytes_start
                     } else if !labels_sorted_unique && dropped_empty {
                         label_bytes_arena.truncate(label_bytes_start);

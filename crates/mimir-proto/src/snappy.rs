@@ -134,9 +134,12 @@ pub fn compress_framed_into(input: &[u8], out: &mut Vec<u8>) -> std::io::Result<
     compress_framed_buf(input, out)
 }
 
+/// Default maximum decompressed gRPC frame size for [`decode_grpc_frame`] (64 MiB).
+pub const DEFAULT_MAX_GRPC_FRAME_DECOMPRESSED_LEN: usize = 64 * 1024 * 1024;
+
 /// Decompresses Snappy framed stream bytes into a `Vec<u8>`.
 pub fn decompress_framed(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 2);
+    let mut out = Vec::with_capacity(input.len().saturating_mul(2).min(64 * 1024));
     decompress_framed_into(input, &mut out)?;
     Ok(out)
 }
@@ -338,9 +341,12 @@ pub fn encode_grpc_frame(payload: &[u8], compress: bool) -> std::io::Result<Byte
     Ok(buf.freeze())
 }
 
-/// Decodes a single gRPC length-prefixed message frame, decompressing Snappy framed payload if the
-/// compressed flag byte is `1`.
-pub fn decode_grpc_frame(frame: &[u8]) -> std::io::Result<Bytes> {
+/// Decodes a single gRPC length-prefixed message frame with a bounded maximum decompressed size
+/// (defaulting to [`DEFAULT_MAX_GRPC_FRAME_DECOMPRESSED_LEN`] in [`decode_grpc_frame`]).
+pub fn decode_grpc_frame_bounded(
+    frame: &[u8],
+    max_decompressed_len: usize,
+) -> std::io::Result<Bytes> {
     if frame.len() < 5 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -349,20 +355,51 @@ pub fn decode_grpc_frame(frame: &[u8]) -> std::io::Result<Bytes> {
     }
     let compressed_flag = frame[0];
     let len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
-    let body = frame.get(5..5 + len).ok_or_else(|| {
+    let frame_end = 5usize.checked_add(len).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "gRPC frame length overflow",
+        )
+    })?;
+    let body = frame.get(5..frame_end).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "gRPC frame body shorter than declared length",
         )
     })?;
     match compressed_flag {
-        0 => Ok(Bytes::copy_from_slice(body)),
-        1 => Ok(Bytes::from(decompress_framed(body)?)),
+        0 => {
+            if body.len() > max_decompressed_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    DecompressLimitExceeded {
+                        limit: max_decompressed_len,
+                    },
+                ));
+            }
+            Ok(Bytes::copy_from_slice(body))
+        }
+        1 => {
+            let mut out = Vec::with_capacity(
+                body.len()
+                    .saturating_mul(2)
+                    .min(max_decompressed_len)
+                    .min(64 * 1024),
+            );
+            decompress_framed_bounded_into(body, &mut out, max_decompressed_len)?;
+            Ok(Bytes::from(out))
+        }
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid gRPC compression flag: {other}"),
         )),
     }
+}
+
+/// Decodes a single gRPC length-prefixed message frame, decompressing Snappy framed payload if the
+/// compressed flag byte is `1`, bounded by [`DEFAULT_MAX_GRPC_FRAME_DECOMPRESSED_LEN`].
+pub fn decode_grpc_frame(frame: &[u8]) -> std::io::Result<Bytes> {
+    decode_grpc_frame_bounded(frame, DEFAULT_MAX_GRPC_FRAME_DECOMPRESSED_LEN)
 }
 
 #[cfg(test)]
