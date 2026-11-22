@@ -155,12 +155,20 @@ fn detect_content_type(data: &[u8]) -> &'static str {
     "text/plain; charset=utf-8"
 }
 
+/// Marker extension for per-route gzip disablement (`RegisterRoute(..., gzipEnabled=false)`).
+#[derive(Clone, Copy, Debug)]
+pub struct GzipRouteEnabled(pub bool);
+
 /// Route layer: Mimir `gziphandler.GzipHandler(handler, level)`.
 pub async fn gzip_handler(State(cfg): State<GzipConfig>, req: Request, next: Next) -> Response {
-    let gzipped_route = req
-        .extensions()
-        .get::<MatchedPath>()
-        .is_some_and(|p| route_is_gzipped(p.as_str(), cfg.cost_attribution_path.as_deref()));
+    let explicit = req.extensions().get::<GzipRouteEnabled>().map(|e| e.0);
+    let gzipped_route = match explicit {
+        Some(enabled) => enabled,
+        None => req
+            .extensions()
+            .get::<MatchedPath>()
+            .is_some_and(|p| route_is_gzipped(p.as_str(), cfg.cost_attribution_path.as_deref())),
+    };
     if !gzipped_route {
         return next.run(req).await;
     }
@@ -170,6 +178,10 @@ pub async fn gzip_handler(State(cfg): State<GzipConfig>, req: Request, next: Nex
         .extensions()
         .get::<crate::server::http_middleware::MethodMismatch>()
         .is_some()
+        || resp
+            .extensions()
+            .get::<GzipRouteEnabled>()
+            .is_some_and(|e| !e.0)
     {
         return resp;
     }

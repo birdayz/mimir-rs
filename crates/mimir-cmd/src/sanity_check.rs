@@ -90,8 +90,23 @@ fn go_path_error(op: &str, path: &Path, err: &std::io::Error) -> String {
     format!("{op} {}: {reason}", path.display())
 }
 
-/// `checkDirectoriesReadWriteAccess` (only the components implemented by mimir-rs can be
-/// enabled, i.e. the ingester).
+fn extra_dir(cfg: &MimirConfig, section: &str, field: &str, flag: &str, default: &str) -> String {
+    if let Some(v) = cfg.extra_cli_flag_value(flag) {
+        return v.to_string();
+    }
+    cfg.extra_sections
+        .get(section)
+        .and_then(|s| s.get(field))
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn is_alertmanager_enabled(cfg: &MimirConfig) -> bool {
+    cfg.is_module_explicitly_targeted("alertmanager")
+}
+
+/// `checkDirectoriesReadWriteAccess` (ported from `pkg/mimir/sanity_check.go`).
 pub fn check_directories_read_write_access(
     cfg: &MimirConfig,
     dir_exists_fn: impl Fn(&Path) -> Result<bool, String>,
@@ -105,6 +120,33 @@ pub fn check_directories_read_write_access(
             &is_dir_read_writable_fn,
         ) {
             errs.push(format!("ingester: {e}"));
+        }
+    }
+    if cfg.is_store_gateway_enabled() {
+        if let Err(e) = check_dir_read_write_access(
+            &cfg.blocks_storage.bucket_store.sync_dir,
+            &dir_exists_fn,
+            &is_dir_read_writable_fn,
+        ) {
+            errs.push(format!("store-gateway: {e}"));
+        }
+    }
+    if cfg.is_compactor_enabled() {
+        let data_dir = extra_dir(cfg, "compactor", "data_dir", "compactor.data-dir", "./data-compactor/");
+        if let Err(e) = check_dir_read_write_access(&data_dir, &dir_exists_fn, &is_dir_read_writable_fn) {
+            errs.push(format!("compactor: {e}"));
+        }
+    }
+    if cfg.is_ruler_enabled() {
+        let rule_path = extra_dir(cfg, "ruler", "rule_path", "ruler.rule-path", "./data-ruler/");
+        if let Err(e) = check_dir_read_write_access(&rule_path, &dir_exists_fn, &is_dir_read_writable_fn) {
+            errs.push(format!("ruler: {e}"));
+        }
+    }
+    if is_alertmanager_enabled(cfg) {
+        let data_dir = extra_dir(cfg, "alertmanager", "data_dir", "alertmanager.storage.path", "./data-alertmanager/");
+        if let Err(e) = check_dir_read_write_access(&data_dir, &dir_exists_fn, &is_dir_read_writable_fn) {
+            errs.push(format!("alertmanager: {e}"));
         }
     }
     multi_error(errs)
@@ -193,13 +235,55 @@ async fn check_object_stores_config_with_retries(
     Err(last_err)
 }
 
-/// `checkObjectStoresConfig` (blocks storage is used by the ingester, the only implemented
-/// component).
-async fn check_object_stores_config(cfg: &MimirConfig) -> Result<(), String> {
+fn extra_bucket_config(cfg: &MimirConfig, section: &str) -> BucketConfig {
+    let mut b = BucketConfig::default();
+    b.backend_cfg.backend = "local".to_string();
+    let Some(val) = cfg.extra_sections.get(section) else {
+        return b;
+    };
+    if let Some(map) = val.as_mapping() {
+        let mut filtered = serde_yaml::Mapping::new();
+        for (k, v) in map {
+            if let Some(ks) = k.as_str() {
+                if matches!(ks, "backend" | "storage_prefix" | "s3" | "gcs" | "azure" | "swift" | "filesystem") {
+                    filtered.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        if let Ok(parsed) = serde_yaml::from_value::<BucketConfig>(serde_yaml::Value::Mapping(filtered)) {
+            return parsed;
+        }
+    }
+    b
+}
+
+/// `checkObjectStoresConfig` (ported from `pkg/mimir/sanity_check.go`).
+pub async fn check_object_stores_config(cfg: &MimirConfig) -> Result<(), String> {
     let mut errs = Vec::new();
-    if cfg.is_ingester_enabled() {
+    if cfg.is_ingester_enabled()
+        || cfg.is_querier_enabled()
+        || cfg.is_ruler_enabled()
+        || cfg.is_store_gateway_enabled()
+        || cfg.is_compactor_enabled()
+    {
         if let Err(e) = check_blocks_storage_config(cfg).await {
             errs.push(format!("blocks storage: {e}"));
+        }
+    }
+    if is_alertmanager_enabled(cfg) {
+        let am_bucket = extra_bucket_config(cfg, "alertmanager_storage");
+        if am_bucket.backend_cfg.backend != "local" {
+            if let Err(e) = check_object_store_config(&am_bucket).await {
+                errs.push(format!("alertmanager storage: {e}"));
+            }
+        }
+    }
+    if cfg.is_ruler_enabled() {
+        let ruler_bucket = extra_bucket_config(cfg, "ruler_storage");
+        if ruler_bucket.backend_cfg.backend != "local" {
+            if let Err(e) = check_object_store_config(&ruler_bucket).await {
+                errs.push(format!("ruler storage: {e}"));
+            }
         }
     }
     multi_error(errs)

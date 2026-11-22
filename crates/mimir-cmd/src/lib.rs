@@ -7,8 +7,13 @@
 //! - github.com/grafana/mimir/pkg/api/*
 //! - github.com/grafana/dskit/server/*
 
+pub mod activity_tracking;
+pub mod api_error;
 pub mod app;
 pub mod cli;
+pub mod grpc_call_check;
+pub mod protobuf_codec;
+pub mod server_service;
 pub use mimir_ingester::expfmt;
 pub mod grpc;
 pub mod http;

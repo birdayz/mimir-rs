@@ -34,7 +34,7 @@ use mimir_common::logging::{LogLevel, Logger};
 use mimir_config::server::ServerConfig;
 use mimir_config::GoDuration;
 use prometheus::Registry;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 
 use self::grpc_server::{finite, GrpcClusterValidation, GrpcContext, GrpcServerConfig};
 use self::http_middleware::{HttpClusterValidation, HttpMiddlewareConfig, SourceIps};
@@ -303,6 +303,10 @@ impl Server {
         self.grpc_listener.local_addr()
     }
 
+    pub fn has_log_source_ips(&self) -> bool {
+        self.middleware.log_source_ips.is_some()
+    }
+
     /// Mimir's `noauth.SetupAuthMiddleware` gRPC interceptors: with multitenancy enabled every
     /// RPC outside `noGRPCAuthOn` must carry exactly one `x-scope-orgid`.
     pub fn set_grpc_multitenancy(&mut self, enabled: bool, no_auth_tenant: impl Into<String>) {
@@ -384,7 +388,7 @@ impl Server {
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let (stopped_tx, stopped_rx) = watch::channel(false);
         std::thread::Builder::new()
             .name("mimir-rpc-rt".to_string())
             .spawn(move || {
@@ -406,26 +410,62 @@ impl Server {
                     let _ = http.await;
                     let _ = grpc.await;
                 });
-                let _ = done_tx.send(());
+                let _ = stopped_tx.send(true);
             })
             .context("spawning mimir-rpc runtime thread")?;
 
-        Ok(RunningServers { shutdown_tx, done_rx })
+        Ok(RunningServers {
+            shutdown_tx: Arc::new(shutdown_tx),
+            stopped_rx,
+        })
+    }
+}
+
+/// Clonable shutdown/wait handle for running servers (used by `ServerService`).
+#[derive(Clone)]
+pub struct ServerShutdownHandle {
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    stopped_rx: watch::Receiver<bool>,
+}
+
+impl ServerShutdownHandle {
+    pub fn trigger_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    pub fn trigger_stop(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    pub async fn wait_stopped(&mut self) {
+        let _ = self.stopped_rx.wait_for(|v| *v).await;
+    }
+
+    pub async fn shutdown(&mut self) {
+        self.trigger_shutdown();
+        self.wait_stopped().await;
     }
 }
 
 /// Handle to running servers.
 pub struct RunningServers {
-    shutdown_tx: watch::Sender<bool>,
-    done_rx: oneshot::Receiver<()>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    stopped_rx: watch::Receiver<bool>,
 }
 
 impl RunningServers {
+    pub fn shutdown_handle(&self) -> ServerShutdownHandle {
+        ServerShutdownHandle {
+            shutdown_tx: Arc::clone(&self.shutdown_tx),
+            stopped_rx: self.stopped_rx.clone(),
+        }
+    }
+
     /// dskit `Server.Shutdown`: HTTP shuts down gracefully within its timeout, gRPC stops
     /// gracefully (waiting for in-flight RPCs).
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.done_rx.await;
+        let _ = self.stopped_rx.wait_for(|v| *v).await;
     }
 }
 
