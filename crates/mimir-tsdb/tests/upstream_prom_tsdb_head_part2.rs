@@ -1244,6 +1244,7 @@ fn test_head_wal_checkpoint_full_range_tombstones() {
 fn test_head_fast_startup_state_file() {
     let dir = tempfile::tempdir().unwrap();
     let h = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+    h.set_enable_fast_startup(true);
     {
         let mut app = h.appender();
         app.append_float(None, &[("fast", "startup")], 100, 1.0).unwrap();

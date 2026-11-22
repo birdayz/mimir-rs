@@ -3883,6 +3883,7 @@ pub struct Head {
     has_any_metadata: AtomicBool,
     enable_st_as_zero_sample: AtomicBool,
     enable_memory_snapshot_on_shutdown: AtomicBool,
+    enable_fast_startup: AtomicBool,
     deleted_series_since_symbol_gc: AtomicU64,
     symbol_arena_baseline_bytes: AtomicU64,
     symbol_gc_arena_growth_threshold: AtomicU64,
@@ -4236,6 +4237,7 @@ impl Head {
             has_any_metadata: AtomicBool::new(false),
             enable_st_as_zero_sample: AtomicBool::new(false),
             enable_memory_snapshot_on_shutdown: AtomicBool::new(enable_memory_snapshot_on_shutdown),
+            enable_fast_startup: AtomicBool::new(false),
             deleted_series_since_symbol_gc: AtomicU64::new(0),
             symbol_arena_baseline_bytes: AtomicU64::new(0),
             symbol_gc_arena_growth_threshold: AtomicU64::new(DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES),
@@ -11235,6 +11237,11 @@ impl Head {
         self.active_reads.wait_for_range(mint, maxt_exclusive);
     }
 
+    /// Enables or disables Go `HeadOptions.EnableFastStartup` (`wal/series_state.json` on close).
+    pub fn set_enable_fast_startup(&self, enabled: bool) {
+        self.enable_fast_startup.store(enabled, Ordering::Release);
+    }
+
     /// Reads `wal/series_state.json` (Go `Head.readSeriesStateFile`).
     pub fn read_series_state_file(&self) -> io::Result<SeriesLifecycleState> {
         let path = self.dir.join("wal").join(SERIES_STATE_FILENAME);
@@ -11681,7 +11688,9 @@ impl Head {
         if self.enable_memory_snapshot_on_shutdown.load(Ordering::Acquire) {
             self.chunk_snapshot()?;
         }
-        let _ = self.write_series_state_file(true);
+        if self.enable_fast_startup.load(Ordering::Acquire) && self.wal.lock().is_some() {
+            let _ = self.write_series_state_file(true);
+        }
         if let Some(cw) = self.chunk_writer.lock().take() {
             cw.close()?;
         }
@@ -18194,6 +18203,7 @@ mod tests {
                 has_any_metadata: AtomicBool::new(false),
                 enable_st_as_zero_sample: AtomicBool::new(false),
                 enable_memory_snapshot_on_shutdown: AtomicBool::new(false),
+                enable_fast_startup: AtomicBool::new(false),
                 deleted_series_since_symbol_gc: AtomicU64::new(0),
                 symbol_arena_baseline_bytes: AtomicU64::new(0),
                 symbol_gc_arena_growth_threshold: AtomicU64::new(DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES),
