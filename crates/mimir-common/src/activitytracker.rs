@@ -87,11 +87,16 @@ pub fn validate_raw_max_entries(raw: i64) -> io::Result<usize> {
     Ok(entries)
 }
 
+struct FreeQueueState {
+    queue: VecDeque<usize>,
+    in_use: Vec<bool>,
+}
+
 /// Mmap-backed tracker remembering active tasks in fixed 1024-byte slots.
 pub struct ActivityTracker {
     _file: File,
     mmap: Mutex<MmapMut>,
-    free_index_queue: Mutex<VecDeque<usize>>,
+    free_index_queue: Mutex<FreeQueueState>,
     max_entries: usize,
     failed_full: Counter,
     failed_empty: Counter,
@@ -173,7 +178,10 @@ impl ActivityTracker {
         Ok(Some(Self {
             _file: file,
             mmap: Mutex::new(mmap),
-            free_index_queue: Mutex::new(free_index_queue),
+            free_index_queue: Mutex::new(FreeQueueState {
+                queue: free_index_queue,
+                in_use: vec![false; cfg.max_entries],
+            }),
             max_entries: cfg.max_entries,
             failed_full,
             failed_empty,
@@ -190,9 +198,10 @@ impl ActivityTracker {
     {
         let idx = {
             let mut q = self.free_index_queue.lock();
-            match q.pop_front() {
+            match q.queue.pop_front() {
                 Some(i) => {
-                    self.free_slots.set(q.len() as f64);
+                    q.in_use[i] = true;
+                    self.free_slots.set(q.queue.len() as f64);
                     i
                 }
                 None => {
@@ -202,11 +211,32 @@ impl ActivityTracker {
             }
         };
 
+        struct SlotGuard<'a> {
+            tracker: &'a ActivityTracker,
+            idx: usize,
+            armed: bool,
+        }
+        impl Drop for SlotGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let mut q = self.tracker.free_index_queue.lock();
+                    if q.in_use[self.idx] {
+                        q.in_use[self.idx] = false;
+                        q.queue.push_back(self.idx);
+                        self.tracker.free_slots.set(q.queue.len() as f64);
+                    }
+                }
+            }
+        }
+        let mut slot_guard = SlotGuard {
+            tracker: self,
+            idx,
+            armed: true,
+        };
+
         let activity = activity_generator();
         if activity.is_empty() {
-            let mut q = self.free_index_queue.lock();
-            q.push_back(idx);
-            self.free_slots.set(q.len() as f64);
+            drop(slot_guard);
             self.failed_empty.inc();
             return -1;
         }
@@ -219,14 +249,17 @@ impl ActivityTracker {
 
         let trimmed = trim_entry_to_size(&activity, MAX_ACTIVITY_LEN);
         let offset = idx * ENTRY_SIZE;
-        let mut mmap = self.mmap.lock();
-        mmap[offset..offset + TIMESTAMP_LENGTH].copy_from_slice(&now_nanos.to_be_bytes());
-        mmap[offset + TIMESTAMP_LENGTH..offset + TIMESTAMP_LENGTH + trimmed.len()]
-            .copy_from_slice(trimmed.as_bytes());
-        // Zero any remaining tail bytes in case a previous write hadn't cleared them
-        if TIMESTAMP_LENGTH + trimmed.len() < ENTRY_SIZE {
-            mmap[offset + TIMESTAMP_LENGTH + trimmed.len()..offset + ENTRY_SIZE].fill(0);
+        {
+            let mut mmap = self.mmap.lock();
+            mmap[offset..offset + TIMESTAMP_LENGTH].copy_from_slice(&now_nanos.to_be_bytes());
+            mmap[offset + TIMESTAMP_LENGTH..offset + TIMESTAMP_LENGTH + trimmed.len()]
+                .copy_from_slice(trimmed.as_bytes());
+            // Zero any remaining tail bytes in case a previous write hadn't cleared them
+            if TIMESTAMP_LENGTH + trimmed.len() < ENTRY_SIZE {
+                mmap[offset + TIMESTAMP_LENGTH + trimmed.len()..offset + ENTRY_SIZE].fill(0);
+            }
         }
+        slot_guard.armed = false;
 
         idx as isize
     }
@@ -242,14 +275,21 @@ impl ActivityTracker {
             return;
         }
         let idx = activity_index as usize;
+        {
+            let mut q = self.free_index_queue.lock();
+            if !q.in_use[idx] {
+                return;
+            }
+            q.in_use[idx] = false;
+        }
         let offset = idx * ENTRY_SIZE;
         {
             let mut mmap = self.mmap.lock();
             mmap[offset..offset + ENTRY_SIZE].copy_from_slice(&EMPTY_ENTRY);
         }
         let mut q = self.free_index_queue.lock();
-        q.push_back(idx);
-        self.free_slots.set(q.len() as f64);
+        q.queue.push_back(idx);
+        self.free_slots.set(q.queue.len() as f64);
     }
 
     /// Flushes mmap changes to disk.

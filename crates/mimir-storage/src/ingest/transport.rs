@@ -400,6 +400,7 @@ impl ScramSession {
         ))
     }
 
+    #[cfg(test)]
     fn challenge(&mut self, resp: &[u8]) -> Result<(bool, Vec<u8>), String> {
         let step = self.step;
         self.step += 1;
@@ -415,7 +416,26 @@ impl ScramSession {
         }
     }
 
-    fn authenticate_client(&mut self, server_first: &[u8]) -> Result<Vec<u8>, String> {
+    async fn challenge_async(&mut self, resp: &[u8]) -> Result<(bool, Vec<u8>), String> {
+        let step = self.step;
+        self.step += 1;
+        match step {
+            0 => Ok((false, self.authenticate_client_async(resp).await?)),
+            1 => {
+                self.verify_server(resp)?;
+                Ok((true, Vec::new()))
+            }
+            _ => Err(format!(
+                "challenge / response should be done, but still going at {step}"
+            )),
+        }
+    }
+
+    fn parse_server_first<'a>(
+        &self,
+        server_first: &'a [u8],
+    ) -> Result<(&'a [u8], Vec<u8>, NonZeroU32), String> {
+        const MAX_SCRAM_ITERATIONS: i64 = 1_000_000;
         let kvs: Vec<&[u8]> = server_first.split(|&b| b == b',').collect();
         if kvs.len() < 3 {
             return Err(format!("got {} kvs != exp min 3", kvs.len()));
@@ -442,15 +462,26 @@ impl ScramSession {
         if iters < 4096 {
             return Err(format!("server iterations {iters} less than minimum 4096"));
         }
+        if iters > MAX_SCRAM_ITERATIONS {
+            return Err(format!(
+                "server iterations {iters} exceeds maximum {MAX_SCRAM_ITERATIONS}"
+            ));
+        }
         let iters = NonZeroU32::new(u32::try_from(iters).map_err(|_| {
             format!("server iterations {iters} too large")
         })?)
-        .expect("iters >= 4096");
+        .ok_or_else(|| format!("server iterations {iters} invalid"))?;
+        Ok((server_nonce, salt, iters))
+    }
 
+    fn finish_authenticate_client(
+        &mut self,
+        server_first: &[u8],
+        server_nonce: &[u8],
+        salted: &[u8],
+    ) -> Vec<u8> {
         let h = self.hash;
-        let mut salted = vec![0u8; h.size()];
-        ring::pbkdf2::derive(h.pbkdf2_alg(), iters, &salt, self.password.as_bytes(), &mut salted);
-        let client_key = h.hmac(&salted, b"Client Key");
+        let client_key = h.hmac(salted, b"Client Key");
         let stored_key = ring::digest::digest(h.digest_alg(), &client_key);
 
         let mut final_without_proof = b"c=biws,r=".to_vec();
@@ -466,13 +497,36 @@ impl ScramSession {
         for (p, c) in proof.iter_mut().zip(client_key.iter()) {
             *p ^= c;
         }
-        let server_key = h.hmac(&salted, b"Server Key");
+        let server_key = h.hmac(salted, b"Server Key");
         self.exp_server_signature = base64_encode(&h.hmac(&server_key, &auth_msg)).into_bytes();
 
         let mut out = final_without_proof;
         out.extend_from_slice(b",p=");
         out.extend_from_slice(base64_encode(&proof).as_bytes());
-        Ok(out)
+        out
+    }
+
+    #[cfg(test)]
+    fn authenticate_client(&mut self, server_first: &[u8]) -> Result<Vec<u8>, String> {
+        let (server_nonce, salt, iters) = self.parse_server_first(server_first)?;
+        let h = self.hash;
+        let mut salted = vec![0u8; h.size()];
+        ring::pbkdf2::derive(h.pbkdf2_alg(), iters, &salt, self.password.as_bytes(), &mut salted);
+        Ok(self.finish_authenticate_client(server_first, server_nonce, &salted))
+    }
+
+    async fn authenticate_client_async(&mut self, server_first: &[u8]) -> Result<Vec<u8>, String> {
+        let (server_nonce, salt, iters) = self.parse_server_first(server_first)?;
+        let h = self.hash;
+        let password = self.password.as_bytes().to_vec();
+        let salted = tokio::task::spawn_blocking(move || {
+            let mut salted = vec![0u8; h.size()];
+            ring::pbkdf2::derive(h.pbkdf2_alg(), iters, &salt, &password, &mut salted);
+            salted
+        })
+        .await
+        .map_err(|e| format!("SCRAM PBKDF2 task failed: {e}"))?;
+        Ok(self.finish_authenticate_client(server_first, server_nonce, &salted))
     }
 
     fn verify_server(&self, server_final: &[u8]) -> Result<(), String> {
@@ -489,12 +543,9 @@ impl ScramSession {
                 String::from_utf8_lossy(kv)
             ));
         };
-        if sig != self.exp_server_signature.as_slice() {
-            return Err(format!(
-                "server signature mismatch; got {:?} != exp {:?}",
-                String::from_utf8_lossy(sig),
-                String::from_utf8_lossy(&self.exp_server_signature)
-            ));
+        #[allow(deprecated)]
+        if ring::constant_time::verify_slices_are_equal(sig, &self.exp_server_signature).is_err() {
+            return Err("server signature mismatch".to_string());
         }
         Ok(())
     }
@@ -757,10 +808,35 @@ impl SaslSession {
     }
 
     /// `sasl.Session.Challenge`: returns `(done, next client message)`.
+    #[cfg(test)]
     fn challenge(&mut self, resp: &[u8]) -> Result<(bool, Vec<u8>), String> {
         match self {
             Self::Plain => Ok((true, Vec::new())),
             Self::Scram(s) => s.challenge(resp),
+            Self::Oauthbearer { error_challenge } => {
+                if !resp.is_empty() {
+                    let msg = String::from_utf8_lossy(resp).trim().to_string();
+                    if msg.starts_with('{') {
+                        *error_challenge = Some(msg);
+                        return Ok((true, vec![0x01]));
+                    }
+                    return Err(format!("unexpected data in oauth response: {msg}"));
+                }
+                Ok((true, Vec::new()))
+            }
+            Self::MskIam => {
+                if resp.is_empty() {
+                    return Err("empty challenge response: failed".to_string());
+                }
+                Ok((true, Vec::new()))
+            }
+        }
+    }
+
+    async fn challenge_async(&mut self, resp: &[u8]) -> Result<(bool, Vec<u8>), String> {
+        match self {
+            Self::Plain => Ok((true, Vec::new())),
+            Self::Scram(s) => s.challenge_async(resp).await,
             Self::Oauthbearer { error_challenge } => {
                 if !resp.is_empty() {
                     let msg = String::from_utf8_lossy(resp).trim().to_string();
@@ -1071,7 +1147,7 @@ impl KafkaTransport {
             };
             client_write.clear();
             if !done {
-                let (d, next) = session.challenge(&challenge).map_err(sasl_err)?;
+                let (d, next) = session.challenge_async(&challenge).await.map_err(sasl_err)?;
                 done = d;
                 client_write = next;
             }
@@ -1146,7 +1222,7 @@ impl Kip368AuthFlow {
         Some(req)
     }
 
-    pub(crate) fn on_authenticate_response(
+    pub(crate) async fn on_authenticate_response(
         &mut self,
         resp: SaslAuthenticateResponse,
     ) -> Result<(), KafkaClientError> {
@@ -1173,7 +1249,8 @@ impl Kip368AuthFlow {
         if !self.done {
             let (d, next) = self
                 .session
-                .challenge(&resp.auth_bytes)
+                .challenge_async(&resp.auth_bytes)
+                .await
                 .map_err(|m| self.sasl_err(m))?;
             self.done = d;
             self.client_write = next;

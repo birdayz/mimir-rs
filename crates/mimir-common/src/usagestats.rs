@@ -21,12 +21,16 @@ use hyper::{Method, Request};
 use prometheus::{Counter, Histogram, HistogramOpts, Opts, Registry};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use std::io::{self, Cursor, Read as _, Write as _};
+
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::backoff::{Backoff, BackoffConfig};
 use crate::logging::format_rfc3339_nano_utc;
 use crate::services::{basic_service, ManagedBasicService, ServiceContext, ServiceError};
+use crate::tls::ClientConfig as TlsClientConfig;
 
 pub const TARGET_KEY: &str = "target";
 pub const EDITION_KEY: &str = "edition";
@@ -696,9 +700,216 @@ impl Default for ReporterConfig {
     }
 }
 
-struct TokioIo(TcpStream);
+struct RustlsStream {
+    io: TcpStream,
+    conn: rustls::ClientConnection,
+    write_buf: Vec<u8>,
+    write_pos: usize,
+    read_eof: bool,
+    close_sent: bool,
+}
 
-impl hyper::rt::Read for TokioIo {
+impl RustlsStream {
+    async fn connect(
+        mut io: TcpStream,
+        tls_cfg: Arc<rustls::ClientConfig>,
+        sni: ServerName<'static>,
+    ) -> Result<Self, String> {
+        let mut conn = rustls::ClientConnection::new(tls_cfg, sni)
+            .map_err(|e| format!("send the report to the stats server: {e}"))?;
+        let mut wbuf = Vec::new();
+        let mut rbuf = [0u8; 8192];
+        while conn.is_handshaking() {
+            while conn.wants_write() {
+                wbuf.clear();
+                conn.write_tls(&mut wbuf)
+                    .map_err(|e| format!("send the report to the stats server: {e}"))?;
+                if !wbuf.is_empty() {
+                    io.write_all(&wbuf)
+                        .await
+                        .map_err(|e| format!("send the report to the stats server: {e}"))?;
+                }
+            }
+            io.flush()
+                .await
+                .map_err(|e| format!("send the report to the stats server: {e}"))?;
+            if conn.wants_read() {
+                let n = io
+                    .read(&mut rbuf)
+                    .await
+                    .map_err(|e| format!("send the report to the stats server: {e}"))?;
+                if n == 0 {
+                    return Err("send the report to the stats server: unexpected EOF during TLS handshake".to_string());
+                }
+                let mut cursor = Cursor::new(&rbuf[..n]);
+                conn.read_tls(&mut cursor)
+                    .map_err(|e| format!("send the report to the stats server: {e}"))?;
+                conn.process_new_packets()
+                    .map_err(|e| format!("send the report to the stats server: {e}"))?;
+            }
+        }
+        // Flush any remaining Finished/ticket bytes produced at handshake completion.
+        while conn.wants_write() {
+            wbuf.clear();
+            conn.write_tls(&mut wbuf)
+                .map_err(|e| format!("send the report to the stats server: {e}"))?;
+            if !wbuf.is_empty() {
+                io.write_all(&wbuf)
+                    .await
+                    .map_err(|e| format!("send the report to the stats server: {e}"))?;
+            }
+        }
+        Ok(Self {
+            io,
+            conn,
+            write_buf: Vec::new(),
+            write_pos: 0,
+            read_eof: false,
+            close_sent: false,
+        })
+    }
+
+    fn poll_drain_tls_writes(&mut self, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        loop {
+            while self.write_pos < self.write_buf.len() {
+                match Pin::new(&mut self.io).poll_write(cx, &self.write_buf[self.write_pos..]) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero)));
+                    }
+                    Poll::Ready(Ok(n)) => self.write_pos += n,
+                }
+            }
+            self.write_buf.clear();
+            self.write_pos = 0;
+            if !self.conn.wants_write() {
+                return Poll::Ready(Ok(()));
+            }
+            self.conn.write_tls(&mut self.write_buf)?;
+        }
+    }
+}
+
+impl AsyncRead for RustlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            match self.conn.reader().read(buf.initialize_unfilled()) {
+                Ok(0) => {
+                    if self.read_eof {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+
+            if self.conn.wants_write() || self.write_pos < self.write_buf.len() {
+                if let Poll::Ready(Err(e)) = self.poll_drain_tls_writes(cx) {
+                    return Poll::Ready(Err(e));
+                }
+            }
+
+            if self.read_eof {
+                return Poll::Ready(Ok(()));
+            }
+
+            let mut tmp = [0u8; 8192];
+            let mut rbuf = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut self.io).poll_read(cx, &mut rbuf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {
+                    let filled = rbuf.filled();
+                    if filled.is_empty() {
+                        self.read_eof = true;
+                        let state = self
+                            .conn
+                            .process_new_packets()
+                            .map_err(io::Error::other)?;
+                        if state.plaintext_bytes_to_read() == 0 {
+                            return Poll::Ready(Ok(()));
+                        }
+                    } else {
+                        let mut cursor = Cursor::new(filled);
+                        while cursor.position() < filled.len() as u64 {
+                            self.conn.read_tls(&mut cursor)?;
+                            self.conn
+                                .process_new_packets()
+                                .map_err(io::Error::other)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl AsyncWrite for RustlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let n = self.conn.writer().write(buf)?;
+        if n == 0 {
+            match self.poll_drain_tls_writes(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {
+                    let n2 = self.conn.writer().write(buf)?;
+                    if n2 == 0 {
+                        return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero)));
+                    }
+                    let _ = self.poll_drain_tls_writes(cx)?;
+                    return Poll::Ready(Ok(n2));
+                }
+            }
+        }
+        match self.poll_drain_tls_writes(cx) {
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending | Poll::Ready(Ok(())) => {}
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.poll_drain_tls_writes(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        if !self.close_sent {
+            self.conn.send_close_notify();
+            self.close_sent = true;
+        }
+        match self.poll_drain_tls_writes(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+struct TokioIo<S>(S);
+
+impl<S: AsyncRead + Unpin> hyper::rt::Read for TokioIo<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -717,7 +928,7 @@ impl hyper::rt::Read for TokioIo {
     }
 }
 
-impl hyper::rt::Write for TokioIo {
+impl<S: AsyncWrite + Unpin> hyper::rt::Write for TokioIo<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -741,14 +952,58 @@ impl hyper::rt::Write for TokioIo {
     }
 }
 
-fn parse_http_url(url: &str) -> Result<(String, String), String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("unsupported scheme in URL {url:?}"))?;
-    match rest.find('/') {
-        Some(idx) => Ok((rest[..idx].to_string(), rest[idx..].to_string())),
-        None => Ok((rest.to_string(), "/".to_string())),
+struct ParsedStatsUrl {
+    is_https: bool,
+    connect_addr: String,
+    host_header: String,
+    server_name: String,
+    path: String,
+}
+
+fn parse_http_url(url: &str) -> Result<ParsedStatsUrl, String> {
+    let (is_https, default_port, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, 443u16, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, 80u16, r)
+    } else {
+        return Err(format!("unsupported scheme in URL {url:?}"));
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return Err(format!("missing host in URL {url:?}"));
     }
+    let (connect_addr, server_name) = if authority.starts_with('[') {
+        let end = authority
+            .find(']')
+            .ok_or_else(|| format!("invalid IPv6 host in URL {url:?}"))?;
+        let host_inner = &authority[1..end];
+        let after = &authority[end + 1..];
+        if after.is_empty() {
+            (format!("{authority}:{default_port}"), host_inner.to_string())
+        } else if after.starts_with(':') {
+            (authority.to_string(), host_inner.to_string())
+        } else {
+            return Err(format!("invalid authority in URL {url:?}"));
+        }
+    } else if let Some((h, port_str)) = authority.rsplit_once(':') {
+        if port_str.parse::<u16>().is_ok() && !h.is_empty() {
+            (authority.to_string(), h.to_string())
+        } else {
+            return Err(format!("invalid port in URL {url:?}"));
+        }
+    } else {
+        (format!("{authority}:{default_port}"), authority.to_string())
+    };
+    Ok(ParsedStatsUrl {
+        is_https,
+        connect_addr,
+        host_header: authority.to_string(),
+        server_name,
+        path: path.to_string(),
+    })
 }
 
 async fn read_body_bytes(mut body: Incoming) -> Result<Vec<u8>, String> {
@@ -771,11 +1026,21 @@ mod http_body_util_fallback {
                 Pin::new(&mut *self.0).poll_frame(cx)
             }
         }
+        const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024;
         let mut out = Vec::new();
         while let Some(frame) = NextFrame(body).await {
             let frame = frame.map_err(|e| format!("read the response from the stats server: {e}"))?;
             if let Some(chunk) = frame.data_ref() {
-                out.extend_from_slice(chunk.chunk());
+                let remaining = MAX_RESPONSE_BODY_BYTES.saturating_sub(out.len());
+                if remaining == 0 {
+                    break;
+                }
+                let slice = chunk.chunk();
+                let take = slice.len().min(remaining);
+                out.extend_from_slice(&slice[..take]);
+                if out.len() >= MAX_RESPONSE_BODY_BYTES {
+                    break;
+                }
             }
         }
         Ok(out)
@@ -786,6 +1051,8 @@ mod http_body_util_fallback {
 pub struct Reporter {
     pub cfg: Mutex<ReporterConfig>,
     bucket: Arc<dyn SeedBucket>,
+    tls_config: Mutex<Option<Arc<rustls::ClientConfig>>>,
+    request_timeout: Mutex<Duration>,
     pub requests_total: Counter,
     pub requests_failed_total: Counter,
     pub requests_latency: Histogram,
@@ -823,10 +1090,28 @@ impl Reporter {
         Arc::new(Self {
             cfg: Mutex::new(cfg),
             bucket,
+            tls_config: Mutex::new(None),
+            request_timeout: Mutex::new(Duration::from_secs(5)),
             requests_total,
             requests_failed_total,
             requests_latency,
         })
+    }
+
+    /// Overrides the TLS client configuration used for `https://` stats URLs.
+    pub fn set_tls_config(&self, tls: Arc<rustls::ClientConfig>) {
+        *self
+            .tls_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tls);
+    }
+
+    /// Overrides the per-request HTTP/HTTPS timeout (defaults to 5s matching Go `http.Client`).
+    pub fn set_request_timeout(&self, timeout: Duration) {
+        *self
+            .request_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
     }
 
     pub async fn send_report(&self, report: &Report) -> Result<(), String> {
@@ -840,25 +1125,11 @@ impl Reporter {
         res
     }
 
-    async fn do_send(&self, report: &Report) -> Result<(), String> {
-        let url = self
-            .cfg
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .server_url
-            .clone();
-        let (host, path) = parse_http_url(&url)?;
-        let data = serde_json::to_vec(report).map_err(|e| format!("marshal the report: {e}"))?;
-
-        let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&host))
-            .await
-            .map_err(|_| "send the report to the stats server: timeout".to_string())?
-            .map_err(|e| {
-                let msg = e.to_string().to_lowercase();
-                format!("send the report to the stats server: {msg}")
-            })?;
-
-        let (mut sender, conn) = http1::handshake(TokioIo(stream))
+    async fn send_over_io<S>(&self, io: S, parsed: &ParsedStatsUrl, data: Vec<u8>) -> Result<(), String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut sender, conn) = http1::handshake(TokioIo(io))
             .await
             .map_err(|e| format!("send the report to the stats server: {e}"))?;
         tokio::spawn(async move {
@@ -867,16 +1138,16 @@ impl Reporter {
 
         let req = Request::builder()
             .method(Method::POST)
-            .uri(&path)
-            .header("Host", &host)
+            .uri(&parsed.path)
+            .header("Host", &parsed.host_header)
             .header("Content-Type", "application/json")
             .header("Content-Length", data.len().to_string())
             .body(FullBytesBody::new(Bytes::from(data)))
             .map_err(|e| format!("build request: {e}"))?;
 
-        let resp = tokio::time::timeout(Duration::from_secs(5), sender.send_request(req))
+        let resp = sender
+            .send_request(req)
             .await
-            .map_err(|_| "send the report to the stats server: timeout".to_string())?
             .map_err(|e| format!("send the report to the stats server: {e}"))?;
 
         let status = resp.status();
@@ -890,6 +1161,55 @@ impl Reporter {
             ));
         }
         Ok(())
+    }
+
+    async fn do_send(&self, report: &Report) -> Result<(), String> {
+        let url = self
+            .cfg
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .server_url
+            .clone();
+        let parsed = parse_http_url(&url)?;
+        let data = serde_json::to_vec(report).map_err(|e| format!("marshal the report: {e}"))?;
+        let timeout = *self
+            .request_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let fut = async {
+            let stream = TcpStream::connect(&parsed.connect_addr).await.map_err(|e| {
+                let msg = e.to_string().to_lowercase();
+                format!("send the report to the stats server: {msg}")
+            })?;
+
+            if parsed.is_https {
+                let tls_cfg = {
+                    let custom = self
+                        .tls_config
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    match custom {
+                        Some(c) => c,
+                        None => TlsClientConfig::default()
+                            .get_tls_config()
+                            .map_err(|e| format!("send the report to the stats server: {e}"))?
+                            .config,
+                    }
+                };
+                let sni = ServerName::try_from(parsed.server_name.clone())
+                    .map_err(|e| format!("invalid stats server host {:?}: {e}", parsed.server_name))?;
+                let tls_stream = RustlsStream::connect(stream, tls_cfg, sni).await?;
+                self.send_over_io(tls_stream, &parsed, data).await
+            } else {
+                self.send_over_io(stream, &parsed, data).await
+            }
+        };
+
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| "send the report to the stats server: timeout".to_string())?
     }
 
     async fn running(self: Arc<Self>, ctx: ServiceContext) -> Result<(), ServiceError> {

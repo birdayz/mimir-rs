@@ -208,14 +208,19 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
 }
 
 /// Parses `Content-Range: bytes <start>-<end>/<total>`.
-pub(crate) fn parse_content_range(s: &str) -> Option<(std::ops::Range<usize>, usize)> {
+#[doc(hidden)]
+pub fn parse_content_range(s: &str) -> Option<(std::ops::Range<usize>, usize)> {
     let rem = s.trim().strip_prefix("bytes ")?;
     let (range, size) = rem.split_once('/')?;
     let size: usize = size.parse().ok()?;
     let (start_s, end_s) = range.split_once('-')?;
     let start: usize = start_s.parse().ok()?;
     let end: usize = end_s.parse().ok()?;
-    Some((start..end + 1, size))
+    if start > end {
+        return None;
+    }
+    let end_exclusive = end.checked_add(1)?;
+    Some((start..end_exclusive, size))
 }
 
 pub(crate) fn map_http_error(
