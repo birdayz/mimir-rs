@@ -59,6 +59,11 @@ impl FloatHistogramStChunk {
     }
 
     #[inline]
+    pub fn reset(&mut self, stream: Vec<u8>) {
+        self.b.reset(stream);
+    }
+
+    #[inline]
     pub const fn encoding(&self) -> Encoding {
         Encoding::FloatHistogramSt
     }
@@ -234,6 +239,11 @@ impl<'a> FloatHistogramStAppender<'a> {
     }
 
     #[inline]
+    pub fn num_samples(&self) -> usize {
+        self.chunk.num_samples()
+    }
+
+    #[inline]
     pub fn set_counter_reset_header(&mut self, cr: CounterResetHeader) {
         self.state.counter_reset_header = cr;
         let bytes = self.chunk.b.bytes_mut();
@@ -394,9 +404,9 @@ impl<'a> FloatHistogramStAppender<'a> {
             if !ok_to_append || counter_reset {
                 if append_only {
                     return if counter_reset {
-                        Err(ChunkError::HistogramCounterReset)
+                        Err(ChunkError::FloatHistogramCounterReset)
                     } else {
-                        Err(ChunkError::HistogramSchemaChange)
+                        Err(ChunkError::FloatHistogramSchemaChange)
                     };
                 }
                 let mut new_chunk = FloatHistogramStChunk::new();
@@ -456,7 +466,7 @@ impl<'a> FloatHistogramStAppender<'a> {
         } = self.state.appendable_gauge(h);
         if !ok_to_append {
             if append_only {
-                return Err(ChunkError::HistogramSchemaChange);
+                return Err(ChunkError::FloatHistogramSchemaChange);
             }
             let mut new_chunk = FloatHistogramStChunk::new();
             let new_cached = {
@@ -533,6 +543,11 @@ impl<'a> FloatHistogramStIterator<'a> {
                 first_st_known,
             },
         }
+    }
+
+    #[inline]
+    pub fn reset(&mut self, b: &'a [u8]) {
+        *self = Self::new(b);
     }
 
     #[inline]

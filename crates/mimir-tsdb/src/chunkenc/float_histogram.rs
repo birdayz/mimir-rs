@@ -23,10 +23,11 @@ const CHUNK_ALLOCATION_SIZE: usize = 128;
 const CHUNK_COMPACT_CAPACITY_THRESHOLD: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct XorValue {
-    pub(super) value: f64,
-    pub(super) leading: u8,
-    pub(super) trailing: u8,
+#[doc(hidden)]
+pub struct XorValue {
+    pub value: f64,
+    pub leading: u8,
+    pub trailing: u8,
 }
 
 impl XorValue {
@@ -78,6 +79,11 @@ impl FloatHistogramChunk {
         Self {
             b: BitStream::from_bytes(bytes, 0),
         }
+    }
+
+    #[inline]
+    pub fn reset(&mut self, stream: Vec<u8>) {
+        self.b.reset(stream);
     }
 
     #[inline]
@@ -241,14 +247,15 @@ pub struct FloatHistogramAppenderState {
 }
 
 #[derive(Default)]
-pub(super) struct AppendableGauge {
-    pub(super) p_fwd: Vec<Insert>,
-    pub(super) n_fwd: Vec<Insert>,
-    pub(super) p_bwd: Vec<Insert>,
-    pub(super) n_bwd: Vec<Insert>,
-    pub(super) p_merged: Vec<HistogramSpan>,
-    pub(super) n_merged: Vec<HistogramSpan>,
-    pub(super) ok_to_append: bool,
+#[doc(hidden)]
+pub struct AppendableGauge {
+    pub p_fwd: Vec<Insert>,
+    pub n_fwd: Vec<Insert>,
+    pub p_bwd: Vec<Insert>,
+    pub n_bwd: Vec<Insert>,
+    pub p_merged: Vec<HistogramSpan>,
+    pub n_merged: Vec<HistogramSpan>,
+    pub ok_to_append: bool,
 }
 
 impl FloatHistogramAppenderState {
@@ -271,7 +278,8 @@ impl FloatHistogramAppenderState {
         }
     }
 
-    pub(crate) fn appendable(
+    #[doc(hidden)]
+    pub fn appendable(
         &self,
         h: &FloatHistogram,
     ) -> (Vec<Insert>, Vec<Insert>, Vec<Insert>, Vec<Insert>, bool, bool) {
@@ -322,7 +330,8 @@ impl FloatHistogramAppenderState {
         (p_fwd, n_fwd, p_bwd, n_bwd, true, false)
     }
 
-    pub(super) fn appendable_gauge(&self, h: &FloatHistogram) -> AppendableGauge {
+    #[doc(hidden)]
+    pub fn appendable_gauge(&self, h: &FloatHistogram) -> AppendableGauge {
         if self.num_samples > 0 && self.counter_reset_header != CounterResetHeader::GaugeType {
             return AppendableGauge::default();
         }
@@ -374,6 +383,36 @@ impl<'a> FloatHistogramAppender<'a> {
     #[inline]
     pub fn into_state(self) -> FloatHistogramAppenderState {
         self.state
+    }
+
+    #[inline]
+    pub fn num_samples(&self) -> usize {
+        self.chunk.num_samples()
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn appendable(
+        &self,
+        h: &FloatHistogram,
+    ) -> (Vec<Insert>, Vec<Insert>, Vec<Insert>, Vec<Insert>, bool, bool) {
+        self.state.appendable(h)
+    }
+
+    #[doc(hidden)]
+    pub fn appendable_gauge(&self, h: &FloatHistogram) -> AppendableGauge {
+        self.state.appendable_gauge(h)
+    }
+
+    #[doc(hidden)]
+    pub fn recode_chunk(
+        &mut self,
+        positive_inserts: &[Insert],
+        negative_inserts: &[Insert],
+        positive_spans: &[HistogramSpan],
+        negative_spans: &[HistogramSpan],
+    ) -> Result<(), ChunkError> {
+        self.recode_in_place(positive_inserts, negative_inserts, positive_spans, negative_spans)
     }
 
     #[inline]
@@ -620,9 +659,9 @@ impl<'a> FloatHistogramAppender<'a> {
             if !ok_to_append || counter_reset {
                 if append_only {
                     return if counter_reset {
-                        Err(ChunkError::HistogramCounterReset)
+                        Err(ChunkError::FloatHistogramCounterReset)
                     } else {
-                        Err(ChunkError::HistogramSchemaChange)
+                        Err(ChunkError::FloatHistogramSchemaChange)
                     };
                 }
                 let mut new_chunk = FloatHistogramChunk::new();
@@ -682,7 +721,7 @@ impl<'a> FloatHistogramAppender<'a> {
         } = self.state.appendable_gauge(h);
         if !ok_to_append {
             if append_only {
-                return Err(ChunkError::HistogramSchemaChange);
+                return Err(ChunkError::FloatHistogramSchemaChange);
             }
             let mut new_chunk = FloatHistogramChunk::new();
             let new_state = {
@@ -724,7 +763,8 @@ impl<'a> FloatHistogramAppender<'a> {
     }
 }
 
-fn expand_float_spans_and_buckets(
+#[doc(hidden)]
+pub fn expand_float_spans_and_buckets(
     a: &[HistogramSpan],
     b: &[HistogramSpan],
     a_buckets: &[XorValue],
@@ -971,6 +1011,11 @@ impl<'a> FloatHistogramIterator<'a> {
             p_buckets_trailing: Vec::new(),
             n_buckets_trailing: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub fn reset(&mut self, b: &'a [u8]) {
+        *self = Self::new(b);
     }
 
     pub fn at_float_histogram(&self) -> (i64, FloatHistogram) {

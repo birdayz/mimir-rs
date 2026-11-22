@@ -51,6 +51,32 @@ pub fn put_varbit_int(b: &mut BitStream, val: i64) {
     }
 }
 
+/// Writes a signed `i64` using Prometheus varbit encoding, fusing the prefix and value bits.
+#[inline]
+pub fn put_varbit_int_fast(b: &mut BitStream, val: i64) {
+    let uval = val as u64;
+    if val == 0 {
+        b.write_bit(false);
+    } else if bit_range(val, 3) {
+        b.write_bits((0b10 << 3) | (uval & 0x7), 5);
+    } else if bit_range(val, 6) {
+        b.write_bits((0b110 << 6) | (uval & 0x3F), 9);
+    } else if bit_range(val, 9) {
+        b.write_bits((0b1110 << 9) | (uval & 0x1FF), 13);
+    } else if bit_range(val, 12) {
+        b.write_bits((0b11110 << 12) | (uval & 0xFFF), 17);
+    } else if bit_range(val, 18) {
+        b.write_bits((0b111110 << 18) | (uval & 0x3_FFFF), 24);
+    } else if bit_range(val, 25) {
+        b.write_bits((0b1111110 << 25) | (uval & 0x1FF_FFFF), 32);
+    } else if bit_range(val, 56) {
+        b.write_bits((0b11111110 << 56) | (uval & 0x00FF_FFFF_FFFF_FFFF), 64);
+    } else {
+        b.write_bits(0b11111111, 8);
+        b.write_bits(uval, 64);
+    }
+}
+
 /// Reads a signed `i64` encoded with [`put_varbit_int`].
 pub fn read_varbit_int(b: &mut BitReader<'_>) -> Result<i64, ChunkError> {
     let mut d: u8 = 0;

@@ -66,6 +66,11 @@ impl XorChunk {
     }
 
     #[inline]
+    pub fn reset(&mut self, stream: Vec<u8>) {
+        self.b.reset(stream);
+    }
+
+    #[inline]
     pub const fn encoding(&self) -> Encoding {
         Encoding::Xor
     }
@@ -293,6 +298,11 @@ impl<'a> XorIterator<'a> {
             val: 0.0,
             t_delta: 0,
         }
+    }
+
+    #[inline]
+    pub fn reset(&mut self, b: &'a [u8]) {
+        *self = Self::new(b);
     }
 
     #[inline]
