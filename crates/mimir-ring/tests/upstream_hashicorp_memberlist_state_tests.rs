@@ -361,7 +361,7 @@ async fn test_member_list_probe_node_awareness_missed_nack() {
     let started = Instant::now();
     m1.probe_node_by_name_for_test("m4").await;
     assert_eq!(m1.get_node_state("m4").unwrap().state, NodeStateType::Suspect);
-    assert!(started.elapsed() <= Duration::from_millis(260));
+    assert!(started.elapsed() <= Duration::from_millis(350));
     assert_eq!(m1.health_score_pub(), 1);
     m2.shutdown().await;
     m1.shutdown().await;

@@ -322,6 +322,18 @@ impl MemberlistKv {
             }
             k_nodes.push(state.clone());
         }
+        // Exhaustive randomized fallback when the fast 3*n sample-with-replacement pass
+        // didn't fill k (e.g. small clusters where (1 - 1/n)^(3n) is non-negligible).
+        if k_nodes.len() < k {
+            let mut rem: Vec<&NodeState> = nodes
+                .into_iter()
+                .filter(|state| !exclude(state) && !k_nodes.iter().any(|kn| kn.name == state.name))
+                .collect();
+            rem.shuffle(&mut rng);
+            for state in rem.into_iter().take(k - k_nodes.len()) {
+                k_nodes.push(state.clone());
+            }
+        }
         k_nodes
     }
 
