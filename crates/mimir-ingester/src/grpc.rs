@@ -2278,6 +2278,14 @@ fn tenant_from_org_id(org_id: &str, ext: &http::Extensions) -> Result<String, St
     })
 }
 
+/// Extracts the activity tracker user ID for `Ingester/AllUserStats` matching Go
+/// `ActivityTrackerWrapper.AllUserStats` -> `requestActivity` -> `tenant.TenantID(ctx)`.
+#[allow(clippy::result_large_err)]
+fn all_user_stats_activity_user_id<T>(ingester: &Ingester, req: &Request<T>) -> Result<String, Status> {
+    let org_id = org_id_from_req(ingester, req)?;
+    Ok(parse_single_tenant_id(&org_id).unwrap_or_default())
+}
+
 /// [`org_id_from_req`] + [`tenant_from_org_id`].
 #[allow(clippy::result_large_err)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2466,13 +2474,13 @@ impl ingesterpb::ingester_server::Ingester for IngesterService {
         mut request: Request<ingesterpb::UserStatsRequest>,
     ) -> Result<Response<ingesterpb::UsersStatsResponse>, Status> {
         // Not per-tenant, but still behind the gRPC auth middleware.
-        org_id_from_req(&self.ingester, &request)?;
+        let user_id = all_user_stats_activity_user_id(&self.ingester, &request)?;
         prepare_read_reactive_for_request(&self.ingester, &mut request).await?;
         let (md, ext, inner) = request.into_parts();
         let trace_id = mimir_common::tracing::current_trace_id().unwrap_or_default();
         let _act = self.ingester.insert_activity(|| {
             request_activity(
-                "",
+                &user_id,
                 &trace_id,
                 "Ingester/AllUserStats",
                 ActivityRequest::UserStats(&inner),
@@ -3889,5 +3897,54 @@ mod tests {
         }
         assert_eq!(read_cb.state(), BreakerState::Closed);
         assert_eq!(read_cb.recorded_successes(), 2);
+    }
+
+    #[test]
+    fn a06_all_user_stats_activity_user_id_matches_go_tenant_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "a06-act".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = dir.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Multitenancy enabled: single tenant ID extracted from x-scope-orgid.
+        ing.set_multitenancy(true, "anonymous");
+        let mut req_single = Request::new(ingesterpb::UserStatsRequest::default());
+        req_single
+            .metadata_mut()
+            .insert("x-scope-orgid", "tenant-a42".parse().unwrap());
+        assert_eq!(
+            all_user_stats_activity_user_id(&ing, &req_single).unwrap(),
+            "tenant-a42"
+        );
+
+        // Multitenancy enabled + multi-tenant header: Go `userID, _ := tenant.TenantID(ctx)`
+        // discards the error and logs `user=""` without rejecting AllUserStats.
+        let mut req_multi = Request::new(ingesterpb::UserStatsRequest::default());
+        req_multi
+            .metadata_mut()
+            .insert("x-scope-orgid", "t1|t2".parse().unwrap());
+        assert_eq!(all_user_stats_activity_user_id(&ing, &req_multi).unwrap(), "");
+
+        // Multitenancy disabled: no_auth_tenant ("anonymous") is injected.
+        ing.set_multitenancy(false, "anonymous");
+        let req_noauth = Request::new(ingesterpb::UserStatsRequest::default());
+        assert_eq!(
+            all_user_stats_activity_user_id(&ing, &req_noauth).unwrap(),
+            "anonymous"
+        );
     }
 }
