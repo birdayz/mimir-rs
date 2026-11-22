@@ -544,17 +544,21 @@ impl HeadChunksWriter {
         self.finalize_current()?;
         let next_seq = self.seq + 1;
         let path = head_chunk_file_path(&self.dir, next_seq);
+        // Stage the new segment at a hidden temporary name until its 8-byte header is
+        // written and flushed, then atomically rename into place so concurrent
+        // HeadChunksReader::refresh_in_place() calls never observe a 0-byte/headerless segment.
+        let tmp_path = self.dir.join(format!(".{next_seq:06}.tmp"));
         let mut f = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&path)?;
+            .open(&tmp_path)?;
 
         let prealloc_len = self.prealloc_len_u64();
         if prealloc_len > 0 {
             if let Err(e) = f.set_len(prealloc_len).and_then(|()| f.seek(SeekFrom::Start(0))) {
                 drop(f);
-                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(&tmp_path);
                 return Err(HeadChunksError::Io(e));
             }
         }
@@ -566,7 +570,13 @@ impl HeadChunksWriter {
             .and_then(|()| f.flush())
         {
             drop(f);
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(HeadChunksError::Io(e));
+        }
+
+        if let Err(e) = fs::rename(&tmp_path, &path) {
+            drop(f);
+            let _ = fs::remove_file(&tmp_path);
             return Err(HeadChunksError::Io(e));
         }
 
@@ -2017,23 +2027,35 @@ impl ChunkDiskMapper {
     fn cut_seq_locked(&self, st: &mut MapperWriteState, file_seq: usize) -> Result<(), HeadChunksError> {
         self.finalize_cur_file_locked(st, true)?;
         let path = head_chunk_file_path(&self.dir, file_seq);
+        let tmp_path = self.dir.join(format!(".{file_seq:06}.tmp"));
         let mut f = OpenOptions::new()
             .create(true)
             .truncate(true)
             .read(true)
             .write(true)
-            .open(&path)?;
+            .open(&tmp_path)?;
         #[cfg(unix)]
         {
             let prealloc_len = HEAD_CHUNK_FILE_PREALLOCATION_SIZE as u64;
-            f.set_len(prealloc_len)?;
-            f.seek(SeekFrom::Start(0))?;
+            if let Err(e) = f.set_len(prealloc_len).and_then(|()| f.seek(SeekFrom::Start(0))) {
+                drop(f);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(HeadChunksError::Io(e));
+            }
         }
         let mut hdr = [0u8; HEAD_CHUNK_FILE_HEADER_SIZE];
         hdr[..MAGIC_CHUNKS_SIZE].copy_from_slice(&MAGIC_HEAD_CHUNKS.to_be_bytes());
         hdr[MAGIC_CHUNKS_SIZE] = HEAD_CHUNKS_FORMAT_V1;
-        f.write_all(&hdr)?;
-        f.flush()?;
+        if let Err(e) = f.write_all(&hdr).and_then(|()| f.flush()) {
+            drop(f);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(HeadChunksError::Io(e));
+        }
+        if let Err(e) = fs::rename(&tmp_path, &path) {
+            drop(f);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(HeadChunksError::Io(e));
+        }
         let active_read = Arc::new(ActiveReadFile::open_read_only(&path)?);
         {
             let mut r = self.read_path_mtx.write();
