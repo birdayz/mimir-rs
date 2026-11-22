@@ -232,10 +232,14 @@ struct JwtClaims<'a> {
     exp: u64,
 }
 
+/// Internal `PutOptions::tags` key requesting `x-goog-if-generation-not-match`.
+pub(crate) const IF_GEN_NOT_MATCH_TAG: &str = "__mimir_if_generation_not_match";
+
 struct ServiceAccountJwtProvider {
     issuer: String,
     key_id: String,
-    private_key: RsaKeyPair,
+    private_key_pem: String,
+    private_key: std::sync::OnceLock<Result<RsaKeyPair, String>>,
     token_uri: String,
     audience: String,
     scopes: String,
@@ -254,14 +258,6 @@ impl fmt::Debug for ServiceAccountJwtProvider {
 
 impl ServiceAccountJwtProvider {
     fn from_sa_json(j: &ServiceAccountJson) -> Result<Self, String> {
-        let key_der = PrivateKeyDer::from_pem_slice(j.private_key.as_bytes())
-            .map_err(|e| format!("invalid service account private_key PEM: {e}"))?;
-        let pair = match &key_der {
-            PrivateKeyDer::Pkcs8(k) => RsaKeyPair::from_pkcs8(k.secret_pkcs8_der()),
-            PrivateKeyDer::Pkcs1(k) => RsaKeyPair::from_der(k.secret_pkcs1_der()),
-            _ => return Err("unsupported private key format in service account".to_string()),
-        }
-        .map_err(|e| format!("invalid RSA private key: {e}"))?;
         let token_uri = if j.token_uri.is_empty() {
             GOOGLE_TOKEN_URL.to_string()
         } else {
@@ -270,12 +266,30 @@ impl ServiceAccountJwtProvider {
         Ok(Self {
             issuer: j.client_email.clone(),
             key_id: j.private_key_id.clone(),
-            private_key: pair,
+            private_key_pem: j.private_key.clone(),
+            private_key: std::sync::OnceLock::new(),
             token_uri,
             audience: j.audience.clone(),
             scopes: DEFAULT_SCOPES_SPACE.to_string(),
             client: exthttp::bounded_auth_client(),
             cache: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    fn key_pair(&self) -> object_store::Result<&RsaKeyPair> {
+        let res = self.private_key.get_or_init(|| {
+            let key_der = PrivateKeyDer::from_pem_slice(self.private_key_pem.as_bytes())
+                .map_err(|e| format!("invalid service account private_key PEM: {e}"))?;
+            match &key_der {
+                PrivateKeyDer::Pkcs8(k) => RsaKeyPair::from_pkcs8(k.secret_pkcs8_der()),
+                PrivateKeyDer::Pkcs1(k) => RsaKeyPair::from_der(k.secret_pkcs1_der()),
+                _ => return Err("unsupported private key format in service account".to_string()),
+            }
+            .map_err(|e| format!("invalid RSA private key: {e}"))
+        });
+        res.as_ref().map_err(|e| object_store::Error::Generic {
+            store: STORE,
+            source: e.clone().into(),
         })
     }
 
@@ -317,8 +331,9 @@ impl ServiceAccountJwtProvider {
             URL_SAFE_NO_PAD.encode(hdr),
             URL_SAFE_NO_PAD.encode(claims)
         );
-        let mut sig = vec![0u8; self.private_key.public().modulus_len()];
-        self.private_key
+        let key = self.key_pair()?;
+        let mut sig = vec![0u8; key.public().modulus_len()];
+        key
             .sign(
                 &ring::signature::RSA_PKCS1_SHA256,
                 &ring::rand::SystemRandom::new(),
@@ -2372,14 +2387,28 @@ impl ObjectStore for GcsStore {
     ) -> object_store::Result<PutResult> {
         let url = self.client.object_url(location);
         let len = payload.content_length();
-        let idempotent = self.retry_always || matches!(opts.mode, PutMode::Overwrite);
+        let if_gen_not_match: Option<i64> = opts
+            .tags
+            .encoded()
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| *k == IF_GEN_NOT_MATCH_TAG)
+            .and_then(|(_, v)| v.parse::<i64>().ok());
+        let idempotent = self.retry_always
+            || (matches!(opts.mode, PutMode::Overwrite) && if_gen_not_match.is_none());
         let res = self
             .client
             .send_with_retry(&self.retry, location.as_ref(), idempotent, |c| {
                 let mut rb = c.put(&url).header(CONTENT_LENGTH, len);
                 rb = apply_gcs_attributes(rb, &opts.attributes)?;
                 rb = match &opts.mode {
-                    PutMode::Overwrite => rb,
+                    PutMode::Overwrite => {
+                        if let Some(gen_val) = if_gen_not_match {
+                            rb.header("x-goog-if-generation-not-match", gen_val.to_string())
+                        } else {
+                            rb
+                        }
+                    }
                     PutMode::Create => rb.header(VERSION_MATCH, "0"),
                     PutMode::Update(v) => {
                         let ver = v.version.as_ref().ok_or_else(|| object_store::Error::Generic {

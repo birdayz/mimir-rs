@@ -39,6 +39,7 @@ pub mod s3utils;
 pub const DIR_DELIM: &str = "/";
 pub const MIMIR_INTERNALS_PREFIX: &str = "__mimir_cluster";
 pub const TENANT_DELETION_MARK_PATH: &str = "markers/tenant-deletion-mark.json";
+pub const READ_COMPARTMENT_ID_PLACEHOLDER: &str = "<read-compartment-id>";
 
 #[derive(Debug, Error)]
 pub enum BucketError {
@@ -65,6 +66,9 @@ pub enum BucketError {
     /// Mimir `SSEBucketClient.getCustomS3SSEConfig` failure.
     #[error("unable to customise S3 SSE config for tenant {user}: {reason}")]
     TenantSse { user: String, reason: String },
+    /// Thanos `objstore.ErrUploadOptionInvalid`.
+    #[error("upload option is invalid: {0}")]
+    UploadOptionInvalid(String),
 }
 
 impl BucketError {
@@ -90,6 +94,154 @@ impl BucketError {
             _ => false,
         }
     }
+
+    /// Matching Thanos `objstore.Bucket.IsConditionNotMetErr`.
+    pub fn is_condition_not_met(&self) -> bool {
+        match self {
+            BucketError::S3(e) => e.is_condition_not_met(),
+            BucketError::Store(
+                object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. },
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Options for [`BucketClient::iter_with_attributes`] (Thanos `objstore.IterOption`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IterOptions {
+    pub recursive: bool,
+    pub updated_at: bool,
+}
+
+impl IterOptions {
+    pub fn recursive() -> Self {
+        Self {
+            recursive: true,
+            updated_at: false,
+        }
+    }
+
+    pub fn updated_at() -> Self {
+        Self {
+            recursive: false,
+            updated_at: true,
+        }
+    }
+
+    pub fn with_recursive(mut self, recursive: bool) -> Self {
+        self.recursive = recursive;
+        self
+    }
+
+    pub fn with_updated_at(mut self, updated_at: bool) -> Self {
+        self.updated_at = updated_at;
+        self
+    }
+}
+
+/// Entry yielded by [`BucketClient::iter_with_attributes`] (Thanos `objstore.IterObjectAttributes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IterObjectAttributes {
+    pub name: String,
+    pub last_modified: Option<SystemTime>,
+}
+
+/// Options for [`BucketClient::download_dir`] (Thanos `objstore.DownloadOption`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadDirOptions {
+    pub concurrency: usize,
+    pub ignored_paths: Vec<String>,
+}
+
+impl Default for DownloadDirOptions {
+    fn default() -> Self {
+        Self {
+            concurrency: 1,
+            ignored_paths: Vec::new(),
+        }
+    }
+}
+
+/// Options for [`BucketClient::upload_dir`] (Thanos `objstore.UploadOption`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadDirOptions {
+    pub concurrency: usize,
+}
+
+impl Default for UploadDirOptions {
+    fn default() -> Self {
+        Self { concurrency: 1 }
+    }
+}
+
+/// Version token for conditional uploads (Thanos `objstore.ObjectVersion`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectVersion {
+    Generation(String),
+    ETag(String),
+}
+
+/// Conditional upload constraint (Thanos `objstore.ObjectUploadOption`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadCondition {
+    IfNotExists,
+    IfMatch(ObjectVersion),
+    IfNotMatch(ObjectVersion),
+}
+
+/// Options for [`BucketClient::upload_with_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectUploadOptions {
+    pub content_type: Option<String>,
+    pub condition: Option<UploadCondition>,
+}
+
+/// Ported from `github.com/grafana/mimir/pkg/storage/bucket/client.go::ReadCompartmentConfig`.
+/// Replaces `<read-compartment-id>` in the active backend's bucket/container/directory name
+/// without mutating the input config.
+pub fn read_compartment_config(cfg: &BucketConfig, read_compartment_id: i32) -> BucketConfig {
+    let mut out = cfg.clone();
+    let id_str = read_compartment_id.to_string();
+    match out.backend_cfg.backend.as_str() {
+        "s3" => {
+            out.backend_cfg.s3.bucket_name = out
+                .backend_cfg
+                .s3
+                .bucket_name
+                .replace(READ_COMPARTMENT_ID_PLACEHOLDER, &id_str);
+        }
+        "gcs" => {
+            out.backend_cfg.gcs.bucket_name = out
+                .backend_cfg
+                .gcs
+                .bucket_name
+                .replace(READ_COMPARTMENT_ID_PLACEHOLDER, &id_str);
+        }
+        "azure" => {
+            out.backend_cfg.azure.container_name = out
+                .backend_cfg
+                .azure
+                .container_name
+                .replace(READ_COMPARTMENT_ID_PLACEHOLDER, &id_str);
+        }
+        "swift" => {
+            out.backend_cfg.swift.container_name = out
+                .backend_cfg
+                .swift
+                .container_name
+                .replace(READ_COMPARTMENT_ID_PLACEHOLDER, &id_str);
+        }
+        "filesystem" => {
+            out.backend_cfg.filesystem.dir = out
+                .backend_cfg
+                .filesystem
+                .dir
+                .replace(READ_COMPARTMENT_ID_PLACEHOLDER, &id_str);
+        }
+        _ => {}
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +402,33 @@ impl BucketClient {
         Self::from_backend(Backend::Store(store), name.into(), &provider.into())
     }
 
+    /// Wraps an [`s3::S3Bucket`] into a [`BucketClient`].
+    pub fn from_s3(bucket: s3::S3Bucket) -> Self {
+        let name = bucket.name().to_string();
+        Self::from_backend(Backend::S3(Arc::new(bucket)), name, "S3")
+    }
+
+    /// Attaches [`metrics::BucketMetrics`] registered on `registry` for `component`.
+    pub fn with_metrics(
+        mut self,
+        registry: &prometheus::Registry,
+        component: &str,
+    ) -> Result<Self, BucketError> {
+        self.metrics = Some(Arc::new(metrics::BucketMetrics::register(
+            registry,
+            component,
+            &self.name,
+        )?));
+        Ok(self)
+    }
+
+    /// Shares the registered [`metrics::BucketMetrics`] from `other` (used when swapping the
+    /// underlying bucket while preserving metrics series).
+    pub fn with_shared_metrics_from(mut self, other: &BucketClient) -> Self {
+        self.metrics = other.metrics.clone();
+        self
+    }
+
     /// Builds a `BucketClient` from Mimir's `BucketConfig` without metrics (component
     /// `ingester`).
     pub fn from_config(cfg: &BucketConfig) -> Result<Self, BucketError> {
@@ -264,10 +443,18 @@ impl BucketClient {
         component: &str,
         registry: Option<&prometheus::Registry>,
     ) -> Result<Self, BucketError> {
-        cfg.validate()
-            .map_err(|e| BucketError::Config(e.to_string()))?;
+        if !cfg.storage_prefix.is_empty()
+            && !cfg.storage_prefix.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return Err(BucketError::InvalidPrefix(cfg.storage_prefix.clone()));
+        }
 
         let b = &cfg.backend_cfg;
+        if !matches!(b.backend.as_str(), "filesystem" | "s3" | "gcs" | "azure") {
+            return Err(BucketError::UnsupportedBackend(b.backend.clone()));
+        }
+        cfg.validate()
+            .map_err(|e| BucketError::Config(e.to_string()))?;
         let mut client = match b.backend.as_str() {
             "filesystem" => {
                 if b.filesystem.dir.is_empty() {
@@ -447,6 +634,12 @@ impl BucketClient {
             s3::UploadSource::File { len, .. } => *len,
         };
         let result = async {
+            if name.trim_start_matches('/').is_empty() {
+                return Err(BucketError::InvalidPath(
+                    name.to_string(),
+                    "object name cannot be empty".to_string(),
+                ));
+            }
             match &self.backend {
                 Backend::S3(b) => {
                     b.upload(&self.full_name(name), source, sse).await?;
@@ -488,6 +681,137 @@ impl BucketClient {
             .await
     }
 
+    /// Uploads `data` as object `name` with Thanos/Mimir upload options
+    /// (`ContentType`, `IfNotExists`, `IfMatch`, `IfNotMatch`).
+    pub async fn upload_with_options(
+        &self,
+        name: &str,
+        data: impl Into<Bytes>,
+        opts: ObjectUploadOptions,
+    ) -> Result<(), BucketError> {
+        let data = data.into();
+        let len = data.len() as u64;
+        let _sse = self.tenant_sse_override()?;
+        if name.trim_start_matches('/').is_empty() {
+            let timer = self.timer(metrics::OP_UPLOAD);
+            let err = BucketError::InvalidPath(
+                name.to_string(),
+                "object name cannot be empty".to_string(),
+            );
+            if let Some(t) = timer {
+                t.finish_upload(false, 0);
+            }
+            return Err(err);
+        }
+        // Delegate directly to self.upload() on backends that don't support custom options so
+        // OP_UPLOAD metrics are recorded once (not double-counted).
+        match &self.backend {
+            Backend::Filesystem(_) => {
+                if opts.condition.is_some() {
+                    let timer = self.timer(metrics::OP_UPLOAD);
+                    if let Some(t) = timer {
+                        t.finish_upload(false, 0);
+                    }
+                    return Err(BucketError::UploadOptionInvalid(
+                        "conditional upload is not supported on filesystem".into(),
+                    ));
+                }
+                return self.upload(name, data).await;
+            }
+            Backend::S3(_) => {
+                if opts.condition.is_some() || opts.content_type.is_some() {
+                    let timer = self.timer(metrics::OP_UPLOAD);
+                    if let Some(t) = timer {
+                        t.finish_upload(false, 0);
+                    }
+                    return Err(BucketError::UploadOptionInvalid(
+                        "custom upload options are not supported on S3".into(),
+                    ));
+                }
+                return self.upload(name, data).await;
+            }
+            Backend::Store(store) => {
+                let timer = self.timer(metrics::OP_UPLOAD);
+                let result: Result<(), BucketError> = async {
+                    if let Some(cond) = &opts.condition {
+                        if self.provider == "GCS" {
+                            let ver = match cond {
+                                UploadCondition::IfNotExists => None,
+                                UploadCondition::IfMatch(v) | UploadCondition::IfNotMatch(v) => Some(v),
+                            };
+                            if let Some(v) = ver {
+                                match v {
+                                    ObjectVersion::Generation(s) => {
+                                        if s.parse::<i64>().is_err() {
+                                            return Err(BucketError::UploadOptionInvalid(format!(
+                                                "GCS conditional upload generation {s:?} is invalid"
+                                            )));
+                                        }
+                                    }
+                                    ObjectVersion::ETag(_) => {
+                                        return Err(BucketError::UploadOptionInvalid(
+                                            "GCS conditional uploads require generation object versions".into(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let path = self.object_path(name)?;
+                    let mut put_opts = object_store::PutOptions::default();
+                    if let Some(ct) = opts.content_type {
+                        put_opts
+                            .attributes
+                            .insert(object_store::Attribute::ContentType, ct.into());
+                    }
+                    if let Some(cond) = opts.condition {
+                        match cond {
+                            UploadCondition::IfNotExists => {
+                                put_opts.mode = object_store::PutMode::Create;
+                            }
+                            UploadCondition::IfMatch(ver) => {
+                                let (e_tag, version) = match ver {
+                                    ObjectVersion::ETag(e) => (Some(e), None),
+                                    ObjectVersion::Generation(g) => (None, Some(g)),
+                                };
+                                put_opts.mode = object_store::PutMode::Update(
+                                    object_store::UpdateVersion { e_tag, version },
+                                );
+                            }
+                            UploadCondition::IfNotMatch(ver) => match ver {
+                                ObjectVersion::Generation(g) if self.provider == "GCS" => {
+                                    let gen_val = g.parse::<i64>().map_err(|_| {
+                                        BucketError::UploadOptionInvalid(format!(
+                                            "GCS conditional upload generation {g:?} is invalid"
+                                        ))
+                                    })?;
+                                    put_opts
+                                        .tags
+                                        .push(gcs::IF_GEN_NOT_MATCH_TAG, &gen_val.to_string());
+                                }
+                                _ => {
+                                    return Err(BucketError::UploadOptionInvalid(
+                                        "IfNotMatch is not supported for this backend".into(),
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    store
+                        .put_opts(&path, PutPayload::from_bytes(data), put_opts)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Some(t) = timer {
+                    let transferred = if result.is_ok() { len } else { 0 };
+                    t.finish_upload(result.is_ok(), transferred);
+                }
+                result
+            }
+        }
+    }
+
     /// Uploads a local file at `src_path` as object `name` (objstore `UploadFile`).
     pub async fn upload_file(
         &self,
@@ -510,34 +834,42 @@ impl BucketClient {
         &self,
         op: &'static str,
         name: &str,
-        range: Option<(u64, u64)>,
+        range: Option<(u64, Option<u64>)>,
     ) -> Result<Bytes, BucketError> {
         let timer = self.timer(op);
-        let result: Result<Bytes, BucketError> = match &self.backend {
-            Backend::S3(b) => {
-                let full = self.full_name(name);
-                let r = match range {
-                    None => b.get(&full).await,
-                    Some((off, len)) => b.get_range(&full, off as i64, len as i64).await,
-                };
-                r.map_err(|e| {
-                    if e.is_obj_not_found() {
-                        BucketError::NotFound(name.to_string())
-                    } else {
-                        BucketError::S3(e)
+        let result: Result<Bytes, BucketError> = if name.trim_start_matches('/').is_empty() {
+            Err(BucketError::InvalidPath(
+                name.to_string(),
+                "object name cannot be empty".to_string(),
+            ))
+        } else {
+            match &self.backend {
+                Backend::S3(b) => {
+                    let full = self.full_name(name);
+                    let r = match range {
+                        None => b.get(&full).await,
+                        Some((off, Some(len))) => b.get_range(&full, off as i64, len as i64).await,
+                        Some((off, None)) => b.get_range(&full, off as i64, -1).await,
+                    };
+                    r.map_err(|e| {
+                        if e.is_obj_not_found() {
+                            BucketError::NotFound(name.to_string())
+                        } else {
+                            BucketError::S3(e)
+                        }
+                    })
+                }
+                Backend::Store(store) => {
+                    let path = self.object_path(name)?;
+                    store_read_op(store, &path, name, range).await
+                }
+                Backend::Filesystem(fs) => {
+                    let path = self.object_path(name)?;
+                    match fs.get_existing().await {
+                        Ok(Some(store)) => fs_read_op(&store, &path, name, range).await,
+                        Ok(None) => Err(BucketError::NotFound(name.to_string())),
+                        Err(e) => Err(e),
                     }
-                })
-            }
-            Backend::Store(store) => {
-                let path = self.object_path(name)?;
-                store_read_op(store, &path, name, range).await
-            }
-            Backend::Filesystem(fs) => {
-                let path = self.object_path(name)?;
-                match fs.get_existing().await {
-                    Ok(Some(store)) => fs_read_op(&store, &path, name, range).await,
-                    Ok(None) => Err(BucketError::NotFound(name.to_string())),
-                    Err(e) => Err(e),
                 }
             }
         };
@@ -561,14 +893,26 @@ impl BucketClient {
         offset: u64,
         length: u64,
     ) -> Result<Bytes, BucketError> {
-        self.read_op(metrics::OP_GET_RANGE, name, Some((offset, length)))
+        self.read_op(metrics::OP_GET_RANGE, name, Some((offset, Some(length))))
+            .await
+    }
+
+    /// Downloads bytes starting at `offset` to the end of object `name` (Thanos `GetRange(..., off, -1)`).
+    pub async fn get_range_from(&self, name: &str, offset: u64) -> Result<Bytes, BucketError> {
+        self.read_op(metrics::OP_GET_RANGE, name, Some((offset, None)))
             .await
     }
 
     /// Returns `true` if object `name` exists in the bucket.
     pub async fn exists(&self, name: &str) -> Result<bool, BucketError> {
         let timer = self.timer(metrics::OP_EXISTS);
-        let result = match &self.backend {
+        let result = if name.trim_start_matches('/').is_empty() {
+            Err(BucketError::InvalidPath(
+                name.to_string(),
+                "object name cannot be empty".to_string(),
+            ))
+        } else {
+            match &self.backend {
             Backend::S3(b) => b.exists(&self.full_name(name)).await.map_err(BucketError::S3),
             Backend::Store(store) => async {
                 let path = self.object_path(name)?;
@@ -591,6 +935,7 @@ impl BucketClient {
                 }
             }
             .await,
+            }
         };
         if let Some(t) = timer {
             let expected =
@@ -602,7 +947,13 @@ impl BucketClient {
 
     async fn delete_op(&self, name: &str, strict: bool) -> Result<(), BucketError> {
         let timer = self.timer(metrics::OP_DELETE);
-        let result = match &self.backend {
+        let result = if name.trim_start_matches('/').is_empty() {
+            Err(BucketError::InvalidPath(
+                name.to_string(),
+                "object name cannot be empty".to_string(),
+            ))
+        } else {
+            match &self.backend {
             // S3 DeleteObject succeeds for missing objects (minio-go RemoveObject).
             Backend::S3(b) => b.delete(&self.full_name(name)).await.map_err(BucketError::S3),
             // GCS, Azure, and InMemory Delete return NotFound for missing objects (matching Go Thanos).
@@ -638,6 +989,7 @@ impl BucketClient {
                 }
             }
             .await,
+            }
         };
         if let Some(t) = timer {
             let expected =
@@ -662,7 +1014,13 @@ impl BucketClient {
     /// Returns object metadata attributes (size and last modified unix seconds).
     pub async fn attributes(&self, name: &str) -> Result<ObjectAttributes, BucketError> {
         let timer = self.timer(metrics::OP_ATTRIBUTES);
-        let result = match &self.backend {
+        let result = if name.trim_start_matches('/').is_empty() {
+            Err(BucketError::InvalidPath(
+                name.to_string(),
+                "object name cannot be empty".to_string(),
+            ))
+        } else {
+            match &self.backend {
             Backend::S3(b) => b
                 .attributes(&self.full_name(name))
                 .await
@@ -708,6 +1066,7 @@ impl BucketClient {
                 }
             }
             .await,
+            }
         };
         if let Some(t) = timer {
             let expected =
@@ -830,6 +1189,318 @@ impl BucketClient {
         self.iter_op(prefix, true).await
     }
 
+    /// Lists entries under `dir` with optional recursion and `last_modified` attributes
+    /// (Thanos `objstore.Bucket.IterWithAttributes`).
+    pub async fn iter_with_attributes(
+        &self,
+        dir: &str,
+        opts: IterOptions,
+    ) -> Result<Vec<IterObjectAttributes>, BucketError> {
+        let timer = self.timer(metrics::OP_ITER);
+        let result = self.iter_with_attributes_inner(dir, opts).await;
+        if let Some(t) = timer {
+            t.finish_iter(result.is_ok());
+        }
+        result
+    }
+
+    async fn iter_with_attributes_inner(
+        &self,
+        dir: &str,
+        opts: IterOptions,
+    ) -> Result<Vec<IterObjectAttributes>, BucketError> {
+        let full = self.full_name(dir);
+        if let Backend::S3(b) = &self.backend {
+            let entries = b.iter_with_attributes(&full, opts.recursive).await?;
+            return Ok(entries
+                .into_iter()
+                .filter_map(|e| {
+                    let name = self.strip_prefix(&e.name);
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let last_modified = if opts.updated_at {
+                        e.last_modified.map(SystemTime::from)
+                    } else {
+                        None
+                    };
+                    Some(IterObjectAttributes {
+                        name,
+                        last_modified,
+                    })
+                })
+                .collect());
+        }
+        let prefix = if full.is_empty() {
+            None
+        } else {
+            Some(
+                ObjectPath::parse(&full)
+                    .map_err(|e| BucketError::InvalidPath(full.clone(), e.to_string()))?,
+            )
+        };
+        let is_fs = matches!(&self.backend, Backend::Filesystem(_));
+        let owned_fs_store: Arc<dyn ObjectStore>;
+        let store: &Arc<dyn ObjectStore> = match &self.backend {
+            Backend::Store(store) => store,
+            Backend::Filesystem(fs) => {
+                let Some(s) = fs.get_existing().await? else {
+                    return Ok(Vec::new());
+                };
+                owned_fs_store = s;
+                &owned_fs_store
+            }
+            Backend::S3(_) => unreachable!(),
+        };
+        if opts.recursive {
+            let mut stream = store.list(prefix.as_ref());
+            let mut out = Vec::new();
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(meta)) => {
+                        let name = self.strip_prefix(meta.location.as_ref());
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let last_modified = if opts.updated_at {
+                            if let Some(root) = &self.fs_root {
+                                let mut p = root.clone();
+                                for part in meta.location.parts() {
+                                    p.push(part.as_ref());
+                                }
+                                std::fs::metadata(&p)?.modified().ok()
+                            } else {
+                                Some(SystemTime::from(meta.last_modified))
+                            }
+                        } else {
+                            None
+                        };
+                        out.push(IterObjectAttributes {
+                            name,
+                            last_modified,
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(object_store::Error::NotFound { .. }) if is_fs => break,
+                    Err(e) => {
+                        return Err(if is_fs {
+                            map_fs_store_error(e)
+                        } else {
+                            BucketError::Store(e)
+                        });
+                    }
+                }
+            }
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok(out);
+        }
+        let list_res = match store.list_with_delimiter(prefix.as_ref()).await {
+            Ok(res) => res,
+            Err(object_store::Error::NotFound { .. }) if is_fs => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(if is_fs {
+                    map_fs_store_error(e)
+                } else {
+                    BucketError::Store(e)
+                });
+            }
+        };
+        let mut out = Vec::with_capacity(list_res.common_prefixes.len() + list_res.objects.len());
+        for cp in list_res.common_prefixes {
+            if let Some(root) = &self.fs_root {
+                let mut dir_path = root.clone();
+                for part in cp.parts() {
+                    dir_path.push(part.as_ref());
+                }
+                if is_dir_empty(&dir_path)? {
+                    continue;
+                }
+                let stripped = self.strip_prefix(cp.as_ref());
+                if stripped.is_empty() {
+                    continue;
+                }
+                let last_modified = if opts.updated_at {
+                    std::fs::metadata(&dir_path)?.modified().ok()
+                } else {
+                    None
+                };
+                out.push(IterObjectAttributes {
+                    name: format!("{stripped}{DIR_DELIM}"),
+                    last_modified,
+                });
+            } else {
+                let stripped = self.strip_prefix(cp.as_ref());
+                if stripped.is_empty() {
+                    continue;
+                }
+                let last_modified = if opts.updated_at && self.provider == "INMEMORY" {
+                    // Thanos InMemBucket sets directory LastModified from a contained object.
+                    let mut stream = store.list(Some(&cp));
+                    match stream.try_next().await? {
+                        Some(meta) => Some(SystemTime::from(meta.last_modified)),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                out.push(IterObjectAttributes {
+                    name: format!("{stripped}{DIR_DELIM}"),
+                    last_modified,
+                });
+            }
+        }
+        for obj in list_res.objects {
+            let stripped = self.strip_prefix(obj.location.as_ref());
+            if stripped.is_empty() {
+                continue;
+            }
+            let last_modified = if opts.updated_at {
+                if let Some(root) = &self.fs_root {
+                    let mut p = root.clone();
+                    for part in obj.location.parts() {
+                        p.push(part.as_ref());
+                    }
+                    std::fs::metadata(&p)?.modified().ok()
+                } else {
+                    Some(SystemTime::from(obj.last_modified))
+                }
+            } else {
+                None
+            };
+            out.push(IterObjectAttributes {
+                name: stripped,
+                last_modified,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Ported from `github.com/thanos-io/objstore/objstore.go::DownloadDir`.
+    /// Downloads all objects under `src` into `dst`. On failure, cleans up `dst`.
+    pub async fn download_dir(
+        &self,
+        original_src: &str,
+        src: &str,
+        dst: &Path,
+        opts: DownloadDirOptions,
+    ) -> Result<(), BucketError> {
+        let res = self.download_dir_inner(original_src, src, dst, &opts).await;
+        if res.is_err() {
+            let _ = tokio::fs::remove_dir_all(dst).await;
+        }
+        res
+    }
+
+    fn download_dir_inner<'a>(
+        &'a self,
+        original_src: &'a str,
+        src: &'a str,
+        dst: &'a Path,
+        opts: &'a DownloadDirOptions,
+    ) -> futures::future::BoxFuture<'a, Result<(), BucketError>> {
+        Box::pin(async move {
+            tokio::fs::create_dir_all(dst).await?;
+            let concurrency = opts.concurrency.max(1);
+            let entries = self.iter_dir(src).await?;
+            let orig_prefix = format!("{}/", original_src.trim_end_matches('/'));
+            let mut futs = FuturesUnordered::new();
+            for name in entries {
+                let base = name
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&name)
+                    .to_string();
+                let child_dst = dst.join(&base);
+                if name.ends_with(DIR_DELIM) {
+                    futs.push(Box::pin(async move {
+                        self.download_dir_inner(original_src, &name, &child_dst, opts)
+                            .await
+                    }) as futures::future::BoxFuture<'_, Result<(), BucketError>>);
+                } else {
+                    let rel = name.strip_prefix(&orig_prefix).unwrap_or(&name).to_string();
+                    if opts.ignored_paths.iter().any(|p| p == &rel) {
+                        continue;
+                    }
+                    futs.push(Box::pin(async move {
+                        let data = self.download(&name).await?;
+                        tokio::fs::write(&child_dst, &data).await?;
+                        Ok(())
+                    }));
+                }
+                if futs.len() >= concurrency {
+                    if let Some(Err(e)) = futs.next().await {
+                        return Err(e);
+                    }
+                }
+            }
+            while let Some(res) = futs.next().await {
+                res?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Ported from `github.com/thanos-io/objstore/objstore.go::UploadDir`.
+    /// Uploads all files in `src_dir` recursively into `dst_dir`.
+    pub async fn upload_dir(
+        &self,
+        src_dir: &Path,
+        dst_dir: &str,
+        opts: UploadDirOptions,
+    ) -> Result<(), BucketError> {
+        let meta = tokio::fs::metadata(src_dir).await?;
+        if !meta.is_dir() {
+            return Err(BucketError::InvalidPath(
+                src_dir.to_string_lossy().into_owned(),
+                "is not a directory".to_string(),
+            ));
+        }
+        let mut files = Vec::new();
+        let mut stack = vec![src_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let mut rd = tokio::fs::read_dir(&dir).await?;
+            while let Some(entry) = rd.next_entry().await? {
+                let path = entry.path();
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+        let dst_clean = dst_dir.trim_matches('/');
+        let concurrency = opts.concurrency.max(1);
+        let mut futs = FuturesUnordered::new();
+        for src_path in files {
+            let rel = src_path
+                .strip_prefix(src_dir)
+                .map_err(|e| BucketError::Config(e.to_string()))?;
+            let rel_slash = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let dst_key = if dst_clean.is_empty() {
+                rel_slash
+            } else {
+                format!("{dst_clean}/{rel_slash}")
+            };
+            futs.push(async move { self.upload_file(&dst_key, &src_path).await });
+            if futs.len() >= concurrency {
+                if let Some(Err(e)) = futs.next().await {
+                    return Err(e);
+                }
+            }
+        }
+        while let Some(res) = futs.next().await {
+            res?;
+        }
+        Ok(())
+    }
+
     /// Recursively deletes all objects under `prefix` and returns the count of deleted objects.
     /// Ported from `DeletePrefix` in `pkg/storage/bucket/bucket_util.go` (one non-recursive
     /// `Iter` per directory level, one `Delete` per object).
@@ -891,13 +1562,13 @@ async fn fs_read_op(
     store: &Arc<dyn ObjectStore>,
     path: &ObjectPath,
     name: &str,
-    range: Option<(u64, u64)>,
+    range: Option<(u64, Option<u64>)>,
 ) -> Result<Bytes, BucketError> {
     match store_read_op(store, path, name, range).await {
         Ok(b) => Ok(b),
         Err(BucketError::Store(e @ object_store::Error::Generic { .. })) => {
-            if let Some((off, len)) = range {
-                if len > 0 {
+            if let Some((off, len_opt)) = range {
+                if len_opt != Some(0) {
                     match store.head(path).await {
                         Ok(meta) if off >= meta.size as u64 => return Ok(Bytes::new()),
                         Err(object_store::Error::NotFound { .. }) => {
@@ -918,7 +1589,7 @@ async fn store_read_op(
     store: &Arc<dyn ObjectStore>,
     path: &ObjectPath,
     name: &str,
-    range: Option<(u64, u64)>,
+    range: Option<(u64, Option<u64>)>,
 ) -> Result<Bytes, BucketError> {
     match range {
         None => match store.get(path).await {
@@ -928,18 +1599,31 @@ async fn store_read_op(
             }
             Err(e) => Err(BucketError::Store(e)),
         },
-        Some((_, 0)) => match store.head(path).await {
+        Some((_, Some(0))) => match store.head(path).await {
             Ok(_) => Ok(Bytes::new()),
             Err(object_store::Error::NotFound { .. }) => {
                 Err(BucketError::NotFound(name.to_string()))
             }
             Err(e) => Err(BucketError::Store(e)),
         },
-        Some((off, len)) => {
+        Some((off, Some(len))) => {
             let opts = GetOptions {
                 range: Some(GetRange::Bounded(
                     (off as usize)..(off.saturating_add(len) as usize),
                 )),
+                ..Default::default()
+            };
+            match store.get_opts(path, opts).await {
+                Ok(res) => Ok(res.bytes().await?),
+                Err(object_store::Error::NotFound { .. }) => {
+                    Err(BucketError::NotFound(name.to_string()))
+                }
+                Err(e) => Err(BucketError::Store(e)),
+            }
+        }
+        Some((off, None)) => {
+            let opts = GetOptions {
+                range: Some(GetRange::Offset(off as usize)),
                 ..Default::default()
             };
             match store.get_opts(path, opts).await {

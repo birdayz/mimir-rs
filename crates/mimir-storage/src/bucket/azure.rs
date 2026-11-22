@@ -70,6 +70,9 @@ pub struct ThanosAzureConfig {
     pub container_name: String,
     pub endpoint: String,
     pub user_assigned_id: String,
+    pub az_tenant_id: String,
+    pub client_id: String,
+    pub client_secret: String,
     pub max_retries: i64,
     pub pipeline_max_tries: i32,
     pub reader_max_retry_requests: i64,
@@ -90,6 +93,9 @@ pub fn thanos_config(cfg: &AzureConfig) -> ThanosAzureConfig {
             cfg.endpoint_suffix.clone()
         },
         user_assigned_id: cfg.user_assigned_id.clone(),
+        az_tenant_id: String::new(),
+        client_id: String::new(),
+        client_secret: String::new(),
         max_retries: cfg.max_retries,
         pipeline_max_tries: 0,
         reader_max_retry_requests: 0,
@@ -124,6 +130,11 @@ impl ThanosAzureConfig {
         }
         if self.reader_max_retry_requests < 0 {
             errs.push("The value of max_retry_requests must be greater than or equal to 0 in the config file");
+        }
+        if (!self.client_id.is_empty() || !self.client_secret.is_empty())
+            && self.az_tenant_id.is_empty()
+        {
+            errs.push("az_tenant_id must be configured when client_id or client_secret is set");
         }
         if errs.is_empty() {
             Ok(())
@@ -1834,6 +1845,9 @@ mod tests {
             container_name: "test".into(),
             endpoint: "blob.core.windows.net".into(),
             user_assigned_id: String::new(),
+            az_tenant_id: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
             max_retries: 3,
             pipeline_max_tries: 0,
             reader_max_retry_requests: 0,

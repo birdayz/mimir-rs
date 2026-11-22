@@ -507,133 +507,146 @@ mod tests {
         }
     }
 
-    // Upstream: TestUtilizationBasedLimiter/CPU based limiting should be enabled if set to a value greater than 0
+    // Upstream: pkg/util/limiter/utilization_test.go::TestUtilizationBasedLimiter
     #[test]
-    fn cpu_based_limiting_enabled() {
-        let mut tim = Instant::now();
-        let (lim, _, reg) = setup(0.11, GIGABYTE, true);
-        warmup(&lim, &mut tim);
-        for _ in 0..59 {
+    fn test_utilization_based_limiter() {
+        // CPU based limiting should be enabled if set to a value greater than 0
+        {
+            let mut tim = Instant::now();
+            let (lim, _, reg) = setup(0.11, GIGABYTE, true);
+            warmup(&lim, &mut tim);
+            for _ in 0..59 {
+                let t = tim;
+                lim.compute(|| t);
+                tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
+                assert_eq!(lim.limiting_reason_str(), "", "Limiting should be disabled");
+            }
             let t = tim;
             lim.compute(|| t);
             tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
-            assert_eq!(lim.limiting_reason_str(), "", "Limiting should be disabled");
+            assert_eq!(lim.limiting_reason_str(), "cpu");
+            for _ in 0..5 {
+                let t = tim;
+                lim.compute(|| t);
+                tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
+            }
+            assert_eq!(lim.limiting_reason_str(), "", "Limiting should be disabled again");
+            let (cpu, mem) = gather(&reg);
+            assert!((cpu - 0.10803555562923002).abs() < 1e-12, "cpu={cpu}");
+            assert_eq!(mem, 0.0);
         }
-        let t = tim;
-        lim.compute(|| t);
-        tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
-        assert_eq!(lim.limiting_reason_str(), "cpu");
-        for _ in 0..5 {
-            let t = tim;
-            lim.compute(|| t);
-            tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
-        }
-        assert_eq!(lim.limiting_reason_str(), "", "Limiting should be disabled again");
-        let (cpu, mem) = gather(&reg);
-        assert!((cpu - 0.10803555562923002).abs() < 1e-12, "cpu={cpu}");
-        assert_eq!(mem, 0.0);
-    }
 
-    // Upstream: TestUtilizationBasedLimiter/CPU based limiting should be disabled if set to 0
-    #[test]
-    fn cpu_based_limiting_disabled() {
-        let mut tim = Instant::now();
-        let (lim, _, reg) = setup(0.0, GIGABYTE, true);
-        warmup(&lim, &mut tim);
-        for _ in 0..60 {
-            let t = tim;
-            lim.compute(|| t);
-            tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
+        // CPU based limiting should be disabled if set to 0
+        {
+            let mut tim = Instant::now();
+            let (lim, _, reg) = setup(0.0, GIGABYTE, true);
+            warmup(&lim, &mut tim);
+            for _ in 0..60 {
+                let t = tim;
+                lim.compute(|| t);
+                tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
+                assert_eq!(lim.limiting_reason_str(), "");
+            }
+            let (cpu, mem) = gather(&reg);
+            assert!((cpu - 0.12581711205891943).abs() < 1e-12, "cpu={cpu}");
+            assert_eq!(mem, 0.0);
+        }
+
+        // memory based limiting should be enabled if set to a value greater than 0
+        {
+            let tim = Instant::now();
+            let (lim, mem, reg) = setup(0.11, GIGABYTE, true);
+            lim.compute(|| tim);
+            mem.store(GIGABYTE, Ordering::Relaxed);
+            lim.compute(|| tim);
+            assert_eq!(lim.limiting_reason_str(), "memory");
+            mem.store(GIGABYTE - 1, Ordering::Relaxed);
+            lim.compute(|| tim + RESOURCE_UTILIZATION_UPDATE_INTERVAL);
             assert_eq!(lim.limiting_reason_str(), "");
+            let (cpu, m) = gather(&reg);
+            assert_eq!(cpu, 0.0);
+            assert_eq!(m, 1.073741823e9);
         }
-        let (cpu, mem) = gather(&reg);
-        assert!((cpu - 0.12581711205891943).abs() < 1e-12, "cpu={cpu}");
-        assert_eq!(mem, 0.0);
-    }
 
-    // Upstream: TestUtilizationBasedLimiter/memory based limiting should be enabled if set to a value greater than 0
-    #[test]
-    fn memory_based_limiting_enabled() {
-        let tim = Instant::now();
-        let (lim, mem, reg) = setup(0.11, GIGABYTE, true);
-        lim.compute(|| tim);
-        mem.store(GIGABYTE, Ordering::Relaxed);
-        lim.compute(|| tim);
-        assert_eq!(lim.limiting_reason_str(), "memory");
-        mem.store(GIGABYTE - 1, Ordering::Relaxed);
-        lim.compute(|| tim + RESOURCE_UTILIZATION_UPDATE_INTERVAL);
-        assert_eq!(lim.limiting_reason_str(), "");
-        let (cpu, m) = gather(&reg);
-        assert_eq!(cpu, 0.0);
-        assert_eq!(m, 1.073741823e9);
-    }
+        // memory based limiting should be disabled if set to 0
+        {
+            let tim = Instant::now();
+            let (lim, mem, reg) = setup(0.11, 0, true);
+            lim.compute(|| tim);
+            mem.store(GIGABYTE, Ordering::Relaxed);
+            lim.compute(|| tim);
+            assert_eq!(lim.limiting_reason_str(), "");
+            let (cpu, m) = gather(&reg);
+            assert_eq!(cpu, 0.0);
+            assert_eq!(m, 1.073741824e9);
+        }
 
-    // Upstream: TestUtilizationBasedLimiter/memory based limiting should be disabled if set to 0
-    #[test]
-    fn memory_based_limiting_disabled() {
-        let tim = Instant::now();
-        let (lim, mem, reg) = setup(0.11, 0, true);
-        lim.compute(|| tim);
-        mem.store(GIGABYTE, Ordering::Relaxed);
-        lim.compute(|| tim);
-        assert_eq!(lim.limiting_reason_str(), "");
-        let (cpu, m) = gather(&reg);
-        assert_eq!(cpu, 0.0);
-        assert_eq!(m, 1.073741824e9);
-    }
-
-    // Upstream: TestUtilizationBasedLimiter/limiting should work without CPU samples logging
-    #[test]
-    fn limiting_without_cpu_samples_logging() {
-        let mut tim = Instant::now();
-        let (lim, _, _) = setup(0.11, GIGABYTE, false);
-        warmup(&lim, &mut tim);
-        for _ in 0..59 {
+        // limiting should work without CPU samples logging
+        {
+            let mut tim = Instant::now();
+            let (lim, _, _) = setup(0.11, GIGABYTE, false);
+            warmup(&lim, &mut tim);
+            for _ in 0..59 {
+                let t = tim;
+                lim.compute(|| t);
+                tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
+                assert_eq!(lim.limiting_reason_str(), "");
+            }
             let t = tim;
             lim.compute(|| t);
-            tim += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
-            assert_eq!(lim.limiting_reason_str(), "");
+            assert_eq!(lim.limiting_reason_str(), "cpu");
+            assert!(lim.cpu_samples_string().is_none());
         }
-        let t = tim;
-        lim.compute(|| t);
-        assert_eq!(lim.limiting_reason_str(), "cpu");
-        assert!(lim.cpu_samples_string().is_none());
+
+        // the limiter should collect the last 60 CPU samples
+        {
+            let inst: Vec<f64> = (1..=62).map(f64::from).collect();
+            let lim = UtilizationBasedLimiter::new(1.0, 0, true, "", Some(&Registry::new()));
+            lim.set_scanner(Box::new(PreRecordedScanner::new(inst.clone())));
+            let mut ts = Instant::now();
+            for _ in 0..inst.len() {
+                let t = ts;
+                lim.compute(|| t);
+                ts += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
+            }
+            let exp = inst[2..62]
+                .iter()
+                .map(|v| format!("{v:.2}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            assert_eq!(lim.cpu_samples_string().unwrap(), exp);
+        }
     }
 
-    // Upstream: TestUtilizationBasedLimiter/the limiter should collect the last 60 CPU samples
+    // Upstream: pkg/util/limiter/utilization_test.go::TestFormatCPU
     #[test]
-    fn collects_last_60_cpu_samples() {
-        let inst: Vec<f64> = (1..=62).map(f64::from).collect();
-        let lim = UtilizationBasedLimiter::new(1.0, 0, true, "", Some(&Registry::new()));
-        lim.set_scanner(Box::new(PreRecordedScanner::new(inst.clone())));
-        let mut ts = Instant::now();
-        for _ in 0..inst.len() {
-            let t = ts;
-            lim.compute(|| t);
-            ts += RESOURCE_UTILIZATION_UPDATE_INTERVAL;
-        }
-        let exp = inst[2..62]
-            .iter()
-            .map(|v| format!("{v:.2}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        assert_eq!(lim.cpu_samples_string().unwrap(), exp);
-    }
-
-    // Upstream: TestFormatCPU / TestFormatCPULimit / TestFormatMemory / TestFormatMemoryLimit
-    #[test]
-    fn formatting() {
+    fn test_format_cpu() {
         assert_eq!(format_cpu(0.0), "0.00");
         assert_eq!(format_cpu(0.11), "0.11");
         assert_eq!(format_cpu(0.111), "0.11");
         assert_eq!(format_cpu(0.115), "0.12");
         assert_eq!(format_cpu(2.1), "2.10");
+    }
+
+    // Upstream: pkg/util/limiter/utilization_test.go::TestFormatCPULimit
+    #[test]
+    fn test_format_cpu_limit() {
         assert_eq!(format_cpu_limit(0.0), "disabled");
         assert_eq!(format_cpu_limit(0.111), "0.11");
         assert_eq!(format_cpu_limit(0.115), "0.12");
+    }
+
+    // Upstream: pkg/util/limiter/utilization_test.go::TestFormatMemory
+    #[test]
+    fn test_format_memory() {
         assert_eq!(format_memory(0), "0");
         assert_eq!(format_memory(GIGABYTE), "1073741824");
         assert_eq!(format_memory(GIGABYTE + 1), "1073741825");
+    }
+
+    // Upstream: pkg/util/limiter/utilization_test.go::TestFormatMemoryLimit
+    #[test]
+    fn test_format_memory_limit() {
         assert_eq!(format_memory_limit(0), "disabled");
         assert_eq!(format_memory_limit(GIGABYTE), "1073741824");
         assert_eq!(format_memory_limit(GIGABYTE + 1), "1073741825");
@@ -647,7 +660,7 @@ mod tests {
         (0..count).map(|i| from + i as f64 * step).collect()
     }
 
-    // Upstream: TestUtilizationBasedLimiter_CPUUtilizationSensitivity
+    // Upstream: pkg/util/limiter/utilization_test.go::TestUtilizationBasedLimiter_CPUUtilizationSensitivity
     #[test]
     fn cpu_utilization_sensitivity() {
         let spike = [10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
@@ -704,7 +717,7 @@ mod tests {
         }
     }
 
-    // Upstream: TestUtilizationBasedLimiter_ShouldNotUpdateCPUIfElapsedVeryShortTimeSincePreviousUpdate
+    // Upstream: pkg/util/limiter/utilization_test.go::TestUtilizationBasedLimiter_ShouldNotUpdateCPUIfElapsedVeryShortTimeSincePreviousUpdate
     #[test]
     fn should_not_update_cpu_if_elapsed_very_short_time() {
         let mut now = Instant::now();

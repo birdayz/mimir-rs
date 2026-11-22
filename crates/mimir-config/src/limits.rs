@@ -7,21 +7,43 @@
 //! - github.com/grafana/mimir/pkg/util/validation/blocked_request.go
 //! - github.com/grafana/mimir/pkg/costattribution/costattributionmodel/*
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::OnceLock;
 
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::duration::{GoDuration, ModelDuration};
 use crate::error::ConfigError;
 use crate::flags::FlagSet;
 use crate::types::{
-    parse_go_yaml_timestamp, CIDRSliceCSV, LabelValueLengthOverLimitStrategy, LimitsMap,
-    NameValidationScheme, OTelTranslationStrategy, StringSliceCSV,
+    parse_go_yaml_timestamp, parse_go_yaml_timestamp_dt, CIDRSliceCSV,
+    LabelValueLengthOverLimitStrategy, LimitsMap, NameValidationScheme, OTelTranslationStrategy,
+    StringSliceCSV,
 };
 
 pub const MIN_COMPACTOR_PARTIAL_BLOCK_DELETION_DELAY_NANOS: i64 = 4 * 3600 * 1_000_000_000;
 pub const LABEL_VALUE_HASH_LEN: usize = "(hash:)".len() + 32 * 2;
+
+fn is_timestamp_expired(expires_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    let Some(raw) = expires_at else {
+        return false;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(dt) = parse_go_yaml_timestamp_dt(trimmed) else {
+        return false;
+    };
+    // Go time.Time{} is year 0001-01-01T00:00:00Z.
+    if dt.year() <= 1 && dt.timestamp() <= -62_135_596_800 {
+        return false;
+    }
+    now > dt
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -35,8 +57,44 @@ pub struct BlockedQuery {
     pub id: String,
     pub note: String,
     pub created_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+}
+
+impl BlockedQuery {
+    /// Reports whether `expires_at` is set and in the past, relative to `now`.
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        is_timestamp_expired(self.expires_at.as_deref(), now)
+    }
+}
+
+pub type BlockedQueriesConfig = Vec<BlockedQuery>;
+
+pub fn validate_blocked_queries(queries: &[BlockedQuery]) -> Result<(), ConfigError> {
+    for (i, q) in queries.iter().enumerate() {
+        if q.pattern.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "blocked_queries[{i}]: pattern is required"
+            )));
+        }
+        if q.regex {
+            if let Err(e) = regex::Regex::new(&q.pattern) {
+                return Err(ConfigError::Validation(format!(
+                    "blocked_queries[{i}]: invalid regex pattern {:?}: {e}",
+                    q.pattern
+                )));
+            }
+        }
+        if let Some(ts) = q.created_at.as_deref() {
+            parse_go_yaml_timestamp(ts)?;
+        }
+        if let Some(ts) = q.expires_at.as_deref() {
+            parse_go_yaml_timestamp(ts)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +110,124 @@ pub struct LimitedQuery {
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+}
+
+impl LimitedQuery {
+    /// Reports whether `expires_at` is set and in the past, relative to `now`.
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        is_timestamp_expired(self.expires_at.as_deref(), now)
+    }
+}
+
+pub const DEFAULT_FLOAT_CHUNK_ENCODING_VALUE: &str = "xor";
+pub const FLOAT_CHUNK_ENCODING_VALUES: &[&str] = &["xor", "xor2"];
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FloatChunkEncoding {
+    Xor,
+    Xor2,
+}
+
+pub fn parse_float_chunk_encoding(value: &str) -> FloatChunkEncoding {
+    match value {
+        "xor2" => FloatChunkEncoding::Xor2,
+        _ => FloatChunkEncoding::Xor,
+    }
+}
+
+pub const DEFAULT_HISTOGRAM_CHUNK_ENCODING_VALUE: &str = "histogram";
+pub const HISTOGRAM_CHUNK_ENCODING_ST: &str = "histogram_st";
+pub const HISTOGRAM_CHUNK_ENCODING_VALUES: &[&str] = &["histogram", "histogram_st"];
+
+pub fn parse_histogram_st_encoding_enabled(value: &str) -> bool {
+    value == HISTOGRAM_CHUNK_ENCODING_ST
+}
+
+/// Marker error for errors that do not comply with configured limits (`validation.LimitError`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitError(pub String);
+
+impl fmt::Display for LimitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LimitError {}
+
+pub fn new_limit_error(msg: impl Into<String>) -> LimitError {
+    LimitError(msg.into())
+}
+
+pub fn is_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if e.downcast_ref::<LimitError>().is_some() {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// HTTP JSON response returned by `/api/v1/user_limits` (`validation.UserLimitsResponse`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct UserLimitsResponse {
+    pub compactor_blocks_retention_period_seconds: i64,
+    pub ingestion_rate: f64,
+    pub ingestion_burst_size: i64,
+    pub ingestion_burst_factor: f64,
+    pub max_global_series_per_user: i64,
+    pub max_global_series_per_metric: i64,
+    pub max_global_exemplars_per_user: i64,
+    pub max_fetched_chunks_per_query: i64,
+    pub max_fetched_series_per_query: i64,
+    pub max_fetched_chunk_bytes_per_query: i64,
+    pub ruler_max_rules_per_rule_group: i64,
+    pub ruler_max_rule_groups_per_tenant: i64,
+    pub alertmanager_notification_rate_limit: f64,
+    pub alertmanager_max_dispatcher_aggregation_groups: i64,
+    pub alertmanager_max_templates_count: i64,
+    pub alertmanager_max_alerts_count: i64,
+}
+
+impl From<&LimitsConfig> for UserLimitsResponse {
+    fn from(l: &LimitsConfig) -> Self {
+        Self {
+            compactor_blocks_retention_period_seconds: l.compactor_blocks_retention_period.0
+                / 1_000_000_000,
+            ingestion_rate: l.ingestion_rate,
+            ingestion_burst_size: l.ingestion_burst_size,
+            ingestion_burst_factor: l.ingestion_burst_factor,
+            max_global_series_per_user: l.max_global_series_per_user,
+            max_global_series_per_metric: l.max_global_series_per_metric,
+            max_global_exemplars_per_user: l.max_global_exemplars_per_user,
+            max_fetched_chunks_per_query: l.max_fetched_chunks_per_query,
+            max_fetched_series_per_query: l.max_fetched_series_per_query,
+            max_fetched_chunk_bytes_per_query: l.max_fetched_chunk_bytes_per_query,
+            ruler_max_rules_per_rule_group: l.ruler_max_rules_per_rule_group,
+            ruler_max_rule_groups_per_tenant: l.ruler_max_rule_groups_per_tenant,
+            alertmanager_notification_rate_limit: l.alertmanager_notification_rate_limit,
+            alertmanager_max_dispatcher_aggregation_groups: l
+                .alertmanager_max_dispatcher_aggregation_groups,
+            alertmanager_max_templates_count: l.alertmanager_max_templates_count,
+            alertmanager_max_alerts_count: l.alertmanager_max_alerts_count,
+        }
+    }
+}
+
+/// Pure handler matching `pkg/util/validation/user_limits_handler.go:UserLimitsHandler`.
+pub fn handle_user_limits_request(
+    org_id_header: Option<&[u8]>,
+    overrides: &crate::runtime_config::Overrides,
+) -> Result<UserLimitsResponse, (u16, String)> {
+    let Some(raw_org) = org_id_header else {
+        return Err((401, "no org id".to_string()));
+    };
+    let user_id = mimir_common::tenant::parse_single_tenant_id_bytes(raw_org)
+        .map_err(|e| (401, e.to_string()))?;
+    let limits = overrides.for_tenant(&user_id);
+    Ok(UserLimitsResponse::from(limits.as_ref()))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,6 +630,7 @@ pub struct LimitsConfig {
     pub alertmanager_receivers_firewall_block_cidr_networks: CIDRSliceCSV,
     pub alertmanager_receivers_firewall_block_private_addresses: bool,
     pub alertmanager_notification_rate_limit: f64,
+    #[serde(deserialize_with = "deserialize_notification_rate_limit_map")]
     pub alertmanager_notification_rate_limit_per_integration: LimitsMap<f64>,
     pub alertmanager_max_config_size_bytes: i64,
     pub alertmanager_max_silences_count: i64,
@@ -483,6 +660,10 @@ pub struct LimitsConfig {
 
     // Name validation scheme.
     pub name_validation_scheme: NameValidationScheme,
+
+    // Registered dynamic extensions (Go: Limits.extensions, skipped in direct serde).
+    #[serde(skip)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for LimitsConfig {
@@ -661,6 +842,7 @@ impl Default for LimitsConfig {
             ingestion_partitions_tenant_write_shard_size: 0,
 
             name_validation_scheme: NameValidationScheme::Legacy,
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -818,9 +1000,23 @@ impl LimitsConfig {
             "{}",
             "Base cost attribution trackers configuration as JSON.",
             move |t, s| {
-                let parsed: CostAttributionTrackerConfigs = serde_json::from_str(s).map_err(|e| {
-                    ConfigError::Flag(format!("invalid cost attribution trackers JSON: {e}"))
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Ok(());
+                }
+                let mut parsed: CostAttributionTrackerConfigs =
+                    serde_json::from_str(trimmed).map_err(|e| {
+                        ConfigError::Flag(format!("failed to parse cost attribution trackers: {e}"))
+                    })?;
+                validate_cost_attribution_trackers(&parsed).map_err(|e| match e {
+                    ConfigError::Validation(msg) | ConfigError::Flag(msg) => {
+                        ConfigError::Flag(msg)
+                    }
+                    other => other,
                 })?;
+                for cfg in parsed.values_mut() {
+                    cfg.labels.sort_by(|a, b| a.input.cmp(&b.input));
+                }
                 get_mut(t).cost_attribution_trackers = parsed;
                 Ok(())
             },
@@ -1144,27 +1340,7 @@ impl LimitsConfig {
             )));
         }
 
-        for (i, q) in self.blocked_queries.iter().enumerate() {
-            if q.pattern.trim().is_empty() {
-                return Err(ConfigError::Validation(format!(
-                    "blocked_queries[{i}]: pattern is required"
-                )));
-            }
-            if q.regex {
-                if let Err(e) = regex::Regex::new(&q.pattern) {
-                    return Err(ConfigError::Validation(format!(
-                        "blocked_queries[{i}]: invalid regex pattern {:?}: {e}",
-                        q.pattern
-                    )));
-                }
-            }
-            if let Some(ts) = q.created_at.as_deref() {
-                parse_go_yaml_timestamp(ts)?;
-            }
-            if let Some(ts) = q.expires_at.as_deref() {
-                parse_go_yaml_timestamp(ts)?;
-            }
-        }
+        validate_blocked_queries(&self.blocked_queries)?;
         for q in &self.limited_queries {
             if let Some(ts) = q.created_at.as_deref() {
                 parse_go_yaml_timestamp(ts)?;
@@ -1429,6 +1605,845 @@ pub(crate) fn validate_integration_limit(k: &str, _v: &f64) -> Result<(), Config
         return Err(ConfigError::Flag(format!("unknown integration name: {k}")));
     }
     Ok(())
+}
+
+fn deserialize_notification_rate_limit_map<'de, D>(
+    deserializer: D,
+) -> Result<LimitsMap<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<LimitsMap<Option<f64>>> = serde::Deserialize::deserialize(deserializer)?;
+    let mut out = LimitsMap::new();
+    for (k, v) in raw.unwrap_or_default() {
+        let val = v.unwrap_or(0.0);
+        if let Err(e) = validate_integration_limit(&k, &val) {
+            let msg = match e {
+                ConfigError::Flag(m) | ConfigError::Validation(m) => m,
+                other => other.to_string(),
+            };
+            return Err(serde::de::Error::custom(msg));
+        }
+        out.insert(k, val);
+    }
+    Ok(out)
+}
+
+/// Validated notification rate limit map (`pkg/util/validation/notifications_limit_flag.go`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct NotificationRateLimitMap(pub LimitsMap<f64>);
+
+impl NotificationRateLimitMap {
+    pub fn new() -> Self {
+        Self(LimitsMap::new())
+    }
+
+    pub fn with_data(data: LimitsMap<f64>) -> Result<Self, ConfigError> {
+        for (k, v) in &data {
+            validate_integration_limit(k, v)?;
+        }
+        Ok(Self(data))
+    }
+
+    pub fn set(&mut self, s: &str) -> Result<(), ConfigError> {
+        let raw: Option<LimitsMap<Option<f64>>> =
+            serde_json::from_str(s).map_err(|e| ConfigError::Flag(e.to_string()))?;
+        let mut out = LimitsMap::new();
+        for (k, v) in raw.unwrap_or_default() {
+            let val = v.unwrap_or(0.0);
+            validate_integration_limit(&k, &val)?;
+            out.insert(k, val);
+        }
+        self.0 = out;
+        Ok(())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for NotificationRateLimitMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_notification_rate_limit_map(deserializer).map(Self)
+    }
+}
+
+impl LimitsConfig {
+    /// Canonicalizes non-regex `blocked_queries` patterns via PromQL selector normalization
+    /// (`pkg/util/validation/limits.go:canonicalizeQueries`).
+    pub fn canonicalize_queries(&mut self) {
+        for q in &mut self.blocked_queries {
+            if q.regex {
+                continue;
+            }
+            if let Some(canon) = canonicalize_promql_expr(&q.pattern) {
+                if canon != q.pattern {
+                    q.pattern = canon;
+                }
+            }
+        }
+    }
+
+    /// Returns a zeroed `LimitsConfig` (matching Go `Limits{}` before `flagext.DefaultValues`).
+    pub fn zeroed() -> Self {
+        Self {
+            active_series_limit_response_code: 0,
+            ingestion_rate: 0.0,
+            ingestion_burst_size: 0,
+            ha_cluster_label: String::new(),
+            ha_replica_label: String::new(),
+            ha_max_clusters: 0,
+            ha_tracker_update_timeout: ModelDuration::ZERO,
+            ha_tracker_update_timeout_jitter_max: ModelDuration::ZERO,
+            ha_tracker_failover_timeout: ModelDuration::ZERO,
+            max_label_name_length: 0,
+            max_label_value_length: 0,
+            max_label_names_per_series: 0,
+            max_label_names_per_info_series: 0,
+            max_metadata_length: 0,
+            reduce_native_histogram_over_max_buckets: false,
+            creation_grace_period: ModelDuration::ZERO,
+            enforce_metadata_metric_name: false,
+            max_global_series_per_user: 0,
+            early_head_compaction_min_estimated_series_reduction_percentage: 0,
+            native_histograms_ingestion_enabled: false,
+            float_chunk_encoding: String::new(),
+            histogram_chunk_encoding: String::new(),
+            max_fetched_chunks_per_query: 0,
+            max_blocks_per_store_request: 0,
+            max_query_parallelism: 0,
+            max_cache_freshness: ModelDuration::ZERO,
+            query_sharding_total_shards: 0,
+            query_sharding_max_sharded_queries: 0,
+            query_sharding_max_regexp_size_bytes: 0,
+            query_ingesters_within: ModelDuration::ZERO,
+            results_cache_ttl: ModelDuration::ZERO,
+            results_cache_ttl_for_out_of_order_time_window: ModelDuration::ZERO,
+            results_cache_ttl_for_errors: ModelDuration::ZERO,
+            labels_query_optimizer_enabled: false,
+            label_names_and_values_results_max_size_bytes: 0,
+            label_values_max_cardinality_label_names_per_request: 0,
+            cardinality_analysis_max_results: 0,
+            active_series_results_max_size_bytes: 0,
+            max_cost_attribution_cardinality: 0,
+            ruler_evaluation_delay_duration: ModelDuration::ZERO,
+            ruler_max_rules_per_rule_group: 0,
+            ruler_max_rule_groups_per_tenant: 0,
+            ruler_recording_rules_evaluation_enabled: false,
+            ruler_alerting_rules_evaluation_enabled: false,
+            ruler_sync_rules_on_changes_enabled: false,
+            ruler_max_independent_rule_evaluation_concurrency_per_tenant: 0,
+            ruler_alertmanager_client_config: RulerAlertmanagerClientConfig {
+                tls_enabled: false,
+                ..Default::default()
+            },
+            compactor_split_groups: 0,
+            compactor_partial_block_deletion_delay: ModelDuration::ZERO,
+            compactor_block_upload_validation_enabled: false,
+            compactor_block_upload_verify_chunks: false,
+            compactor_max_per_block_upload_concurrency: 0,
+            otel_metric_suffixes_enabled: None,
+            otel_label_name_underscore_sanitization: false,
+            otel_label_name_preserve_multiple_underscores: false,
+            ingest_storage_read_consistency: String::new(),
+            name_validation_scheme: NameValidationScheme::Unset,
+            ..Default::default()
+        }
+    }
+
+    /// Registers defaults for all extensions active in the current thread
+    /// (`Limits.RegisterExtensionsDefaults`).
+    pub fn register_extensions_defaults(&mut self) {
+        for (name, def_fn) in current_thread_extensions() {
+            self.extensions.insert(name, def_fn());
+        }
+    }
+
+    /// Unmarshals YAML into `LimitsConfig` using `LimitsConfig::default()` as the base
+    /// (`Limits.UnmarshalYAML`).
+    pub fn unmarshal_yaml(yaml: &str) -> Result<Self, ConfigError> {
+        Self::unmarshal_yaml_with_defaults(yaml, &Self::default())
+    }
+
+    /// Unmarshals YAML into `LimitsConfig` starting from `defaults`, mirroring Go
+    /// `Limits.unmarshal`.
+    pub fn unmarshal_yaml_with_defaults(yaml: &str, defaults: &Self) -> Result<Self, ConfigError> {
+        let input: serde_yaml::Value =
+            serde_yaml::from_str(yaml).map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        Self::unmarshal_yaml_value_with_defaults(input, defaults)
+    }
+
+    /// Unmarshals JSON into `LimitsConfig` using `LimitsConfig::default()` as the base
+    /// (`Limits.UnmarshalJSON`).
+    pub fn unmarshal_json(json: &str) -> Result<Self, ConfigError> {
+        Self::unmarshal_json_with_defaults(json, &Self::default())
+    }
+
+    /// Unmarshals JSON into `LimitsConfig` starting from `defaults`, mirroring Go
+    /// `Limits.unmarshal`.
+    pub fn unmarshal_json_with_defaults(json: &str, defaults: &Self) -> Result<Self, ConfigError> {
+        let json_val: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        let yaml_val =
+            serde_yaml::to_value(&json_val).map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        Self::unmarshal_yaml_value_with_defaults(yaml_val, defaults)
+    }
+
+    /// Unmarshals an already-parsed map/value into `LimitsConfig` starting from `defaults`,
+    /// mirroring `DecodeLimitsMap`.
+    pub fn unmarshal_map_with_defaults(
+        input: serde_yaml::Value,
+        defaults: &Self,
+    ) -> Result<Self, ConfigError> {
+        Self::unmarshal_yaml_value_with_defaults(input, defaults)
+    }
+
+    /// Unmarshals `map[string]*Limits` YAML (used in `limits_test.go` override tests).
+    pub fn unmarshal_overrides_yaml_with_defaults(
+        yaml: &str,
+        defaults: &Self,
+    ) -> Result<BTreeMap<String, Option<Self>>, ConfigError> {
+        let input: serde_yaml::Value =
+            serde_yaml::from_str(yaml).map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        if input.is_null() {
+            return Ok(BTreeMap::new());
+        }
+        let map = input.as_mapping().ok_or_else(|| {
+            ConfigError::Yaml("expected YAML mapping for overrides".to_string())
+        })?;
+        let mut out = BTreeMap::new();
+        for (k, v) in map {
+            let key = k
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| serde_yaml::to_string(k).ok().map(|s| s.trim().to_string()))
+                .ok_or_else(|| ConfigError::Yaml("non-string override key".to_string()))?;
+            if v.is_null() {
+                out.insert(key, None);
+            } else {
+                out.insert(key, Some(Self::unmarshal_yaml_value_with_defaults(v.clone(), defaults)?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Unmarshals `map[string]Limits` (non-pointer value map) YAML matching Go `yaml.v3`:
+    /// empty/null entry yields zeroed `LimitsConfig`, non-null calls `unmarshal_yaml_value_with_defaults`.
+    pub fn unmarshal_limits_value_map_yaml(
+        yaml: &str,
+        defaults: &Self,
+    ) -> Result<BTreeMap<String, Self>, ConfigError> {
+        let input: serde_yaml::Value =
+            serde_yaml::from_str(yaml).map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        if input.is_null() {
+            return Ok(BTreeMap::new());
+        }
+        let map = input.as_mapping().ok_or_else(|| {
+            ConfigError::Yaml("expected YAML mapping for limits map".to_string())
+        })?;
+        let mut out = BTreeMap::new();
+        for (k, v) in map {
+            let key = k
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| ConfigError::Yaml("non-string map key".to_string()))?;
+            if v.is_null() {
+                out.insert(key, Self::zeroed());
+            } else {
+                out.insert(key, Self::unmarshal_yaml_value_with_defaults(v.clone(), defaults)?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn unmarshal_yaml_value_with_defaults(
+        input: serde_yaml::Value,
+        defaults: &Self,
+    ) -> Result<Self, ConfigError> {
+        use serde_yaml::{Mapping, Value};
+
+        let mut base = crate::secret::with_secrets_revealed(|| serde_yaml::to_value(defaults))
+            .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        if let Some(base_map) = base.as_mapping_mut() {
+            base_map.insert(
+                Value::String("otel_metric_suffixes_enabled".to_string()),
+                Value::Null,
+            );
+            base_map.insert(
+                Value::String("name_validation_scheme".to_string()),
+                Value::String(String::new()),
+            );
+        }
+
+        let mut ext_values: BTreeMap<String, serde_json::Value> = defaults.extensions.clone();
+        let registered_exts = current_thread_extensions();
+        for (name, def_fn) in &registered_exts {
+            ext_values.entry(name.clone()).or_insert_with(def_fn);
+        }
+
+        let mut cleaned_input = input;
+        if let Some(in_map) = cleaned_input.as_mapping_mut() {
+            for (name, _) in &registered_exts {
+                if let Some(raw_ext) = in_map.remove(Value::String(name.clone())) {
+                    let json_ext = serde_json::to_value(&raw_ext)
+                        .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+                    ext_values.insert(name.clone(), json_ext);
+                }
+            }
+        }
+
+        if let (Some(merged_map), Some(in_map)) =
+            (base.as_mapping_mut(), cleaned_input.as_mapping())
+        {
+            for (k, v) in in_map {
+                let key_str = k.as_str().unwrap_or_default();
+                if matches!(
+                    key_str,
+                    "active_series_custom_trackers"
+                        | "active_series_additional_custom_trackers"
+                        | "ruler_max_rules_per_rule_group_by_namespace"
+                        | "ruler_max_rule_groups_per_tenant_by_namespace"
+                        | "alertmanager_notification_rate_limit_per_integration"
+                ) {
+                    let val = if v.is_null() {
+                        Value::Mapping(Mapping::new())
+                    } else {
+                        v.clone()
+                    };
+                    merged_map.insert(k.clone(), val);
+                } else if matches!(
+                    key_str,
+                    "cost_attribution_trackers" | "additional_cost_attribution_trackers"
+                ) {
+                    if v.is_null() {
+                        merged_map.insert(k.clone(), Value::Mapping(Mapping::new()));
+                    } else if let Some(ov_map) = v.as_mapping() {
+                        let entry = merged_map
+                            .entry(k.clone())
+                            .or_insert_with(|| Value::Mapping(Mapping::new()));
+                        if !entry.is_mapping() {
+                            *entry = Value::Mapping(Mapping::new());
+                        }
+                        if let Some(base_entries) = entry.as_mapping_mut() {
+                            for (tk, tv) in ov_map {
+                                if tv.is_null() {
+                                    if !base_entries.contains_key(tk) {
+                                        base_entries
+                                            .insert(tk.clone(), Value::Mapping(Mapping::new()));
+                                    }
+                                } else {
+                                    base_entries.insert(tk.clone(), tv.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        merged_map.insert(k.clone(), v.clone());
+                    }
+                } else if v.is_null() {
+                    if matches!(
+                        key_str,
+                        "metric_relabel_configs"
+                            | "blocked_queries"
+                            | "limited_queries"
+                            | "blocked_requests"
+                            | "cost_attribution_labels_structured"
+                            | "drop_labels"
+                    ) {
+                        merged_map.insert(k.clone(), Value::Sequence(Vec::new()));
+                    } else if key_str == "otel_metric_suffixes_enabled" {
+                        merged_map.insert(k.clone(), Value::Null);
+                    }
+                } else if let Some(existing) = merged_map.get_mut(k) {
+                    if existing.is_mapping() && v.is_mapping() {
+                        merge_yaml_mappings(existing, v.clone());
+                    } else {
+                        *existing = v.clone();
+                    }
+                } else {
+                    merged_map.insert(k.clone(), v.clone());
+                }
+            }
+        } else if !cleaned_input.is_null() {
+            return Err(ConfigError::Yaml(
+                "expected YAML mapping for LimitsConfig".to_string(),
+            ));
+        }
+
+        let mut limits: LimitsConfig =
+            serde_yaml::from_value(base).map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        limits.extensions = ext_values;
+        validate_custom_trackers_yaml(&limits)?;
+        limits
+            .migrate_cost_attribution_labels_structured()
+            .map_err(|e| match e {
+                ConfigError::Validation(msg) | ConfigError::Flag(msg) => ConfigError::Yaml(msg),
+                other => other,
+            })?;
+        limits.validate().map_err(|e| match e {
+            ConfigError::Validation(msg) | ConfigError::Flag(msg) => ConfigError::Yaml(msg),
+            other => other,
+        })?;
+        limits.canonicalize_queries();
+        Ok(limits)
+    }
+
+    /// Serializes `LimitsConfig` (including any registered extensions) to a JSON object.
+    pub fn to_json_value_with_extensions(&self) -> Result<serde_json::Value, ConfigError> {
+        let mut obj = serde_json::Map::new();
+        for (name, zero_fn) in current_thread_extension_zeros() {
+            let val = self
+                .extensions
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(zero_fn);
+            obj.insert(name, val);
+        }
+        let plain = crate::secret::with_secrets_revealed(|| serde_json::to_value(self))
+            .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        if let serde_json::Value::Object(m) = plain {
+            for (k, v) in m {
+                obj.insert(k, v);
+            }
+        }
+        Ok(serde_json::Value::Object(obj))
+    }
+
+    /// Serializes `LimitsConfig` (including any registered extensions) to a `serde_yaml::Value`
+    /// preserving Go struct field order (extensions first, then standard fields).
+    pub fn to_yaml_value_with_extensions(&self) -> Result<serde_yaml::Value, ConfigError> {
+        let mut map = serde_yaml::Mapping::new();
+        for (name, zero_fn) in current_thread_extension_zeros() {
+            let val = self
+                .extensions
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(zero_fn);
+            let yv = serde_yaml::to_value(&val).map_err(|e| ConfigError::Yaml(e.to_string()))?;
+            map.insert(serde_yaml::Value::String(name), yv);
+        }
+        let plain = crate::secret::with_secrets_revealed(|| serde_yaml::to_value(self))
+            .map_err(|e| ConfigError::Yaml(e.to_string()))?;
+        if let serde_yaml::Value::Mapping(m) = plain {
+            for (k, v) in m {
+                map.insert(k, v);
+            }
+        }
+        Ok(serde_yaml::Value::Mapping(map))
+    }
+
+    /// Serializes `LimitsConfig` (including any registered extensions) to a YAML string.
+    pub fn to_yaml_with_extensions(&self) -> Result<String, ConfigError> {
+        let yaml_val = self.to_yaml_value_with_extensions()?;
+        serde_yaml::to_string(&yaml_val).map_err(|e| ConfigError::Yaml(e.to_string()))
+    }
+}
+
+fn merge_yaml_mappings(dst: &mut serde_yaml::Value, src: serde_yaml::Value) {
+    if let (Some(dst_map), serde_yaml::Value::Mapping(src_map)) = (dst.as_mapping_mut(), src) {
+        for (k, v) in src_map {
+            match dst_map.get_mut(&k) {
+                Some(existing) if existing.is_mapping() && v.is_mapping() => {
+                    merge_yaml_mappings(existing, v);
+                }
+                _ => {
+                    dst_map.insert(k, v);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Thread-local dynamic Limits extensions registry (Go: MustRegisterExtension)
+// ---------------------------------------------------------------------------------------------
+
+pub trait LimitsExtensionDefault:
+    Clone + Default + Serialize + serde::de::DeserializeOwned + 'static
+{
+    fn extension_default() -> Self;
+}
+
+struct RegisteredExtension {
+    default_value: fn() -> serde_json::Value,
+    zero_value: fn() -> serde_json::Value,
+}
+
+thread_local! {
+    static REGISTERED_EXTENSIONS: RefCell<Vec<(String, RegisteredExtension)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn current_thread_extensions() -> Vec<(String, fn() -> serde_json::Value)> {
+    REGISTERED_EXTENSIONS.with(|cell| {
+        cell.borrow()
+            .iter()
+            .map(|(n, e)| (n.clone(), e.default_value))
+            .collect()
+    })
+}
+
+fn current_thread_extension_zeros() -> Vec<(String, fn() -> serde_json::Value)> {
+    REGISTERED_EXTENSIONS.with(|cell| {
+        cell.borrow()
+            .iter()
+            .map(|(n, e)| (n.clone(), e.zero_value))
+            .collect()
+    })
+}
+
+fn standard_limits_keys() -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(LimitsConfig::default()) {
+        for k in map.keys() {
+            keys.insert(k.clone());
+        }
+    }
+    for extra in [
+        "metric_relabel_configs",
+        "blocked_queries",
+        "limited_queries",
+        "blocked_requests",
+        "cost_attribution_labels_structured",
+        "cost_attribution_trackers",
+        "additional_cost_attribution_trackers",
+    ] {
+        keys.insert(extra.to_string());
+    }
+    keys
+}
+
+/// Clears all extensions registered on the current thread (used in test cleanup).
+pub fn clear_registered_extensions() {
+    REGISTERED_EXTENSIONS.with(|cell| cell.borrow_mut().clear());
+}
+
+pub type ExtensionGetter<E> = Box<dyn Fn(Option<&LimitsConfig>) -> E>;
+
+/// Registers an extension field on `LimitsConfig` for the current thread
+/// (`pkg/util/validation/limits.go:MustRegisterExtension`).
+pub fn must_register_extension<E: LimitsExtensionDefault>(
+    name: &str,
+) -> ExtensionGetter<E> {
+    assert!(!name.is_empty(), "extension name cannot be empty");
+    let std_keys = standard_limits_keys();
+    assert!(
+        !std_keys.contains(name),
+        "extension {name} cannot be registered because it's a standard limits field"
+    );
+    REGISTERED_EXTENSIONS.with(|cell| {
+        let mut list = cell.borrow_mut();
+        assert!(
+            !list.iter().any(|(n, _)| n == name),
+            "extension {name} already registered"
+        );
+        fn make_default<T: LimitsExtensionDefault>() -> serde_json::Value {
+            serde_json::to_value(T::extension_default()).unwrap_or(serde_json::Value::Null)
+        }
+        fn make_zero<T: LimitsExtensionDefault>() -> serde_json::Value {
+            serde_json::to_value(T::default()).unwrap_or(serde_json::Value::Null)
+        }
+        list.push((
+            name.to_string(),
+            RegisteredExtension {
+                default_value: make_default::<E>,
+                zero_value: make_zero::<E>,
+            },
+        ));
+    });
+    let key = name.to_string();
+    Box::new(move |l: Option<&LimitsConfig>| match l {
+        None => E::extension_default(),
+        Some(cfg) => match cfg.extensions.get(&key) {
+            None => E::default(),
+            Some(v) => serde_json::from_value::<E>(v.clone()).unwrap_or_default(),
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-tenant aggregation helpers (pkg/util/validation/limits.go:2050-2150)
+// ---------------------------------------------------------------------------------------------
+
+pub fn all_true_booleans_per_tenant<S: AsRef<str>>(
+    tenant_ids: &[S],
+    f: impl Fn(&str) -> bool,
+) -> bool {
+    tenant_ids.iter().all(|t| f(t.as_ref()))
+}
+
+pub fn smallest_positive_int_per_tenant<S: AsRef<str>>(
+    tenant_ids: &[S],
+    f: impl Fn(&str) -> i64,
+) -> i64 {
+    let mut result: Option<i64> = None;
+    for t in tenant_ids {
+        let v = f(t.as_ref());
+        if result.is_none_or(|r| v < r) {
+            result = Some(v);
+        }
+    }
+    result.unwrap_or(0)
+}
+
+pub fn smallest_positive_non_zero_int_per_tenant<S: AsRef<str>>(
+    tenant_ids: &[S],
+    f: impl Fn(&str) -> i64,
+) -> i64 {
+    let mut result: Option<i64> = None;
+    for t in tenant_ids {
+        let v = f(t.as_ref());
+        if v > 0 && result.is_none_or(|r| v < r) {
+            result = Some(v);
+        }
+    }
+    result.unwrap_or(0)
+}
+
+pub fn smallest_positive_non_zero_duration_per_tenant<S: AsRef<str>>(
+    tenant_ids: &[S],
+    f: impl Fn(&str) -> ModelDuration,
+) -> ModelDuration {
+    let mut result: Option<i64> = None;
+    for t in tenant_ids {
+        let v = f(t.as_ref()).0;
+        if v > 0 && result.is_none_or(|r| v < r) {
+            result = Some(v);
+        }
+    }
+    ModelDuration(result.unwrap_or(0))
+}
+
+pub fn largest_positive_non_zero_duration_per_tenant<S: AsRef<str>>(
+    tenant_ids: &[S],
+    f: impl Fn(&str) -> ModelDuration,
+) -> ModelDuration {
+    let mut result: i64 = 0;
+    for t in tenant_ids {
+        let v = f(t.as_ref()).0;
+        if v > result {
+            result = v;
+        }
+    }
+    ModelDuration(result)
+}
+
+pub fn min_duration_per_tenant<S: AsRef<str>>(
+    tenant_ids: &[S],
+    f: impl Fn(&str) -> ModelDuration,
+) -> ModelDuration {
+    let mut result: i64 = 0;
+    for (idx, t) in tenant_ids.iter().enumerate() {
+        let v = f(t.as_ref()).0;
+        if idx == 0 || v < result {
+            result = v;
+        }
+    }
+    ModelDuration(result)
+}
+
+pub fn max_duration_per_tenant<S: AsRef<str>>(
+    tenant_ids: &[S],
+    f: impl Fn(&str) -> ModelDuration,
+) -> ModelDuration {
+    let mut result: i64 = 0;
+    for t in tenant_ids {
+        let v = f(t.as_ref()).0;
+        if v > result {
+            result = v;
+        }
+    }
+    ModelDuration(result)
+}
+
+// ---------------------------------------------------------------------------------------------
+// PromQL vector-selector canonicalizer for BlockedQuery (Go: promqlext + VectorSelector.String)
+// ---------------------------------------------------------------------------------------------
+
+fn canonicalize_promql_expr(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    let mut paren_depth = 0i32;
+    let mut brace_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                let mut closed = false;
+                while i < bytes.len() {
+                    if q != b'`' && bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == q {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return None;
+                }
+                continue;
+            }
+            b'(' => paren_depth += 1,
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return None;
+                }
+            }
+            b'{' => brace_depth += 1,
+            b'}' => {
+                brace_depth -= 1;
+                if brace_depth < 0 {
+                    return None;
+                }
+            }
+            b'[' => bracket_depth += 1,
+            b']' => {
+                bracket_depth -= 1;
+                if bracket_depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if paren_depth != 0 || brace_depth != 0 || bracket_depth != 0 {
+        return None;
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    let mut pos = 0usize;
+    while pos < trimmed.len() {
+        let rest = &trimmed[pos..];
+        let ch = rest.chars().next()?;
+        if matches!(ch, '"' | '\'' | '`') {
+            let end = scan_quoted_literal(rest)?;
+            out.push_str(&rest[..end]);
+            pos += end;
+            continue;
+        }
+        if ch == '{' {
+            let close_rel = find_matching_brace(rest)?;
+            let inner = &rest[1..close_rel];
+            let canon_inner = canonicalize_label_matchers(inner)?;
+            out.push('{');
+            out.push_str(&canon_inner);
+            out.push('}');
+            pos += close_rel + 1;
+            continue;
+        }
+        out.push(ch);
+        pos += ch.len_utf8();
+    }
+    Some(out)
+}
+
+fn scan_quoted_literal(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let q = *bytes.first()?;
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if q != b'`' && bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == q {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_matching_brace(s: &str) -> Option<usize> {
+    let mut i = 1usize;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if matches!(bytes[i], b'"' | b'\'' | b'`') {
+            let len = scan_quoted_literal(&s[i..])?;
+            i += len;
+            continue;
+        }
+        if bytes[i] == b'}' {
+            return Some(i);
+        }
+        if bytes[i] == b'{' {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn canonicalize_label_matchers(inner: &str) -> Option<String> {
+    let mut matchers = Vec::new();
+    let mut i = 0usize;
+    let bytes = inner.as_bytes();
+    loop {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name_start = i;
+        if matches!(bytes[i], b'"' | b'\'' | b'`') {
+            let len = scan_quoted_literal(&inner[i..])?;
+            i += len;
+        } else {
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b':')
+            {
+                i += 1;
+            }
+        }
+        let name = inner[name_start..i].trim();
+        if name.is_empty() {
+            return None;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let op = if inner[i..].starts_with("=~") {
+            i += 2;
+            "=~"
+        } else if inner[i..].starts_with("!~") {
+            i += 2;
+            "!~"
+        } else if inner[i..].starts_with("!=") {
+            i += 2;
+            "!="
+        } else if inner[i..].starts_with('=') {
+            i += 1;
+            "="
+        } else {
+            return None;
+        };
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || !matches!(bytes[i], b'"' | b'\'' | b'`') {
+            return None;
+        }
+        let val_len = scan_quoted_literal(&inner[i..])?;
+        let val = &inner[i..i + val_len];
+        i += val_len;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] != b',' {
+            return None;
+        }
+        matchers.push(format!("{name}{op}{val}"));
+    }
+    matchers.sort();
+    Some(matchers.join(","))
 }
 
 fn deserialize_metric_relabel_configs<'de, D>(

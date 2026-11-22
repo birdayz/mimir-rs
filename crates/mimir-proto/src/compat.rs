@@ -134,6 +134,45 @@ impl PromLabels {
             .find(|l| l.name == name)
             .map(|l| l.value.as_str())
     }
+
+    /// Returns the Prometheus `stringlabels` flat-buffer byte size (`labels.Labels.ByteSize()`).
+    pub fn byte_size(&self) -> usize {
+        fn size_len(len: usize) -> usize {
+            if len < 255 { 1 } else { 4 }
+        }
+        self.labels
+            .iter()
+            .filter(|l| !l.value.is_empty())
+            .map(|l| size_len(l.name.len()) + l.name.len() + size_len(l.value.len()) + l.value.len())
+            .sum()
+    }
+
+    /// Computes Prometheus `labels.Labels.Hash()` (`xxhash64` seed 0 over the `stringlabels` buffer).
+    pub fn hash(&self) -> u64 {
+        fn update_len_str(h: &mut Xxh64, s: &str) {
+            let len = s.len();
+            if len < 255 {
+                h.update(&[len as u8]);
+            } else {
+                h.update(&[
+                    255u8,
+                    (len & 0xff) as u8,
+                    ((len >> 8) & 0xff) as u8,
+                    ((len >> 16) & 0xff) as u8,
+                ]);
+            }
+            h.update(s.as_bytes());
+        }
+        let mut h = Xxh64::new(0);
+        for l in &self.labels {
+            if l.value.is_empty() {
+                continue;
+            }
+            update_len_str(&mut h, &l.name);
+            update_len_str(&mut h, &l.value);
+        }
+        h.digest()
+    }
 }
 
 /// Compact contiguous-buffer copy of labels (ported from `CopyLabels` in `pkg/mimirpb/compat_slice.go`).

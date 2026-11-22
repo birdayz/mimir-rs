@@ -460,6 +460,15 @@ impl OTelTranslationStrategy {
             ))),
         }
     }
+
+    pub fn set(&mut self, text: &str) -> Result<(), ConfigError> {
+        *self = Self::parse(text)?;
+        Ok(())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Display for OTelTranslationStrategy {
@@ -768,13 +777,15 @@ impl<'de> Deserialize<'de> for CIDRSliceCSV {
     }
 }
 
-/// Validates a YAML/Go `time.Time` timestamp string (RFC3339 / RFC3339Nano / ISO date / space-separated datetime).
-pub fn parse_go_yaml_timestamp(s: &str) -> Result<(), ConfigError> {
-    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
-        return Ok(());
+/// Parses a YAML/Go `time.Time` timestamp string (RFC3339 / RFC3339Nano / ISO date / space-separated datetime).
+pub fn parse_go_yaml_timestamp_dt(s: &str) -> Result<chrono::DateTime<chrono::Utc>, ConfigError> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
     }
-    if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok() {
-        return Ok(());
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        if let Some(ndt) = d.and_hms_opt(0, 0, 0) {
+            return Ok(ndt.and_utc());
+        }
     }
     for fmt in [
         "%Y-%m-%d %H:%M:%S%.f %z",
@@ -782,15 +793,21 @@ pub fn parse_go_yaml_timestamp(s: &str) -> Result<(), ConfigError> {
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%dT%H:%M:%S%.f",
     ] {
-        if chrono::NaiveDateTime::parse_from_str(s, fmt).is_ok()
-            || chrono::DateTime::parse_from_str(s, fmt).is_ok()
-        {
-            return Ok(());
+        if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
+            return Ok(dt.with_timezone(&chrono::Utc));
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(ndt.and_utc());
         }
     }
     Err(ConfigError::Validation(format!(
         "cannot parse {s:?} as time.Time"
     )))
+}
+
+/// Validates a YAML/Go `time.Time` timestamp string (RFC3339 / RFC3339Nano / ISO date / space-separated datetime).
+pub fn parse_go_yaml_timestamp(s: &str) -> Result<(), ConfigError> {
+    parse_go_yaml_timestamp_dt(s).map(|_| ())
 }
 
 /// `flagext.LimitsMap[T]`: YAML map or JSON object on CLI.

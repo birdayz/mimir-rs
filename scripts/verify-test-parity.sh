@@ -40,6 +40,11 @@ if [[ "${1:-}" == "--deps" ]]; then
   MEMBERLIST_PKGS=(.)
   PROM_PKGS=(tsdb tsdb/wlog tsdb/chunks tsdb/chunkenc tsdb/record tsdb/index tsdb/tombstones
     tsdb/fileutil tsdb/encoding model/labels model/histogram)
+  OBJSTORE_PKGS=(. clientutil exthttp providers/azure providers/filesystem providers/gcs providers/s3)
+  S2_PKGS=(s2)
+  PROXYPROTO_PKGS=(.)
+  EXPORTER_TOOLKIT_PKGS=(web)
+  FRANZ_PKGS=(pkg/kgo)
 
   modcache_dir() {
     (cd "$REF" && GOFLAGS=-mod=mod go mod download -json "$1" 2>/dev/null) \
@@ -118,6 +123,11 @@ if [[ "${1:-}" == "--deps" ]]; then
   report_module github.com/grafana/dskit github.com/grafana/dskit "${DSKIT_PKGS[@]}"
   report_module github.com/hashicorp/memberlist github.com/hashicorp/memberlist "${MEMBERLIST_PKGS[@]}"
   report_module github.com/prometheus/prometheus github.com/prometheus/prometheus "${PROM_PKGS[@]}"
+  report_module github.com/thanos-io/objstore github.com/thanos-io/objstore "${OBJSTORE_PKGS[@]}"
+  report_module github.com/klauspost/compress github.com/klauspost/compress "${S2_PKGS[@]}"
+  report_module github.com/pires/go-proxyproto github.com/pires/go-proxyproto "${PROXYPROTO_PKGS[@]}"
+  report_module github.com/prometheus/exporter-toolkit github.com/prometheus/exporter-toolkit "${EXPORTER_TOOLKIT_PKGS[@]}"
+  report_module github.com/twmb/franz-go github.com/twmb/franz-go "${FRANZ_PKGS[@]}"
 
   echo "Upstream dependency test parity (${DFILTER:-all dependency scope}): $G_PORTED / $G_TOTAL ported ($((G_TOTAL - G_PORTED)) missing, $G_NAME heuristic name-match)"
   if [[ "$STRICT" -eq 1 && "$G_PORTED" -lt "$G_TOTAL" ]]; then
@@ -131,9 +141,12 @@ FILTER="${1:-}"
 mapfile -t GO_TEST_FILES < <(
   cd "$REF"
   {
-    find cmd/mimir pkg/ingester pkg/storage/ingest pkg/mimirpb \
-      pkg/util/activitytracker pkg/util/globalerror pkg/util/shutdownmarker \
+    find cmd/mimir pkg/mimir pkg/api pkg/ingester pkg/storage/ingest pkg/storage/bucket \
+      pkg/mimirpb pkg/compartments pkg/usagestats \
+      pkg/util/activitytracker pkg/util/atomicfs pkg/util/globalerror pkg/util/grpcencoding \
+      pkg/util/limiter pkg/util/log pkg/util/shutdownmarker \
       -name "*_test.go"
+    find pkg/util/validation -maxdepth 1 -name "*_test.go"
     printf "%s\n" \
       pkg/storage/tsdb/config_test.go \
       pkg/storage/tsdb/tenant_deletion_mark_test.go \

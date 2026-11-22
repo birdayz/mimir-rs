@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -594,6 +594,19 @@ pub trait Logger: Send + Sync {
             .collect();
         self.log(level, &pairs);
     }
+
+    /// Probes the minimum enabled log level across any `LevelFilterLogger` wrappers,
+    /// matching `pkg/util/log/slogadapter.go` (`privateLevelDetector`).
+    fn probe_level(&self) -> Option<LogLevel> {
+        self.log(
+            LogLevel::Debug,
+            &[(
+                "probe",
+                "internal message: if you see this, probably log initialization has gone wrong",
+            )],
+        );
+        None
+    }
 }
 
 /// Structured logger writing `logfmt` or `json` lines filtered by [`LogLevel`].
@@ -658,6 +671,10 @@ impl StructuredLogger {
 }
 
 impl Logger for StructuredLogger {
+    fn probe_level(&self) -> Option<LogLevel> {
+        Some(self.min_level)
+    }
+
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
         let pairs: Vec<(&str, LogValue<'_>)> = kvs.iter().map(|&(k, v)| (k, v.into())).collect();
         self.log_values(level, &pairs);
@@ -838,6 +855,10 @@ impl LogSink {
 }
 
 impl Logger for LogSink {
+    fn probe_level(&self) -> Option<LogLevel> {
+        Some(self.min_level)
+    }
+
     #[track_caller]
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
         if !self.enabled(level) {
@@ -1150,52 +1171,237 @@ impl Logger for TokenBucketRateLimitedLogger {
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
         self.log_at(Instant::now(), level, kvs);
     }
+
+    fn probe_level(&self) -> Option<LogLevel> {
+        self.next.probe_level()
+    }
 }
 
 /// Interval-based rate-limited logger (`pkg/util/log/rate_limit.go`) permitting at most
 /// one log invocation per `interval`.
 pub struct IntervalRateLimitedLogger {
-    interval_nanos: u64,
-    next_log_nanos: AtomicU64,
-    origin: Instant,
+    interval: Duration,
+    next_log: Mutex<Instant>,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     delegate: Arc<dyn Logger>,
 }
 
 impl IntervalRateLimitedLogger {
     pub fn new(interval: Duration, delegate: Arc<dyn Logger>) -> Self {
+        Self::with_start(interval, delegate, Instant::now())
+    }
+
+    pub fn with_start(interval: Duration, delegate: Arc<dyn Logger>, start: Instant) -> Self {
         Self {
-            interval_nanos: interval.as_nanos().min(u64::MAX as u128) as u64,
-            next_log_nanos: AtomicU64::new(0),
-            origin: Instant::now(),
+            interval,
+            next_log: Mutex::new(start),
+            clock: Arc::new(Instant::now),
+            delegate,
+        }
+    }
+
+    pub fn new_with_clock(
+        interval: Duration,
+        delegate: Arc<dyn Logger>,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
+        let start = clock();
+        Self {
+            interval,
+            next_log: Mutex::new(start),
+            clock,
             delegate,
         }
     }
 
     pub fn log_at(&self, now: Instant, level: LogLevel, kvs: &[(&str, &str)]) {
-        let now_nanos = now.saturating_duration_since(self.origin).as_nanos() as u64;
-        let next = self.next_log_nanos.load(Ordering::Acquire);
-        if now_nanos <= next {
-            return;
-        }
-        if self
-            .next_log_nanos
-            .compare_exchange(
-                next,
-                now_nanos.saturating_add(self.interval_nanos),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
         {
-            self.delegate.log(level, kvs);
+            let mut next = self.next_log.lock();
+            if now <= *next {
+                return;
+            }
+            *next = now + self.interval;
         }
+        self.delegate.log(level, kvs);
     }
 }
 
 impl Logger for IntervalRateLimitedLogger {
     fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
-        self.log_at(Instant::now(), level, kvs);
+        let now = (self.clock)();
+        self.log_at(now, level, kvs);
     }
+
+    fn probe_level(&self) -> Option<LogLevel> {
+        self.delegate.probe_level()
+    }
+}
+
+/// Ported from `dskit/middleware.OptionalLogging`.
+pub trait OptionalLogging {
+    fn should_log(&self) -> (bool, String);
+}
+
+/// Error wrapper returned by `Sampler::wrap_error` (`pkg/util/log/sampler.go`).
+#[derive(Debug)]
+pub struct SampledError<E> {
+    err: E,
+    sampler: Option<Arc<Sampler>>,
+}
+
+impl<E> SampledError<E> {
+    pub fn new(err: E, sampler: Option<Arc<Sampler>>) -> Self {
+        Self { err, sampler }
+    }
+
+    pub fn inner(&self) -> &E {
+        &self.err
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for SampledError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.err.fmt(f)
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for SampledError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.err)
+    }
+}
+
+impl<E> OptionalLogging for SampledError<E> {
+    fn should_log(&self) -> (bool, String) {
+        match self.sampler {
+            None => (true, String::new()),
+            Some(ref s) => (s.sample(), format!("sampled 1/{}", s.freq)),
+        }
+    }
+}
+
+/// Rate-limited sampler (`pkg/util/log/sampler.go`).
+#[derive(Debug)]
+pub struct Sampler {
+    freq: i64,
+    count: AtomicI64,
+}
+
+impl Sampler {
+    /// Returns `None` when `freq == 0` (matching Go `NewSampler(0) == nil`).
+    pub fn new(freq: i64) -> Option<Arc<Self>> {
+        if freq == 0 {
+            return None;
+        }
+        Some(Arc::new(Self {
+            freq,
+            count: AtomicI64::new(0),
+        }))
+    }
+
+    pub fn freq(&self) -> i64 {
+        self.freq
+    }
+
+    pub fn sample(&self) -> bool {
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        (count - 1) % self.freq == 0
+    }
+
+    pub fn wrap_error<E>(self: &Arc<Self>, err: E) -> SampledError<E> {
+        SampledError::new(err, Some(Arc::clone(self)))
+    }
+}
+
+/// Wraps `err` in `SampledError` if `sampler` is `Some`, or returns `err` unchanged if `None`
+/// (matching `(*Sampler).WrapError` when receiver is `nil`).
+pub fn wrap_error_with_sampler<E: std::error::Error + Send + Sync + 'static>(
+    sampler: Option<&Arc<Sampler>>,
+    err: E,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match sampler {
+        None => Box::new(err),
+        Some(s) => Box::new(s.wrap_error(err)),
+    }
+}
+
+/// Level-filtering wrapper matching `pkg/util/log/log.go` (`newFilter` / `levelFilter`).
+pub struct LevelFilterLogger {
+    inner: Arc<dyn Logger>,
+    min_level: LogLevel,
+}
+
+impl LevelFilterLogger {
+    pub fn new(inner: Arc<dyn Logger>, min_level: LogLevel) -> Arc<Self> {
+        Arc::new(Self { inner, min_level })
+    }
+
+    pub fn debug_enabled(&self) -> bool {
+        self.min_level <= LogLevel::Debug
+    }
+}
+
+impl Logger for LevelFilterLogger {
+    #[track_caller]
+    fn log(&self, level: LogLevel, kvs: &[(&str, &str)]) {
+        if level >= self.min_level {
+            self.inner.log(level, kvs);
+        }
+    }
+
+    fn probe_level(&self) -> Option<LogLevel> {
+        Some(self.min_level)
+    }
+}
+
+/// Adapter returned by `slog_from_gokit` (`pkg/util/log/slogadapter.go`).
+pub struct SlogAdapter {
+    logger: Arc<dyn Logger>,
+    min_level: LogLevel,
+}
+
+impl SlogAdapter {
+    pub fn enabled(&self, level: LogLevel) -> bool {
+        level >= self.min_level
+    }
+
+    #[track_caller]
+    pub fn debug(&self, msg: &str, attrs: &[(&str, &str)]) {
+        self.emit(LogLevel::Debug, msg, attrs);
+    }
+
+    #[track_caller]
+    pub fn info(&self, msg: &str, attrs: &[(&str, &str)]) {
+        self.emit(LogLevel::Info, msg, attrs);
+    }
+
+    #[track_caller]
+    pub fn warn(&self, msg: &str, attrs: &[(&str, &str)]) {
+        self.emit(LogLevel::Warn, msg, attrs);
+    }
+
+    #[track_caller]
+    pub fn error(&self, msg: &str, attrs: &[(&str, &str)]) {
+        self.emit(LogLevel::Error, msg, attrs);
+    }
+
+    #[track_caller]
+    fn emit(&self, level: LogLevel, msg: &str, attrs: &[(&str, &str)]) {
+        if !self.enabled(level) {
+            return;
+        }
+        let mut kvs: Vec<(&str, &str)> = Vec::with_capacity(1 + attrs.len());
+        kvs.push(("msg", msg));
+        kvs.extend_from_slice(attrs);
+        self.logger.log(level, &kvs);
+    }
+}
+
+/// Probes `logger` to determine its minimum enabled level and returns a `SlogAdapter`
+/// (`pkg/util/log/slogadapter.go::SlogFromGoKit`).
+pub fn slog_from_gokit(logger: Arc<dyn Logger>) -> SlogAdapter {
+    let min_level = logger.probe_level().unwrap_or(LogLevel::Debug);
+    SlogAdapter { logger, min_level }
 }
 
 #[cfg(test)]

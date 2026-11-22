@@ -1,12 +1,17 @@
 //! Ported from github.com/grafana/mimir/pkg/ingester/client/streaming.go,
-//! streaming_test_utils.go, and pkg/util/limiter/{query_limiter.go,memory_consumption.go,errors.go}.
+//! streaming_test_utils.go, pkg/querier/stats/query_metrics.go, and
+//! pkg/util/limiter/{query_limiter.go,memory_consumption.go,series_labels_deduplicator.go,errors.go}.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use parking_lot::Mutex;
-use prometheus::Counter;
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::{Gauge as ProtoGauge, Metric as ProtoMetric, MetricFamily, MetricType as PromMetricType};
+use prometheus::{Counter, CounterVec, Opts, Registry};
 use prost::Message as _;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -17,8 +22,8 @@ use crate::ingesterpb;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LimitError(pub String);
 
-impl std::fmt::Display for LimitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for LimitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
@@ -42,8 +47,8 @@ impl StreamError {
     }
 }
 
-impl std::fmt::Display for StreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StreamError::Canceled(m) | StreamError::Other(m) => f.write_str(m),
             StreamError::Limit(l) => f.write_str(&l.0),
@@ -55,6 +60,79 @@ impl std::error::Error for StreamError {}
 
 const CARDINALITY_STRATEGY: &str = "Consider reducing the time range and/or number of series selected by the query. One way to reduce the number of selected series is to add more label matchers to the query";
 
+pub const REJECT_REASON_MAX_SERIES: &str = "max-fetched-series-per-query";
+pub const REJECT_REASON_MAX_CHUNK_BYTES: &str = "max-fetched-chunk-bytes-per-query";
+pub const REJECT_REASON_MAX_CHUNKS: &str = "max-fetched-chunks-per-query";
+pub const REJECT_REASON_MAX_ESTIMATED_CHUNKS: &str = "max-estimated-fetched-chunks-per-query";
+pub const REJECT_REASON_MAX_ESTIMATED_QUERY_MEMORY_CONSUMPTION: &str =
+    "max-estimated-memory-consumption-per-query";
+
+const REJECT_REASONS: [&str; 5] = [
+    REJECT_REASON_MAX_SERIES,
+    REJECT_REASON_MAX_CHUNK_BYTES,
+    REJECT_REASON_MAX_CHUNKS,
+    REJECT_REASON_MAX_ESTIMATED_CHUNKS,
+    REJECT_REASON_MAX_ESTIMATED_QUERY_MEMORY_CONSUMPTION,
+];
+
+/// Ported from `stats.QueryMetrics` in `pkg/querier/stats/query_metrics.go`.
+#[derive(Clone)]
+pub struct QueryMetrics {
+    pub ingester_chunks_deduplicated: Counter,
+    pub ingester_chunks_total: Counter,
+    pub queries_rejected_total: CounterVec,
+    pub queries_executed_total: CounterVec,
+}
+
+impl QueryMetrics {
+    pub fn new(reg: Option<&Registry>) -> Self {
+        let ingester_chunks_deduplicated = Counter::with_opts(Opts::new(
+            "cortex_distributor_query_ingester_chunks_deduped_total",
+            "Number of chunks received from ingesters at query time but discarded as duplicates.",
+        ))
+        .expect("valid metric");
+        let ingester_chunks_total = Counter::with_opts(Opts::new(
+            "cortex_distributor_query_ingester_chunks_total",
+            "Number of chunks received from ingesters at query time, including any chunks discarded as duplicates.",
+        ))
+        .expect("valid metric");
+        let queries_rejected_total = CounterVec::new(
+            Opts::new(
+                "cortex_querier_queries_rejected_total",
+                "Number of queries that were rejected, for example because they exceeded a limit.",
+            ),
+            &["reason"],
+        )
+        .expect("valid metric");
+        let queries_executed_total = CounterVec::new(
+            Opts::new(
+                "cortex_querier_queries_storage_type_total",
+                "Number of PromQL queries that were executed against a particular storage type.",
+            ),
+            &["storage"],
+        )
+        .expect("valid metric");
+
+        for reason in REJECT_REASONS {
+            queries_rejected_total.with_label_values(&[reason]);
+        }
+
+        if let Some(r) = reg {
+            let _ = r.register(Box::new(ingester_chunks_deduplicated.clone()));
+            let _ = r.register(Box::new(ingester_chunks_total.clone()));
+            let _ = r.register(Box::new(queries_rejected_total.clone()));
+            let _ = r.register(Box::new(queries_executed_total.clone()));
+        }
+
+        Self {
+            ingester_chunks_deduplicated,
+            ingester_chunks_total,
+            queries_rejected_total,
+            queries_executed_total,
+        }
+    }
+}
+
 /// Ported from `limiter.QueryLimiter` in `pkg/util/limiter/query_limiter.go`.
 pub struct QueryLimiter {
     unique_series: Mutex<HashSet<u64>>,
@@ -65,6 +143,7 @@ pub struct QueryLimiter {
     max_chunk_bytes_per_query: usize,
     max_chunks_per_query: usize,
     max_estimated_chunks_per_query: usize,
+    query_metrics: Option<Arc<QueryMetrics>>,
 }
 
 impl QueryLimiter {
@@ -73,6 +152,22 @@ impl QueryLimiter {
         max_chunk_bytes_per_query: usize,
         max_chunks_per_query: usize,
         max_estimated_chunks_per_query: usize,
+    ) -> Self {
+        Self::with_metrics(
+            max_series_per_query,
+            max_chunk_bytes_per_query,
+            max_chunks_per_query,
+            max_estimated_chunks_per_query,
+            None,
+        )
+    }
+
+    pub fn with_metrics(
+        max_series_per_query: usize,
+        max_chunk_bytes_per_query: usize,
+        max_chunks_per_query: usize,
+        max_estimated_chunks_per_query: usize,
+        query_metrics: Option<Arc<QueryMetrics>>,
     ) -> Self {
         Self {
             unique_series: Mutex::new(HashSet::new()),
@@ -83,7 +178,15 @@ impl QueryLimiter {
             max_chunk_bytes_per_query,
             max_chunks_per_query,
             max_estimated_chunks_per_query,
+            query_metrics,
         }
+    }
+
+    pub fn add_series(&self, series_labels: &PromLabels) -> Result<(), LimitError> {
+        if self.max_series_per_query == 0 {
+            return Ok(());
+        }
+        self.add_series_hash(series_labels.hash())
     }
 
     pub fn add_series_hash(&self, fingerprint: u64) -> Result<(), LimitError> {
@@ -91,8 +194,17 @@ impl QueryLimiter {
             return Ok(());
         }
         let mut set = self.unique_series.lock();
+        let before = set.len();
         set.insert(fingerprint);
-        if set.len() > self.max_series_per_query {
+        let after = set.len();
+        if after > self.max_series_per_query {
+            if before <= self.max_series_per_query {
+                if let Some(ref m) = self.query_metrics {
+                    m.queries_rejected_total
+                        .with_label_values(&[REJECT_REASON_MAX_SERIES])
+                        .inc();
+                }
+            }
             return Err(LimitError(format!(
                 "the query exceeded the maximum number of series (limit: {} series) (err-mimir-max-series-per-query). {CARDINALITY_STRATEGY}. Otherwise, to adjust the related per-tenant limit, configure -querier.max-fetched-series-per-query, or contact your service administrator.",
                 self.max_series_per_query
@@ -101,15 +213,26 @@ impl QueryLimiter {
         Ok(())
     }
 
+    pub fn unique_series_count(&self) -> usize {
+        self.unique_series.lock().len()
+    }
+
     pub fn add_chunk_bytes(&self, chunk_size_in_bytes: usize) -> Result<(), LimitError> {
         if self.max_chunk_bytes_per_query == 0 {
             return Ok(());
         }
-        let total_bytes = self
+        let prev = self
             .chunk_bytes_count
-            .fetch_add(chunk_size_in_bytes as i64, Ordering::SeqCst)
-            + chunk_size_in_bytes as i64;
+            .fetch_add(chunk_size_in_bytes as i64, Ordering::SeqCst);
+        let total_bytes = prev + chunk_size_in_bytes as i64;
         if total_bytes > self.max_chunk_bytes_per_query as i64 {
+            if prev <= self.max_chunk_bytes_per_query as i64 {
+                if let Some(ref m) = self.query_metrics {
+                    m.queries_rejected_total
+                        .with_label_values(&[REJECT_REASON_MAX_CHUNK_BYTES])
+                        .inc();
+                }
+            }
             return Err(LimitError(format!(
                 "the query exceeded the aggregated chunks size limit (limit: {} bytes) (err-mimir-max-chunks-bytes-per-query). {CARDINALITY_STRATEGY}. Otherwise, to adjust the related per-tenant limit, configure -querier.max-fetched-chunk-bytes-per-query, or contact your service administrator.",
                 self.max_chunk_bytes_per_query
@@ -122,11 +245,16 @@ impl QueryLimiter {
         if self.max_chunks_per_query == 0 {
             return Ok(());
         }
-        let total = self
-            .chunk_count
-            .fetch_add(count as i64, Ordering::SeqCst)
-            + count as i64;
+        let prev = self.chunk_count.fetch_add(count as i64, Ordering::SeqCst);
+        let total = prev + count as i64;
         if total > self.max_chunks_per_query as i64 {
+            if prev <= self.max_chunks_per_query as i64 {
+                if let Some(ref m) = self.query_metrics {
+                    m.queries_rejected_total
+                        .with_label_values(&[REJECT_REASON_MAX_CHUNKS])
+                        .inc();
+                }
+            }
             return Err(LimitError(format!(
                 "the query exceeded the maximum number of chunks (limit: {} chunks) (err-mimir-max-chunks-per-query). {CARDINALITY_STRATEGY}. Otherwise, to adjust the related per-tenant limit, configure -querier.max-fetched-chunks-per-query, or contact your service administrator.",
                 self.max_chunks_per_query
@@ -139,11 +267,18 @@ impl QueryLimiter {
         if self.max_estimated_chunks_per_query == 0 {
             return Ok(());
         }
-        let total = self
+        let prev = self
             .estimated_chunk_count
-            .fetch_add(count as i64, Ordering::SeqCst)
-            + count as i64;
+            .fetch_add(count as i64, Ordering::SeqCst);
+        let total = prev + count as i64;
         if total > self.max_estimated_chunks_per_query as i64 {
+            if prev <= self.max_estimated_chunks_per_query as i64 {
+                if let Some(ref m) = self.query_metrics {
+                    m.queries_rejected_total
+                        .with_label_values(&[REJECT_REASON_MAX_ESTIMATED_CHUNKS])
+                        .inc();
+                }
+            }
             return Err(LimitError(format!(
                 "the estimated number of chunks for the query exceeded the maximum allowed (limit: {} chunks) (err-mimir-max-estimated-chunks-per-query). {CARDINALITY_STRATEGY}. Otherwise, to adjust the related per-tenant limit, configure -querier.max-estimated-chunks-per-query-multiplier, or contact your service administrator.",
                 self.max_estimated_chunks_per_query
@@ -153,19 +288,169 @@ impl QueryLimiter {
     }
 }
 
+/// Ported from `limiter.MemoryConsumptionSource` in `pkg/util/limiter/memory_consumption.go`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(usize)]
+pub enum MemoryConsumptionSource {
+    IngesterChunks = 0,
+    StoreGatewayChunks = 1,
+    FPointSlices = 2,
+    HPointSlices = 3,
+    Vectors = 4,
+    Float64Slices = 5,
+    IntSlices = 6,
+    IntSliceSlice = 7,
+    Int64Slices = 8,
+    BoolSlices = 9,
+    HistogramPointerSlices = 10,
+    SeriesMetadataSlices = 11,
+    BucketSlices = 12,
+    BucketsSlices = 13,
+    QuantileGroupSlices = 14,
+    TopKBottomKInstantQuerySeriesSlices = 15,
+    TopKBottomKRangeQuerySeriesSlices = 16,
+    Labels = 17,
+    CounterResetHintSlices = 18,
+    SeriesGroupPairSlices = 19,
+    BucketGroupPointerSlices = 20,
+    GroupPointerSlices = 21,
+    AggregationGroup = 22,
+    BufferedQuerierResponses = 23,
+    CachedResponses = 24,
+    BinaryOperationOutputSeries = 25,
+}
+
+pub const MEMORY_CONSUMPTION_SOURCE_COUNT: usize = 26;
+
+impl MemoryConsumptionSource {
+    pub const ALL: [MemoryConsumptionSource; MEMORY_CONSUMPTION_SOURCE_COUNT] = [
+        Self::IngesterChunks,
+        Self::StoreGatewayChunks,
+        Self::FPointSlices,
+        Self::HPointSlices,
+        Self::Vectors,
+        Self::Float64Slices,
+        Self::IntSlices,
+        Self::IntSliceSlice,
+        Self::Int64Slices,
+        Self::BoolSlices,
+        Self::HistogramPointerSlices,
+        Self::SeriesMetadataSlices,
+        Self::BucketSlices,
+        Self::BucketsSlices,
+        Self::QuantileGroupSlices,
+        Self::TopKBottomKInstantQuerySeriesSlices,
+        Self::TopKBottomKRangeQuerySeriesSlices,
+        Self::Labels,
+        Self::CounterResetHintSlices,
+        Self::SeriesGroupPairSlices,
+        Self::BucketGroupPointerSlices,
+        Self::GroupPointerSlices,
+        Self::AggregationGroup,
+        Self::BufferedQuerierResponses,
+        Self::CachedResponses,
+        Self::BinaryOperationOutputSeries,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IngesterChunks => "ingester chunks",
+            Self::StoreGatewayChunks => "store-gateway chunks",
+            Self::FPointSlices => "[]promql.FPoint",
+            Self::HPointSlices => "[]promql.HPoint",
+            Self::Vectors => "promql.Vector",
+            Self::Float64Slices => "[]float64",
+            Self::IntSlices => "[]int",
+            Self::IntSliceSlice => "[][]int",
+            Self::Int64Slices => "[]int64",
+            Self::CounterResetHintSlices => "[]CounterResetHint",
+            Self::BoolSlices => "[]bool",
+            Self::HistogramPointerSlices => "[]*histogram.FloatHistogram",
+            Self::SeriesMetadataSlices => "[]SeriesMetadata",
+            Self::BucketSlices => "[]promql.Bucket",
+            Self::BucketsSlices => "[]promql.Buckets",
+            Self::QuantileGroupSlices => "[]aggregations.qGroup",
+            Self::TopKBottomKInstantQuerySeriesSlices => "[]topkbottom.instantQuerySeries",
+            Self::TopKBottomKRangeQuerySeriesSlices => "[]topkbottom.rangeQuerySeries",
+            Self::Labels => "labels.Labels",
+            Self::SeriesGroupPairSlices => "[]functions.seriesGroupPair",
+            Self::BucketGroupPointerSlices => "[]*functions.bucketGroup",
+            Self::GroupPointerSlices => "[]*aggregations.group",
+            Self::AggregationGroup => "aggregation.AggregationGroup",
+            Self::BufferedQuerierResponses => "buffered querier responses",
+            Self::CachedResponses => "cached responses",
+            Self::BinaryOperationOutputSeries => "binary operation output series",
+        }
+    }
+}
+
+impl fmt::Display for MemoryConsumptionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug)]
+struct TrackerState {
+    current_bytes: u64,
+    peak_bytes: u64,
+    by_source: [u64; MEMORY_CONSUMPTION_SOURCE_COUNT],
+    have_recorded_rejection: bool,
+}
+
+impl Default for TrackerState {
+    fn default() -> Self {
+        Self {
+            current_bytes: 0,
+            peak_bytes: 0,
+            by_source: [0u64; MEMORY_CONSUMPTION_SOURCE_COUNT],
+            have_recorded_rejection: false,
+        }
+    }
+}
+
 /// Ported from `limiter.MemoryConsumptionTracker` in `pkg/util/limiter/memory_consumption.go`.
 pub struct MemoryConsumptionTracker {
     max_estimated_memory_bytes: u64,
-    current_bytes: AtomicU64,
+    state: Mutex<TrackerState>,
     rejections: Option<Counter>,
+    query_description: String,
+    trace_id: String,
+    producer: Option<std::sync::Weak<InflightMemoryConsumptionTracker>>,
+    parent: Option<Arc<MemoryConsumptionTracker>>,
+    start_time: Option<SystemTime>,
+}
+
+impl fmt::Debug for MemoryConsumptionTracker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoryConsumptionTracker")
+            .field("max_estimated_memory_bytes", &self.max_estimated_memory_bytes)
+            .field("query_description", &self.query_description)
+            .field("trace_id", &self.trace_id)
+            .finish()
+    }
 }
 
 impl MemoryConsumptionTracker {
     pub fn new(max_estimated_memory_bytes: u64, rejections: Option<Counter>) -> Self {
+        Self::new_with_details(max_estimated_memory_bytes, rejections, "", None)
+    }
+
+    pub fn new_with_details(
+        max_estimated_memory_bytes: u64,
+        rejections: Option<Counter>,
+        query_description: impl Into<String>,
+        trace_id: Option<String>,
+    ) -> Self {
         Self {
             max_estimated_memory_bytes,
-            current_bytes: AtomicU64::new(0),
+            state: Mutex::new(TrackerState::default()),
             rejections,
+            query_description: query_description.into(),
+            trace_id: trace_id.unwrap_or_default(),
+            producer: None,
+            parent: None,
+            start_time: None,
         }
     }
 
@@ -173,28 +458,539 @@ impl MemoryConsumptionTracker {
         Self::new(0, None)
     }
 
+    pub fn max_estimated_memory_consumption_bytes(&self) -> u64 {
+        self.max_estimated_memory_bytes
+    }
+
+    pub fn query_description(&self) -> &str {
+        &self.query_description
+    }
+
     pub fn increase_memory_consumption(&self, bytes: u64) -> Result<(), LimitError> {
-        let new_total = self.current_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes;
-        if self.max_estimated_memory_bytes > 0 && new_total > self.max_estimated_memory_bytes {
-            self.current_bytes.fetch_sub(bytes, Ordering::SeqCst);
-            if let Some(ref counter) = self.rejections {
-                counter.inc();
+        self.increase_memory_consumption_by_source(bytes, MemoryConsumptionSource::IngesterChunks)
+    }
+
+    pub fn increase_memory_consumption_by_source(
+        &self,
+        bytes: u64,
+        source: MemoryConsumptionSource,
+    ) -> Result<(), LimitError> {
+        if let Some(ref parent) = self.parent {
+            parent.increase_memory_consumption_by_source(bytes, source)?;
+        }
+
+        let mut st = self.state.lock();
+        if self.max_estimated_memory_bytes > 0
+            && st.current_bytes.saturating_add(bytes) > self.max_estimated_memory_bytes
+        {
+            if !st.have_recorded_rejection {
+                st.have_recorded_rejection = true;
+                if let Some(ref counter) = self.rejections {
+                    counter.inc();
+                }
             }
             return Err(LimitError(format!(
                 "the query exceeded the maximum allowed estimated amount of memory consumed by a single query (limit: {} bytes) (err-mimir-max-estimated-memory-consumption-per-query). {CARDINALITY_STRATEGY}. Otherwise, to adjust the related per-tenant limit, configure -querier.max-estimated-memory-consumption-per-query, or contact your service administrator.",
                 self.max_estimated_memory_bytes
             )));
         }
+
+        st.by_source[source as usize] += bytes;
+        st.current_bytes += bytes;
+        st.peak_bytes = st.peak_bytes.max(st.current_bytes);
         Ok(())
     }
 
     pub fn decrease_memory_consumption(&self, bytes: u64) {
-        self.current_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        self.decrease_memory_consumption_by_source(bytes, MemoryConsumptionSource::IngesterChunks);
+    }
+
+    pub fn decrease_memory_consumption_by_source(
+        &self,
+        bytes: u64,
+        source: MemoryConsumptionSource,
+    ) {
+        if let Some(ref parent) = self.parent {
+            parent.decrease_memory_consumption_by_source(bytes, source);
+        }
+
+        let mut st = self.state.lock();
+        let current_src = st.by_source[source as usize];
+        if bytes > current_src {
+            let trace_description = if self.trace_id.is_empty() {
+                String::new()
+            } else {
+                format!(" (trace ID: {})", self.trace_id)
+            };
+            panic!(
+                "Estimated memory consumption of all instances of {} in this query is {} bytes when trying to return {} bytes. This indicates something has been returned to a pool more than once, which is a bug. The affected query is: {}{}",
+                source, current_src, bytes, self.query_description, trace_description
+            );
+        }
+        st.current_bytes -= bytes;
+        st.by_source[source as usize] -= bytes;
+    }
+
+    pub fn increase_memory_consumption_for_labels(
+        &self,
+        labels: &PromLabels,
+    ) -> Result<(), LimitError> {
+        self.increase_memory_consumption_by_source(
+            labels.byte_size() as u64,
+            MemoryConsumptionSource::Labels,
+        )
+    }
+
+    pub fn decrease_memory_consumption_for_labels(&self, labels: &PromLabels) {
+        self.decrease_memory_consumption_by_source(
+            labels.byte_size() as u64,
+            MemoryConsumptionSource::Labels,
+        );
     }
 
     pub fn current_estimated_memory_consumption_bytes(&self) -> u64 {
-        self.current_bytes.load(Ordering::SeqCst)
+        self.state.lock().current_bytes
     }
+
+    pub fn peak_estimated_memory_consumption_bytes(&self) -> u64 {
+        self.state.lock().peak_bytes
+    }
+
+    pub fn current_estimated_memory_consumption_bytes_by_source(
+        &self,
+        source: MemoryConsumptionSource,
+    ) -> u64 {
+        self.state.lock().by_source[source as usize]
+    }
+
+    pub fn describe_current_memory_consumption(&self) -> String {
+        let st = self.state.lock();
+        let mut out = String::new();
+        for src in MemoryConsumptionSource::ALL {
+            out.push_str(src.as_str());
+            out.push_str(": ");
+            out.push_str(&st.by_source[src as usize].to_string());
+            out.push_str(" B \n");
+        }
+        out
+    }
+
+    pub fn new_nested_memory_consumption_tracker(
+        self: &Arc<Self>,
+        query_description: impl Into<String>,
+        trace_id: Option<String>,
+    ) -> Arc<Self> {
+        let producer = self
+            .producer
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .expect("cannot nest a tracker not created via a InflightMemoryConsumptionTracker");
+        Arc::new(Self {
+            max_estimated_memory_bytes: self.max_estimated_memory_bytes,
+            state: Mutex::new(TrackerState::default()),
+            rejections: producer.queries_rejected.clone(),
+            query_description: query_description.into(),
+            trace_id: trace_id.unwrap_or_default(),
+            producer: None,
+            parent: Some(Arc::clone(self)),
+            start_time: None,
+        })
+    }
+}
+
+/// Ported from `limiter.InflightMemoryConsumptionTracker` in `pkg/util/limiter/memory_consumption.go`.
+pub struct InflightMemoryConsumptionTracker {
+    inflight: Mutex<HashMap<usize, Arc<MemoryConsumptionTracker>>>,
+    max_desc: Desc,
+    current_desc: Desc,
+    peak_desc: Desc,
+    sampled_desc: Desc,
+    max_age_desc: Desc,
+    now: Mutex<Arc<dyn Fn() -> SystemTime + Send + Sync>>,
+    queries_rejected: Option<Counter>,
+    force_unlimited: AtomicBool,
+}
+
+#[derive(Clone)]
+struct InflightCollector(Arc<InflightMemoryConsumptionTracker>);
+
+impl Collector for InflightCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.0.descs()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.0.collect_families()
+    }
+}
+
+impl InflightMemoryConsumptionTracker {
+    pub fn new_unlimited(reg: Option<&Registry>) -> Arc<Self> {
+        let t = Self::new(reg, None);
+        t.force_unlimited.store(true, Ordering::Release);
+        t
+    }
+
+    pub fn new(reg: Option<&Registry>, queries_rejected: Option<Counter>) -> Arc<Self> {
+        let t = Arc::new(Self {
+            inflight: Mutex::new(HashMap::new()),
+            max_desc: Desc::new(
+                "cortex_querier_inflight_query_max_estimated_memory_consumption_limit_bytes".to_string(),
+                "Total of the max estimated memory consumption limit across all in-flight queries.".to_string(),
+                vec![],
+                HashMap::new(),
+            )
+            .expect("valid desc"),
+            current_desc: Desc::new(
+                "cortex_querier_inflight_query_current_estimated_memory_consumption_bytes".to_string(),
+                "Total current estimated memory consumption across all in-flight queries.".to_string(),
+                vec![],
+                HashMap::new(),
+            )
+            .expect("valid desc"),
+            peak_desc: Desc::new(
+                "cortex_querier_inflight_query_peak_estimated_memory_consumption_bytes".to_string(),
+                "Total peak estimated memory consumption across all in-flight queries.".to_string(),
+                vec![],
+                HashMap::new(),
+            )
+            .expect("valid desc"),
+            sampled_desc: Desc::new(
+                "cortex_querier_inflight_query_sampled_count".to_string(),
+                "Number of in-flight memory consumption trackers accumulated during the last metrics collection.".to_string(),
+                vec![],
+                HashMap::new(),
+            )
+            .expect("valid desc"),
+            max_age_desc: Desc::new(
+                "cortex_querier_inflight_query_max_age_seconds".to_string(),
+                "Age in seconds of the oldest in-flight query memory consumption tracker. Zero when there are no in-flight queries.".to_string(),
+                vec![],
+                HashMap::new(),
+            )
+            .expect("valid desc"),
+            now: Mutex::new(Arc::new(SystemTime::now)),
+            queries_rejected,
+            force_unlimited: AtomicBool::new(false),
+        });
+        if let Some(r) = reg {
+            r.register(Box::new(InflightCollector(Arc::clone(&t))))
+                .expect("register InflightMemoryConsumptionTracker");
+        }
+        t
+    }
+
+    pub fn set_clock(&self, clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) {
+        *self.now.lock() = clock;
+    }
+
+    fn current_time(&self) -> SystemTime {
+        let f = self.now.lock().clone();
+        f()
+    }
+
+    pub fn new_memory_consumption_tracker(
+        self: &Arc<Self>,
+        mut max_estimated_memory_bytes: u64,
+        query_description: impl Into<String>,
+        trace_id: Option<String>,
+    ) -> Arc<MemoryConsumptionTracker> {
+        if self.force_unlimited.load(Ordering::Acquire) {
+            max_estimated_memory_bytes = 0;
+        }
+        let start = self.current_time();
+        let tracker = Arc::new(MemoryConsumptionTracker {
+            max_estimated_memory_bytes,
+            state: Mutex::new(TrackerState::default()),
+            rejections: self.queries_rejected.clone(),
+            query_description: query_description.into(),
+            trace_id: trace_id.unwrap_or_default(),
+            producer: Some(Arc::downgrade(self)),
+            parent: None,
+            start_time: Some(start),
+        });
+        let key = Arc::as_ptr(&tracker) as usize;
+        self.inflight.lock().insert(key, Arc::clone(&tracker));
+        tracker
+    }
+
+    pub fn deregister(self: &Arc<Self>, tracker: &Arc<MemoryConsumptionTracker>) {
+        if tracker.parent.is_some() || tracker.producer.is_none() {
+            return;
+        }
+        if let Some(ref prod) = tracker.producer {
+            if !std::ptr::eq(prod.as_ptr(), Arc::as_ptr(self)) {
+                panic!("cannot deregister inflight memory consumption tracker - the given tracker was allocated by another InflightMemoryConsumptionTracker");
+            }
+        }
+        let key = Arc::as_ptr(tracker) as usize;
+        self.inflight.lock().remove(&key);
+    }
+
+    pub fn is_tracking(self: &Arc<Self>, tracker: &Arc<MemoryConsumptionTracker>) -> bool {
+        match tracker.producer {
+            Some(ref prod) if std::ptr::eq(prod.as_ptr(), Arc::as_ptr(self)) => {
+                let key = Arc::as_ptr(tracker) as usize;
+                self.inflight.lock().contains_key(&key)
+            }
+            _ => false,
+        }
+    }
+
+    fn descs(&self) -> Vec<&Desc> {
+        vec![
+            &self.max_desc,
+            &self.current_desc,
+            &self.peak_desc,
+            &self.sampled_desc,
+            &self.max_age_desc,
+        ]
+    }
+
+    fn collect_families(&self) -> Vec<MetricFamily> {
+        let trackers: Vec<Arc<MemoryConsumptionTracker>> =
+            self.inflight.lock().values().cloned().collect();
+        let mut max_bytes = 0.0f64;
+        let mut current_bytes = 0.0f64;
+        let mut peak_bytes = 0.0f64;
+        let mut oldest_start: Option<SystemTime> = None;
+        let sampled = trackers.len();
+
+        for tr in &trackers {
+            max_bytes += tr.max_estimated_memory_bytes as f64;
+            current_bytes += tr.current_estimated_memory_consumption_bytes() as f64;
+            peak_bytes += tr.peak_estimated_memory_consumption_bytes() as f64;
+            if let Some(st) = tr.start_time {
+                oldest_start = Some(match oldest_start {
+                    None => st,
+                    Some(cur) if st < cur => st,
+                    Some(cur) => cur,
+                });
+            }
+        }
+
+        let max_age_seconds = match oldest_start {
+            Some(oldest) => {
+                let now = self.current_time();
+                match now.duration_since(oldest) {
+                    Ok(d) => d.as_secs_f64(),
+                    Err(e) => -e.duration().as_secs_f64(),
+                }
+            }
+            None => 0.0,
+        };
+
+        let make_gauge = |desc: &Desc, val: f64| -> MetricFamily {
+            let mut g = ProtoGauge::default();
+            g.set_value(val);
+            let mut m = ProtoMetric::default();
+            m.set_gauge(g);
+            let mut mf = MetricFamily::default();
+            mf.set_name(desc.fq_name.clone());
+            mf.set_help(desc.help.clone());
+            mf.set_field_type(PromMetricType::GAUGE);
+            mf.set_metric(vec![m].into());
+            mf
+        };
+
+        vec![
+            make_gauge(&self.max_desc, max_bytes),
+            make_gauge(&self.current_desc, current_bytes),
+            make_gauge(&self.peak_desc, peak_bytes),
+            make_gauge(&self.sampled_desc, sampled as f64),
+            make_gauge(&self.max_age_desc, max_age_seconds),
+        ]
+    }
+}
+
+/// Metrics for series label deduplication (`pkg/util/limiter/series_labels_deduplicator.go`).
+#[derive(Clone)]
+pub struct SeriesDeduplicatorMetrics {
+    pub series_labels_total: Counter,
+    pub series_labels_deduplicated: Counter,
+}
+
+impl SeriesDeduplicatorMetrics {
+    pub fn new(reg: Option<&Registry>) -> Self {
+        let series_labels_total = Counter::with_opts(Opts::new(
+            "cortex_querier_labels_deduplicator_processed_total",
+            "Total number of series labels processed by the deduplicator, including both unique and duplicate series.",
+        ))
+        .expect("valid metric");
+        let series_labels_deduplicated = Counter::with_opts(Opts::new(
+            "cortex_querier_labels_deduplicator_deduplicated_total",
+            "Number of series labels that were deduplicated by reusing existing labels instead of creating new ones.",
+        ))
+        .expect("valid metric");
+        if let Some(r) = reg {
+            let _ = r.register(Box::new(series_labels_total.clone()));
+            let _ = r.register(Box::new(series_labels_deduplicated.clone()));
+        }
+        Self {
+            series_labels_total,
+            series_labels_deduplicated,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DeduplicatorState {
+    unique_series: HashMap<u64, PromLabels>,
+    conflict_series: Option<HashMap<u64, Vec<PromLabels>>>,
+}
+
+/// Ported from `limiter.SeriesLabelsDeduplicator` in `pkg/util/limiter/series_labels_deduplicator.go`.
+pub struct SeriesLabelsDeduplicator {
+    state: Mutex<DeduplicatorState>,
+    hash_func: Box<dyn Fn(&PromLabels) -> u64 + Send + Sync>,
+    metrics: SeriesDeduplicatorMetrics,
+}
+
+impl SeriesLabelsDeduplicator {
+    pub fn new(metrics: SeriesDeduplicatorMetrics) -> Self {
+        Self::with_hash_func(metrics, Box::new(PromLabels::hash))
+    }
+
+    pub fn with_hash_func(
+        metrics: SeriesDeduplicatorMetrics,
+        hash_func: Box<dyn Fn(&PromLabels) -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            state: Mutex::new(DeduplicatorState::default()),
+            hash_func,
+            metrics,
+        }
+    }
+
+    pub fn deduplicate(
+        &self,
+        new_labels: PromLabels,
+        tracker: &MemoryConsumptionTracker,
+    ) -> Result<PromLabels, LimitError> {
+        let fingerprint = (self.hash_func)(&new_labels);
+        let mut st = self.state.lock();
+        self.metrics.series_labels_total.inc();
+
+        if let Some(existing) = st.unique_series.get(&fingerprint) {
+            if existing == &new_labels {
+                self.metrics.series_labels_deduplicated.inc();
+                return Ok(existing.clone());
+            }
+        } else {
+            st.unique_series.insert(fingerprint, new_labels.clone());
+            return match tracker.increase_memory_consumption_for_labels(&new_labels) {
+                Ok(()) => Ok(new_labels),
+                Err(e) => Err(e),
+            };
+        }
+
+        let conflicts = st.conflict_series.get_or_insert_with(HashMap::new);
+        let bucket = conflicts.entry(fingerprint).or_default();
+        for existing in bucket.iter() {
+            if existing == &new_labels {
+                self.metrics.series_labels_deduplicated.inc();
+                return Ok(existing.clone());
+            }
+        }
+        bucket.push(new_labels.clone());
+        match tracker.increase_memory_consumption_for_labels(&new_labels) {
+            Ok(()) => Ok(new_labels),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn series_count(&self) -> usize {
+        let st = self.state.lock();
+        let mut count = st.unique_series.len();
+        if let Some(ref conflicts) = st.conflict_series {
+            for v in conflicts.values() {
+                count += v.len();
+            }
+        }
+        count
+    }
+
+    pub fn unique_series_len(&self) -> usize {
+        self.state.lock().unique_series.len()
+    }
+
+    pub fn has_conflicts(&self) -> bool {
+        self.state.lock().conflict_series.is_some()
+    }
+
+    pub fn conflict_bucket_len(&self, hash: u64) -> usize {
+        self.state
+            .lock()
+            .conflict_series
+            .as_ref()
+            .and_then(|c| c.get(&hash))
+            .map_or(0, Vec::len)
+    }
+}
+
+tokio::task_local! {
+    static MEMORY_TRACKER_CTX: Arc<MemoryConsumptionTracker>;
+    static QUERY_LIMITER_CTX: Arc<QueryLimiter>;
+    static SERIES_DEDUP_CTX: Arc<SeriesLabelsDeduplicator>;
+}
+
+pub const ERR_NO_MEMORY_CONSUMPTION_TRACKER_IN_CONTEXT: &str =
+    "no memory consumption tracker in context";
+
+pub async fn with_memory_tracker<F>(
+    tracker: Arc<MemoryConsumptionTracker>,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    MEMORY_TRACKER_CTX.scope(tracker, fut).await
+}
+
+pub fn memory_consumption_tracker_from_context(
+) -> Result<Arc<MemoryConsumptionTracker>, &'static str> {
+    MEMORY_TRACKER_CTX
+        .try_with(Arc::clone)
+        .map_err(|_| ERR_NO_MEMORY_CONSUMPTION_TRACKER_IN_CONTEXT)
+}
+
+pub async fn with_unlimited_memory_tracker<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    with_memory_tracker(Arc::new(MemoryConsumptionTracker::unlimited()), fut).await
+}
+
+pub async fn with_query_limiter<F>(limiter: Arc<QueryLimiter>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    QUERY_LIMITER_CTX.scope(limiter, fut).await
+}
+
+pub fn query_limiter_from_context_with_fallback() -> Arc<QueryLimiter> {
+    QUERY_LIMITER_CTX
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| Arc::new(QueryLimiter::new(0, 0, 0, 0)))
+}
+
+pub async fn with_new_series_labels_deduplicator<F>(
+    metrics: SeriesDeduplicatorMetrics,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    SERIES_DEDUP_CTX
+        .scope(Arc::new(SeriesLabelsDeduplicator::new(metrics)), fut)
+        .await
+}
+
+pub fn series_labels_deduplicator_from_context(
+) -> Result<Arc<SeriesLabelsDeduplicator>, &'static str> {
+    SERIES_DEDUP_CTX
+        .try_with(Arc::clone)
+        .map_err(|_| "no series deduplicator in context")
 }
 
 #[tonic::async_trait]
