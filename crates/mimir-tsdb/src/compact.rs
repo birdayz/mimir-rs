@@ -7,7 +7,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
+
+use parking_lot::Mutex;
 
 use thiserror::Error;
 use ulid::Ulid;
@@ -3241,20 +3243,20 @@ pub fn open_blocks_for_compaction(
             if s.load(Ordering::Acquire) {
                 break;
             }
-            let next = q.lock().unwrap().pop_front();
+            let next = q.lock().pop_front();
             let Some(dir) = next else { break };
             let res = Block::open(&dir);
             if res.is_err() {
                 s.store(true, Ordering::Release);
             }
-            r.lock().unwrap().push(res);
+            r.lock().push(res);
         }));
     }
     for h in handles {
         let _ = h.join();
     }
     let mut first_err = None;
-    for res in results.lock().unwrap().drain(..) {
+    for res in results.lock().drain(..) {
         match res {
             Ok(b) => {
                 let arc = Arc::new(b);
@@ -3330,7 +3332,7 @@ impl AsyncBlockWriter {
     }
 
     pub fn add_series(&self, labels: Labels, chunks: Vec<ChunkMeta>) -> Result<(), CompactError> {
-        let sender = self.tx.lock().unwrap().as_ref().cloned();
+        let sender = self.tx.lock().as_ref().cloned();
         if let Some(tx) = sender {
             let _ = tx.send(AsyncSeriesItem { labels, chunks });
         }
@@ -3339,15 +3341,15 @@ impl AsyncBlockWriter {
 
     /// Idempotently closes the input channel.
     pub fn close_async(&self) {
-        self.tx.lock().unwrap().take();
+        self.tx.lock().take();
     }
 
     /// Waits for background completion and idempotently returns the cached result.
     pub fn wait_finished(&self) -> Result<BlockStats, CompactError> {
         self.close_async();
-        let mut res_guard = self.result.lock().unwrap();
+        let mut res_guard = self.result.lock();
         if res_guard.is_none() {
-            if let Some(h) = self.handle.lock().unwrap().take() {
+            if let Some(h) = self.handle.lock().take() {
                 let r = h
                     .join()
                     .unwrap_or_else(|_| Err("async block writer thread panicked".to_string()));

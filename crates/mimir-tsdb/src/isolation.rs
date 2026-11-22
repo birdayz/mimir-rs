@@ -277,11 +277,33 @@ impl TxRing {
             }
         }
         self.tx_id_first %= len;
+        if self.tx_ids.len() > 64 && self.tx_id_count * 4 < self.tx_ids.len() {
+            let new_len = (self.tx_id_count * 2).max(16).next_power_of_two();
+            let mut new_ring = vec![0u64; new_len];
+            let first_part = (self.tx_ids.len() - self.tx_id_first).min(self.tx_id_count);
+            if first_part > 0 {
+                new_ring[..first_part].copy_from_slice(
+                    &self.tx_ids[self.tx_id_first..self.tx_id_first + first_part],
+                );
+            }
+            let second_part = self.tx_id_count - first_part;
+            if second_part > 0 {
+                new_ring[first_part..first_part + second_part]
+                    .copy_from_slice(&self.tx_ids[..second_part]);
+            }
+            self.tx_ids = new_ring;
+            self.tx_id_first = 0;
+        }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
         self.tx_id_count
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.tx_ids.len()
     }
 
     #[inline]
