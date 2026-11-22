@@ -1005,7 +1005,9 @@ async fn test_memberlist_integ() {
             c,
             KvOptions {
                 secret_key: Some(secret.clone()),
-                probe_interval: Some(Duration::from_millis(20)),
+                // Keep probe_interval > probe_timeout so 16 encrypted nodes do not
+                // false-suspect each other under heavy parallel CI CPU contention.
+                probe_interval: Some(Duration::from_millis(250)),
                 probe_timeout: Some(Duration::from_millis(100)),
                 event_delegate: (i == 0).then(|| joins.clone() as Arc<dyn EventDelegate>),
                 ..Default::default()
@@ -1022,7 +1024,7 @@ async fn test_memberlist_integ() {
         }
         members.push(m);
     }
-    let converged = wait_for(Duration::from_secs(5), || {
+    let converged = wait_for(Duration::from_secs(10), || {
         members.iter().all(|m| m.num_members() == NUM)
     })
     .await;
