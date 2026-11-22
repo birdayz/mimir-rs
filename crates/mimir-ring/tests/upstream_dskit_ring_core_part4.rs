@@ -1903,6 +1903,7 @@ async fn start_test_lifecycler(
         port: 1,
         id: format!("instance-{id_num}"),
         token_generator: None,
+        spread_minimizing_token_generator: false,
     };
     let lc = Lifecycler::with_store(
         cfg,
