@@ -152,42 +152,49 @@ impl Mergeable for PropagationDelayTrackerDesc {
     }
 
     fn to_go_json(&self) -> GoJson {
-        let entries = self
-            .beacons
-            .iter()
-            .map(|(k, b)| {
-                let mut fields = Vec::new();
-                if !b.published_by.is_empty() {
-                    fields.push(("published_by".into(), GoJson::str(&b.published_by)));
-                }
-                if b.published_at != 0 {
-                    fields.push(("published_at".into(), GoJson::int(b.published_at)));
-                }
-                if b.deleted_at != 0 {
-                    fields.push(("deleted_at".into(), GoJson::int(b.deleted_at)));
-                }
-                (k.to_string(), GoJson::Object(fields))
-            })
-            .collect();
-        GoJson::Object(vec![("beacons".into(), GoJson::sorted_map(entries))])
+        let beacons = if self.beacons.is_empty() {
+            GoJson::Null
+        } else {
+            let entries = self
+                .beacons
+                .iter()
+                .map(|(k, b)| {
+                    let mut fields = Vec::new();
+                    if !b.published_by.is_empty() {
+                        fields.push(("published_by".into(), GoJson::str(&b.published_by)));
+                    }
+                    if b.published_at != 0 {
+                        fields.push(("published_at".into(), GoJson::int(b.published_at)));
+                    }
+                    if b.deleted_at != 0 {
+                        fields.push(("deleted_at".into(), GoJson::int(b.deleted_at)));
+                    }
+                    (k.to_string(), GoJson::Object(fields))
+                })
+                .collect();
+            GoJson::sorted_map(entries)
+        };
+        GoJson::Object(vec![("beacons".into(), beacons)])
     }
 
     fn go_string(&self) -> String {
-        let mut keys: Vec<u64> = self.beacons.keys().copied().collect();
-        keys.sort_unstable();
-        let mut s = String::from(
-            "&memberlist.PropagationDelayTrackerDesc{Beacons: map[uint64]BeaconDesc{",
-        );
-        for k in keys {
-            let b = &self.beacons[&k];
-            s.push_str(&format!(
-                "{k:#x}: memberlist.BeaconDesc{{PublishedBy:{}, PublishedAt:{}, DeletedAt:{}}},",
-                go_sharp_v_str(&b.published_by),
-                b.published_at,
-                b.deleted_at,
-            ));
+        let mut s = String::from("&memberlist.PropagationDelayTrackerDesc{");
+        if !self.beacons.is_empty() {
+            let mut keys: Vec<u64> = self.beacons.keys().copied().collect();
+            keys.sort_unstable();
+            s.push_str("Beacons: map[uint64]BeaconDesc{");
+            for k in keys {
+                let b = &self.beacons[&k];
+                s.push_str(&format!(
+                    "{k:#x}: memberlist.BeaconDesc{{PublishedBy:{}, PublishedAt:{}, DeletedAt:{}}},",
+                    go_sharp_v_str(&b.published_by),
+                    b.published_at,
+                    b.deleted_at,
+                ));
+            }
+            s.push_str("},\n");
         }
-        s.push_str("},\n}");
+        s.push('}');
         s
     }
 
@@ -771,10 +778,9 @@ mod tests {
         let empty = PropagationDelayTrackerDesc::default();
         assert_eq!(
             empty.go_string(),
-            "&memberlist.PropagationDelayTrackerDesc{Beacons: map[uint64]BeaconDesc{},
-}"
+            "&memberlist.PropagationDelayTrackerDesc{}"
         );
-        assert_eq!(empty.to_go_json().encode(), "{\"beacons\":{}}\n");
+        assert_eq!(empty.to_go_json().encode(), "{\"beacons\":null}\n");
 
         let mut desc = PropagationDelayTrackerDesc::default();
         desc.beacons.insert(

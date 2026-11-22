@@ -202,6 +202,7 @@ struct BeaconInputJson {
 
 #[derive(Debug, Clone, Serialize)]
 struct FormatPropTrackerRequest {
+    value_b64: String,
     beacons: BTreeMap<String, BeaconInputJson>,
 }
 
@@ -1897,6 +1898,7 @@ fn w28_propagation_delay_tracker_format_metrics_and_live_gossip_parity() {
         let go: FormatPropTrackerResponse = invoke_oracle(
             "format-propagation-tracker",
             &FormatPropTrackerRequest {
+                value_b64: B64.encode(&encoded),
                 beacons: beacons_in,
             },
         )
@@ -1964,6 +1966,7 @@ memberlist:
   advertise_addr: 127.0.0.1
   advertise_port: {ml_p}
   gossip_interval: 100ms
+  rejoin_interval: 1s
   abort_if_cluster_join_fails: false
   join_members:
 {join_yaml}ingester:
@@ -2000,22 +2003,26 @@ activity_tracker:
             "-memberlist.propagation-delay-tracker.enabled=false".to_string(),
         ];
 
+        // Start rust-tracker first (which also builds the release binary before Go starts) so
+        // Go's initial fast-join connects immediately instead of entering exponential backoff.
         let go_dir = tmp.path().join("go-enabled");
         let rs_dir = tmp.path().join("rs-enabled");
         let dis_dir = tmp.path().join("rs-disabled");
+
+        let mut rs_proc = start_mimir(
+            Impl::Rust,
+            "pt-rs",
+            &rs_dir,
+            &make_yaml("rust-tracker", rs_http, rs_grpc, rs_ml, &[go_ml], &rs_dir),
+            &enabled_flags,
+        );
+        wait_ready(&http, &mut rs_proc, rs_http, Duration::from_secs(30)).await;
 
         let mut go_proc = start_mimir(
             Impl::Go,
             "pt-go",
             &go_dir,
             &make_yaml("go-tracker", go_http, go_grpc, go_ml, &[rs_ml], &go_dir),
-            &enabled_flags,
-        );
-        let mut rs_proc = start_mimir(
-            Impl::Rust,
-            "pt-rs",
-            &rs_dir,
-            &make_yaml("rust-tracker", rs_http, rs_grpc, rs_ml, &[go_ml], &rs_dir),
             &enabled_flags,
         );
         let mut dis_proc = start_mimir(
@@ -2027,7 +2034,6 @@ activity_tracker:
         );
 
         wait_ready(&http, &mut go_proc, go_http, Duration::from_secs(30)).await;
-        wait_ready(&http, &mut rs_proc, rs_http, Duration::from_secs(30)).await;
         wait_ready(&http, &mut dis_proc, dis_http, Duration::from_secs(30)).await;
 
         let deadline = Instant::now() + Duration::from_secs(20);
