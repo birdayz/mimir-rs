@@ -1029,7 +1029,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let reached_running_set: parking_lot::Mutex<std::collections::HashSet<&'static str>> =
         parking_lot::Mutex::new(std::collections::HashSet::new());
 
-    let (signaled, startup_err, mut runtime_failure) = {
+    let (mut signaled, startup_err, mut runtime_failure) = {
         let startup_fut = async {
             // memberlist-kv: mirrors Go KVInitService — transitions to Running immediately while
             // inner MemberlistKv starts (transport + fast-join) in the background, failing only if
@@ -1115,6 +1115,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         };
         tokio::select! {
             _ = &mut shutdown_sig => {
+                signaled = true;
                 request_shutdown(&shutdown_requested, shutdown_delay).await;
             }
             err = ingester_failure => {
@@ -1303,8 +1304,8 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
     sd_notify("STOPPING=1");
     // Go Mimir.Run suppresses "failed services" whenever a shutdown signal was received
-    // (shutdownRequested == true), exiting 0 instead of 1.
-    if signaled || shutdown_requested.load(Ordering::Acquire) {
+    // (exiting 0); any unrequested startup/runtime module failure exits non-zero.
+    if signaled {
         return Ok(());
     }
     if startup_err.is_some() || runtime_failure.is_some() || ingester_failed {
