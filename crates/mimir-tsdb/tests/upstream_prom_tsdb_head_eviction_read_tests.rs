@@ -873,6 +873,7 @@ fn test_series_eviction_creation_paused_before_insertion_is_declared_after_tombs
                 })),
             })));
 
+        let mut old_app = db.appender();
         let (created_tx, created_rx) = mpsc::channel::<Result<u64, String>>();
         let db_creator = Arc::clone(&db);
         let creator_handle = std::thread::spawn(move || {
@@ -890,11 +891,10 @@ fn test_series_eviction_creation_paused_before_insertion_is_declared_after_tombs
         paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
         {
-            let mut app = db.appender();
             let mut r = 0u64;
             for i in 0..3 {
                 let v = if i == 2 { stale_nan() } else { i as f64 };
-                r = app
+                r = old_app
                     .append_float(
                         None,
                         &[("__name__", "series"), ("id", "20")],
@@ -904,7 +904,7 @@ fn test_series_eviction_creation_paused_before_insertion_is_declared_after_tombs
                     .unwrap();
             }
             *old_ref.lock().unwrap() = r;
-            app.commit().unwrap();
+            old_app.commit().unwrap();
         }
         let target_ref = *old_ref.lock().unwrap();
 
