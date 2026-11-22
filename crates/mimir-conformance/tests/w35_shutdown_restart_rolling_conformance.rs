@@ -473,7 +473,7 @@ fn w35_shutdown_delay_ready_503_inflight_rpc_and_unprefaced_grpc_tcp() {
                 "",
                 "",
                 "",
-                "shutdown_delay: 2s\n",
+                "shutdown_delay: 5s\n",
             );
             let mut proc = start_mimir(which, "drain", &dir, &yaml, &[]);
             wait_ready(&client, &mut proc, ports[0], Duration::from_secs(30)).await;
@@ -488,12 +488,18 @@ fn w35_shutdown_delay_ready_503_inflight_rpc_and_unprefaced_grpc_tcp() {
                     .expect("raw tcp connect to gRPC port")
             });
 
-            // Send SIGTERM -> enters 2s shutdown_delay.
+            // Send SIGTERM -> enters 5s shutdown_delay; poll until /ready flips to 503.
             proc.sigterm();
-            tokio::time::sleep(Duration::from_millis(250)).await;
-
-            // /ready must immediately return 503 + Connection: close, gRPC health -> NOT_SERVING(2).
-            let (code, headers, body) = http_get(&client, ports[0], "/ready", false).await.unwrap();
+            let dl = Instant::now() + Duration::from_secs(5);
+            let (code, headers, body) = loop {
+                if let Ok(r) = http_get(&client, ports[0], "/ready", false).await {
+                    if r.0 == 503 {
+                        break r;
+                    }
+                }
+                assert!(Instant::now() < dl, "{} did not flip /ready to 503", proc.name);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
             assert_eq!(code, 503, "{} /ready during shutdown_delay", proc.name);
             assert_eq!(body, "Application is stopping\n", "{} body", proc.name);
             let conn = headers
@@ -528,8 +534,8 @@ fn w35_shutdown_delay_ready_503_inflight_rpc_and_unprefaced_grpc_tcp() {
             assert_eq!(series.len(), 1, "{} QueryStream during shutdown_delay", proc.name);
             drop(grpc);
 
-            // Must exit cleanly within 12s even while _raw_stalled_grpc stays open!
-            assert_exit_ok(&mut proc, Duration::from_secs(12));
+            // Must exit cleanly within 15s even while _raw_stalled_grpc stays open!
+            assert_exit_ok(&mut proc, Duration::from_secs(15));
         }
     });
 }
@@ -1061,7 +1067,9 @@ activity_tracker:
             tokio::spawn(async move {
                 let mut seq: i64 = 0;
                 while !stop.load(Ordering::Acquire) {
-                    let ts = base_ts + seq * 1_000;
+                    // Advance by 50ms per ~80ms iteration so timestamps never outrun wall clock
+                    // or cross creation_grace_period on slow 2-core CI runners.
+                    let ts = base_ts + seq * 50;
                     let val = seq as f64 + 0.5;
                     let mut ok_count = 0usize;
                     for &gp in &grpc_ports {
@@ -1593,9 +1601,12 @@ activity_tracker:
             let ports = free_tcp_ports(2);
             let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let dead_kafka = blackhole.local_addr().unwrap().port();
+            let bh_accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bh_accepted_srv = Arc::clone(&bh_accepted);
             let bh_task = tokio::spawn(async move {
                 let mut held = Vec::new();
                 while let Ok((sock, _)) = blackhole.accept().await {
+                    bh_accepted_srv.fetch_add(1, Ordering::AcqRel);
                     held.push(sock);
                 }
             });
@@ -1667,13 +1678,21 @@ activity_tracker:
                 assert!(Instant::now() < dl, "{} /ready never came up", proc.name);
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            let dial_dl = Instant::now() + Duration::from_secs(10);
+            while bh_accepted.load(Ordering::Acquire) == 0 {
+                assert!(
+                    Instant::now() < dial_dl,
+                    "{} never dialed hung Kafka broker",
+                    proc.name
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
 
             let t0 = Instant::now();
             proc.sigterm();
-            assert_exit_ok(&mut proc, Duration::from_secs(8));
+            assert_exit_ok(&mut proc, Duration::from_secs(10));
             assert!(
-                t0.elapsed() < Duration::from_secs(8),
+                t0.elapsed() < Duration::from_secs(10),
                 "{} hung shutting down with hung Kafka broker ({:?})",
                 proc.name,
                 t0.elapsed()

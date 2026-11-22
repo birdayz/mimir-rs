@@ -1729,8 +1729,8 @@ impl Lifecycler {
                             inst.zone = zone.clone();
                             inst.state = InstanceState::Pending as i32;
                             let now_s = system_time_to_unix_secs(SystemTime::now());
-                            inst.timestamp = if inst.timestamp == now_s {
-                                now_s.saturating_add(1)
+                            inst.timestamp = if now_s <= inst.timestamp {
+                                inst.timestamp.saturating_add(1)
                             } else {
                                 now_s
                             };
@@ -1786,8 +1786,8 @@ impl Lifecycler {
                                 needs_write = false;
                             } else {
                                 let now_s = system_time_to_unix_secs(SystemTime::now());
-                                inst.timestamp = if prev_ts == now_s {
-                                    now_s.saturating_add(1)
+                                inst.timestamp = if now_s <= prev_ts {
+                                    prev_ts.saturating_add(1)
                                 } else {
                                     now_s
                                 };

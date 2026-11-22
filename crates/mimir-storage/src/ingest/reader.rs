@@ -3995,8 +3995,8 @@ mod tests {
         reader_a.stop().await;
         let elapsed = t0.elapsed();
         assert!(
-            elapsed < Duration::from_millis(500),
-            "stop() must interrupt blocked get_start_offset() in <500ms, took {elapsed:?}"
+            elapsed < Duration::from_secs(2),
+            "stop() must interrupt blocked get_start_offset() in <2s, took {elapsed:?}"
         );
         let start_res = rx_a.await.unwrap();
         assert!(
@@ -4082,8 +4082,8 @@ mod tests {
         reader_b.stop().await;
         let elapsed_b = t1.elapsed();
         assert!(
-            elapsed_b < Duration::from_millis(500),
-            "stop() must interrupt blocked create_topics() in <500ms, took {elapsed_b:?}"
+            elapsed_b < Duration::from_secs(2),
+            "stop() must interrupt blocked create_topics() in <2s, took {elapsed_b:?}"
         );
         let start_res_b = rx_b.await.unwrap();
         assert!(

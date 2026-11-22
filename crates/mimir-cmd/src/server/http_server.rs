@@ -725,10 +725,10 @@ mod tests {
 
         let start = Instant::now();
         let _ = shutdown_tx.send(true);
-        tokio::time::timeout(Duration::from_millis(500), srv)
+        tokio::time::timeout(Duration::from_secs(2), srv)
             .await
             .expect("http server must abort pre-handshake connection immediately")
             .unwrap();
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

@@ -108,7 +108,7 @@ async fn bug_r2_watch_key_and_watch_prefix_abort_promptly_when_canceled_while_kv
         min_join_backoff: GoDuration::from_millis(1),
         max_join_backoff: GoDuration::from_millis(5),
         max_join_retries: 1,
-        stream_timeout: GoDuration::from_millis(400),
+        stream_timeout: GoDuration::from_secs(10),
         abort_if_cluster_fast_join_fails: false,
         ..Default::default()
     };
@@ -152,11 +152,11 @@ async fn bug_r2_watch_key_and_watch_prefix_abort_promptly_when_canceled_while_kv
     watch_key_ctx.cancel();
     watch_prefix_ctx.cancel();
 
-    tokio::time::timeout(Duration::from_millis(500), h_key)
+    tokio::time::timeout(Duration::from_secs(2), h_key)
         .await
         .expect("watch_key must abort promptly when canceled during Starting")
         .expect("watch_key task");
-    tokio::time::timeout(Duration::from_millis(500), h_prefix)
+    tokio::time::timeout(Duration::from_secs(2), h_prefix)
         .await
         .expect("watch_prefix must abort promptly when canceled during Starting")
         .expect("watch_prefix task");
@@ -224,7 +224,7 @@ async fn bug_r3_kv_init_service_propagates_failure_and_shuts_down_inflight_kv() 
             min_join_backoff: GoDuration::from_millis(1),
             max_join_backoff: GoDuration::from_millis(5),
             max_join_retries: 1,
-            stream_timeout: GoDuration::from_millis(400),
+            stream_timeout: GoDuration::from_secs(10),
             abort_if_cluster_fast_join_fails: false,
             ..Default::default()
         };

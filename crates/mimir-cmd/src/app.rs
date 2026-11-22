@@ -335,7 +335,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
         // Install SIGTERM/SIGINT listeners before any module starts: Go's signal handler runs for
         // the whole lifetime of the service manager, including module startup.
-        let shutdown_sig = install_shutdown_signal(Arc::clone(&logger))?;
+        let (shutdown_sig, _second_signal_guard) = install_shutdown_signal(Arc::clone(&logger))?;
         server.set_shutdown_requested(Arc::clone(&shutdown_requested));
 
         // Active groups cleanup service (pkg/mimir/modules.go initActiveGroupsCleanupService): a
@@ -1479,9 +1479,22 @@ fn stop_timer_module(
     log_module_stopped(logger, module);
 }
 
-fn install_shutdown_signal(
-    logger: Arc<LogSink>,
-) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+struct SecondSignalGuard(Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>);
+
+impl Drop for SecondSignalGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.lock().take() {
+            h.abort();
+        }
+    }
+}
+
+type ShutdownSignalFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+fn install_shutdown_signal(logger: Arc<LogSink>) -> Result<(ShutdownSignalFuture, SecondSignalGuard)> {
+    let second_task = Arc::new(parking_lot::Mutex::new(None));
+    let guard = SecondSignalGuard(Arc::clone(&second_task));
+
     #[cfg(unix)]
     {
         let mut sigterm =
@@ -1489,7 +1502,7 @@ fn install_shutdown_signal(
                 .context("install SIGTERM handler")?;
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("install SIGINT handler")?;
-        Ok(Box::pin(async move {
+        let fut = Box::pin(async move {
             tokio::select! {
                 _ = sigterm.recv() => {}
                 _ = sigint.recv() => {}
@@ -1501,7 +1514,7 @@ fn install_shutdown_signal(
             );
             // Keep signal receivers alive and reset to SIG_DFL + re-raise on a 2nd signal,
             // matching Go signals/signals.go (`defer signal.Stop(sigs)`).
-            tokio::spawn(async move {
+            let h = tokio::spawn(async move {
                 let sig = tokio::select! {
                     Some(_) = sigterm.recv() => libc::SIGTERM,
                     Some(_) = sigint.recv() => libc::SIGINT,
@@ -1515,18 +1528,22 @@ fn install_shutdown_signal(
                 }
                 std::process::exit(128 + sig);
             });
-        }))
+            *second_task.lock() = Some(h);
+        });
+        Ok((fut, guard))
     }
 
     #[cfg(not(unix))]
     {
-        Ok(Box::pin(async move {
+        let _ = second_task;
+        let fut = Box::pin(async move {
             let _ = tokio::signal::ctrl_c().await;
             logger.log(
                 LogLevel::Info,
                 &[("msg", "=== received SIGINT/SIGTERM ===\n*** exiting")],
             );
-        }))
+        });
+        Ok((fut, guard))
     }
 }
 

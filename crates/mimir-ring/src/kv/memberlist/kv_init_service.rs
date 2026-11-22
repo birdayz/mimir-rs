@@ -8,6 +8,7 @@ use mimir_common::services::{
     basic_service, FnListener, ManagedBasicService, Service, ServiceContext, ServiceError,
 };
 use mimir_config::server::MemberlistConfig;
+use parking_lot::RwLock as SyncRwLock;
 use prometheus::Registry;
 use tokio::sync::{watch, Mutex};
 
@@ -15,14 +16,20 @@ use super::client::{KvOptions, MemberlistKv};
 use crate::dns::DnsProvider;
 use crate::kv::{Codec, KvError};
 
+#[derive(Default)]
+struct InitState {
+    result: Option<Result<Arc<MemberlistKv>, String>>,
+    stopped: bool,
+}
+
 /// Port of `dskit/kv/memberlist.KVInitService`.
 pub struct KvInitService {
     cfg: MemberlistConfig,
     codecs: Vec<Arc<dyn Codec>>,
     dns_provider: Option<Arc<dyn DnsProvider>>,
     registry: Option<Registry>,
-    init: OnceLock<Result<Arc<MemberlistKv>, String>>,
-    init_lock: Mutex<()>,
+    init_state: Mutex<InitState>,
+    kv_ref: SyncRwLock<Option<Arc<MemberlistKv>>>,
     failure_tx: watch::Sender<Option<String>>,
     failure_rx: watch::Receiver<Option<String>>,
     service: OnceLock<Arc<ManagedBasicService>>,
@@ -41,8 +48,8 @@ impl KvInitService {
             codecs,
             dns_provider,
             registry,
-            init: OnceLock::new(),
-            init_lock: Mutex::new(()),
+            init_state: Mutex::new(InitState::default()),
+            kv_ref: SyncRwLock::new(None),
             failure_tx,
             failure_rx,
             service: OnceLock::new(),
@@ -109,13 +116,14 @@ impl KvInitService {
             ));
         }
 
-        if let Some(res) = self.init.get() {
+        let mut st = self.init_state.lock().await;
+        if let Some(res) = st.result.as_ref() {
             return res.clone().map_err(KvError::Other);
         }
-
-        let _guard = self.init_lock.lock().await;
-        if let Some(res) = self.init.get() {
-            return res.clone().map_err(KvError::Other);
+        if st.stopped {
+            return Err(KvError::Other(
+                "memberlist KV service is already stopping or stopped".to_string(),
+            ));
         }
 
         let opts = KvOptions {
@@ -132,7 +140,7 @@ impl KvInitService {
             Ok(kv) => kv,
             Err(e) => {
                 let msg = e.to_string();
-                let _ = self.init.set(Err(msg.clone()));
+                st.result = Some(Err(msg.clone()));
                 return Err(KvError::Other(msg));
             }
         };
@@ -157,22 +165,31 @@ impl KvInitService {
         );
         let _ = kv.service().add_listener(listener);
 
-        let _ = self.init.set(Ok(Arc::clone(&kv)));
         if let Err(e) = kv.service().start_async(ServiceContext::background()).await {
-            return Err(KvError::Other(e.to_string()));
+            let msg = e.to_string();
+            st.result = Some(Err(msg.clone()));
+            return Err(KvError::Other(msg));
         }
+
+        st.result = Some(Ok(Arc::clone(&kv)));
+        *self.kv_ref.write() = Some(Arc::clone(&kv));
         Ok(kv)
     }
 
     pub fn get_kv(&self) -> Option<Arc<MemberlistKv>> {
-        self.init.get().and_then(|r| r.as_ref().ok().cloned())
+        self.kv_ref.read().clone()
     }
 
     pub async fn stopping(&self) -> Result<(), ServiceError> {
-        if let Some(kv) = self.get_kv() {
+        let kv = {
+            let mut st = self.init_state.lock().await;
+            st.stopped = true;
+            st.result.as_ref().and_then(|r| r.as_ref().ok().cloned())
+        };
+        if let Some(kv) = kv {
             let svc = kv.service();
             svc.stop_async();
-            let _ = svc.await_terminated().await;
+            svc.await_terminated().await?;
         }
         Ok(())
     }

@@ -1991,7 +1991,11 @@ impl MemberlistKv {
         let mut nodes: VecDeque<String> = nodes.into();
         while to_join > 0 && !nodes.is_empty() && !ctx.is_canceled() {
             let node = nodes.pop_front().expect("non-empty");
-            let (reached, err) = self.ml_join(std::slice::from_ref(&node)).await;
+            let (reached, err) = tokio::select! {
+                biased;
+                _ = ctx.canceled() => break,
+                res = self.ml_join(std::slice::from_ref(&node)) => res,
+            };
             if let Some(err) = err {
                 info!(node, %err, "fast-joining node failed");
             }
@@ -2121,7 +2125,14 @@ impl MemberlistKv {
                     batch_err = Some("joining batch: context canceled".to_string());
                     break;
                 }
-                let (reached, err) = self.ml_join(std::slice::from_ref(node)).await;
+                let (reached, err) = tokio::select! {
+                    biased;
+                    _ = ctx.canceled() => {
+                        batch_err = Some("joining batch: context canceled".to_string());
+                        break;
+                    }
+                    res = self.ml_join(std::slice::from_ref(node)) => res,
+                };
                 joined_in_batch += reached;
                 if err.is_some() {
                     batch_err = err;

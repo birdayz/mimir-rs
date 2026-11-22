@@ -519,6 +519,7 @@ impl PartitionInstanceLifecycler {
                 Box::pin(async move {
                     if l.create_partition_on_startup() {
                         tokio::select! {
+                            biased;
                             res = l.create_partition_and_register_owner() => {
                                 res.map_err(|e| ServiceError::failure(e.to_string()))?;
                             }
@@ -526,6 +527,7 @@ impl PartitionInstanceLifecycler {
                         }
                     } else {
                         tokio::select! {
+                            biased;
                             res = l.wait_partition_and_register_owner(&ctx) => {
                                 res.map_err(|e| ServiceError::failure(e.to_string()))?;
                             }

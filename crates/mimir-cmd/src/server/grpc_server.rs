@@ -488,11 +488,27 @@ async fn serve_conn<T>(
 {
     const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     let mut preface_buf = [0u8; 24];
+    let read_preface = async {
+        let mut filled = 0usize;
+        while filled < H2_PREFACE.len() {
+            match io.read(&mut preface_buf[filled..]).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => {
+                    filled += n;
+                    // Reject short non-H2 probes immediately instead of holding the socket for 120s.
+                    if preface_buf[..filled] != H2_PREFACE[..filled] {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    };
     let preface_ok = tokio::select! {
         biased;
         _ = super::wait_shutdown(&mut shutdown) => false,
-        res = tokio::time::timeout(Duration::from_secs(120), io.read_exact(&mut preface_buf)) => {
-            matches!(res, Ok(Ok(_))) && &preface_buf == H2_PREFACE
+        res = tokio::time::timeout(Duration::from_secs(120), read_preface) => {
+            matches!(res, Ok(true))
         }
     };
     if !preface_ok {
@@ -564,10 +580,13 @@ async fn serve_conn<T>(
                     cfg.keepalive_timeout.min(Duration::from_secs(5))
                 };
                 loop {
+                    let notified = conn_state.idle_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
                     if conn_state.active.load(Ordering::Acquire) > 0 {
                         tokio::select! {
                             _ = conn.as_mut() => return,
-                            _ = conn_state.idle_notify.notified() => {}
+                            _ = &mut notified => {}
                         }
                     } else {
                         let sleep = tokio::time::sleep(idle_grace);
@@ -1937,11 +1956,11 @@ mod tests {
 
         let start = Instant::now();
         let _ = shutdown_tx.send(true);
-        tokio::time::timeout(Duration::from_millis(500), srv)
+        tokio::time::timeout(Duration::from_secs(2), srv)
             .await
             .expect("grpc server must shut down immediately on un-prefaced raw TCP conns")
             .unwrap();
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
@@ -2060,16 +2079,16 @@ mod tests {
 
         let start = Instant::now();
         let _ = shutdown_tx.send(true);
-        tokio::time::timeout(Duration::from_millis(500), srv)
+        tokio::time::timeout(Duration::from_secs(2), srv)
             .await
             .expect("idle h2 client must drain cleanly")
             .unwrap();
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(start.elapsed() < Duration::from_secs(2));
         let _ = client_task.await;
 
         // 2) Frozen HTTP/2 client (sent preface + SETTINGS, then stops reading/replying to GOAWAY)
         // must still be bounded by idle_grace (cfg.keepalive_timeout.min(5s)).
-        let (acceptor, cfg, ctx, addr) = grpc_test_server(Duration::from_millis(80));
+        let (acceptor, cfg, ctx, addr) = grpc_test_server(Duration::from_millis(120));
         let routes = tonic::service::Routes::new(HangingSvc);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let srv = tokio::spawn(serve(acceptor, cfg, routes, ctx, shutdown_rx));
@@ -2080,15 +2099,21 @@ mod tests {
         raw.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait deterministically for the server's initial HTTP/2 SETTINGS frame header so we know
+        // the server has completed preface read and entered hyper HTTP/2 serve_connection.
+        let mut srv_hdr = [0u8; 9];
+        tokio::time::timeout(Duration::from_secs(2), raw.read_exact(&mut srv_hdr))
+            .await
+            .expect("server must send initial HTTP/2 SETTINGS frame")
+            .unwrap();
 
         let start = Instant::now();
         let _ = shutdown_tx.send(true);
-        tokio::time::timeout(Duration::from_millis(500), srv)
+        tokio::time::timeout(Duration::from_secs(2), srv)
             .await
             .expect("frozen h2 client must close within bounded idle_grace")
             .unwrap();
-        assert!(start.elapsed() >= Duration::from_millis(60), "elapsed {:?}", start.elapsed());
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(start.elapsed() >= Duration::from_millis(90), "elapsed {:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

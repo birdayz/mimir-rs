@@ -986,6 +986,7 @@ pub struct KafkaClient {
     kprom: OnceLock<Arc<KpromMetrics>>,
     extended_metrics: Option<KafkaClientExtendedMetrics>,
     closed: AtomicBool,
+    close_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl KafkaClient {
@@ -1025,6 +1026,7 @@ impl KafkaClient {
             kprom: OnceLock::new(),
             extended_metrics: None,
             closed: AtomicBool::new(false),
+            close_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1074,6 +1076,7 @@ impl KafkaClient {
     pub async fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         let mut map = self.conns_by_addr.lock().await;
+        self.close_epoch.fetch_add(1, Ordering::AcqRel);
         for (_, conn) in map.drain() {
             conn.mark_dead();
         }
@@ -1343,6 +1346,7 @@ impl KafkaClient {
         addr: &str,
         kind: ConnKind,
     ) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        let start_epoch = self.close_epoch.load(Ordering::Acquire);
         let key = (addr.to_string(), kind);
         {
             let mut map = self.conns_by_addr.lock().await;
@@ -1405,6 +1409,13 @@ impl KafkaClient {
         })?;
 
         let mut map = self.conns_by_addr.lock().await;
+        if self.close_epoch.load(Ordering::Acquire) != start_epoch {
+            conn.mark_dead();
+            return Err(KafkaClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "kafka client closed during connect",
+            )));
+        }
         if let Some(existing) = map.get(&key) {
             if existing.is_alive() {
                 conn.mark_dead();

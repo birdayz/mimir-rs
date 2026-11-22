@@ -4805,6 +4805,8 @@ impl Head {
         let mut snapshot_pos: Option<(usize, usize)> = None;
         if self.enable_memory_snapshot_on_shutdown.load(Ordering::Acquire) {
             if let Ok(Some((snap_dir, snap_idx, snap_offset))) = Self::last_chunk_snapshot(&self.dir) {
+                // In Go Prometheus, wlog.NewSize creates empty segment 00000000 before Head.Init
+                // calls wlog.Segments(), so an empty wal/ reports endAt == 0 (0 < snap_idx iff snap_idx > 0).
                 let wal_behind = !disable_wal
                     && pre_open_wal_last.map_or(snap_idx > 0, |last| last < snap_idx);
                 if wal_behind {
