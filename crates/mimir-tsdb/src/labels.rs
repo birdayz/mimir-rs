@@ -1235,7 +1235,7 @@ fn stringlabel_size_when_encoded(len: usize) -> usize {
     if len < 255 {
         1
     } else {
-        assert!(len <= (1 << 24), "string too long to encode as label");
+        assert!(len < (1 << 24), "string too long to encode as label");
         4
     }
 }
@@ -1518,7 +1518,9 @@ pub fn append_openmetrics_float(dst: &mut Vec<u8>, f: f64) {
 /// and github.com/grafana/regexp/syntax.
 pub mod prom_regexp {
     use std::collections::{BTreeMap, VecDeque};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
+
+    use parking_lot::Mutex;
 
     use hashbrown::HashSet;
     use regex::{Regex, RegexBuilder};
@@ -1917,10 +1919,12 @@ pub mod prom_regexp {
                 });
             if ok_to_sort {
                 sub.sort_by(|a, b| {
-                    let (la, _) = leading_string(a);
-                    let (lb, _) = leading_string(b);
-                    let la = la.unwrap();
-                    let lb = lb.unwrap();
+                    let (Some(la), _) = leading_string(a) else {
+                        return std::cmp::Ordering::Equal;
+                    };
+                    let (Some(lb), _) = leading_string(b) else {
+                        return std::cmp::Ordering::Equal;
+                    };
                     let pref = la.len().min(lb.len());
                     la[..pref].cmp(&lb[..pref])
                 });
@@ -1987,7 +1991,8 @@ pub mod prom_regexp {
         // Round 2: factor common leading charclass / AnyChar (or fixed repeat thereof).
         let is_char_class = |r: &SyntaxRegexp| -> bool {
             (r.op == SyntaxOp::Literal && r.runes.len() == 1)
-                || matches!(r.op, SyntaxOp::CharClass | SyntaxOp::AnyCharNotNL | SyntaxOp::AnyChar)
+                || (r.op == SyntaxOp::CharClass && !(r.negated && r.runes.is_empty()))
+                || matches!(r.op, SyntaxOp::AnyCharNotNL | SyntaxOp::AnyChar)
         };
         let mut out2: Vec<SyntaxRegexp> = Vec::with_capacity(sub.len());
         let mut start = 0usize;
@@ -2066,7 +2071,9 @@ pub mod prom_regexp {
         }
 
         if out3.len() == 1 {
-            out3.into_iter().next().unwrap()
+            out3.into_iter()
+                .next()
+                .unwrap_or_else(|| SyntaxRegexp::new(SyntaxOp::EmptyMatch, flags))
         } else {
             let mut alt = SyntaxRegexp::new(SyntaxOp::Alternate, flags);
             alt.sub = out3;
@@ -2133,6 +2140,13 @@ pub mod prom_regexp {
         cc
     }
 
+    fn syntax_err(pattern: &str, reason: &str) -> MatcherError {
+        MatcherError::InvalidRegex {
+            pattern: pattern.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
     fn collapse_alternates(mut frame: ParserFrame) -> SyntaxRegexp {
         let cur = std::mem::take(&mut frame.cur);
         frame.alts.push(cur);
@@ -2146,7 +2160,10 @@ pub mod prom_regexp {
             }
         }
         if branch_nodes.len() == 1 {
-            branch_nodes.into_iter().next().unwrap()
+            branch_nodes
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| SyntaxRegexp::new(SyntaxOp::EmptyMatch, frame.flags))
         } else {
             factor_alternates(branch_nodes, frame.flags)
         }
@@ -2168,8 +2185,14 @@ pub mod prom_regexp {
                 b'(' => {
                     if pos + 1 < len && b[pos + 1] == b'?' {
                         if pos + 2 < len && b[pos + 2] == b'P' && pos + 3 < len && b[pos + 3] == b'<' {
-                            let end = pattern[pos + 4..].find('>').map(|i| pos + 4 + i + 1).unwrap_or(pos + 4);
-                            let flags = frames.last().unwrap().flags;
+                            let end = pattern[pos + 4..]
+                                .find('>')
+                                .map(|i| pos + 4 + i + 1)
+                                .ok_or_else(|| syntax_err(pattern, "invalid named capture"))?;
+                            let flags = frames
+                                .last()
+                                .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?
+                                .flags;
                             let cap_idx = next_cap;
                             next_cap += 1;
                             frames.push(ParserFrame {
@@ -2180,8 +2203,14 @@ pub mod prom_regexp {
                             });
                             pos = end;
                         } else if pos + 2 < len && b[pos + 2] == b'<' {
-                            let end = pattern[pos + 3..].find('>').map(|i| pos + 3 + i + 1).unwrap_or(pos + 3);
-                            let flags = frames.last().unwrap().flags;
+                            let end = pattern[pos + 3..]
+                                .find('>')
+                                .map(|i| pos + 3 + i + 1)
+                                .ok_or_else(|| syntax_err(pattern, "invalid named capture"))?;
+                            let flags = frames
+                                .last()
+                                .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?
+                                .flags;
                             let cap_idx = next_cap;
                             next_cap += 1;
                             frames.push(ParserFrame {
@@ -2193,7 +2222,10 @@ pub mod prom_regexp {
                             pos = end;
                         } else {
                             let mut p = pos + 2;
-                            let mut flags = frames.last().unwrap().flags;
+                            let mut flags = frames
+                                .last()
+                                .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?
+                                .flags;
                             let mut neg = false;
                             while p < len && !matches!(b[p], b':' | b')') {
                                 match b[p] {
@@ -2222,12 +2254,18 @@ pub mod prom_regexp {
                                 });
                                 pos = p + 1;
                             } else {
-                                frames.last_mut().unwrap().flags = flags;
+                                frames
+                                    .last_mut()
+                                    .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?
+                                    .flags = flags;
                                 pos = (p + 1).min(len);
                             }
                         }
                     } else {
-                        let flags = frames.last().unwrap().flags;
+                        let flags = frames
+                            .last()
+                            .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?
+                            .flags;
                         let cap_idx = next_cap;
                         next_cap += 1;
                         frames.push(ParserFrame {
@@ -2240,11 +2278,19 @@ pub mod prom_regexp {
                     }
                 }
                 b'|' => {
-                    frames.last_mut().unwrap().push_alt();
+                    frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?
+                        .push_alt();
                     pos += 1;
                 }
                 b')' => {
-                    let popped = frames.pop().unwrap();
+                    if frames.len() <= 1 {
+                        return Err(syntax_err(pattern, "unexpected )"));
+                    }
+                    let popped = frames
+                        .pop()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected )"))?;
                     let cap_idx = popped.cap_idx;
                     let is_cap = popped.is_capturing;
                     let flags = popped.flags;
@@ -2257,41 +2303,55 @@ pub mod prom_regexp {
                     } else {
                         inner
                     };
-                    frames.last_mut().unwrap().push_node(node);
+                    frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?
+                        .push_node(node);
                     pos += 1;
                 }
                 b'^' => {
-                    let flags = frames.last().unwrap().flags;
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
+                    let flags = frame.flags;
                     let op = if (flags & FLAG_MULTILINE) != 0 {
                         SyntaxOp::BeginLine
                     } else {
                         SyntaxOp::BeginText
                     };
-                    frames.last_mut().unwrap().push_node(SyntaxRegexp::new(op, flags));
+                    frame.push_node(SyntaxRegexp::new(op, flags));
                     pos += 1;
                 }
                 b'$' => {
-                    let flags = frames.last().unwrap().flags;
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
+                    let flags = frame.flags;
                     let op = if (flags & FLAG_MULTILINE) != 0 {
                         SyntaxOp::EndLine
                     } else {
                         SyntaxOp::EndText
                     };
-                    frames.last_mut().unwrap().push_node(SyntaxRegexp::new(op, flags));
+                    frame.push_node(SyntaxRegexp::new(op, flags));
                     pos += 1;
                 }
                 b'.' => {
-                    let flags = frames.last().unwrap().flags;
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
+                    let flags = frame.flags;
                     let op = if (flags & FLAG_DOT_NL) != 0 {
                         SyntaxOp::AnyChar
                     } else {
                         SyntaxOp::AnyCharNotNL
                     };
-                    frames.last_mut().unwrap().push_node(SyntaxRegexp::new(op, flags));
+                    frame.push_node(SyntaxRegexp::new(op, flags));
                     pos += 1;
                 }
                 b'*' | b'+' | b'?' => {
-                    let frame = frames.last_mut().unwrap();
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
                     let mut flags = frame.flags;
                     let op = match b[pos] {
                         b'*' => SyntaxOp::Star,
@@ -2303,11 +2363,16 @@ pub mod prom_regexp {
                         flags ^= FLAG_NON_GREEDY;
                         pos += 1;
                     }
-                    let sub = frame.cur.pop().unwrap();
+                    let sub = frame
+                        .cur
+                        .pop()
+                        .ok_or_else(|| syntax_err(pattern, "missing argument to repetition operator"))?;
                     let sub = if sub.op == SyntaxOp::Literal && sub.runes.len() > 1 {
-                        let last_ch = *sub.runes.last().unwrap();
                         let mut head = sub.clone();
-                        head.runes.pop();
+                        let last_ch = head
+                            .runes
+                            .pop()
+                            .ok_or_else(|| syntax_err(pattern, "empty literal repetition"))?;
                         frame.push_node(head);
                         let mut tail = SyntaxRegexp::new(SyntaxOp::Literal, sub.flags);
                         tail.runes.push(last_ch);
@@ -2321,18 +2386,24 @@ pub mod prom_regexp {
                 }
                 b'{' => {
                     if let Some((min, max, after)) = parse_repeat_bounds(b, pos) {
-                        let frame = frames.last_mut().unwrap();
+                        let frame = frames
+                            .last_mut()
+                            .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
                         let mut flags = frame.flags;
                         pos = after;
                         if pos < len && b[pos] == b'?' {
                             flags ^= FLAG_NON_GREEDY;
                             pos += 1;
                         }
-                        let sub = frame.cur.pop().unwrap();
+                        let sub = frame.cur.pop().ok_or_else(|| {
+                            syntax_err(pattern, "missing argument to repetition operator")
+                        })?;
                         let sub = if sub.op == SyntaxOp::Literal && sub.runes.len() > 1 {
-                            let last_ch = *sub.runes.last().unwrap();
                             let mut head = sub.clone();
-                            head.runes.pop();
+                            let last_ch = head
+                                .runes
+                                .pop()
+                                .ok_or_else(|| syntax_err(pattern, "empty literal repetition"))?;
                             frame.push_node(head);
                             let mut tail = SyntaxRegexp::new(SyntaxOp::Literal, sub.flags);
                             tail.runes.push(last_ch);
@@ -2346,21 +2417,30 @@ pub mod prom_regexp {
                         rep.sub.push(sub);
                         frame.push_node(rep);
                     } else {
-                        let flags = frames.last().unwrap().flags;
+                        let frame = frames
+                            .last_mut()
+                            .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
+                        let flags = frame.flags;
                         let mut lit = SyntaxRegexp::new(SyntaxOp::Literal, flags);
                         lit.runes.push('{');
-                        frames.last_mut().unwrap().push_node(lit);
+                        frame.push_node(lit);
                         pos += 1;
                     }
                 }
                 b'[' => {
-                    let flags = frames.last().unwrap().flags;
-                    let (node, next) = parse_char_class(pattern, pos, flags);
-                    frames.last_mut().unwrap().push_node(node);
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
+                    let flags = frame.flags;
+                    let (node, next) = parse_char_class(pattern, pos, flags)?;
+                    frame.push_node(node);
                     pos = next;
                 }
                 b'\\' => {
-                    let flags = frames.last().unwrap().flags;
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
+                    let flags = frame.flags;
                     if pos + 1 < len && b[pos + 1] == b'Q' {
                         let start = pos + 2;
                         let end = pattern[start..].find(r"\E").map(|i| start + i);
@@ -2369,7 +2449,7 @@ pub mod prom_regexp {
                             None => (&pattern[start..], len),
                         };
                         if body.is_empty() {
-                            frames.last_mut().unwrap().push_node(SyntaxRegexp::new(SyntaxOp::EmptyMatch, flags));
+                            frame.push_node(SyntaxRegexp::new(SyntaxOp::EmptyMatch, flags));
                         } else {
                             let mut lit = SyntaxRegexp::new(SyntaxOp::Literal, flags);
                             for ch in body.chars() {
@@ -2379,19 +2459,25 @@ pub mod prom_regexp {
                                     ch
                                 });
                             }
-                            frames.last_mut().unwrap().push_node(lit);
+                            frame.push_node(lit);
                         }
                         pos = next;
                     } else {
-                        let (node, next) = parse_escape_node(pattern, pos, flags);
-                        frames.last_mut().unwrap().push_node(node);
+                        let (node, next) = parse_escape_node(pattern, pos, flags)?;
+                        frame.push_node(node);
                         pos = next;
                     }
                 }
                 _ => {
-                    let ch = pattern[pos..].chars().next().unwrap();
+                    let ch = pattern[pos..]
+                        .chars()
+                        .next()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected end of pattern"))?;
                     let clen = ch.len_utf8();
-                    let flags = frames.last().unwrap().flags;
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
+                    let flags = frame.flags;
                     let stored = if (flags & FLAG_FOLD_CASE) != 0 {
                         min_fold_rune(ch)
                     } else {
@@ -2399,16 +2485,23 @@ pub mod prom_regexp {
                     };
                     let mut lit = SyntaxRegexp::new(SyntaxOp::Literal, flags);
                     lit.runes.push(stored);
-                    frames.last_mut().unwrap().push_node(lit);
+                    frame.push_node(lit);
                     pos += clen;
                 }
             }
         }
 
-        let root = frames.pop().unwrap();
+        if frames.len() != 1 {
+            return Err(syntax_err(pattern, "missing closing )"));
+        }
+        let root = frames
+            .pop()
+            .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?;
         Ok(collapse_alternates(root))
     }
 
+    // Mirrors Go syntax.parseRepeat / parseInt: rejects leading zeros so {01},
+    // {00}, {1,02} stay literal '{', and enforces 0..=1000 and max == -1 || min <= max.
     fn parse_repeat_bounds(b: &[u8], pos: usize) -> Option<(i32, i32, usize)> {
         let mut p = pos + 1;
         let min_start = p;
@@ -2418,7 +2511,13 @@ pub mod prom_regexp {
         if p == min_start || p >= b.len() {
             return None;
         }
+        if p - min_start >= 2 && b[min_start] == b'0' {
+            return None;
+        }
         let min: i32 = std::str::from_utf8(&b[min_start..p]).ok()?.parse().ok()?;
+        if !(0..=1000).contains(&min) {
+            return None;
+        }
         if b[p] == b'}' {
             return Some((min, min, p + 1));
         }
@@ -2436,15 +2535,30 @@ pub mod prom_regexp {
         if p == max_start || p >= b.len() || b[p] != b'}' {
             return None;
         }
+        if p - max_start >= 2 && b[max_start] == b'0' {
+            return None;
+        }
         let max: i32 = std::str::from_utf8(&b[max_start..p]).ok()?.parse().ok()?;
+        if !(0..=1000).contains(&max) || min > max {
+            return None;
+        }
         Some((min, max, p + 1))
     }
 
-    fn parse_escape_node(s: &str, pos: usize, flags: u16) -> (SyntaxRegexp, usize) {
+    fn opaque_char_class(flags: u16) -> SyntaxRegexp {
+        let mut cc = SyntaxRegexp::new(SyntaxOp::CharClass, flags);
+        cc.negated = true;
+        cc
+    }
+
+    fn parse_escape_node(s: &str, pos: usize, flags: u16) -> Result<(SyntaxRegexp, usize), MatcherError> {
         let b = s.as_bytes();
-        let next_ch = s[pos + 1..].chars().next().unwrap();
+        let next_ch = s
+            .get(pos + 1..)
+            .and_then(|rest| rest.chars().next())
+            .ok_or_else(|| syntax_err(s, "trailing backslash"))?;
         let next_pos = pos + 1 + next_ch.len_utf8();
-        match next_ch {
+        Ok(match next_ch {
             'A' => (SyntaxRegexp::new(SyntaxOp::BeginText, flags), next_pos),
             'z' => (SyntaxRegexp::new(SyntaxOp::EndText, flags), next_pos),
             'b' => (SyntaxRegexp::new(SyntaxOp::WordBoundary, flags), next_pos),
@@ -2490,15 +2604,22 @@ pub mod prom_regexp {
             'a' => lit_char('\x07', flags, next_pos),
             'x' => {
                 if next_pos < b.len() && b[next_pos] == b'{' {
-                    if let Some(end) = s[next_pos + 1..].find('}') {
-                        let hex = &s[next_pos + 1..next_pos + 1 + end];
-                        let val = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
-                        let ch = char::from_u32(val).unwrap_or('\u{FFFD}');
-                        return lit_char(ch, flags, next_pos + 1 + end + 1);
-                    }
+                    let end = s[next_pos + 1..]
+                        .find('}')
+                        .ok_or_else(|| syntax_err(s, "invalid hex escape"))?;
+                    let hex = &s[next_pos + 1..next_pos + 1 + end];
+                    let val = u32::from_str_radix(hex, 16)
+                        .map_err(|_| syntax_err(s, "invalid hex escape"))?;
+                    let Some(ch) = char::from_u32(val) else {
+                        return Ok((opaque_char_class(flags), next_pos + 1 + end + 1));
+                    };
+                    return Ok(lit_char(ch, flags, next_pos + 1 + end + 1));
                 }
-                let hex = &s[next_pos..next_pos + 2];
-                let val = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
+                let hex = s
+                    .get(next_pos..next_pos + 2)
+                    .ok_or_else(|| syntax_err(s, "invalid hex escape"))?;
+                let val = u32::from_str_radix(hex, 16)
+                    .map_err(|_| syntax_err(s, "invalid hex escape"))?;
                 let ch = char::from_u32(val).unwrap_or('\u{FFFD}');
                 lit_char(ch, flags, next_pos + 2)
             }
@@ -2517,20 +2638,23 @@ pub mod prom_regexp {
                 lit_char(ch, flags, p)
             }
             'p' | 'P' => {
-                let negated = next_ch == 'P';
-                let (name_end, _name) = if next_pos < b.len() && b[next_pos] == b'{' {
-                    let end = s[next_pos + 1..].find('}').map(|i| next_pos + 1 + i + 1).unwrap_or(next_pos + 1);
-                    (end, &s[next_pos + 1..end - 1])
+                let name_end = if next_pos < b.len() && b[next_pos] == b'{' {
+                    let end = s[next_pos + 1..]
+                        .find('}')
+                        .ok_or_else(|| syntax_err(s, "invalid unicode class"))?;
+                    next_pos + 1 + end + 1
                 } else {
-                    (next_pos + 1, &s[next_pos..next_pos + 1])
+                    let ch = s
+                        .get(next_pos..)
+                        .and_then(|rest| rest.chars().next())
+                        .ok_or_else(|| syntax_err(s, "invalid unicode class"))?;
+                    next_pos + ch.len_utf8()
                 };
-                let mut cc = SyntaxRegexp::new(SyntaxOp::CharClass, flags);
-                cc.negated = negated;
-                cc.runes.extend_from_slice(&['\0', char::MAX]);
-                (cc, name_end)
+                // Mark Unicode classes opaque so FastRegexMatcher always delegates to the compiled Regex.
+                (opaque_char_class(flags), name_end)
             }
             c => lit_char(c, flags, next_pos),
-        }
+        })
     }
 
     fn lit_char(ch: char, flags: u16, next: usize) -> (SyntaxRegexp, usize) {
@@ -2543,7 +2667,93 @@ pub mod prom_regexp {
         (lit, next)
     }
 
-    fn parse_char_class(s: &str, start: usize, flags: u16) -> (SyntaxRegexp, usize) {
+    fn push_scalar_range_no_surrogates(out: &mut Vec<(char, char)>, lo: u32, hi: u32) {
+        if lo > hi {
+            return;
+        }
+        if lo <= 0xD7FF {
+            let r_hi = hi.min(0xD7FF);
+            if let (Some(a), Some(b)) = (char::from_u32(lo), char::from_u32(r_hi)) {
+                out.push((a, b));
+            }
+        }
+        if hi >= 0xE000 {
+            let r_lo = lo.max(0xE000);
+            if let (Some(a), Some(b)) = (char::from_u32(r_lo), char::from_u32(hi.min(0x10FFFF))) {
+                out.push((a, b));
+            }
+        }
+    }
+
+    fn complement_ranges(input: &[(char, char)]) -> Vec<(char, char)> {
+        let mut sorted = input.to_vec();
+        sorted.sort();
+        let mut out = Vec::new();
+        let mut cur: u32 = 0;
+        for (lo, hi) in sorted {
+            let lo_u = lo as u32;
+            let hi_u = hi as u32;
+            if lo_u > cur {
+                push_scalar_range_no_surrogates(&mut out, cur, lo_u - 1);
+            }
+            if hi_u >= cur {
+                cur = hi_u.saturating_add(1);
+                if (0xD800..=0xDFFF).contains(&cur) {
+                    cur = 0xE000;
+                }
+            }
+        }
+        if cur <= 0x10FFFF {
+            push_scalar_range_no_surrogates(&mut out, cur, 0x10FFFF);
+        }
+        out
+    }
+
+    fn posix_class_ranges(cname: &str) -> Option<Vec<(char, char)>> {
+        let (negated, base) = match cname.strip_prefix('^') {
+            Some(rest) => (true, rest),
+            None => (false, cname),
+        };
+        let pos: Vec<(char, char)> = match base {
+            "alnum" => vec![('0', '9'), ('A', 'Z'), ('a', 'z')],
+            "alpha" => vec![('A', 'Z'), ('a', 'z')],
+            "ascii" => vec![('\0', '\x7f')],
+            "blank" => vec![('\t', '\t'), (' ', ' ')],
+            "cntrl" => vec![('\0', '\x1f'), ('\x7f', '\x7f')],
+            "digit" => vec![('0', '9')],
+            "graph" => vec![('!', '~')],
+            "lower" => vec![('a', 'z')],
+            "print" => vec![(' ', '~')],
+            "punct" => vec![('!', '/'), (':', '@'), ('[', '`'), ('{', '~')],
+            "space" => vec![('\t', '\r'), (' ', ' ')],
+            "upper" => vec![('A', 'Z')],
+            "word" => vec![('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')],
+            "xdigit" => vec![('0', '9'), ('A', 'F'), ('a', 'f')],
+            _ => return None,
+        };
+        if negated {
+            Some(complement_ranges(&pos))
+        } else {
+            Some(pos)
+        }
+    }
+
+    enum ClassItem {
+        Char {
+            ch: char,
+            is_surrogate_or_invalid: bool,
+            next: usize,
+        },
+        Ranges {
+            ranges: Vec<(char, char)>,
+            next: usize,
+        },
+        Opaque {
+            next: usize,
+        },
+    }
+
+    fn parse_char_class(s: &str, start: usize, flags: u16) -> Result<(SyntaxRegexp, usize), MatcherError> {
         let b = s.as_bytes();
         let mut p = start + 1;
         let mut negated = false;
@@ -2552,59 +2762,92 @@ pub mod prom_regexp {
             p += 1;
         }
         let mut ranges: Vec<(char, char)> = Vec::new();
+        let mut opaque = false;
         let mut first = true;
+        let mut closed = false;
         while p < b.len() {
             if b[p] == b']' && !first {
                 p += 1;
+                closed = true;
                 break;
             }
             first = false;
             if b[p] == b'[' && p + 1 < b.len() && b[p + 1] == b':' {
                 if let Some(end) = s[p + 2..].find(":]") {
                     let cname = &s[p + 2..p + 2 + end];
-                    let cname = cname.strip_prefix('^').unwrap_or(cname);
-                    match cname {
-                        "digit" => ranges.push(('0', '9')),
-                        "alpha" => { ranges.push(('A', 'Z')); ranges.push(('a', 'z')); }
-                        "alnum" => { ranges.push(('0', '9')); ranges.push(('A', 'Z')); ranges.push(('a', 'z')); }
-                        "lower" => ranges.push(('a', 'z')),
-                        "upper" => ranges.push(('A', 'Z')),
-                        "space" => {
-                            ranges.push(('\t', '\r'));
-                            ranges.push((' ', ' '));
-                        }
-                        "ascii" => ranges.push(('\0', '\x7f')),
-                        _ => ranges.push((' ', '~')),
+                    if let Some(posix_ranges) = posix_class_ranges(cname) {
+                        ranges.extend(posix_ranges);
+                    } else {
+                        opaque = true;
                     }
                     p = p + 2 + end + 2;
                     continue;
                 }
             }
-            let (lo, next1, class_ranges) = parse_class_item(s, p);
-            if let Some(cr) = class_ranges {
-                ranges.extend(cr);
-                p = next1;
-                continue;
+            match parse_class_item(s, p)? {
+                ClassItem::Opaque { next } => {
+                    opaque = true;
+                    p = next;
+                }
+                ClassItem::Ranges { ranges: cr, next } => {
+                    ranges.extend(cr);
+                    p = next;
+                }
+                ClassItem::Char {
+                    ch: lo,
+                    is_surrogate_or_invalid: lo_inv,
+                    next: next1,
+                } => {
+                    p = next1;
+                    if p + 1 < b.len() && b[p] == b'-' && b[p + 1] != b']' {
+                        match parse_class_item(s, p + 1)? {
+                            ClassItem::Opaque { next } => {
+                                opaque = true;
+                                p = next;
+                            }
+                            ClassItem::Ranges { next, .. } => {
+                                opaque = true;
+                                p = next;
+                            }
+                            ClassItem::Char {
+                                ch: hi,
+                                is_surrogate_or_invalid: hi_inv,
+                                next: next2,
+                            } => {
+                                p = next2;
+                                if lo_inv || hi_inv || lo > hi {
+                                    opaque = true;
+                                } else {
+                                    ranges.push((lo, hi));
+                                }
+                            }
+                        }
+                    } else if lo_inv {
+                        opaque = true;
+                    } else {
+                        ranges.push((lo, lo));
+                    }
+                }
             }
-            p = next1;
-            if p + 1 < b.len() && b[p] == b'-' && b[p + 1] != b']' {
-                let (hi, next2, _) = parse_class_item(s, p + 1);
-                p = next2;
-                ranges.push((lo, hi));
-            } else {
-                ranges.push((lo, lo));
-            }
+        }
+        if !closed {
+            return Err(syntax_err(s, "missing closing ]"));
+        }
+        if opaque {
+            return Ok((opaque_char_class(flags), p));
         }
         if (flags & FLAG_FOLD_CASE) != 0 {
             let mut folded = Vec::with_capacity(ranges.len() * 2);
             for (lo, hi) in ranges {
                 folded.push((lo, hi));
-                if hi as u32 - lo as u32 <= 256 {
+                if lo <= hi && (hi as u32 - lo as u32) <= 256 {
                     for c in lo..=hi {
                         for fc in simple_fold_all(c) {
                             folded.push((fc, fc));
                         }
                     }
+                } else {
+                    return Ok((opaque_char_class(flags), p));
                 }
             }
             ranges = folded;
@@ -2616,38 +2859,115 @@ pub mod prom_regexp {
                 cc.runes.push(lo);
                 cc.runes.push(hi);
             }
-            return (cc, p);
+            return Ok((cc, p));
         }
-        (clean_ranges_to_syntax(ranges, flags), p)
+        Ok((clean_ranges_to_syntax(ranges, flags), p))
     }
 
-    fn parse_class_item(s: &str, pos: usize) -> (char, usize, Option<Vec<(char, char)>>) {
+    fn parse_class_item(s: &str, pos: usize) -> Result<ClassItem, MatcherError> {
         let b = s.as_bytes();
         if b[pos] == b'\\' {
-            let next_ch = s[pos + 1..].chars().next().unwrap();
+            let next_ch = s
+                .get(pos + 1..)
+                .and_then(|rest| rest.chars().next())
+                .ok_or_else(|| syntax_err(s, "trailing backslash"))?;
             let next_pos = pos + 1 + next_ch.len_utf8();
-            match next_ch {
-                'd' => return ('\0', next_pos, Some(vec![('0', '9')])),
-                's' => return ('\0', next_pos, Some(vec![('\t', '\n'), ('\x0c', '\r'), (' ', ' ')])),
-                'w' => return ('\0', next_pos, Some(vec![('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')])),
-                'D' | 'S' | 'W' => return ('\0', next_pos, Some(vec![('\0', char::MAX)])),
-                'n' => return ('\n', next_pos, None),
-                'r' => return ('\r', next_pos, None),
-                't' => return ('\t', next_pos, None),
-                'f' => return ('\x0c', next_pos, None),
-                'v' => return ('\x0b', next_pos, None),
-                'a' => return ('\x07', next_pos, None),
+            return Ok(match next_ch {
+                'd' => ClassItem::Ranges {
+                    ranges: vec![('0', '9')],
+                    next: next_pos,
+                },
+                's' => ClassItem::Ranges {
+                    ranges: vec![('\t', '\n'), ('\x0c', '\r'), (' ', ' ')],
+                    next: next_pos,
+                },
+                'w' => ClassItem::Ranges {
+                    ranges: vec![('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')],
+                    next: next_pos,
+                },
+                'D' => ClassItem::Ranges {
+                    ranges: complement_ranges(&[('0', '9')]),
+                    next: next_pos,
+                },
+                'S' => ClassItem::Ranges {
+                    ranges: complement_ranges(&[('\t', '\n'), ('\x0c', '\r'), (' ', ' ')]),
+                    next: next_pos,
+                },
+                'W' => ClassItem::Ranges {
+                    ranges: complement_ranges(&[('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')]),
+                    next: next_pos,
+                },
+                'p' | 'P' => {
+                    let name_end = if next_pos < b.len() && b[next_pos] == b'{' {
+                        let end = s[next_pos + 1..]
+                            .find('}')
+                            .ok_or_else(|| syntax_err(s, "invalid unicode class"))?;
+                        next_pos + 1 + end + 1
+                    } else {
+                        let ch = s
+                            .get(next_pos..)
+                            .and_then(|rest| rest.chars().next())
+                            .ok_or_else(|| syntax_err(s, "invalid unicode class"))?;
+                        next_pos + ch.len_utf8()
+                    };
+                    ClassItem::Opaque { next: name_end }
+                }
+                'n' => ClassItem::Char {
+                    ch: '\n',
+                    is_surrogate_or_invalid: false,
+                    next: next_pos,
+                },
+                'r' => ClassItem::Char {
+                    ch: '\r',
+                    is_surrogate_or_invalid: false,
+                    next: next_pos,
+                },
+                't' => ClassItem::Char {
+                    ch: '\t',
+                    is_surrogate_or_invalid: false,
+                    next: next_pos,
+                },
+                'f' => ClassItem::Char {
+                    ch: '\x0c',
+                    is_surrogate_or_invalid: false,
+                    next: next_pos,
+                },
+                'v' => ClassItem::Char {
+                    ch: '\x0b',
+                    is_surrogate_or_invalid: false,
+                    next: next_pos,
+                },
+                'a' => ClassItem::Char {
+                    ch: '\x07',
+                    is_surrogate_or_invalid: false,
+                    next: next_pos,
+                },
                 'x' => {
                     if next_pos < b.len() && b[next_pos] == b'{' {
-                        if let Some(end) = s[next_pos + 1..].find('}') {
-                            let hex = &s[next_pos + 1..next_pos + 1 + end];
-                            let val = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
-                            return (char::from_u32(val).unwrap_or('\u{FFFD}'), next_pos + 1 + end + 1, None);
-                        }
+                        let end = s[next_pos + 1..]
+                            .find('}')
+                            .ok_or_else(|| syntax_err(s, "invalid hex escape"))?;
+                        let hex = &s[next_pos + 1..next_pos + 1 + end];
+                        let val = u32::from_str_radix(hex, 16)
+                            .map_err(|_| syntax_err(s, "invalid hex escape"))?;
+                        let ch = char::from_u32(val);
+                        return Ok(ClassItem::Char {
+                            ch: ch.unwrap_or('\u{FFFD}'),
+                            is_surrogate_or_invalid: ch.is_none(),
+                            next: next_pos + 1 + end + 1,
+                        });
                     }
-                    let hex = &s[next_pos..next_pos + 2];
-                    let val = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
-                    return (char::from_u32(val).unwrap_or('\u{FFFD}'), next_pos + 2, None);
+                    let hex = s
+                        .get(next_pos..next_pos + 2)
+                        .ok_or_else(|| syntax_err(s, "invalid hex escape"))?;
+                    let val = u32::from_str_radix(hex, 16)
+                        .map_err(|_| syntax_err(s, "invalid hex escape"))?;
+                    let ch = char::from_u32(val);
+                    ClassItem::Char {
+                        ch: ch.unwrap_or('\u{FFFD}'),
+                        is_surrogate_or_invalid: ch.is_none(),
+                        next: next_pos + 2,
+                    }
                 }
                 '0'..='7' => {
                     let mut p = pos + 1;
@@ -2660,13 +2980,29 @@ pub mod prom_regexp {
                             break;
                         }
                     }
-                    return (char::from_u32(v).unwrap_or('\u{FFFD}'), p, None);
+                    let ch = char::from_u32(v);
+                    ClassItem::Char {
+                        ch: ch.unwrap_or('\u{FFFD}'),
+                        is_surrogate_or_invalid: ch.is_none(),
+                        next: p,
+                    }
                 }
-                c => return (c, next_pos, None),
-            }
+                c => ClassItem::Char {
+                    ch: c,
+                    is_surrogate_or_invalid: false,
+                    next: next_pos,
+                },
+            });
         }
-        let ch = s[pos..].chars().next().unwrap();
-        (ch, pos + ch.len_utf8(), None)
+        let ch = s
+            .get(pos..)
+            .and_then(|rest| rest.chars().next())
+            .ok_or_else(|| syntax_err(s, "unexpected end of character class"))?;
+        Ok(ClassItem::Char {
+            ch,
+            is_surrogate_or_invalid: false,
+            next: pos + ch.len_utf8(),
+        })
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3360,6 +3696,9 @@ pub mod prom_regexp {
                 }
                 let mut total = 0usize;
                 for pair in re.runes.as_chunks::<2>().0 {
+                    if pair[1] < pair[0] {
+                        return (None, false);
+                    }
                     total = total.saturating_add((pair[1] as u32 - pair[0] as u32 + 1) as usize);
                 }
                 if total > MAX_SET_MATCHES {
@@ -3768,12 +4107,12 @@ pub mod prom_regexp {
     impl FastRegexMatcher {
         pub fn new(v: &str) -> Result<Self, MatcherError> {
             let cache = global_cache();
-            if let Some(hit) = cache.lock().unwrap().get(v) {
+            if let Some(hit) = cache.lock().get(v) {
                 return Ok(hit);
             }
             let matcher = Self::new_without_cache(v)?;
             let cost = matcher.estimated_size_bytes();
-            cache.lock().unwrap().set(v.to_string(), matcher.clone(), cost);
+            cache.lock().set(v.to_string(), matcher.clone(), cost);
             Ok(matcher)
         }
 

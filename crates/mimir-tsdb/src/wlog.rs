@@ -1324,6 +1324,11 @@ impl<R: Read + SegmentTracker> WlogReader<R> {
             if length > PAGE_SIZE - RECORD_HEADER_SIZE {
                 return Err(self.make_corruption(format!("invalid record size {length}")));
             }
+            if self.precompr_buf.len().saturating_add(length) > MAX_WAL_RECORD_DECOMPRESSED_BYTES {
+                return Err(self.make_corruption(format!(
+                    "WAL record exceeds maximum allowed size {MAX_WAL_RECORD_DECOMPRESSED_BYTES}"
+                )));
+            }
 
             let payload = &mut self.page_buf[..length];
             if let Err(e) = self.rdr.read_exact(payload) {
