@@ -8,6 +8,7 @@ pub mod client;
 pub mod gofmt;
 pub mod gometrics;
 pub mod http_status;
+pub mod kv_init_service;
 pub mod lzw;
 pub mod mergeable;
 mod metrics;
@@ -18,9 +19,9 @@ mod stream;
 pub mod suspicion;
 pub mod tcp_transport;
 pub mod wire;
-mod zone_aware;
+pub mod zone_aware;
 
-pub use client::{KvOptions, MemberlistKv, MemberlistKvClient, NodeState, ValueDesc};
+pub use client::{KvOptions, MemberlistKv, MemberlistKvClient, NodeState, RingBroadcast, ValueDesc};
 pub use mergeable::Mergeable;
 pub use node_meta::{encode_node_metadata, EncodedNodeMetadata, NodeRole};
 pub use propagation_tracker::{

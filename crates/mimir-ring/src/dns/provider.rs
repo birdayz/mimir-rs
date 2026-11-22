@@ -13,8 +13,8 @@ use prometheus::proto::{Gauge, LabelPair, Metric, MetricFamily, MetricType};
 use prometheus::{Counter, Opts, Registry};
 
 use super::error::DnsError;
-use super::godns;
-use super::resolver::{DnsSd, QType, Resolver};
+use super::resolver::{DnsSd, IpLookupResolver, QType, Resolver};
+use super::{godns, miekgdns};
 
 /// Go `dns.ResolverType` (a plain string type; the zero value is `""`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
@@ -135,8 +135,7 @@ impl Provider {
     /// `component="memberlist"`). As with Go `MustRegister`, registration
     /// conflicts are fatal (returned as an error here).
     ///
-    /// `miekgdns` is not ported and returns an explicit error; any other
-    /// unknown type falls back to the Go resolver with a warning, like dskit.
+    /// Any unknown resolver type falls back to the Go resolver with a warning, like dskit.
     pub fn new(
         resolver_type: &ResolverType,
         max_idle_connections: u32,
@@ -144,13 +143,15 @@ impl Provider {
         metric_prefix: &str,
         const_labels: HashMap<String, String>,
     ) -> Result<Self, DnsError> {
-        let _ = max_idle_connections; // only used by the miekgdns resolver.
-        let backend: Arc<godns::Resolver> = match resolver_type.as_str() {
+        let backend: Arc<dyn IpLookupResolver> = match resolver_type.as_str() {
             "golang" => Arc::new(godns::Resolver::new()),
             "miekgdns" => {
-                return Err(DnsError::Other(
-                    "dns resolver type \"miekgdns\" is not implemented in mimir-rs (only \"golang\" is supported)".to_string(),
-                ))
+                let r = Arc::new(miekgdns::Resolver::new(
+                    miekgdns::DEFAULT_RESOLV_CONF_PATH,
+                    max_idle_connections as usize,
+                ));
+                r.start_reload_loop(miekgdns::DEFAULT_RESOLV_CONF_RELOAD);
+                r
             }
             other => {
                 tracing::warn!(r#type = %other, "no such resolver type, defaulting to golang");

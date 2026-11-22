@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
+use super::etcd_mock::{CmpOp, CmpTarget, MockCmp, MockEtcdKv, MockEventType, MockOp};
 use super::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError};
 
 /// reqwest's error text plus its source chain (the TLS / connect cause is only in the sources).
@@ -246,6 +247,7 @@ pub struct EtcdKv {
     codec: Arc<dyn Codec>,
     auth_state: RwLock<AuthState>,
     next_endpoint: AtomicUsize,
+    mock: Option<Arc<MockEtcdKv>>,
 }
 
 impl EtcdKv {
@@ -304,7 +306,23 @@ impl EtcdKv {
             codec,
             auth_state: RwLock::new(AuthState::Unknown),
             next_endpoint: AtomicUsize::new(0),
+            mock: None,
         })
+    }
+
+    /// Port of `dskit/kv/etcd.NewInMemoryClient`: returns an `EtcdKv` backed by `MockEtcdKv`.
+    pub fn new_in_memory_client(codec: Arc<dyn Codec>) -> (Self, Arc<MockEtcdKv>) {
+        let mock = MockEtcdKv::new();
+        let client = Self {
+            http: reqwest::Client::new(),
+            endpoints: Vec::new(),
+            cfg: EtcdConfig::default(),
+            codec,
+            auth_state: RwLock::new(AuthState::NotEnabled),
+            next_endpoint: AtomicUsize::new(0),
+            mock: Some(Arc::clone(&mock)),
+        };
+        (client, mock)
     }
 
     fn endpoint(&self, idx: usize) -> &str {
@@ -559,6 +577,16 @@ impl EtcdKv {
 impl KvClient for EtcdKv {
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
         Box::pin(async move {
+            if let Some(mock) = &self.mock {
+                let resp = mock.get(prefix, true);
+                let mut keys = Vec::with_capacity(resp.kvs.len());
+                for kv in resp.kvs {
+                    let s = String::from_utf8(kv.key)
+                        .map_err(|e| KvError::Codec(format!("etcd key utf8: {e}")))?;
+                    keys.push(s);
+                }
+                return Ok(keys);
+            }
             let (key, range_end) = prefix_range(prefix);
             let req = RangeRequest {
                 key: b64_encode(&key),
@@ -582,6 +610,19 @@ impl KvClient for EtcdKv {
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Any + Send + Sync>>, KvError>> {
         Box::pin(async move {
+            if let Some(mock) = &self.mock {
+                let resp = mock.get(key, false);
+                if resp.kvs.is_empty() {
+                    return Ok(None);
+                }
+                if resp.kvs.len() != 1 {
+                    return Err(KvError::Other(format!(
+                        "got {} kvs, expected 1 or 0",
+                        resp.kvs.len()
+                    )));
+                }
+                return Ok(Some(self.codec.decode(&resp.kvs[0].value)?));
+            }
             let req = RangeRequest {
                 key: b64_encode(key.as_bytes()),
                 range_end: None,
@@ -607,6 +648,10 @@ impl KvClient for EtcdKv {
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
+            if let Some(mock) = &self.mock {
+                let _ = mock.delete(key, false);
+                return Ok(());
+            }
             let req = DeleteRangeRequest {
                 key: b64_encode(key.as_bytes()),
             };
@@ -617,6 +662,67 @@ impl KvClient for EtcdKv {
 
     fn cas<'a>(&'a self, key: &'a str, mut f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
+            if let Some(mock) = &self.mock {
+                let max_retries = self.cfg.max_retries.max(0) as usize;
+                let mut last_err: Option<KvError> = None;
+                for _ in 0..max_retries {
+                    let resp = mock.get(key, false);
+                    let mut revision = 0i64;
+                    let decoded = if let Some(first) = resp.kvs.first() {
+                        revision = first.version;
+                        match self.codec.decode(&first.value) {
+                            Ok(d) => Some(d),
+                            Err(e) => {
+                                last_err = Some(e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let outcome = match f(decoded.as_deref()) {
+                        Ok(o) => o,
+                        Err(cb_err) => {
+                            if !cb_err.retry {
+                                return Err(cb_err.err);
+                            }
+                            last_err = Some(cb_err.err);
+                            continue;
+                        }
+                    };
+                    let new_val = match outcome {
+                        CasOutcome::NoChange => return Ok(()),
+                        CasOutcome::Update(v) | CasOutcome::UpdateOnce(v) => v,
+                    };
+                    let encoded = match self.codec.encode(new_val.as_ref()) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            last_err = Some(e);
+                            continue;
+                        }
+                    };
+                    let txn_resp = mock.txn(
+                        &[MockCmp {
+                            key: key.to_string(),
+                            op: CmpOp::Equal,
+                            target: CmpTarget::Version(revision),
+                        }],
+                        &[MockOp::Put {
+                            key: key.to_string(),
+                            value: encoded,
+                        }],
+                        &[],
+                    );
+                    if !txn_resp.succeeded {
+                        continue;
+                    }
+                    return Ok(());
+                }
+                return Err(last_err.unwrap_or_else(|| KvError::CasFailed {
+                    key: key.to_string(),
+                    reason: "failed to CAS".to_string(),
+                }));
+            }
             let max_retries = self.cfg.max_retries.max(0) as usize;
             let mut last_err: Option<KvError> = None;
             let key_b64 = b64_encode(key.as_bytes());
@@ -728,6 +834,22 @@ impl KvClient for EtcdKv {
         mut f: Box<dyn FnMut(Box<dyn Any + Send + Sync>) -> bool + Send>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(mock) = &self.mock {
+                let mut rx = mock.watch(cancel.clone(), key, false);
+                while let Some(resp) = rx.recv().await {
+                    if resp.canceled {
+                        break;
+                    }
+                    for ev in resp.events {
+                        if let Ok(out) = self.codec.decode(&ev.kv.value) {
+                            if !f(out) {
+                                return;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             self.watch_impl(
                 key,
                 key.as_bytes(),
@@ -747,6 +869,26 @@ impl KvClient for EtcdKv {
         mut f: Box<dyn FnMut(&str, Box<dyn Any + Send + Sync>) -> bool + Send>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(mock) = &self.mock {
+                let mut rx = mock.watch(cancel.clone(), prefix, true);
+                while let Some(resp) = rx.recv().await {
+                    if resp.canceled {
+                        break;
+                    }
+                    for ev in resp.events {
+                        if ev.event_type == MockEventType::Delete {
+                            continue;
+                        }
+                        if let Ok(out) = self.codec.decode(&ev.kv.value) {
+                            let k = String::from_utf8_lossy(&ev.kv.key);
+                            if !f(&k, out) {
+                                return;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             let (req_key, range_end) = prefix_range(prefix);
             self.watch_impl(
                 prefix,

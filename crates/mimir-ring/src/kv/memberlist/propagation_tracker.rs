@@ -5,7 +5,7 @@
 //! - github.com/grafana/dskit/kv/memberlist/propagation_tracker_model.go
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -61,7 +61,7 @@ fn unix_millis_before(ts_millis: i64, limit: SystemTime) -> bool {
     }
 }
 
-pub(crate) fn merge_propagation_tracker_with_time(
+pub fn merge_propagation_tracker_with_time(
     dst: &mut PropagationDelayTrackerDesc,
     other: &PropagationDelayTrackerDesc,
     local_cas: bool,
@@ -211,12 +211,22 @@ impl Mergeable for PropagationDelayTrackerDesc {
     }
 }
 
-pub(crate) struct PropagationDelayTracker {
+pub fn get_or_create_propagation_delay_tracker_desc(
+    in_val: Option<&(dyn Any + Send + Sync)>,
+) -> PropagationDelayTrackerDesc {
+    match in_val.and_then(|v| v.downcast_ref::<PropagationDelayTrackerDesc>()) {
+        Some(d) => d.clone(),
+        None => PropagationDelayTrackerDesc::default(),
+    }
+}
+
+pub struct PropagationDelayTracker {
     cfg: PropagationDelayTrackerConfig,
     node_name: String,
     kv: Weak<MemberlistKv>,
     codec: Arc<dyn Codec>,
-    seen_beacons: RwLock<HashSet<u64>>,
+    /// Maps beacon_id -> whether this beacon has been observed in a watch snapshot.
+    seen_beacons: RwLock<HashMap<u64, bool>>,
     pending_beacon_id: AtomicU64,
     startup_time_ms: AtomicI64,
     propagation_delay: SingleHistogram,
@@ -263,7 +273,7 @@ impl PropagationDelayTracker {
             node_name,
             kv,
             codec: propagation_delay_tracker_codec(),
-            seen_beacons: RwLock::new(HashSet::new()),
+            seen_beacons: RwLock::new(HashMap::new()),
             pending_beacon_id: AtomicU64::new(0),
             startup_time_ms: AtomicI64::new(0),
             propagation_delay,
@@ -323,14 +333,15 @@ impl PropagationDelayTracker {
         });
 
         let initial_nanos = rand::thread_rng().gen_range(1..=(beacon_interval.as_nanos().max(1) as u64));
-        let mut next_tick = tokio::time::Instant::now() + Duration::from_nanos(initial_nanos);
+        let start_at = tokio::time::Instant::now() + Duration::from_nanos(initial_nanos);
+        let mut ticker = tokio::time::interval_at(start_at, beacon_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 biased;
                 _ = ctx.canceled() => break,
-                _ = tokio::time::sleep_until(next_tick) => {
-                    next_tick = tokio::time::Instant::now() + beacon_interval;
+                _ = ticker.tick() => {
                     tokio::select! {
                         biased;
                         _ = ctx.canceled() => break,
@@ -400,18 +411,22 @@ impl PropagationDelayTracker {
         }
     }
 
-    fn already_seen(&self, beacon_id: u64) -> bool {
-        self.seen_beacons.read().contains(&beacon_id)
+    pub fn already_seen(&self, beacon_id: u64) -> bool {
+        self.seen_beacons.read().contains_key(&beacon_id)
     }
 
-    fn mark_as_seen(&self, beacon_id: u64) {
-        self.seen_beacons.write().insert(beacon_id);
+    fn mark_as_seen(&self, beacon_id: u64, observed_in_kv: bool) {
+        self.seen_beacons
+            .write()
+            .entry(beacon_id)
+            .and_modify(|seen| *seen |= observed_in_kv)
+            .or_insert(observed_in_kv);
     }
 
     fn cleanup_seen_beacons(&self, desc: &PropagationDelayTrackerDesc) {
         let pending_id = self.pending_beacon_id.load(Ordering::Acquire);
-        self.seen_beacons.write().retain(|id| {
-            if *id == pending_id {
+        self.seen_beacons.write().retain(|id, observed_in_kv| {
+            if *id == pending_id || !*observed_in_kv {
                 return true;
             }
             desc.beacons.get(id).is_some_and(|b| b.deleted_at == 0)
@@ -433,9 +448,10 @@ impl PropagationDelayTracker {
                 continue;
             }
             if self.already_seen(beacon_id) {
+                self.mark_as_seen(beacon_id, true);
                 continue;
             }
-            self.mark_as_seen(beacon_id);
+            self.mark_as_seen(beacon_id, true);
 
             if beacon.published_at < startup_ms {
                 continue;
@@ -541,7 +557,7 @@ impl PropagationDelayTracker {
 
         self.pending_beacon_id.store(beacon_id, Ordering::Release);
         let _pending_guard = PendingBeaconGuard(&self.pending_beacon_id);
-        self.mark_as_seen(beacon_id);
+        self.mark_as_seen(beacon_id, false);
 
         let res = client
             .cas(
@@ -569,6 +585,7 @@ impl PropagationDelayTracker {
 
         drop(_pending_guard);
         if let Err(err) = res {
+            self.seen_beacons.write().remove(&beacon_id);
             warn!(component = COMPONENT, %err, "failed to publish beacon");
             return;
         }

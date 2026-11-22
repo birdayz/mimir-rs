@@ -7,11 +7,10 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use mimir_common::services::ServiceContext;
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use super::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError};
 
@@ -23,7 +22,7 @@ struct KvEntry {
 
 pub struct InMemoryStore {
     inner: Mutex<InMemoryState>,
-    notify: Notify,
+    notify: watch::Sender<u64>,
 }
 
 struct InMemoryState {
@@ -45,8 +44,12 @@ impl InMemoryStore {
                 // Start from 1 to match Consul/dskit mock.go semantics.
                 current: 1,
             }),
-            notify: Notify::new(),
+            notify: watch::channel(0u64).0,
         }
+    }
+
+    fn bump_notify(&self) {
+        self.notify.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     pub fn put_raw(&self, key: &str, value: Vec<u8>) {
@@ -70,7 +73,7 @@ impl InMemoryStore {
                 }
             }
         }
-        self.notify.notify_waiters();
+        self.bump_notify();
     }
 }
 
@@ -171,7 +174,7 @@ impl KvClient for InMemoryKv {
                 r
             };
             if removed {
-                self.store.notify.notify_waiters();
+                self.store.bump_notify();
             }
             Ok(())
         })
@@ -237,7 +240,7 @@ impl KvClient for InMemoryKv {
                 };
 
                 if swapped {
-                    self.store.notify.notify_waiters();
+                    self.store.bump_notify();
                     return Ok(());
                 }
             }
@@ -256,12 +259,13 @@ impl KvClient for InMemoryKv {
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let mut last_index = 0u64;
+            let mut rx = self.store.notify.subscribe();
             loop {
                 if cancel.is_canceled() {
                     return;
                 }
 
-                let notified = self.store.notify.notified();
+                let _ = rx.borrow_and_update();
                 let snapshot = {
                     let st = self.store.inner.lock();
                     st.kvps
@@ -283,8 +287,11 @@ impl KvClient for InMemoryKv {
 
                 tokio::select! {
                     _ = cancel.canceled() => return,
-                    _ = notified => {}
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    res = rx.changed() => {
+                        if res.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         })
@@ -298,12 +305,13 @@ impl KvClient for InMemoryKv {
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let mut last_seen: HashMap<String, u64> = HashMap::new();
+            let mut rx = self.store.notify.subscribe();
             loop {
                 if cancel.is_canceled() {
                     return;
                 }
 
-                let notified = self.store.notify.notified();
+                let _ = rx.borrow_and_update();
                 let changed: Vec<(String, u64, Vec<u8>)> = {
                     let st = self.store.inner.lock();
                     let mut out = Vec::new();
@@ -332,8 +340,11 @@ impl KvClient for InMemoryKv {
 
                 tokio::select! {
                     _ = cancel.canceled() => return,
-                    _ = notified => {}
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    res = rx.changed() => {
+                        if res.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         })

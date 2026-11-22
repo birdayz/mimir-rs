@@ -278,6 +278,11 @@ pub fn shuffle_shard_expected_instances_per_zone(shard_size: usize, num_zones: u
     (shard_size as f64 / num_zones as f64).ceil() as usize
 }
 
+/// Safe Rust equivalent of `github.com/grafana/dskit/ring/shard.yoloBuf`.
+pub fn yolo_buf(s: &str) -> &[u8] {
+    s.as_bytes()
+}
+
 /// Exact port of `github.com/grafana/dskit/ring/shard.ShuffleShardExpectedInstances`.
 pub fn shuffle_shard_expected_instances(shard_size: usize, num_zones: usize) -> usize {
     shuffle_shard_expected_instances_per_zone(shard_size, num_zones).saturating_mul(num_zones)
