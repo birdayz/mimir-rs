@@ -96,6 +96,8 @@ pub struct TsdbOptions {
     /// Optional shared `PostingsForMatchersCache` across all tenant Blocks when
     /// `shared_postings_for_matchers_cache: true`.
     pub shared_block_postings_cache: Option<Arc<PostingsForMatchersCache>>,
+    /// Go `Options.CompactionDelay` (delays auto-compaction of Head after becoming compactable).
+    pub compaction_delay: Duration,
 }
 
 impl std::fmt::Debug for TsdbOptions {
@@ -137,6 +139,7 @@ impl Default for TsdbOptions {
             enable_bigger_ooo_block_for_old_samples: false,
             block_postings_cache: PostingsForMatchersCacheConfig::default(),
             shared_block_postings_cache: None,
+            compaction_delay: Duration::ZERO,
         }
     }
 }
@@ -415,6 +418,8 @@ struct TsdbInner {
     closed: AtomicBool,
     compact_mtx: Mutex<()>,
     compact_pending: AtomicBool,
+    auto_compactions_enabled: AtomicBool,
+    time_when_compaction_delay_started: Mutex<Option<Instant>>,
     bg_stop: Arc<(Mutex<bool>, Condvar)>,
     block_ranges_ms: RwLock<Vec<i64>>,
     enable_overlapping_compaction: AtomicBool,
@@ -430,6 +435,46 @@ impl CompactNotifier for TsdbInner {
             let _guard = self.bg_stop.0.lock();
             self.bg_stop.1.notify_all();
         }
+    }
+}
+
+/// Queryable restricted to single-source non-OOO native readers (`tsdb.costSamplingQueryable`).
+pub struct CostSamplingQueryable<'a> {
+    db: &'a Tsdb,
+}
+
+impl<'a> CostSamplingQueryable<'a> {
+    fn check_layout(&self, mint: i64, maxt: i64) -> Result<(), crate::querier::QuerierError> {
+        let snap = self.db.try_snapshot_query_sources(mint, maxt)?;
+        let head_has_in_order = snap.head.as_ref().is_some_and(|_| {
+            self.db.head().initialized()
+                && self.db.head().min_time() <= maxt
+                && mint <= self.db.head().max_time()
+        });
+        let head_has_ooo = snap.head.as_ref().is_some_and(|_| {
+            let mo = self.db.head().min_ooo_time();
+            let xo = self.db.head().max_ooo_time();
+            mo != i64::MAX && mo <= maxt && mint <= xo
+        });
+        if head_has_ooo {
+            return Err(crate::querier::QuerierError::CostSamplingUnsupported);
+        }
+        let head_sources = usize::from(head_has_in_order);
+        let total_sources = snap.blocks.len() + head_sources;
+        if total_sources > 1 {
+            return Err(crate::querier::QuerierError::CostSamplingUnsupported);
+        }
+        Ok(())
+    }
+
+    pub fn querier(&self, mint: i64, maxt: i64) -> Result<TsdbQuerier<'a>, crate::querier::QuerierError> {
+        self.check_layout(mint, maxt)?;
+        Ok(self.db.querier(mint, maxt))
+    }
+
+    pub fn chunk_querier(&self, mint: i64, maxt: i64) -> Result<TsdbChunkQuerier<'a>, crate::querier::QuerierError> {
+        self.check_layout(mint, maxt)?;
+        Ok(self.db.chunk_querier(mint, maxt))
     }
 }
 
@@ -496,6 +541,9 @@ impl Tsdb {
         metrics
             .retention_limit_seconds
             .set((opts.retention_duration_ms.max(0) as f64) / 1000.0);
+
+        // Go `DB.Open` -> `repairBadIndexVersion` (Prometheus 2.1 index/meta version fix).
+        crate::block::repair_bad_index_version(&dir)?;
 
         // Go `DB.Open` -> `db.reload()` -> `reloadBlocks()` (before the head is replayed).
         let blocks_vec = {
@@ -566,6 +614,8 @@ impl Tsdb {
             closed: AtomicBool::new(false),
             compact_mtx: Mutex::new(()),
             compact_pending: AtomicBool::new(false),
+            auto_compactions_enabled: AtomicBool::new(false),
+            time_when_compaction_delay_started: Mutex::new(None),
             bg_stop: Arc::clone(&bg_stop),
             block_ranges_ms: RwLock::new(initial_ranges),
             enable_overlapping_compaction: AtomicBool::new(false),
@@ -585,7 +635,11 @@ impl Tsdb {
                         if inner_bg.compact_pending.swap(false, Ordering::AcqRel) {
                             drop(stopped);
                             inner_bg.metrics.compactions_triggered.inc();
-                            inner_bg.metrics.compactions_skipped.inc();
+                            if !inner_bg.auto_compactions_enabled.load(Ordering::Acquire) {
+                                inner_bg.metrics.compactions_skipped.inc();
+                            } else {
+                                let _ = inner_bg.auto_compact_step();
+                            }
                             if Instant::now() < next_tick {
                                 stopped = stop_bg.0.lock();
                                 continue;
@@ -676,6 +730,35 @@ impl Tsdb {
             .head
             .appender_with_capacity(series_hint)
             .with_compact_notifier(&*self.inner)
+    }
+
+    /// Enables background auto-compactions (`DB.EnableCompactions`).
+    pub fn enable_compactions(&self) {
+        self.inner
+            .auto_compactions_enabled
+            .store(true, Ordering::Release);
+    }
+
+    /// Disables background auto-compactions (`DB.DisableCompactions`).
+    pub fn disable_compactions(&self) {
+        self.inner
+            .auto_compactions_enabled
+            .store(false, Ordering::Release);
+    }
+
+    /// Synchronously executes one auto-compaction trigger step (respecting `compaction_delay`).
+    pub fn trigger_auto_compaction(&self) -> Result<Vec<Ulid>, TsdbError> {
+        self.inner.metrics.compactions_triggered.inc();
+        if !self.inner.auto_compactions_enabled.load(Ordering::Acquire) {
+            self.inner.metrics.compactions_skipped.inc();
+            return Ok(Vec::new());
+        }
+        self.inner.auto_compact_step()
+    }
+
+    /// Returns the timestamp when `compaction_delay` started, if currently waiting.
+    pub fn compaction_delay_started(&self) -> Option<Instant> {
+        *self.inner.time_when_compaction_delay_started.lock()
     }
 
     /// Go `DB.Compact`: compacts every ready `chunk_range` window of the Head into blocks,
@@ -865,6 +948,23 @@ impl Tsdb {
             maxt,
         )
         .with_last_garbage_collected_mmap_ref(&self.inner.last_garbage_collected_mmap_ref)
+    }
+
+    /// Deletes samples in `[mint, maxt]` matching `matchers` from Head and overlapping Blocks (`DB.Delete`).
+    pub fn delete(&self, mint: i64, maxt: i64, matchers: &[LabelMatcher]) -> Result<(), TsdbError> {
+        self.inner.head.delete(mint, maxt, matchers)?;
+        let blocks = self.inner.blocks.read().clone();
+        for b in blocks {
+            if b.overlaps_closed_interval(mint, maxt) {
+                b.delete(mint, maxt, matchers)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a cost-sampling queryable restricted to single-source non-OOO layouts (`DB.CostSamplingQueryable`).
+    pub fn cost_sampling_queryable(&self) -> (CostSamplingQueryable<'_>, bool) {
+        (CostSamplingQueryable { db: self }, true)
     }
 
     /// Returns the Head's [`CircularExemplarStorage`].
@@ -1274,6 +1374,18 @@ impl TsdbInner {
         ids
     }
 
+    fn waiting_for_compaction_delay(&self) -> bool {
+        if self.opts.compaction_delay.is_zero() {
+            return false;
+        }
+        let guard = self.time_when_compaction_delay_started.lock();
+        guard.is_some_and(|t0| t0.elapsed() < self.opts.compaction_delay)
+    }
+
+    fn auto_compact_step(&self) -> Result<Vec<Ulid>, TsdbError> {
+        self.compact()
+    }
+
     /// Go `DB.Compact`: compacts every ready `chunk_range` window of the Head into blocks,
     /// truncates the WAL (also when a later step fails, via the deferred truncation), then
     /// compacts the OOO head. Errors count `prometheus_tsdb_compactions_failed_total`.
@@ -1286,9 +1398,21 @@ impl TsdbInner {
         let mut last_block_maxt = i64::MIN;
 
         let res = (|| -> Result<(), TsdbError> {
-            while self.head.compactable() {
+            loop {
                 if self.closed.load(Ordering::Acquire) {
                     break;
+                }
+                if !self.head.compactable() {
+                    *self.time_when_compaction_delay_started.lock() = None;
+                    break;
+                }
+                if !self.opts.compaction_delay.is_zero() {
+                    let mut started = self.time_when_compaction_delay_started.lock();
+                    let t0 = *started.get_or_insert_with(Instant::now);
+                    if t0.elapsed() < self.opts.compaction_delay {
+                        break;
+                    }
+                    *started = None;
                 }
                 let mint = self.head.min_time();
                 let maxt = range_for_timestamp(mint, self.head.options().chunk_range_ms);
@@ -1629,7 +1753,9 @@ impl TsdbInner {
         let ranges = self.block_ranges_ms.read().clone();
         let enable_overlapping = self.enable_overlapping_compaction.load(Ordering::Acquire);
         loop {
-            if self.closed.load(Ordering::Acquire) || self.head.compactable() {
+            if self.closed.load(Ordering::Acquire)
+                || (self.head.compactable() && !self.waiting_for_compaction_delay())
+            {
                 return Ok(());
             }
             let Some(plan_dirs) = plan_block_compactions(&self.dir, &ranges, enable_overlapping)? else {

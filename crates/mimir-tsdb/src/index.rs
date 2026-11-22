@@ -977,6 +977,25 @@ impl IndexReader {
             .collect()
     }
 
+    /// Like `label_values`, supporting `limit` and `limit_smallest` (matching Go `index.Reader.LabelValues`).
+    pub fn label_values_with_hints(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+        limit_smallest: bool,
+    ) -> Result<Vec<String>, IndexError> {
+        let mut vals = self.label_values(name)?;
+        if self.version == INDEX_FORMAT_V1 && limit_smallest {
+            vals.sort_unstable();
+        }
+        if let Some(lim) = limit {
+            if lim > 0 && vals.len() > lim {
+                vals.truncate(lim);
+            }
+        }
+        Ok(vals)
+    }
+
     /// Returns all sorted label values for `name`.
     pub fn label_values(&self, name: &str) -> Result<Vec<String>, IndexError> {
         if self.version == INDEX_FORMAT_V1 {
@@ -1874,10 +1893,25 @@ impl LookupPlan for ConcreteLookupPlan {
     }
 }
 
+/// Trait for index lookup planners (`index.LookupPlanner` in `tsdb/index/lookup.go`).
+pub trait IndexLookupPlanner: Send + Sync {
+    fn plan_index_lookup(&self, plan: &dyn LookupPlan) -> Result<ConcreteLookupPlan, IndexError>;
+}
+
 /// Defers empty/non-selective matchers (`l=""`, `l=~".+"`) to scan matchers,
 /// matching `index.ScanEmptyMatchersLookupPlanner` in `tsdb/index/lookup.go`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanEmptyMatchersLookupPlanner;
+
+impl IndexLookupPlanner for ScanEmptyMatchersLookupPlanner {
+    fn plan_index_lookup(&self, plan: &dyn LookupPlan) -> Result<ConcreteLookupPlan, IndexError> {
+        let planned = ScanEmptyMatchersLookupPlanner::plan_index_lookup(self, plan);
+        Ok(ConcreteLookupPlan {
+            index_matchers: planned.index_matchers().to_vec(),
+            scan_matchers: planned.scan_matchers().to_vec(),
+        })
+    }
+}
 
 impl ScanEmptyMatchersLookupPlanner {
     fn should_drop_matcher(matcher: &LabelMatcher) -> bool {

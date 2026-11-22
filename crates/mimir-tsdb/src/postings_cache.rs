@@ -334,7 +334,7 @@ struct CacheInner {
 const METRIC_VERSION_PAGE_BITS: usize = 13;
 const METRIC_VERSION_PAGE_SLOTS: usize = 1 << METRIC_VERSION_PAGE_BITS; // 8192 * 8 B = 64 KiB
 
-struct PagedMetricVersions {
+pub struct PagedMetricVersions {
     slots_mask: usize,
     page_len: usize,
     pages: Box<[AtomicPtr<AtomicU64>]>,
@@ -364,7 +364,7 @@ impl Drop for PagedMetricVersions {
 }
 
 impl PagedMetricVersions {
-    fn new(num_metric_versions: usize) -> Self {
+    pub fn new(num_metric_versions: usize) -> Self {
         let slots = num_metric_versions.max(64).next_power_of_two();
         let page_len = slots.min(METRIC_VERSION_PAGE_SLOTS);
         let num_pages = slots.div_ceil(page_len);
@@ -401,7 +401,7 @@ impl PagedMetricVersions {
     }
 
     #[inline]
-    fn load(&self, source_id: u64, metric_name: &str) -> u64 {
+    pub fn load(&self, source_id: u64, metric_name: &str) -> u64 {
         let (page_idx, off) = self.slot_coords(source_id, metric_name);
         let ptr = self.pages[page_idx].load(Ordering::Acquire);
         if ptr.is_null() {
@@ -413,7 +413,7 @@ impl PagedMetricVersions {
     }
 
     #[inline]
-    fn fetch_add(&self, source_id: u64, metric_name: &str) {
+    pub fn fetch_add(&self, source_id: u64, metric_name: &str) {
         let (page_idx, off) = self.slot_coords(source_id, metric_name);
         let ptr = self.get_or_alloc_page(page_idx);
         // SAFETY: `ptr` is non-null and points to `page_len` `AtomicU64` elements where
@@ -989,6 +989,26 @@ impl PostingsForMatchersCache {
 /// Returns the value of the first `__name__=...` equality matcher (even if empty or followed by
 /// another `__name__=` matcher), matching Go `metricNameFromMatchers`.
 #[inline]
+/// Formats the canonical shared cache key string matching Go `sharedCacheKey`.
+pub fn shared_cache_key_string(
+    version: u64,
+    user: &str,
+    block_ulid: &str,
+    matchers: &[LabelMatcher],
+) -> String {
+    let mut parts: Vec<String> = matchers
+        .iter()
+        .map(|m| format!("{}{}{}", m.name, m.match_type.as_str(), m.value))
+        .collect();
+    parts.sort();
+    let mut out = format!("{version}\0{user}\0{block_ulid}");
+    for p in parts {
+        out.push('\0');
+        out.push_str(&p);
+    }
+    out
+}
+
 pub fn exact_metric_name_from_matchers(matchers: &[LabelMatcher]) -> Option<&str> {
     matchers
         .iter()
