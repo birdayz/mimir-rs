@@ -188,7 +188,10 @@ pub(crate) fn snapshot_head_query_source(
                     return None;
                 }
             }
-            let overlaps_in_order = ino_mint <= maxt && ino_mint <= head_max_time;
+            // Match Go `headIndexReader.LabelValues`/`LabelNames` (`head_read.go:89,103`):
+            // `!(h.maxt < h.head.MinTime() || h.mint > h.head.MaxTime())`, allowing inverted
+            // ranges (`mint > maxt`) that still overlap `[head_min_time, head_max_time]`.
+            let overlaps_in_order = head.min_time() <= maxt && ino_mint <= head.max_time();
             if !overlaps_in_order {
                 drop(guard);
                 return None;
@@ -233,8 +236,12 @@ pub(crate) fn snapshot_head_query_source(
                     }
                 }
             }
+            // Match Go `DB.Querier`/`DB.ChunkQuerier` (`db.go:2868,2951`): in-order Head is
+            // active whenever `maxt >= head_min_time` (unless truncation collided past `maxt`),
+            // including inverted ranges (`mint > maxt`) whose chunk checks use
+            // `overlaps_closed_interval(ino_mint, maxt)`.
             let overlaps_in_order =
-                head.initialized() && !collided_past_maxt && maxt >= head_min_time && ino_mint <= maxt;
+                head.initialized() && !collided_past_maxt && maxt >= head_min_time;
             Some(HeadQuerySnapshot {
                 guard,
                 isolation: HeadReadIsolation {
@@ -3211,5 +3218,59 @@ mod wave4_tests {
         expected.sort();
         sort_labels(&mut actual);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn a01_inverted_time_range_head_overlap_all_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        {
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", "inv_m"), ("env", "prod")], 1_000, 1.0)
+                .unwrap();
+            app.append_float(None, &[("__name__", "inv_m"), ("env", "prod")], 5_000, 1.5)
+                .unwrap();
+            app.append_float(None, &[("__name__", "inv_m"), ("env", "dev")], 1_000, 2.0)
+                .unwrap();
+            app.append_float(None, &[("__name__", "inv_m"), ("env", "dev")], 5_000, 2.5)
+                .unwrap();
+            app.commit().unwrap();
+        }
+
+        // Inverted query [3000, 2000] overlapping Head [1000, 5000] must include Head.
+        let q = TsdbQuerier::new(Some(&head), Vec::new(), 3_000, 2_000);
+        assert_eq!(q.label_names(&[]).unwrap(), vec!["__name__", "env"]);
+        assert_eq!(q.label_values("env", None, &[]).unwrap(), vec!["dev", "prod"]);
+        let sn = q
+            .search_label_names(&SearchHints::default(), &[])
+            .unwrap();
+        assert_eq!(
+            sn.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(),
+            vec!["__name__", "env"]
+        );
+        let sv = q
+            .search_label_values("env", &SearchHints::default(), &[])
+            .unwrap();
+        assert_eq!(
+            sv.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(),
+            vec!["dev", "prod"]
+        );
+        let all_m = [LabelMatcher::new(MatchType::Equal, "__name__", "inv_m").unwrap()];
+        let chunks = q.select_chunks(true, &all_m).unwrap();
+        assert_eq!(chunks.len(), 2);
+
+        // Inverted query [6000, 2000] with mint > head.max_time() returns empty.
+        let q_past_max = TsdbQuerier::new(Some(&head), Vec::new(), 6_000, 2_000);
+        assert!(q_past_max.label_names(&[]).unwrap().is_empty());
+        assert!(q_past_max.label_values("env", None, &[]).unwrap().is_empty());
+        assert!(q_past_max.select_chunks(true, &all_m).unwrap().is_empty());
+
+        // Inverted query [3000, 500] with maxt < head.min_time() returns empty.
+        let q_before_min = TsdbQuerier::new(Some(&head), Vec::new(), 3_000, 500);
+        assert!(q_before_min.label_names(&[]).unwrap().is_empty());
+        assert!(q_before_min.label_values("env", None, &[]).unwrap().is_empty());
+        assert!(q_before_min.select_chunks(true, &all_m).unwrap().is_empty());
+
+        head.close().unwrap();
     }
 }

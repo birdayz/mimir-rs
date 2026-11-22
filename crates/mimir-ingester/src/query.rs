@@ -1816,7 +1816,7 @@ impl Ingester {
         user_id: &str,
         db: &UserTsdb,
         sink: &BlockSelectStatsSink,
-        estimates: &[(u64, u64)],
+        estimates: &[PlannedSelectMeta],
         sharded: bool,
         matchers: &[LabelMatcher],
     ) {
@@ -1825,8 +1825,9 @@ impl Ingester {
             return;
         }
         let tsdb_cfg = &self.blocks_cfg.tsdb;
-        let has_metric_name = mimir_tsdb::postings_cache::exact_metric_name_from_matchers(matchers).is_some();
-        let postings_tracked = |head: bool| {
+        let default_has_metric_name =
+            mimir_tsdb::postings_cache::exact_metric_name_from_matchers(matchers).is_some();
+        let postings_tracked = |head: bool, has_metric_name: bool| {
             let force = if head {
                 tsdb_cfg.head_postings_for_matchers_cache_force
             } else {
@@ -1844,32 +1845,39 @@ impl Ingester {
         let filter = self.metrics.queried_series.with_label_values(&["single_block_filter"]);
         let lp = &self.lookup_plan_metrics;
         for (idx, mut st) in stats.into_iter().enumerate() {
-            let (est_postings, est_final) = estimates.get(idx).copied().unwrap_or((0, 0));
-            if st.head {
-                self.metrics.queried_blocks.with_label_values(&["0"]).inc();
-            } else if head_min_time == i64::MAX {
-                self.metrics
-                    .queried_blocks
-                    .with_label_values(&["unknown"])
-                    .inc();
-            } else {
-                let gen = (head_min_time.saturating_sub(st.block_min_time) / block_range).max(1);
-                if gen > 100 {
+            let meta = estimates.get(idx).copied().unwrap_or(PlannedSelectMeta {
+                estimated_postings: 0,
+                estimated_final: 0,
+                is_secondary_unplanned: false,
+                has_index_metric_name: default_has_metric_name,
+            });
+            if !meta.is_secondary_unplanned {
+                if st.head {
+                    self.metrics.queried_blocks.with_label_values(&["0"]).inc();
+                } else if head_min_time == i64::MAX {
                     self.metrics
                         .queried_blocks
-                        .with_label_values(&["100+"])
+                        .with_label_values(&["unknown"])
                         .inc();
                 } else {
-                    self.metrics
-                        .queried_blocks
-                        .with_label_values(&[&gen.to_string()])
-                        .inc();
+                    let gen = (head_min_time.saturating_sub(st.block_min_time) / block_range).max(1);
+                    if gen > 100 {
+                        self.metrics
+                            .queried_blocks
+                            .with_label_values(&["100+"])
+                            .inc();
+                    } else {
+                        self.metrics
+                            .queried_blocks
+                            .with_label_values(&[&gen.to_string()])
+                            .inc();
+                    }
                 }
             }
             if st.head && st.overlaps_ooo {
                 continue;
             }
-            if !postings_tracked(st.head) {
+            if !postings_tracked(st.head, meta.has_index_metric_name) {
                 st.selected_postings = 0;
             }
             index.observe(st.selected_postings as f64);
@@ -1880,12 +1888,12 @@ impl Ingester {
                     .observe(st.selected_postings as f64 / st.series as f64);
                 lp.final_cardinality_ratio
                     .with_label_values(&[user_id])
-                    .observe(est_final as f64 / st.series as f64);
+                    .observe(meta.estimated_final as f64 / st.series as f64);
             }
             if st.selected_postings > 0 {
                 lp.intersection_size_ratio
                     .with_label_values(&[user_id])
-                    .observe(est_postings as f64 / st.selected_postings as f64);
+                    .observe(meta.estimated_postings as f64 / st.selected_postings as f64);
             }
         }
     }
@@ -2645,29 +2653,131 @@ impl Ingester {
         matchers_set: &[Vec<LabelMatcher>],
         limit: usize,
     ) -> Result<Vec<Labels>, IngesterError> {
-        let cq = db.db.chunk_querier(start_ts, end_ts);
         if matchers_set.is_empty() {
             return Ok(Vec::new());
         }
-        if matchers_set.len() == 1 {
-            let mut series =
-                cq.select_raw_labels(true, &matchers_set[0])
-                    .map_err(|e| IngesterError::Internal {
-                        message: e.to_string(),
-                    })?;
-            if series.len() > limit {
-                series.truncate(limit);
-            }
-            return Ok(series);
-        }
-        let mut dedup = hashbrown::HashSet::<Labels>::new();
-        for matchers in matchers_set {
-            let series = cq
-                .select_raw_labels(false, matchers)
+        let snapshot = db
+            .db
+            .try_snapshot_query_sources(start_ts, end_ts)
+            .map_err(|e| IngesterError::Internal {
+                message: e.to_string(),
+            })?;
+        // Keep `block_guards` declared before `blocks` so block mmaps drop before guards.
+        let _block_guards = snapshot.block_guards;
+        let blocks = snapshot.blocks;
+        let head_snap = snapshot.head;
+        let head = head_snap.as_ref().map(|_| db.db.head());
+        let head_iso = head_snap.as_ref().map(|hs| &hs.isolation);
+
+        let head_planner = head.map(|_| db.head_lookup_planner());
+        let block_planners: Vec<Arc<dyn LookupPlanner>> = blocks
+            .iter()
+            .map(|blk| db.block_lookup_planner(blk))
+            .collect();
+
+        let plan_for =
+            |planner: &Arc<dyn LookupPlanner>, matchers: &[LabelMatcher]| -> BasicLookupPlan {
+                let in_plan = BasicLookupPlan::new(matchers.to_vec(), Vec::new());
+                match planner.plan_index_lookup(&in_plan, None) {
+                    Ok(p) => p,
+                    Err(_) => in_plan,
+                }
+            };
+
+        if matchers_set.len() == 1 && blocks.is_empty() {
+            let (Some(head), Some(planner)) = (head, head_planner.as_ref()) else {
+                return Ok(Vec::new());
+            };
+            let plan = plan_for(planner, &matchers_set[0]);
+            let refs = head
+                .postings_for_matchers_with_concurrent(&plan.index_matchers, false)
                 .map_err(|e| IngesterError::Internal {
                     message: e.to_string(),
                 })?;
-            dedup.extend(series);
+            let mut out = Vec::with_capacity(refs.len());
+            for &r in refs.iter() {
+                let labels_opt = match head_iso {
+                    Some(iso) => {
+                        head.series_has_chunks_in_range_with_isolation(r, start_ts, end_ts, iso)
+                    }
+                    None => head.series_has_chunks_in_range(r, start_ts, end_ts),
+                };
+                if let Some(labels) = labels_opt {
+                    if plan
+                        .scan_matchers
+                        .iter()
+                        .all(|m| m.matches(labels.get(&m.name)))
+                    {
+                        out.push(labels);
+                    }
+                }
+            }
+            if out.len() > 1 {
+                mimir_tsdb::querier::sort_labels(&mut out);
+            }
+            if out.len() > limit {
+                out.truncate(limit);
+            }
+            return Ok(out);
+        }
+
+        let mut dedup = hashbrown::HashSet::<Labels>::new();
+        for matchers in matchers_set {
+            if let (Some(head), Some(planner)) = (head, head_planner.as_ref()) {
+                let plan = plan_for(planner, matchers);
+                let refs = head
+                    .postings_for_matchers_with_concurrent(&plan.index_matchers, false)
+                    .map_err(|e| IngesterError::Internal {
+                        message: e.to_string(),
+                    })?;
+                for &r in refs.iter() {
+                    let labels_opt = match head_iso {
+                        Some(iso) => {
+                            head.series_has_chunks_in_range_with_isolation(r, start_ts, end_ts, iso)
+                        }
+                        None => head.series_has_chunks_in_range(r, start_ts, end_ts),
+                    };
+                    if let Some(labels) = labels_opt {
+                        if plan
+                            .scan_matchers
+                            .iter()
+                            .all(|m| m.matches(labels.get(&m.name)))
+                        {
+                            dedup.insert(labels);
+                        }
+                    }
+                }
+            }
+            for (blk, planner) in blocks.iter().zip(&block_planners) {
+                let plan = plan_for(planner, matchers);
+                let idx = blk.index();
+                let tombr = blk.tombstones();
+                let refs = blk
+                    .postings_for_matchers_with_concurrent(&plan.index_matchers, false)
+                    .map_err(|e| IngesterError::Internal {
+                        message: e.to_string(),
+                    })?;
+                for &r in refs.iter() {
+                    let (labels, chks) = idx.series(r).map_err(|e| IngesterError::Internal {
+                        message: e.to_string(),
+                    })?;
+                    if !plan
+                        .scan_matchers
+                        .iter()
+                        .all(|m| m.matches(labels.get(&m.name)))
+                    {
+                        continue;
+                    }
+                    let tombs = tombr.get(r);
+                    let any_chunk = chks.iter().any(|cm| {
+                        cm.overlaps_closed_interval(start_ts, end_ts)
+                            && !tombs.iter().any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
+                    });
+                    if any_chunk {
+                        dedup.insert(labels);
+                    }
+                }
+            }
         }
         let mut merged: Vec<Labels> = dedup.into_iter().collect();
         if limit < merged.len() {
@@ -4201,7 +4311,15 @@ pub(crate) fn merge_per_block_chunk_series(
     Ok(out)
 }
 
-pub type EstimatesSink = Arc<parking_lot::Mutex<Vec<(u64, u64)>>>;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlannedSelectMeta {
+    pub estimated_postings: u64,
+    pub estimated_final: u64,
+    pub is_secondary_unplanned: bool,
+    pub has_index_metric_name: bool,
+}
+
+pub type EstimatesSink = Arc<parking_lot::Mutex<Vec<PlannedSelectMeta>>>;
 
 enum PlannedSource {
     All,
@@ -4369,17 +4487,28 @@ impl PlannedTsdbChunkQuerier {
         &self,
         planning_disabled: bool,
         q_stats: &QueryStats,
+        index_matchers: &[LabelMatcher],
         stat: BlockSelectStats,
     ) {
-        if planning_disabled {
-            return;
-        }
         if let Some((sink, _)) = &self.select_stats {
             sink.lock().push(stat);
             if let Some(ref est_sink) = self.estimates_sink {
-                let est_p = QueryStats::load_estimated_selected_postings(Some(q_stats));
-                let est_f = QueryStats::load_estimated_final_cardinality(Some(q_stats));
-                est_sink.lock().push((est_p, est_f));
+                let (est_p, est_f) = if planning_disabled {
+                    (0, 0)
+                } else {
+                    (
+                        QueryStats::load_estimated_selected_postings(Some(q_stats)),
+                        QueryStats::load_estimated_final_cardinality(Some(q_stats)),
+                    )
+                };
+                est_sink.lock().push(PlannedSelectMeta {
+                    estimated_postings: est_p,
+                    estimated_final: est_f,
+                    is_secondary_unplanned: planning_disabled,
+                    has_index_metric_name:
+                        mimir_tsdb::postings_cache::exact_metric_name_from_matchers(index_matchers)
+                            .is_some(),
+                });
             }
         }
     }
@@ -4415,10 +4544,11 @@ impl PlannedTsdbChunkQuerier {
         let head = self.db.head();
         let head_ooo = *overlaps_ooo;
         let ino_mint = isolation.ino_mint;
-        if !*overlaps_in_order || !head.initialized() || ino_mint > self.maxt || head.is_closed() {
+        if !*overlaps_in_order || !head.initialized() || head.is_closed() {
             self.record_planned_stats(
                 planning_disabled,
                 q_stats,
+                &plan.index_matchers,
                 BlockSelectStats {
                     selected_postings: 0,
                     series: 0,
@@ -4515,6 +4645,7 @@ impl PlannedTsdbChunkQuerier {
         self.record_planned_stats(
             planning_disabled,
             q_stats,
+            &plan.index_matchers,
             BlockSelectStats {
                 selected_postings: refs.len() as u64,
                 series: items.len() as u64,
@@ -4673,6 +4804,7 @@ impl PlannedTsdbChunkQuerier {
         self.record_planned_stats(
             planning_disabled,
             q_stats,
+            &plan.index_matchers,
             BlockSelectStats {
                 selected_postings: refs.len() as u64,
                 series: items.len() as u64,
@@ -4746,10 +4878,8 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
         }
         .with_concurrent(shard.is_some());
         let stats_len_before = self.select_stats.as_ref().map(|(s, _)| s.lock().len());
-        if !planning_disabled {
-            if let Some((sink, filter)) = &self.select_stats {
-                cq = cq.with_filtered_select_stats(Arc::clone(sink), filter.clone());
-            }
+        if let Some((sink, filter)) = &self.select_stats {
+            cq = cq.with_filtered_select_stats(Arc::clone(sink), filter.clone());
         }
         match cq.select(sort_series, &plan.index_matchers) {
             Ok(series) => {
@@ -4770,20 +4900,34 @@ impl ChunkQuerier for PlannedTsdbChunkQuerier {
                         }) as Arc<dyn ChunkSeries>
                     })
                     .collect();
-                if !planning_disabled {
-                    if let (Some((sink, _)), Some(before)) = (&self.select_stats, stats_len_before) {
-                        let mut g = sink.lock();
-                        let added = g.len().saturating_sub(before);
-                        if added == 1 && !plan.scan_matchers.is_empty() {
-                            g[before].series = items.len() as u64;
-                        }
-                        if let Some(ref est_sink) = self.estimates_sink {
-                            let est_p = QueryStats::load_estimated_selected_postings(Some(&q_stats));
-                            let est_f = QueryStats::load_estimated_final_cardinality(Some(&q_stats));
-                            let mut eg = est_sink.lock();
-                            for _ in 0..added {
-                                eg.push((est_p, est_f));
-                            }
+                if let (Some((sink, _)), Some(before)) = (&self.select_stats, stats_len_before) {
+                    let mut g = sink.lock();
+                    let added = g.len().saturating_sub(before);
+                    if added == 1 && !plan.scan_matchers.is_empty() {
+                        g[before].series = items.len() as u64;
+                    }
+                    if let Some(ref est_sink) = self.estimates_sink {
+                        let (est_p, est_f) = if planning_disabled {
+                            (0, 0)
+                        } else {
+                            (
+                                QueryStats::load_estimated_selected_postings(Some(&q_stats)),
+                                QueryStats::load_estimated_final_cardinality(Some(&q_stats)),
+                            )
+                        };
+                        let has_index_metric_name =
+                            mimir_tsdb::postings_cache::exact_metric_name_from_matchers(
+                                &plan.index_matchers,
+                            )
+                            .is_some();
+                        let mut eg = est_sink.lock();
+                        for _ in 0..added {
+                            eg.push(PlannedSelectMeta {
+                                estimated_postings: est_p,
+                                estimated_final: est_f,
+                                is_secondary_unplanned: planning_disabled,
+                                has_index_metric_name,
+                            });
                         }
                     }
                 }
@@ -4955,17 +5099,28 @@ impl HeadAndOOOChunkQuerier {
         &self,
         planning_disabled: bool,
         q_stats: &QueryStats,
+        index_matchers: &[LabelMatcher],
         stat: BlockSelectStats,
     ) {
-        if planning_disabled {
-            return;
-        }
         if let Some((sink, _)) = &self.select_stats {
             sink.lock().push(stat);
             if let Some(ref est_sink) = self.estimates_sink {
-                let est_p = QueryStats::load_estimated_selected_postings(Some(q_stats));
-                let est_f = QueryStats::load_estimated_final_cardinality(Some(q_stats));
-                est_sink.lock().push((est_p, est_f));
+                let (est_p, est_f) = if planning_disabled {
+                    (0, 0)
+                } else {
+                    (
+                        QueryStats::load_estimated_selected_postings(Some(q_stats)),
+                        QueryStats::load_estimated_final_cardinality(Some(q_stats)),
+                    )
+                };
+                est_sink.lock().push(PlannedSelectMeta {
+                    estimated_postings: est_p,
+                    estimated_final: est_f,
+                    is_secondary_unplanned: planning_disabled,
+                    has_index_metric_name:
+                        mimir_tsdb::postings_cache::exact_metric_name_from_matchers(index_matchers)
+                            .is_some(),
+                });
             }
         }
     }
@@ -5008,13 +5163,13 @@ impl ChunkQuerier for HeadAndOOOChunkQuerier {
 
         let head = self.db.head();
         let head_ooo = self.overlaps_ooo;
-        let ino_mint = self.isolation.ino_mint;
         if head.is_closed()
-            || (!head_ooo && (!self.overlaps_in_order || !head.initialized() || ino_mint > self.maxt))
+            || (!head_ooo && (!self.overlaps_in_order || !head.initialized()))
         {
             self.record_planned_stats(
                 planning_disabled,
                 &q_stats,
+                &plan.index_matchers,
                 BlockSelectStats {
                     selected_postings: 0,
                     series: 0,
@@ -5093,6 +5248,7 @@ impl ChunkQuerier for HeadAndOOOChunkQuerier {
         self.record_planned_stats(
             planning_disabled,
             &q_stats,
+            &plan.index_matchers,
             BlockSelectStats {
                 selected_postings: refs.len() as u64,
                 series: items.len() as u64,

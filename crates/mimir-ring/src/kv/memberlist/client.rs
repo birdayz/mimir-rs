@@ -491,9 +491,10 @@ impl MemberlistKv {
                         .into_iter()
                         .map(|c| (c.codec_id().to_string(), c))
                         .collect();
-                    let pt_codec = super::propagation_tracker::propagation_delay_tracker_codec();
-                    map.entry(pt_codec.codec_id().to_string())
-                        .or_insert(pt_codec);
+                    if cfg.propagation_delay_tracker.enabled {
+                        let pt_codec = super::propagation_tracker::propagation_delay_tracker_codec();
+                        map.insert(pt_codec.codec_id().to_string(), pt_codec);
+                    }
                     map
                 }),
                 node_meta,

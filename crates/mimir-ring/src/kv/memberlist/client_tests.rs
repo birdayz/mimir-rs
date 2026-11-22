@@ -551,3 +551,71 @@
 
         kv.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn c3_propagation_delay_tracker_codec_gated_on_enabled_flag() {
+        use super::super::propagation_tracker::{
+            propagation_delay_tracker_codec, PROPAGATION_DELAY_TRACKER_CODEC_ID,
+            PROPAGATION_DELAY_TRACKER_KEY,
+        };
+        use mimir_proto::memberlistpb::{BeaconDesc, KeyValuePair, PropagationDelayTrackerDesc};
+        use prost::Message;
+
+        // When disabled (default), MemberlistKv must NOT register propagationDelayTracker codec.
+        let reg = Registry::new();
+        let cfg_disabled = local_cfg("pt-disabled");
+        assert!(!cfg_disabled.propagation_delay_tracker.enabled);
+        let kv_disabled = MemberlistKv::start(cfg_disabled, Vec::new(), "", Some(&reg))
+            .await
+            .expect("MemberlistKv::start");
+        assert!(kv_disabled.get_codec(PROPAGATION_DELAY_TRACKER_CODEC_ID).is_none());
+
+        let pt_codec = propagation_delay_tracker_codec();
+        let err = match MemberlistKvClient::new(Arc::clone(&kv_disabled), Arc::clone(&pt_codec)) {
+            Ok(_) => panic!("MemberlistKvClient::new must reject unregistered codec"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("codec not registered in KV: propagationDelayTracker"),
+            "unexpected error: {err}"
+        );
+
+        // Incoming broadcast for propagationDelayTracker must increment invalid broadcasts counter
+        // and must NOT populate the KV store.
+        let mut desc = PropagationDelayTrackerDesc::default();
+        desc.beacons.insert(
+            1,
+            BeaconDesc {
+                published_by: "remote".into(),
+                published_at: 1000,
+                deleted_at: 0,
+            },
+        );
+        let pair = KeyValuePair {
+            key: PROPAGATION_DELAY_TRACKER_KEY.into(),
+            value: pt_codec.encode(&desc).unwrap().into(),
+            codec: PROPAGATION_DELAY_TRACKER_CODEC_ID.into(),
+            deleted: false,
+            update_time_millis: 0,
+        };
+        let mut msg = Vec::new();
+        pair.encode(&mut msg).unwrap();
+        kv_disabled.notify_msg(&msg);
+        assert!(kv_disabled.get_value(PROPAGATION_DELAY_TRACKER_KEY).is_none());
+
+        let invalid_count = reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "memberlist_client_received_broadcasts_invalid_total")
+            .and_then(|mf| mf.get_metric().first().map(|m| m.get_counter().get_value()))
+            .unwrap_or(0.0);
+        assert_eq!(invalid_count, 1.0);
+
+        // When enabled, MemberlistKv registers propagationDelayTracker codec.
+        let mut cfg_enabled = local_cfg("pt-enabled");
+        cfg_enabled.propagation_delay_tracker.enabled = true;
+        let kv_enabled = MemberlistKv::new(cfg_enabled, Vec::new(), "", None, Default::default())
+            .expect("MemberlistKv::new with enabled tracker");
+        assert!(kv_enabled.get_codec(PROPAGATION_DELAY_TRACKER_CODEC_ID).is_some());
+        kv_disabled.shutdown().await;
+    }
