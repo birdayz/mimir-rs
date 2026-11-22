@@ -207,190 +207,229 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         &[("msg", "Starting application"), ("version", &version)],
     );
 
-    // 1. Activity tracker (matching initActivityTracker in pkg/mimir/modules.go).
-    let activity_tracker: Option<Arc<ActivityTracker>> = if !cfg.activity_tracker.filepath.is_empty()
-    {
-        let (entries, err) = load_unfinished_entries_partial(&cfg.activity_tracker.filepath);
-        if let Some(err) = err {
-            let err_s = err.to_string();
-            logger.log(
-                LogLevel::Warn,
-                &[
-                    ("component", "activity-tracker"),
-                    ("msg", "failed to fully read file with unfinished activities"),
-                    ("err", &err_s),
-                ],
-            );
-        }
-        if !entries.is_empty() {
-            logger.log_values(
-                LogLevel::Warn,
-                &[
-                    ("component", LogValue::from("activity-tracker")),
-                    (
-                        "msg",
-                        LogValue::from("found unfinished activities from previous run"),
-                    ),
-                    ("count", LogValue::U64(entries.len() as u64)),
-                ],
-            );
-            for e in &entries {
-                let ts = format_rfc3339_nano_utc(e.timestamp);
+    let ingester_enabled = cfg.is_ingester_enabled();
+    let service_ctx = ServiceContext::background();
+    let modules = ModuleStates::new();
+    let server_state = StateCell::new(State::New);
+    modules.add("server", server_state.state_fn());
+    let active_groups_state = StateCell::new(State::New);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_delay = Duration::from_nanos(cfg.shutdown_delay.0.max(0) as u64);
+
+    let mut activity_tracker: Option<Arc<ActivityTracker>> = None;
+    let mut activity_tracker_state: Option<Arc<StateCell>> = None;
+    let mut runtime_config_mgr: Option<Arc<RuntimeConfigManager>> = None;
+    let runtime_config_state = StateCell::new(State::New);
+    let mut active_groups_timer: Option<Option<tokio::task::JoinHandle<()>>> = None;
+    let mut usage_stats_svc: Option<Arc<ManagedBasicService>> = None;
+
+    let pre_sanity = async {
+        // 1. Activity tracker (matching initActivityTracker in pkg/mimir/modules.go).
+        if !cfg.activity_tracker.filepath.is_empty() {
+            let (entries, err) = load_unfinished_entries_partial(&cfg.activity_tracker.filepath);
+            if let Some(err) = err {
+                let err_s = err.to_string();
                 logger.log(
                     LogLevel::Warn,
                     &[
                         ("component", "activity-tracker"),
-                        ("start", &ts),
-                        ("activity", &e.activity),
+                        ("msg", "failed to fully read file with unfinished activities"),
+                        ("err", &err_s),
                     ],
                 );
             }
+            if !entries.is_empty() {
+                logger.log_values(
+                    LogLevel::Warn,
+                    &[
+                        ("component", LogValue::from("activity-tracker")),
+                        (
+                            "msg",
+                            LogValue::from("found unfinished activities from previous run"),
+                        ),
+                        ("count", LogValue::U64(entries.len() as u64)),
+                    ],
+                );
+                for e in &entries {
+                    let ts = format_rfc3339_nano_utc(e.timestamp);
+                    logger.log(
+                        LogLevel::Warn,
+                        &[
+                            ("component", "activity-tracker"),
+                            ("start", &ts),
+                            ("activity", &e.activity),
+                        ],
+                    );
+                }
+            }
+
+            let max_entries =
+                validate_activity_tracker_max_entries(cfg.activity_tracker.max_entries)
+                    .context("initializing activity tracker")?;
+            let tracker = ActivityTracker::new(
+                ActivityTrackerConfig {
+                    filepath: PathBuf::from(&cfg.activity_tracker.filepath),
+                    max_entries,
+                },
+                Some(&registry),
+            )
+            .context("initializing activity tracker")?;
+            activity_tracker = tracker.map(Arc::new);
         }
 
-        let max_entries = validate_activity_tracker_max_entries(cfg.activity_tracker.max_entries)
-            .context("initializing activity tracker")?;
-        let tracker = ActivityTracker::new(
-            ActivityTrackerConfig {
-                filepath: PathBuf::from(&cfg.activity_tracker.filepath),
-                max_entries,
-            },
-            Some(&registry),
-        )
-        .context("initializing activity tracker")?;
-        tracker.map(Arc::new)
-    } else {
-        None
-    };
-
-    let ingester_enabled = cfg.is_ingester_enabled();
-
-    // 2. RuntimeConfigManager & Overrides.
-    let (runtime_config_mgr, overrides) =
-        if ingester_enabled && !cfg.runtime_config.file.0.is_empty() {
-        let sources = mimir_config::runtime_config_source_ids(&cfg.runtime_config)
+        // 2. RuntimeConfigManager & Overrides.
+        let overrides = if ingester_enabled && !cfg.runtime_config.file.0.is_empty() {
+            let sources = mimir_config::runtime_config_source_ids(&cfg.runtime_config)
+                .context("initializing runtime config manager")?;
+            let observer = Arc::new(
+                crate::runtime_config_metrics::RuntimeConfigMetrics::new_with_http(
+                    &registry,
+                    Arc::clone(&logger) as Arc<dyn Logger>,
+                    &sources,
+                    &cfg.runtime_config.file.0,
+                    &cfg.runtime_config.http_client_cluster_validation.label,
+                )
+                .context("registering runtime config metrics")?,
+            );
+            let default_distributor_limits = cfg
+                .distributor_instance_limits()
+                .context("reading distributor.instance_limits")?;
+            let querier_query_store_after = cfg.querier_query_store_after();
+            let mgr = RuntimeConfigManager::new_with_options(RuntimeConfigManagerOptions {
+                cfg: cfg.runtime_config.clone(),
+                default_limits: cfg.limits.clone(),
+                default_ingester_limits: cfg.ingester.instance_limits.clone(),
+                default_distributor_limits,
+                querier_query_store_after,
+                observer: Some(Arc::clone(&observer) as Arc<dyn RuntimeConfigObserver>),
+                http_observer: Some(observer as Arc<dyn RuntimeConfigHttpObserver>),
+            })
             .context("initializing runtime config manager")?;
-        let observer = Arc::new(
-            crate::runtime_config_metrics::RuntimeConfigMetrics::new_with_http(
-                &registry,
-                Arc::clone(&logger) as Arc<dyn Logger>,
-                &sources,
-                &cfg.runtime_config.file.0,
-                &cfg.runtime_config.http_client_cluster_validation.label,
-            )
-            .context("registering runtime config metrics")?,
-        );
-        let default_distributor_limits = cfg
-            .distributor_instance_limits()
-            .context("reading distributor.instance_limits")?;
-        let querier_query_store_after = cfg.querier_query_store_after();
-        let mgr = RuntimeConfigManager::new_with_options(RuntimeConfigManagerOptions {
-            cfg: cfg.runtime_config.clone(),
-            default_limits: cfg.limits.clone(),
-            default_ingester_limits: cfg.ingester.instance_limits.clone(),
-            default_distributor_limits,
-            querier_query_store_after,
-            observer: Some(Arc::clone(&observer) as Arc<dyn RuntimeConfigObserver>),
-            http_observer: Some(observer as Arc<dyn RuntimeConfigHttpObserver>),
-        })
-        .context("initializing runtime config manager")?;
-        let ov = mgr.overrides();
-        (Some(mgr), ov)
-    } else {
-        (None, Overrides::new(cfg.limits.clone()))
-    };
-
-    // 3. Server module (dskit server.New): validates server config, binds HTTP & gRPC
-    //    listeners early so port 0 resolves before ring registration, builds TLS configs and middleware.
-    cfg.server
-        .validate()
-        .context("error initialising module: server")?;
-    let mut server = crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
-        .context("error initialising module: server")?;
-    server.set_grpc_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
-    server.set_compartments_enabled(cfg.compartments.enabled);
-    let _bound_http_addr = server.http_addr()?;
-    let bound_grpc_addr = server.grpc_addr()?;
-
-    let service_ctx = ServiceContext::background();
-
-    // Module services of the configured targets (Go `Mimir.ServiceMap`), used by /ready,
-    // /services, the gRPC health check and failure propagation.
-    let modules = ModuleStates::new();
-    let activity_tracker_state = activity_tracker
-        .as_ref()
-        .map(|_| StateCell::new(State::Running));
-    if let Some(ref st) = activity_tracker_state {
-        log_module_starting(&*logger, "activity-tracker");
-        modules.add("activity-tracker", st.state_fn());
-    }
-    let server_state = StateCell::new(State::New);
-    modules.add("server", server_state.state_fn());
-
-    // Install SIGTERM/SIGINT listeners before any module starts: Go's signal handler runs for
-    // the whole lifetime of the service manager, including module startup.
-    let mut shutdown_sig = install_shutdown_signal(Arc::clone(&logger));
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    server.set_shutdown_requested(Arc::clone(&shutdown_requested));
-    let shutdown_delay = Duration::from_nanos(cfg.shutdown_delay.0.max(0) as u64);
-
-    // Active groups cleanup service (pkg/mimir/modules.go initActiveGroupsCleanupService): a
-    // dependency-free timer module of the `ingester` target, started at once with the other
-    // leaf modules and stopped first.
-    let active_groups_state = StateCell::new(State::New);
-    let active_groups = if ingester_enabled {
-        let ag = mimir_ingester::active_groups::ActiveGroupsCleanupService::new(
-            Duration::from_secs(3 * 60),
-            go_duration_std(cfg.ingester.active_series.active_series_metrics_idle_timeout),
-            cfg.max_separate_metrics_groups_per_user.max(0) as usize,
-        );
-        modules.add("active-groups-cleanup-service", active_groups_state.state_fn());
-        Some(ag)
-    } else {
-        None
-    };
-    let active_groups_timer = active_groups.as_ref().map(|ag| {
-        log_module_starting(&*logger, "active-groups-cleanup-service");
-        let ag = Arc::clone(ag);
-        let timer = spawn_timer(ag.cleanup_interval(), move || {
-            ag.iteration(std::time::SystemTime::now());
-        });
-        active_groups_state.set(State::Running);
-        timer
-    });
-
-    // Anonymous usage statistics (`initUsageStats`), only for components accessing the blocks
-    // storage. `Server` depends on `UsageStats` in Go.
-    mimir_common::usagestats::set_target(&cfg.target.0.join(","));
-    mimir_common::usagestats::set_mode(
-        if cfg.ingest_storage.enabled && ingester_enabled {
-            mimir_common::usagestats::MODE_INGEST_STORAGE
+            let ov = mgr.overrides();
+            runtime_config_mgr = Some(mgr);
+            ov
         } else {
-            mimir_common::usagestats::MODE_CLASSIC
-        },
-    );
-    let usage_stats_svc = if cfg.usage_stats.enabled && ingester_enabled {
-        // bucket.NewClient(ctx, cfg.BlocksStorage.Bucket, UsageStats, logger, t.Registerer)
-        let bucket =
-            BucketClient::new_client(&cfg.blocks_storage.bucket, "usage-stats", Some(&registry))
-                .context("create usage-stats bucket client")?;
-        mimir_common::usagestats::get_string("blocks_storage_backend")
-            .set(&cfg.blocks_storage.bucket.backend_cfg.backend);
-        mimir_common::usagestats::get_string("installation_mode")
-            .set(&cfg.usage_stats.installation_mode);
-        let svc = crate::usagestats::Reporter::new(
-            crate::usagestats::ReporterConfig::default(),
-            &bucket,
-            Some(&registry),
-        )
-        .into_service();
-        log_module_starting(&*logger, "usage-stats");
-        svc.start_async(service_ctx.child())
-            .await
-            .context("starting module usage-stats")?;
-        modules.add("usage-stats", service_state_fn(&svc));
-        Some(svc)
-    } else {
-        None
+            Overrides::new(cfg.limits.clone())
+        };
+
+        // 3. Server module (dskit server.New): validates server config, binds HTTP & gRPC
+        //    listeners early so port 0 resolves before ring registration, builds TLS configs and middleware.
+        cfg.server
+            .validate()
+            .context("error initialising module: server")?;
+        let mut server =
+            crate::server::Server::new(&cfg.server, &registry, Arc::clone(&logger) as Arc<dyn Logger>)
+                .context("error initialising module: server")?;
+        server.set_grpc_multitenancy(cfg.multitenancy_enabled, &cfg.no_auth_tenant);
+        server.set_compartments_enabled(cfg.compartments.enabled);
+        let _bound_http_addr = server.http_addr()?;
+        let bound_grpc_addr = server.grpc_addr()?;
+
+        activity_tracker_state = activity_tracker
+            .as_ref()
+            .map(|_| StateCell::new(State::Running));
+        if let Some(ref st) = activity_tracker_state {
+            log_module_starting(&*logger, "activity-tracker");
+            modules.add("activity-tracker", st.state_fn());
+        }
+
+        // Install SIGTERM/SIGINT/SIGQUIT listeners before any module starts: Go's signal handler
+        // runs for the whole lifetime of the service manager, including module startup.
+        let (shutdown_sig, second_signal_guard) = install_shutdown_signal(Arc::clone(&logger))?;
+        server.set_shutdown_requested(Arc::clone(&shutdown_requested));
+
+        // Active groups cleanup service (pkg/mimir/modules.go initActiveGroupsCleanupService): a
+        // dependency-free timer module of the `ingester` target, started at once with the other
+        // leaf modules and stopped first.
+        let active_groups = if ingester_enabled {
+            let ag = mimir_ingester::active_groups::ActiveGroupsCleanupService::new(
+                Duration::from_secs(3 * 60),
+                go_duration_std(cfg.ingester.active_series.active_series_metrics_idle_timeout),
+                cfg.max_separate_metrics_groups_per_user.max(0) as usize,
+            );
+            modules.add("active-groups-cleanup-service", active_groups_state.state_fn());
+            Some(ag)
+        } else {
+            None
+        };
+        active_groups_timer = active_groups.as_ref().map(|ag| {
+            log_module_starting(&*logger, "active-groups-cleanup-service");
+            let ag = Arc::clone(ag);
+            let timer = spawn_timer(ag.cleanup_interval(), move || {
+                ag.iteration(std::time::SystemTime::now());
+            });
+            active_groups_state.set(State::Running);
+            timer
+        });
+
+        // Anonymous usage statistics (`initUsageStats`), only for components accessing the blocks
+        // storage. `Server` depends on `UsageStats` in Go.
+        mimir_common::usagestats::set_target(&cfg.target.0.join(","));
+        mimir_common::usagestats::set_mode(
+            if cfg.ingest_storage.enabled && ingester_enabled {
+                mimir_common::usagestats::MODE_INGEST_STORAGE
+            } else {
+                mimir_common::usagestats::MODE_CLASSIC
+            },
+        );
+        if cfg.usage_stats.enabled && ingester_enabled {
+            // bucket.NewClient(ctx, cfg.BlocksStorage.Bucket, UsageStats, logger, t.Registerer)
+            let bucket =
+                BucketClient::new_client(&cfg.blocks_storage.bucket, "usage-stats", Some(&registry))
+                    .context("create usage-stats bucket client")?;
+            mimir_common::usagestats::get_string("blocks_storage_backend")
+                .set(&cfg.blocks_storage.bucket.backend_cfg.backend);
+            mimir_common::usagestats::get_string("installation_mode")
+                .set(&cfg.usage_stats.installation_mode);
+            let svc = crate::usagestats::Reporter::new(
+                crate::usagestats::ReporterConfig::default(),
+                &bucket,
+                Some(&registry),
+            )
+            .into_service();
+            log_module_starting(&*logger, "usage-stats");
+            svc.start_async(ServiceContext::background())
+                .await
+                .context("starting module usage-stats")?;
+            modules.add("usage-stats", service_state_fn(&svc));
+            usage_stats_svc = Some(svc);
+        }
+
+        Ok::<_, anyhow::Error>((
+            overrides,
+            server,
+            bound_grpc_addr,
+            shutdown_sig,
+            second_signal_guard,
+            active_groups,
+        ))
+    }
+    .await;
+
+    let (
+        overrides,
+        mut server,
+        bound_grpc_addr,
+        mut shutdown_sig,
+        _second_signal_guard,
+        active_groups,
+    ) = match pre_sanity {
+        Ok(v) => v,
+        Err(e) => {
+            cleanup_pre_server_modules(
+                &*logger,
+                active_groups_timer,
+                &active_groups_state,
+                usage_stats_svc,
+                runtime_config_mgr,
+                &cfg.activity_tracker.filepath,
+                activity_tracker,
+                activity_tracker_state.as_deref(),
+                span_exporter_handle.take(),
+            )
+            .await;
+            return Err(e);
+        }
     };
 
     // `Server` depends on `SanityCheck`: nothing is served and no other module starts until
@@ -425,32 +464,20 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             );
         }
         // The service manager stops every other (already started) module.
-        if let Some(timer) = active_groups_timer {
-            stop_timer_module(
-                &*logger,
-                "active-groups-cleanup-service",
-                &active_groups_state,
-                timer,
-            );
-        }
-        if let Some(svc) = usage_stats_svc {
-            svc.stop_async();
-            let _ = svc.await_terminated().await;
-            log_module_stopped(&*logger, "usage-stats");
-        }
-        if let Some(rt) = runtime_config_mgr {
-            rt.stop();
-        }
-        stop_activity_tracker_module(
+        cleanup_pre_server_modules(
             &*logger,
+            active_groups_timer,
+            &active_groups_state,
+            usage_stats_svc,
+            runtime_config_mgr,
             &cfg.activity_tracker.filepath,
             activity_tracker,
             activity_tracker_state.as_deref(),
-        );
-        if let Some(h) = span_exporter_handle.take() {
-            h.shutdown(Duration::from_secs(5), logger.as_ref()).await;
-        }
+            span_exporter_handle.take(),
+        )
+        .await;
         logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
+        sd_notify("STOPPING=1");
         if signaled {
             return Ok(());
         }
@@ -458,6 +485,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
     sanity_state.set(State::Running);
 
+    let post_sanity = async {
     // 4. Memberlist KV (if required by ring/partition_ring or explicitly targeted).
     // Go always runs `initMemberlistKV` for the ingester (`memberlist.KVInitService`, which
     // creates the memberlist client lazily on `GetMemberlistKV`, while eagerly creating its
@@ -811,7 +839,6 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         None
     };
 
-    let runtime_config_state = StateCell::new(State::New);
     if runtime_config_mgr.is_some() {
         modules.add("runtime-config", runtime_config_state.state_fn());
     }
@@ -882,6 +909,51 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     let servers = server.start(http_router, grpc_routes)?;
     server_state.set(State::Running);
 
+    Ok::<_, anyhow::Error>((
+        memberlist_module,
+        memberlist_kv,
+        memberlist_svc,
+        memberlist_state,
+        ring_svc,
+        watcher_svc,
+        cost_attribution_mgr,
+        cost_attribution_state,
+        ingester_opt,
+        servers,
+    ))
+    }
+    .await;
+
+    let (
+        memberlist_module,
+        memberlist_kv,
+        memberlist_svc,
+        memberlist_state,
+        ring_svc,
+        watcher_svc,
+        cost_attribution_mgr,
+        cost_attribution_state,
+        ingester_opt,
+        servers,
+    ) = match post_sanity {
+        Ok(v) => v,
+        Err(e) => {
+            cleanup_pre_server_modules(
+                &*logger,
+                active_groups_timer,
+                &active_groups_state,
+                usage_stats_svc,
+                runtime_config_mgr,
+                &cfg.activity_tracker.filepath,
+                activity_tracker,
+                activity_tracker_state.as_deref(),
+                span_exporter_handle.take(),
+            )
+            .await;
+            return Err(e);
+        }
+    };
+
     if let Some(ref rt) = runtime_config_mgr {
         log_module_starting(&*logger, "runtime-config");
         rt.start_reloader();
@@ -904,6 +976,24 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     // manager's `serviceFailed` listener in Go, which stops the whole application.
     let (module_failed_tx, mut module_failed_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+    let server_stopping = Arc::new(AtomicBool::new(false));
+    let server_monitor_task = {
+        let mut server_stopped_rx = servers.subscribe_stopped();
+        let server_stopping_flag = Arc::clone(&server_stopping);
+        let server_state_monitor = Arc::clone(&server_state);
+        let server_failed_tx = module_failed_tx.clone();
+        tokio::spawn(async move {
+            if server_stopped_rx.wait_for(|v| *v).await.is_ok()
+                && !server_stopping_flag.load(Ordering::Acquire)
+            {
+                server_state_monitor.set(State::Failed);
+                let _ = server_failed_tx.send((
+                    "server".to_string(),
+                    "server stopped unexpectedly".to_string(),
+                ));
+            }
+        })
+    };
     let mut listener_handles = Vec::new();
     for (name, svc) in [
         ("memberlist-kv", &memberlist_svc),
@@ -913,7 +1003,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     ] {
         if let Some(svc) = svc {
             let tx = module_failed_tx.clone();
-            let name = name.to_string();
+            let name_s = name.to_string();
             let ml_state = (name == "memberlist-kv").then(|| Arc::clone(&memberlist_state));
             listener_handles.push(svc.add_listener(FnListener::new(
                 None,
@@ -924,18 +1014,28 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                     if let Some(ref ml_state) = ml_state {
                         ml_state.set(State::Failed);
                     }
-                    let _ = tx.send((name.clone(), err.to_string()));
+                    let _ = tx.send((name_s.clone(), err.to_string()));
                 })),
             )));
+            if svc.state() == State::Failed {
+                let err_s = svc.failure_case().map(|e| e.to_string()).unwrap_or_default();
+                let _ = module_failed_tx.send((name.to_string(), err_s));
+            }
         }
     }
 
-    let (signaled, startup_err) = {
+    let current_startup_module: parking_lot::Mutex<Option<&'static str>> =
+        parking_lot::Mutex::new(None);
+    let reached_running_set: parking_lot::Mutex<std::collections::HashSet<&'static str>> =
+        parking_lot::Mutex::new(std::collections::HashSet::new());
+
+    let (mut signaled, startup_err, mut runtime_failure) = {
         let startup_fut = async {
             // memberlist-kv: mirrors Go KVInitService — transitions to Running immediately while
             // inner MemberlistKv starts (transport + fast-join) in the background, failing only if
             // MemberlistKv fails. Rings still await MemberlistKv via await_kv_running_or_stopping().
             if memberlist_module {
+                *current_startup_module.lock() = Some("memberlist-kv");
                 log_module_starting(&*logger, "memberlist-kv");
                 memberlist_state.set(State::Running);
             }
@@ -945,7 +1045,11 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                     return Err(("memberlist-kv".to_string(), anyhow::anyhow!(e)));
                 }
             }
+            if memberlist_module {
+                reached_running_set.lock().insert("memberlist-kv");
+            }
             if let Some(ref rsvc) = ring_svc {
+                *current_startup_module.lock() = Some("ingester-ring");
                 log_module_starting(&*logger, "ingester-ring");
                 rsvc.start_async(service_ctx.child())
                     .await
@@ -956,8 +1060,10 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                         anyhow::anyhow!("starting module ingester-ring: {e}"),
                     )
                 })?;
+                reached_running_set.lock().insert("ingester-ring");
             }
             if let Some(ref wsvc) = watcher_svc {
+                *current_startup_module.lock() = Some("ingester-partitions-ring");
                 log_module_starting(&*logger, "ingester-partitions-ring");
                 wsvc.start_async(service_ctx.child())
                     .await
@@ -968,8 +1074,10 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                         anyhow::anyhow!("starting module ingester-partitions-ring: {e}"),
                     )
                 })?;
+                reached_running_set.lock().insert("ingester-partitions-ring");
             }
             if let Some(ref ing) = ingester_opt {
+                *current_startup_module.lock() = Some("ingester-service");
                 log_module_starting(&*logger, "ingester-service");
                 ing.start().await.map_err(|e| {
                     (
@@ -977,7 +1085,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                         anyhow::anyhow!("starting module ingester-service: {e}"),
                     )
                 })?;
+                reached_running_set.lock().insert("ingester-service");
             }
+            *current_startup_module.lock() = None;
             Ok::<(), (String, anyhow::Error)>(())
         };
         await_startup_with_shutdown(
@@ -985,13 +1095,16 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             &mut shutdown_sig,
             &shutdown_requested,
             shutdown_delay,
+            &mut module_failed_rx,
+            &service_ctx,
+            Some(&current_startup_module),
         )
         .await
     };
 
-    let mut runtime_failure: Option<(String, String)> = None;
-    if !signaled && startup_err.is_none() {
+    if !signaled && startup_err.is_none() && runtime_failure.is_none() {
         logger.log(LogLevel::Info, &[("msg", "Application started")]);
+        sd_notify("READY=1");
         // 9. Wait for SIGTERM / SIGINT, or for any module to fail (POST /ingester/shutdown stops
         // only the Ingester service, keeping HTTP/gRPC alive until SIGTERM, matching Go Mimir).
         let ingester_failure = async {
@@ -1002,6 +1115,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         };
         tokio::select! {
             _ = &mut shutdown_sig => {
+                signaled = true;
                 request_shutdown(&shutdown_requested, shutdown_delay).await;
             }
             err = ingester_failure => {
@@ -1028,9 +1142,6 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     .into_iter()
     .filter_map(|(present, name)| present.then_some(name))
     .collect();
-    // Index in `start_order` of the module whose startup failed: it and the modules after it
-    // never reached Running, so dskit never runs their `stop()` (no "module stopped" line).
-    let mut first_not_running = start_order.len();
     if let Some((ref module, ref err)) = startup_err {
         let err_s = format!("{err:#}");
         if signaled {
@@ -1048,7 +1159,6 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
                 &[("msg", "module failed"), ("module", module), ("err", &err_s)],
             );
             if let Some(pos) = start_order.iter().position(|m| m == module) {
-                first_not_running = pos;
                 // dskit module_service.go start(): modules waiting for the failed one fail too.
                 for dependent in &start_order[pos + 1..] {
                     let dep_err = format!(
@@ -1064,12 +1174,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             }
         }
     }
-    let reached_running = |module: &str| {
-        start_order
-            .iter()
-            .position(|m| *m == module)
-            .is_none_or(|pos| pos < first_not_running)
-    };
+    let reached_running = |module: &str| reached_running_set.lock().contains(module);
     if let Some((ref module, ref err)) = runtime_failure {
         logger.log(
             LogLevel::Error,
@@ -1094,7 +1199,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
             Ok(()) => {}
             Err(err) => {
                 ingester_failed = true;
-                if !signaled && startup_err.is_none() && runtime_failure.is_none() {
+                if reached_running("ingester-service") {
                     // dskit modules/module_service.go stop()
                     let err_s = err.to_string();
                     logger.log(
@@ -1133,7 +1238,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     if memberlist_state.get() != State::Failed {
         memberlist_state.set(State::Stopping);
     }
-    server_state.set(State::Stopping);
+    if server_state.get() != State::Failed {
+        server_state.set(State::Stopping);
+    }
 
     // `MemberlistKV` depends on `API` -> `Server`: memberlist leaves the cluster and stops
     // before the HTTP/gRPC servers.
@@ -1159,18 +1266,29 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
         }
     }
 
+    server_stopping.store(true, Ordering::Release);
+    server_monitor_task.abort();
     servers.shutdown().await;
-    server_state.set(State::Terminated);
-    // dskit server_service.go
-    logger.log(LogLevel::Info, &[("msg", "server stopped")]);
-    log_module_stopped(&*logger, "server");
+    if server_state.get() == State::Failed {
+        logger.log(
+            LogLevel::Warn,
+            &[
+                ("msg", "module failed with error"),
+                ("module", "server"),
+                ("err", "server stopped unexpectedly"),
+            ],
+        );
+    } else {
+        server_state.set(State::Terminated);
+        // dskit server_service.go
+        logger.log(LogLevel::Info, &[("msg", "server stopped")]);
+        log_module_stopped(&*logger, "server");
+    }
     // `Server` depends on `SanityCheck` and `UsageStats`: they stop after it.
     sanity_state.set(State::Terminated);
     log_module_stopped(&*logger, "sanity-check");
     if let Some(svc) = usage_stats_svc {
-        svc.stop_async();
-        let _ = svc.await_terminated().await;
-        log_module_stopped(&*logger, "usage-stats");
+        stop_module_service(&*logger, "usage-stats", &svc, true).await;
     }
 
     stop_activity_tracker_module(
@@ -1184,8 +1302,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     }
 
     logger.log(LogLevel::Info, &[("msg", "Application stopped")]);
-    // A shutdown signal received while services are still starting is a requested shutdown,
-    // not a failure (exit 0); any other module failure makes the process exit non-zero.
+    sd_notify("STOPPING=1");
+    // Go Mimir.Run suppresses "failed services" whenever a shutdown signal was received
+    // (exiting 0); any unrequested startup/runtime module failure exits non-zero.
     if signaled {
         return Ok(());
     }
@@ -1288,8 +1407,45 @@ fn stop_activity_tracker_module(
         let _ = at.flush();
         if let Some(st) = state {
             st.set(State::Terminated);
+            log_module_stopped(logger, "activity-tracker");
         }
-        log_module_stopped(logger, "activity-tracker");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cleanup_pre_server_modules(
+    logger: &dyn Logger,
+    active_groups_timer: Option<Option<tokio::task::JoinHandle<()>>>,
+    active_groups_state: &StateCell,
+    usage_stats_svc: Option<Arc<ManagedBasicService>>,
+    runtime_config_mgr: Option<Arc<RuntimeConfigManager>>,
+    activity_tracker_filepath: &str,
+    activity_tracker: Option<Arc<ActivityTracker>>,
+    activity_tracker_state: Option<&StateCell>,
+    span_exporter_handle: Option<SpanExporterHandle>,
+) {
+    if let Some(timer) = active_groups_timer {
+        stop_timer_module(
+            logger,
+            "active-groups-cleanup-service",
+            active_groups_state,
+            timer,
+        );
+    }
+    if let Some(svc) = usage_stats_svc {
+        stop_module_service(logger, "usage-stats", &svc, true).await;
+    }
+    if let Some(rt) = runtime_config_mgr {
+        rt.stop();
+    }
+    stop_activity_tracker_module(
+        logger,
+        activity_tracker_filepath,
+        activity_tracker,
+        activity_tracker_state,
+    );
+    if let Some(h) = span_exporter_handle {
+        h.shutdown(Duration::from_secs(5), logger).await;
     }
 }
 
@@ -1341,74 +1497,130 @@ fn stop_timer_module(
     log_module_stopped(logger, module);
 }
 
-fn install_shutdown_signal(
-    logger: Arc<LogSink>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+/// Sends a systemd `sd_notify` datagram (e.g. `READY=1`, `STOPPING=1`) to `NOTIFY_SOCKET`,
+/// matching `github.com/okzk/sdnotify.SdNotify` called in `pkg/mimir/mimir.go`.
+/// Best-effort: silently no-ops if `NOTIFY_SOCKET` is unset or unreachable.
+fn sd_notify(state: &str) {
     #[cfg(unix)]
     {
-        let sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(s) => Some(s),
-            Err(err) => {
-                logger.log(
-                    LogLevel::Error,
-                    &[
-                        ("msg", "failed to install SIGTERM handler"),
-                        ("err", &err.to_string()),
-                    ],
-                );
-                None
-            }
+        let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
+            return;
         };
-        let sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        {
-            Ok(s) => Some(s),
-            Err(err) => {
-                logger.log(
-                    LogLevel::Error,
-                    &[
-                        ("msg", "failed to install SIGINT handler"),
-                        ("err", &err.to_string()),
-                    ],
-                );
-                None
-            }
+        if socket_path.is_empty() {
+            return;
+        }
+        let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else {
+            return;
         };
-        Box::pin(async move {
-            match (sigterm, sigint) {
-                (Some(mut term), Some(mut int)) => {
-                    tokio::select! {
-                        _ = term.recv() => {}
-                        _ = int.recv() => {}
-                    }
-                }
-                (Some(mut term), None) => {
-                    let _ = term.recv().await;
-                }
-                (None, Some(mut int)) => {
-                    let _ = int.recv().await;
-                }
-                (None, None) => {
-                    std::future::pending::<()>().await;
-                }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(abstract_name) = socket_path.strip_prefix('@') {
+            use std::os::linux::net::SocketAddrExt;
+            if let Ok(addr) = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name) {
+                let _ = sock.send_to_addr(state.as_bytes(), &addr);
+            }
+            return;
+        }
+        let _ = sock.send_to(state.as_bytes(), &socket_path);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = state;
+    }
+}
+
+struct SecondSignalGuard {
+    second_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    sigquit_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SecondSignalGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.second_task.lock().take() {
+            h.abort();
+        }
+        if let Some(h) = self.sigquit_task.take() {
+            h.abort();
+        }
+    }
+}
+
+type ShutdownSignalFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+fn install_shutdown_signal(logger: Arc<LogSink>) -> Result<(ShutdownSignalFuture, SecondSignalGuard)> {
+    let second_task = Arc::new(parking_lot::Mutex::new(None));
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("install SIGTERM handler")?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("install SIGINT handler")?;
+        // dskit signals/signals.go Handler.Loop(): catch SIGQUIT, log, and continue running
+        // instead of terminating the process with a core dump.
+        let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
+            .context("install SIGQUIT handler")?;
+        let quit_logger = Arc::clone(&logger);
+        let sigquit_task = Some(tokio::spawn(async move {
+            while sigquit.recv().await.is_some() {
+                quit_logger.log(
+                    LogLevel::Info,
+                    &[(
+                        "msg",
+                        "=== received SIGQUIT ===\n*** goroutine dump...\n(rust process; see /debug/pprof/profile for stack profiles)\n*** end",
+                    )],
+                );
+            }
+        }));
+        let guard = SecondSignalGuard {
+            second_task: Arc::clone(&second_task),
+            sigquit_task,
+        };
+        let fut = Box::pin(async move {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
             }
             // dskit signals/signals.go Handler.Loop()
             logger.log(
                 LogLevel::Info,
                 &[("msg", "=== received SIGINT/SIGTERM ===\n*** exiting")],
             );
-        })
+            // Keep signal receivers alive and reset to SIG_DFL + re-raise on a 2nd signal,
+            // matching Go signals/signals.go (`defer signal.Stop(sigs)`).
+            let h = tokio::spawn(async move {
+                let sig = tokio::select! {
+                    Some(_) = sigterm.recv() => libc::SIGTERM,
+                    Some(_) = sigint.recv() => libc::SIGINT,
+                    else => return,
+                };
+                // SAFETY: Resetting signal disposition to SIG_DFL and re-raising the caught
+                // signal terminates the process immediately with the signal status.
+                unsafe {
+                    libc::signal(sig, libc::SIG_DFL);
+                    libc::raise(sig);
+                }
+                std::process::exit(128 + sig);
+            });
+            *second_task.lock() = Some(h);
+        });
+        Ok((fut, guard))
     }
 
     #[cfg(not(unix))]
     {
-        Box::pin(async move {
+        let guard = SecondSignalGuard {
+            second_task: Arc::clone(&second_task),
+            sigquit_task: None,
+        };
+        let fut = Box::pin(async move {
             let _ = tokio::signal::ctrl_c().await;
             logger.log(
                 LogLevel::Info,
                 &[("msg", "=== received SIGINT/SIGTERM ===\n*** exiting")],
             );
-        })
+        });
+        Ok((fut, guard))
     }
 }
 
@@ -1855,27 +2067,55 @@ async fn await_startup_with_shutdown<F, S>(
     shutdown_sig: &mut S,
     shutdown_requested: &AtomicBool,
     shutdown_delay: Duration,
-) -> (bool, Option<(String, anyhow::Error)>)
+    module_failed_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+    service_ctx: &ServiceContext,
+    current_module: Option<&parking_lot::Mutex<Option<&'static str>>>,
+) -> (bool, Option<(String, anyhow::Error)>, Option<(String, String)>)
 where
     F: std::future::Future<Output = std::result::Result<(), (String, anyhow::Error)>>,
     S: std::future::Future<Output = ()> + Unpin,
 {
     tokio::pin!(startup_fut);
     tokio::select! {
-        res = &mut startup_fut => (false, res.err()),
+        res = &mut startup_fut => (false, res.err(), None),
+        Some(failure) = module_failed_rx.recv() => {
+            service_ctx.cancel();
+            (false, None, Some(failure))
+        }
         _ = shutdown_sig => {
             // Go keeps starting modules during -shutdown-delay, then stops the manager.
             shutdown_requested.store(true, Ordering::Release);
             let delay_deadline = tokio::time::Instant::now() + shutdown_delay;
             tokio::select! {
-                _ = tokio::time::sleep_until(delay_deadline) => {}
+                _ = tokio::time::sleep_until(delay_deadline) => {
+                    let aborted = current_module.and_then(|m| *m.lock()).map(|m| {
+                        (
+                            m.to_string(),
+                            anyhow::anyhow!("starting module {m}: context canceled"),
+                        )
+                    });
+                    (true, aborted, None)
+                }
                 res = &mut startup_fut => {
-                    if res.is_ok() {
-                        tokio::time::sleep_until(delay_deadline).await;
+                    match res {
+                        Ok(()) => {
+                            tokio::select! {
+                                _ = tokio::time::sleep_until(delay_deadline) => {}
+                                Some(failure) = module_failed_rx.recv() => {
+                                    service_ctx.cancel();
+                                    return (true, None, Some(failure));
+                                }
+                            }
+                            (true, None, None)
+                        }
+                        Err(e) => (true, Some(e), None),
                     }
                 }
+                Some(failure) = module_failed_rx.recv() => {
+                    service_ctx.cancel();
+                    (true, None, Some(failure))
+                }
             }
-            (true, None)
         }
     }
 }
@@ -1958,14 +2198,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         });
 
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let service_ctx = ServiceContext::background();
         let start = tokio::time::Instant::now();
-        let (signaled, err) =
-            await_startup_with_shutdown(startup_fut, &mut sig, &shutdown_requested, shutdown_delay)
-                .await;
+        let (signaled, err, bg_failure) = await_startup_with_shutdown(
+            startup_fut,
+            &mut sig,
+            &shutdown_requested,
+            shutdown_delay,
+            &mut rx,
+            &service_ctx,
+            None,
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert!(signaled);
         assert!(err.is_none());
+        assert!(bg_failure.is_none());
         assert!(shutdown_requested.load(Ordering::Acquire));
         // Signal fired at ~10ms, delay_deadline is ~130ms. Startup finished at ~80ms, so we must
         // sleep only the remaining ~50ms — total ~130ms, well below 2*shutdown_delay (240ms)!
@@ -1977,6 +2227,168 @@ mod tests {
             elapsed < Duration::from_millis(190),
             "must NOT sleep 2 * shutdown_delay ({elapsed:?})"
         );
+    }
+
+    #[tokio::test]
+    async fn cmd_06_await_startup_preserves_error_on_signal_during_shutdown_delay() {
+        let shutdown_requested = AtomicBool::new(false);
+        let shutdown_delay = Duration::from_millis(200);
+        let current_module = parking_lot::Mutex::new(None::<&'static str>);
+        let reached_running_set = parking_lot::Mutex::new(std::collections::HashSet::<&'static str>::new());
+
+        let startup_fut = async {
+            *current_module.lock() = Some("memberlist-kv");
+            reached_running_set.lock().insert("memberlist-kv");
+            *current_module.lock() = Some("ingester-ring");
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Err::<(), (String, anyhow::Error)>((
+                "ingester-ring".to_string(),
+                anyhow::anyhow!("ring init failed during shutdown delay"),
+            ))
+        };
+        let mut sig = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let service_ctx = ServiceContext::background();
+        let (signaled, err, bg_failure) = await_startup_with_shutdown(
+            startup_fut,
+            &mut sig,
+            &shutdown_requested,
+            shutdown_delay,
+            &mut rx,
+            &service_ctx,
+            Some(&current_module),
+        )
+        .await;
+
+        assert!(signaled);
+        assert!(bg_failure.is_none());
+        let (mod_name, err) = err.expect("startup error during shutdown_delay must be preserved");
+        assert_eq!(mod_name, "ingester-ring");
+        assert!(err.to_string().contains("ring init failed"), "{err}");
+        let running = reached_running_set.lock();
+        assert!(running.contains("memberlist-kv"));
+        assert!(!running.contains("ingester-ring"));
+        assert!(!running.contains("ingester-service"));
+    }
+
+    #[tokio::test]
+    async fn cmd_06_await_startup_synthesizes_canceled_module_when_shutdown_delay_expires() {
+        let shutdown_requested = AtomicBool::new(false);
+        let shutdown_delay = Duration::from_millis(30);
+        let current_module = parking_lot::Mutex::new(None::<&'static str>);
+        let reached_running_set = parking_lot::Mutex::new(std::collections::HashSet::<&'static str>::new());
+
+        let startup_fut = async {
+            *current_module.lock() = Some("memberlist-kv");
+            reached_running_set.lock().insert("memberlist-kv");
+            *current_module.lock() = Some("ingester-service");
+            std::future::pending::<()>().await;
+            Ok::<(), (String, anyhow::Error)>(())
+        };
+        let mut sig = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let service_ctx = ServiceContext::background();
+        let (signaled, err, bg_failure) = await_startup_with_shutdown(
+            startup_fut,
+            &mut sig,
+            &shutdown_requested,
+            shutdown_delay,
+            &mut rx,
+            &service_ctx,
+            Some(&current_module),
+        )
+        .await;
+
+        assert!(signaled);
+        assert!(bg_failure.is_none());
+        let (mod_name, err) = err.expect("canceled in-flight module must be reported");
+        assert_eq!(mod_name, "ingester-service");
+        assert!(err.to_string().contains("context canceled"), "{err}");
+        let running = reached_running_set.lock();
+        assert!(running.contains("memberlist-kv"));
+        assert!(!running.contains("ingester-service"));
+    }
+
+    #[tokio::test]
+    async fn cmd_04_await_startup_aborts_immediately_on_background_module_failure() {
+        let shutdown_requested = AtomicBool::new(false);
+        let shutdown_delay = Duration::from_secs(5);
+        let current_module = parking_lot::Mutex::new(None::<&'static str>);
+
+        let startup_fut = async {
+            *current_module.lock() = Some("ingester-service");
+            std::future::pending::<()>().await;
+            Ok::<(), (String, anyhow::Error)>(())
+        };
+        let mut sig = Box::pin(std::future::pending::<()>());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let service_ctx = ServiceContext::background();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send((
+                "server".to_string(),
+                "server stopped unexpectedly".to_string(),
+            ));
+        });
+
+        let start = tokio::time::Instant::now();
+        let (signaled, err, bg_failure) = await_startup_with_shutdown(
+            startup_fut,
+            &mut sig,
+            &shutdown_requested,
+            shutdown_delay,
+            &mut rx,
+            &service_ctx,
+            Some(&current_module),
+        )
+        .await;
+
+        assert!(!signaled);
+        assert!(err.is_none());
+        assert_eq!(
+            bg_failure,
+            Some((
+                "server".to_string(),
+                "server stopped unexpectedly".to_string()
+            ))
+        );
+        assert!(service_ctx.is_canceled(), "service_ctx must be canceled on background failure");
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn cmd_04_running_servers_subscribe_stopped_notifies_on_shutdown() {
+        struct NoopLogger;
+        impl Logger for NoopLogger {
+            fn log(&self, _level: LogLevel, _kvs: &[(&str, &str)]) {}
+        }
+        let cfg = crate::server::Server::new(
+            &mimir_config::server::ServerConfig {
+                http_listen_address: "127.0.0.1".into(),
+                http_listen_port: 0,
+                grpc_listen_address: "127.0.0.1".into(),
+                grpc_listen_port: 0,
+                ..Default::default()
+            },
+            &Registry::new(),
+            Arc::new(NoopLogger),
+        )
+        .unwrap();
+        let running = cfg
+            .start(axum::Router::new(), tonic::service::Routes::default())
+            .unwrap();
+        let mut stopped_rx = running.subscribe_stopped();
+        assert!(!*stopped_rx.borrow());
+        running.shutdown().await;
+        stopped_rx.wait_for(|v| *v).await.unwrap();
+        assert!(*stopped_rx.borrow());
     }
 
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2102,5 +2514,32 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("no active tokio runtime"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sd_notify_sends_ready_and_stopping_to_notify_socket() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("notify.sock");
+        let receiver = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let prev = std::env::var("NOTIFY_SOCKET").ok();
+        std::env::set_var("NOTIFY_SOCKET", &sock_path);
+        sd_notify("READY=1");
+        sd_notify("STOPPING=1");
+        match prev {
+            Some(v) => std::env::set_var("NOTIFY_SOCKET", v),
+            None => std::env::remove_var("NOTIFY_SOCKET"),
+        }
+
+        let mut buf = [0u8; 64];
+        let n1 = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"READY=1");
+        let n2 = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n2], b"STOPPING=1");
     }
 }

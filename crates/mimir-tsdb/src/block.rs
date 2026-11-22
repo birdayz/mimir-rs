@@ -728,6 +728,8 @@ impl Block {
         let tomb_n = write_tombstones_file(&self.dir, &self.tombstones)?;
         let mut m = self.meta.clone();
         m.stats.num_tombstones = self.tombstones.total();
+        m.compaction.failed = self.compaction_failed();
+        m.compaction.deletable = self.is_deletable();
         let meta_n = write_meta_file(&self.dir, &mut m)?;
         let new_size = (self.index.size() as u64)
             + (self.chunks.total_size() as u64)
@@ -855,5 +857,45 @@ mod tests {
         // Deliberately omit chunks/ directory.
         let err = Block::open(&bdir).expect_err("missing chunks/ must fail Block::open");
         assert!(matches!(err, BlockError::Chunks(BlockChunksError::Io(_))));
+    }
+
+    #[test]
+    fn w35_tsdb8_block_delete_preserves_compaction_failed_and_deletable() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = {
+            let db = crate::db::Tsdb::open_with_reload_interval(
+                dir.path(),
+                crate::db::TsdbOptions::default(),
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+            let mut app = db.appender();
+            app.append_float(None, &[("__name__", "up"), ("job", "api")], 1_000, 1.0)
+                .unwrap();
+            app.append_float(None, &[("__name__", "up"), ("job", "api")], 2_000, 2.0)
+                .unwrap();
+            app.commit().unwrap();
+            let uid = db.compact_head_all().unwrap().unwrap();
+            db.close().unwrap();
+            uid
+        };
+        let bdir = dir.path().join(uid.to_string());
+        let blk = Block::open(&bdir).unwrap();
+        blk.set_compaction_failed().unwrap();
+        blk.set_deletable();
+        assert!(blk.compaction_failed());
+        assert!(blk.is_deletable());
+
+        blk.delete(
+            1_500,
+            2_500,
+            &[LabelMatcher::new(crate::matcher::MatchType::Equal, "__name__", "up").unwrap()],
+        )
+        .unwrap();
+
+        let disk_meta = read_meta_file(&bdir).unwrap();
+        assert!(disk_meta.compaction.failed, "Block::delete must preserve compaction.failed");
+        assert!(disk_meta.compaction.deletable, "Block::delete must preserve compaction.deletable");
+        assert!(disk_meta.stats.num_tombstones > 0);
     }
 }

@@ -999,9 +999,17 @@ impl MemberlistKv {
             TcpTransport::new(&self.cfg, &self.metrics_namespace, reg.as_ref())
                 .await
                 .map_err(|e| format!("failed to create transport: {e}"))?;
-        let (ip, port) = transport
+        let (ip, port) = match transport
             .final_advertise_addr(&self.cfg.advertise_addr, self.cfg.advertise_port)
-            .map_err(|e| format!("failed to create memberlist: failed to get final advertise address: {e}"))?;
+        {
+            Ok(addr) => addr,
+            Err(e) => {
+                transport.shutdown_and_wait().await;
+                return Err(format!(
+                    "failed to create memberlist: failed to get final advertise address: {e}"
+                ));
+            }
+        };
         if self.use_transport_bind_port {
             self.bound_port.store(transport.auto_bind_port(), Ordering::Release);
         }
@@ -1021,6 +1029,13 @@ impl MemberlistKv {
             if let Err(err) = self.fast_join_members_on_startup(&ctx).await {
                 error!(%err, "failed to fast-join the memberlist cluster at startup");
                 if self.cfg.abort_if_cluster_fast_join_fails {
+                    if let Some(t) = self.transport.get() {
+                        t.shutdown_and_wait().await;
+                    }
+                    self.shutdown_ctx.cancel();
+                    for timer in self.nodes.read().timers.values() {
+                        timer.stop();
+                    }
                     return Err(format!("failed to fast-join the memberlist cluster at startup: {err}"));
                 }
             }
@@ -1149,10 +1164,10 @@ impl MemberlistKv {
                 error!(%err, "error when leaving memberlist cluster");
             }
         }
-        self.shutdown_ctx.cancel();
         if let Some(t) = self.transport.get() {
             t.shutdown_and_wait().await;
         }
+        self.shutdown_ctx.cancel();
         for timer in self.nodes.read().timers.values() {
             timer.stop();
         }
@@ -2093,7 +2108,11 @@ impl MemberlistKv {
         let mut nodes: VecDeque<String> = nodes.into();
         while to_join > 0 && !nodes.is_empty() && !ctx.is_canceled() {
             let node = nodes.pop_front().expect("non-empty");
-            let (reached, err) = self.ml_join(std::slice::from_ref(&node)).await;
+            let (reached, err) = tokio::select! {
+                biased;
+                _ = ctx.canceled() => break,
+                res = self.ml_join(std::slice::from_ref(&node)) => res,
+            };
             if let Some(err) = err {
                 info!(node, %err, "fast-joining node failed");
             }
@@ -2223,7 +2242,14 @@ impl MemberlistKv {
                     batch_err = Some("joining batch: context canceled".to_string());
                     break;
                 }
-                let (reached, err) = self.ml_join(std::slice::from_ref(node)).await;
+                let (reached, err) = tokio::select! {
+                    biased;
+                    _ = ctx.canceled() => {
+                        batch_err = Some("joining batch: context canceled".to_string());
+                        break;
+                    }
+                    res = self.ml_join(std::slice::from_ref(node)) => res,
+                };
                 joined_in_batch += reached;
                 if err.is_some() {
                     batch_err = err;
@@ -3870,11 +3896,17 @@ impl MemberlistKvClient {
     }
 
     /// dskit `awaitKVRunningOrStopping`.
-    async fn await_kv_running_or_stopping(&self) -> Result<(), KvError> {
+    async fn await_kv_running_or_stopping(
+        &self,
+        cancel: Option<&ServiceContext>,
+    ) -> Result<(), KvError> {
         match self.kv.state() {
             State::Running | State::Stopping => Ok(()),
             State::New | State::Starting => {
-                let res = self.kv.service().await_running().await;
+                let res = match cancel {
+                    Some(c) => self.kv.service().await_running_ctx(c.clone()).await,
+                    None => self.kv.service().await_running().await,
+                };
                 if self.kv.state() == State::Stopping {
                     return Ok(());
                 }
@@ -3888,7 +3920,7 @@ impl MemberlistKvClient {
 impl KvClient for MemberlistKvClient {
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
         Box::pin(async move {
-            self.await_kv_running_or_stopping().await?;
+            self.await_kv_running_or_stopping(None).await?;
             Ok(self.kv.list_keys(prefix))
         })
     }
@@ -3898,21 +3930,21 @@ impl KvClient for MemberlistKvClient {
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Any + Send + Sync>>, KvError>> {
         Box::pin(async move {
-            self.await_kv_running_or_stopping().await?;
+            self.await_kv_running_or_stopping(None).await?;
             Ok(self.kv.get_value(key).map(|(v, _)| v))
         })
     }
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
-            self.await_kv_running_or_stopping().await?;
+            self.await_kv_running_or_stopping(None).await?;
             self.kv.delete_key(key).await
         })
     }
 
     fn cas<'a>(&'a self, key: &'a str, f: CasFn) -> BoxFuture<'a, Result<(), KvError>> {
         Box::pin(async move {
-            self.await_kv_running_or_stopping().await?;
+            self.await_kv_running_or_stopping(None).await?;
             self.kv.cas_with_codec(key, self.codec.as_ref(), f).await
         })
     }
@@ -3924,7 +3956,7 @@ impl KvClient for MemberlistKvClient {
         mut f: Box<dyn FnMut(Box<dyn Any + Send + Sync>) -> bool + Send>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if self.await_kv_running_or_stopping().await.is_err() {
+            if self.await_kv_running_or_stopping(Some(&cancel)).await.is_err() {
                 return;
             }
             let notify = Arc::new(Notify::new());
@@ -3972,7 +4004,7 @@ impl KvClient for MemberlistKvClient {
         mut f: Box<dyn FnMut(&str, Box<dyn Any + Send + Sync>) -> bool + Send>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if self.await_kv_running_or_stopping().await.is_err() {
+            if self.await_kv_running_or_stopping(Some(&cancel)).await.is_err() {
                 return;
             }
             let buf_size = self.kv.cfg.watch_prefix_buffer_size.max(1) as usize;

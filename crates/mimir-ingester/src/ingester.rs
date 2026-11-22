@@ -1586,7 +1586,10 @@ impl Ingester {
     async fn run_starting(self: &Arc<Self>, ctx: ServiceContext) -> Result<(), IngesterError> {
         let res = self.run_starting_inner(&ctx).await;
         if let Err(ref _e) = res {
-            let reader_opt = self.ingest_reader.write().take();
+            // Stop Kafka reader first so any blocked catchup exits, while keeping `self.ingest_reader`
+            // populated so `lifecycler_svc` stop -> `flush()` -> `sync_offset_catalogues()` can still
+            // read `last_seen_offsets()` and persist `offset-catalogue.json` before shipping blocks.
+            let reader_opt = self.ingest_reader.read().clone();
             if let Some(r) = reader_opt {
                 r.stop().await;
             }
@@ -1609,6 +1612,10 @@ impl Ingester {
             }
             if let Some(h) = self.lifecycler_listener.lock().take() {
                 h.stop();
+            }
+            let reader_opt = self.ingest_reader.write().take();
+            if let Some(r) = reader_opt {
+                r.stop().await;
             }
             if !self.blocks_cfg.tsdb.keep_user_tsdb_open_on_shutdown {
                 self.close_all_tsdbs().await;
@@ -1689,7 +1696,7 @@ impl Ingester {
             let reader_fut = crate::ingest_storage::start_ingest_reader(Arc::clone(self));
             let res = tokio::select! {
                 _ = ctx.canceled() => {
-                    let reader_opt = self.ingest_reader.write().take();
+                    let reader_opt = self.ingest_reader.read().clone();
                     if let Some(r) = reader_opt {
                         r.stop().await;
                     }
@@ -2393,5 +2400,278 @@ mod tests {
             ing.get_tsdb("u-open").is_some(),
             "keep_user_tsdb_open_on_shutdown=true must keep TSDBs open on startup cancellation"
         );
+    }
+
+    #[tokio::test]
+    async fn w35_ing01_run_starting_abort_keeps_ingest_reader_for_lifecycler_flush_offset_catalogue() {
+        use bytes::BufMut;
+        use kafka_protocol::messages::api_versions_response::ApiVersion;
+        use kafka_protocol::messages::list_offsets_response::{
+            ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+        };
+        use kafka_protocol::messages::metadata_response::{
+            MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+        };
+        use kafka_protocol::messages::{
+            ApiKey, ApiVersionsRequest, ApiVersionsResponse, BrokerId, FetchRequest, FetchResponse,
+            ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
+            RequestHeader, ResponseHeader, TopicName,
+        };
+        use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+        use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+        use mimir_ring::lifecycler::BasicLifecyclerConfig;
+        use mimir_ring::ring::{ring_desc_codec, Ring};
+        use mimir_storage::ingest::{read_offset_catalogue_from_file, OffsetFile};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = sock.into_split();
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if rd.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; len];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = bytes::Bytes::from(payload);
+                        let req_hdr_ver =
+                            if i16::from_be_bytes([buf[0], buf[1]]) == ApiKey::ApiVersions as i16 {
+                                let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                                ApiVersionsRequest::header_version(ver)
+                            } else {
+                                let key =
+                                    ApiKey::try_from(i16::from_be_bytes([buf[0], buf[1]])).unwrap();
+                                let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                                match key {
+                                    ApiKey::Metadata => MetadataRequest::header_version(ver),
+                                    ApiKey::ListOffsets => ListOffsetsRequest::header_version(ver),
+                                    ApiKey::Fetch => FetchRequest::header_version(ver),
+                                    _ => 1,
+                                }
+                            };
+                        let req_hdr = RequestHeader::decode(&mut buf, req_hdr_ver).unwrap();
+                        let api_key = ApiKey::try_from(req_hdr.request_api_key).unwrap();
+                        let ver = req_hdr.request_api_version;
+
+                        let mut out = bytes::BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = if api_key == ApiKey::ApiVersions {
+                            0
+                        } else {
+                            api_key.response_header_version(ver)
+                        };
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 1, 12),
+                                    (ApiKey::ListOffsets as i16, 1, 7),
+                                    (ApiKey::Fetch as i16, 4, 12),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = addr.port() as i32;
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("ingest")));
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(0);
+                                t.partitions.push(p);
+                                resp.topics.push(t);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::ListOffsets => {
+                                let _ = ListOffsetsRequest::decode(&mut buf, ver);
+                                let mut resp = ListOffsetsResponse::default();
+                                let mut topic = ListOffsetsTopicResponse::default();
+                                topic.name = TopicName(StrBytes::from_static_str("ingest"));
+                                let mut part = ListOffsetsPartitionResponse::default();
+                                part.partition_index = 0;
+                                part.offset = 0;
+                                topic.partitions.push(part);
+                                resp.topics.push(topic);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Fetch => {
+                                let _ = FetchRequest::decode(&mut buf, ver);
+                                let mut resp = FetchResponse::default();
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic = TopicName(StrBytes::from_static_str("ingest"));
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                ft.partitions.push(pd);
+                                resp.responses.push(ft);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed local offset file with offset 41 so start_ingest_reader initializes last_seen_offset = 41.
+        OffsetFile::new(tmp.path().join("kafka-offset.json"), 0)
+            .write(41)
+            .unwrap();
+
+        let mut ing_cfg = IngesterConfig::default();
+        ing_cfg.ring.instance_id = "inst-0".to_string();
+        ing_cfg.ring.final_sleep = mimir_config::GoDuration::ZERO;
+        ing_cfg.ring.heartbeat_period = mimir_config::GoDuration::from_millis(50);
+
+        let mut blocks_cfg = BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().to_string();
+        blocks_cfg.tsdb.flush_blocks_on_shutdown = true;
+        blocks_cfg.tsdb.ship_interval = mimir_config::GoDuration::ZERO;
+        blocks_cfg.tsdb.retention_period = mimir_config::GoDuration::from_secs(3600);
+        blocks_cfg.tsdb.offset_catalogue.enabled = true;
+
+        let mut ingest_cfg = IngestStorageConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        ingest_cfg.kafka.address = mimir_config::types::StringSliceCSV(vec![addr.to_string()]);
+        ingest_cfg.kafka.topic = "ingest".to_string();
+        ingest_cfg.kafka.auto_create_topic_enabled = false;
+        ingest_cfg.kafka.consumer_group_offset_commit_file_enforced = true;
+        ingest_cfg.kafka.fetch_concurrency_max = 0;
+        ingest_cfg.kafka.target_consumer_lag_at_startup = mimir_config::GoDuration::ZERO;
+        ingest_cfg.kafka.max_consumer_lag_at_startup = mimir_config::GoDuration::ZERO;
+
+        let lc_kv: Arc<dyn mimir_ring::kv::KvClient> =
+            Arc::new(InMemoryKv::new(ring_desc_codec()));
+        let mut basic_cfg =
+            BasicLifecyclerConfig::from_ring_config_tokenless(&ing_cfg.ring, 9095).unwrap();
+        basic_cfg.heartbeat_period = Duration::from_millis(20);
+        let tokenless = crate::TokenlessLifecycler::new(
+            basic_cfg,
+            "ingester",
+            "ring",
+            lc_kv,
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            None,
+            None,
+        );
+
+        // Separate empty KV for instance_ring so run_starting_inner stays in the
+        // wait-for-ACTIVE loop right after lifecycler_svc enters Running until ctx cancels.
+        let mut ring_cfg = mimir_config::ingester::RingConfig::default();
+        ring_cfg.kvstore.store = "inmemory".to_string();
+        let instance_ring = Ring::new(
+            &ring_cfg,
+            "ingester",
+            "ring",
+            None,
+            None::<&prometheus::Registry>,
+        )
+        .unwrap();
+
+        let ing = Ingester::new_with_ingester_lifecycler(
+            ing_cfg,
+            blocks_cfg,
+            ingest_cfg,
+            Overrides::new(mimir_config::LimitsConfig::default()),
+            Some(instance_ring),
+            Some(tokenless as Arc<dyn IngesterLifecycler>),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ctx = ServiceContext::background();
+        let ing_task = Arc::clone(&ing);
+        let ctx_task = ctx.clone();
+        let h = tokio::spawn(async move { ing_task.run_starting(ctx_task).await });
+
+        // Wait until both ingest_reader and lifecycler_svc are started.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ing.lifecycler_svc.lock().is_none() || ing.ingest_reader.read().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for ingest_reader and lifecycler_svc"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Create a tenant TSDB with 1 sample so flush() compacts and calls sync_offset_catalogues().
+        {
+            let user_db = ing.get_or_create_tsdb("user-1").unwrap();
+            let mut app = user_db.db.appender();
+            app.append_float(
+                None,
+                &[("__name__", "test_metric")],
+                1_700_000_000_000,
+                1.0,
+            )
+            .unwrap();
+            app.commit().unwrap();
+        }
+
+        // Abort startup while lifecycler is running.
+        ctx.cancel();
+        let res = h.await.unwrap();
+        assert!(res.is_err(), "canceled run_starting must return Err");
+        assert!(
+            ing.ingest_reader.read().is_none(),
+            "ingest_reader must be cleared after lifecycler_svc finishes terminating"
+        );
+
+        // Verify lifecycler's Flush() -> sync_offset_catalogues() observed ingest_reader's
+        // last_seen_offsets (41) and wrote offset-catalogue.json before ingest_reader was cleared.
+        let cat = read_offset_catalogue_from_file(tmp.path().join("user-1"))
+            .expect("offset-catalogue.json must be written during run_starting abort flush");
+        assert!(
+            !cat.data.is_empty(),
+            "expected flushed block entry in offset-catalogue.json"
+        );
+        for block_map in cat.data.values() {
+            let wm = block_map.get(&0).expect("cluster 0 watermark");
+            assert_eq!(wm.partition, 0);
+            assert_eq!(wm.offset, 41);
+        }
+
+        srv.abort();
     }
 }

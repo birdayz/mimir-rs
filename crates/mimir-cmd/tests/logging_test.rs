@@ -372,3 +372,50 @@ activity_tracker:
         "plain-text fatal error must be gone"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn cmd_03_second_sigterm_terminates_immediately_during_shutdown_delay() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempdir().unwrap();
+    let cfg = write_memberlist_ingester_config(dir.path());
+    let mut run = spawn(&[
+        format!("-config.file={}", cfg.display()),
+        "-shutdown-delay=10s".to_string(),
+    ]);
+    run.wait_for_line(r#"msg="Application started""#, Duration::from_secs(30));
+
+    let pid = run.child.id() as libc::pid_t;
+    // 1st SIGTERM starts graceful shutdown (-shutdown-delay=10s).
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    run.wait_for_line(
+        r#"msg="=== received SIGINT/SIGTERM ===\n*** exiting""#,
+        Duration::from_secs(5),
+    );
+
+    // Give the spawned 2nd-signal watcher task a brief moment to poll, then send 2nd SIGTERM.
+    std::thread::sleep(Duration::from_millis(50));
+    let start = Instant::now();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(s) = run.child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second SIGTERM did not terminate process immediately (elapsed {:?})",
+            start.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _ = run.reader.join();
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "must not wait for -shutdown-delay=10s (elapsed {:?})",
+        start.elapsed()
+    );
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "status={status:?}");
+}

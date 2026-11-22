@@ -606,7 +606,6 @@ struct TsdbInner {
     retention: RwLock<RetentionSettings>,
     configured_block_reload_interval: Duration,
     compaction_delay: Mutex<Duration>,
-    dir_lock: Mutex<Option<DirLocker>>,
     head: Arc<Head>,
     blocks: Arc<RwLock<Vec<Arc<Block>>>>,
     /// Protected by blocks.write() on updates and read under blocks.read() when snapshotting
@@ -626,6 +625,8 @@ struct TsdbInner {
     compact_ooo_head_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     compactor_override: Mutex<Option<Arc<dyn TsdbCompactorOverride>>>,
     metrics: DbMetrics,
+    /// Kept last so Head and Blocks always drop before `<dir>/lock` is released on drop/unwind.
+    dir_lock: Mutex<Option<DirLocker>>,
 }
 
 impl CompactNotifier for TsdbInner {
@@ -836,18 +837,23 @@ impl Tsdb {
         )?);
         let blocks = Arc::new(RwLock::new(blocks_vec));
         {
-            let blks = Arc::clone(&blocks);
-            let hd = Arc::clone(&head);
+            let blks = Arc::downgrade(&blocks);
+            let hd = Arc::downgrade(&head);
             FnGaugeCollector::register(
                 opts.head.registry.as_deref(),
                 "prometheus_tsdb_lowest_timestamp",
                 "Lowest timestamp value stored in the database. The unit is decided by the library consumer.",
                 move || {
+                    let Some(blks) = blks.upgrade() else {
+                        return i64::MAX as f64;
+                    };
                     let guard = blks.read();
                     if let Some(first) = guard.first() {
                         first.min_time() as f64
-                    } else {
+                    } else if let Some(hd) = hd.upgrade() {
                         hd.min_time() as f64
+                    } else {
+                        i64::MAX as f64
                     }
                 },
             );
@@ -870,7 +876,6 @@ impl Tsdb {
             retention: RwLock::new(retention_init),
             configured_block_reload_interval: block_reload_interval,
             compaction_delay: Mutex::new(init_delay),
-            dir_lock: Mutex::new(dir_lock),
             head,
             blocks,
             last_garbage_collected_mmap_ref: AtomicU64::new(0),
@@ -888,6 +893,7 @@ impl Tsdb {
             compact_ooo_head_hook: Mutex::new(None),
             compactor_override,
             metrics,
+            dir_lock: Mutex::new(dir_lock),
         });
         let bg_handle = if !block_reload_interval.is_zero() {
             let inner_bg = Arc::clone(&inner);
@@ -922,7 +928,9 @@ impl Tsdb {
                         if wait_res.timed_out() {
                             drop(stopped);
                             if let Err(e) = inner_bg.reload_blocks() {
-                                tracing::error!(err = %e, "reloadBlocks");
+                                if !matches!(e, TsdbError::Closed) {
+                                    tracing::error!(err = %e, "reloadBlocks");
+                                }
                             }
                             // Go `DB.run`: every block reload tick (and every `Commit` while
                             // `head.is_compactable()`) signals `compactc`, which counts as a
@@ -1058,7 +1066,7 @@ impl Tsdb {
     pub fn compact_blocks(&self) -> Result<Vec<Ulid>, TsdbError> {
         let _guard = self.inner.compact_mtx.lock();
         if self.inner.closed.load(Ordering::Acquire) {
-            return Ok(Vec::new());
+            return Err(TsdbError::Closed);
         }
         let mut created = Vec::new();
         self.inner.compact_blocks_locked(&mut created)?;
@@ -1445,7 +1453,7 @@ impl Tsdb {
 
 impl Drop for Tsdb {
     fn drop(&mut self) {
-        self.stop_background_loop();
+        let _ = self.close();
     }
 }
 
@@ -1817,6 +1825,9 @@ impl TsdbInner {
     /// Reloads on-disk blocks, applying the block deletion filter (Go `DB.reloadBlocks`).
     fn reload_blocks(&self) -> Result<(), TsdbError> {
         let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TsdbError::Closed);
+        }
         self.reload_blocks_locked()
     }
 
@@ -2015,7 +2026,10 @@ impl TsdbInner {
         maxt: i64,
     ) -> Result<Option<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
-        if self.closed.load(Ordering::Acquire) || maxt <= mint {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TsdbError::Closed);
+        }
+        if maxt <= mint {
             return Ok(None);
         }
         self.compact_head_range_locked(mint, maxt, maxt - 1, false)
@@ -2035,6 +2049,9 @@ impl TsdbInner {
             }
         }
         let _compact_guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TsdbError::Closed);
+        }
         let blocks = self.blocks.read().clone();
         for b in &blocks {
             tracing::info!(block = %b.ulid(), "Snapshotting block");
@@ -2071,6 +2088,9 @@ impl TsdbInner {
 
     fn clean_tombstones(&self) -> Result<(), TsdbError> {
         let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TsdbError::Closed);
+        }
         let start = Instant::now();
         let res = (|| -> Result<(), TsdbError> {
             loop {
@@ -2258,6 +2278,9 @@ impl TsdbInner {
     /// and clears the compacted OOO state.
     fn compact_ooo_head(&self) -> Result<Vec<Ulid>, TsdbError> {
         let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TsdbError::Closed);
+        }
         self.compact_ooo_head_locked()
     }
 
@@ -2722,6 +2745,9 @@ impl TsdbInner {
     /// Truncates Head memory and WAL older than `mint`.
     fn truncate(&self, mint: i64) -> Result<(), TsdbError> {
         let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TsdbError::Closed);
+        }
         self.head.truncate(mint)?;
         Ok(())
     }
@@ -3916,6 +3942,139 @@ mod tests {
         assert_eq!(created_ooo.len(), 2);
         assert_eq!(compactions_total(), 7.0);
 
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn w35_tsdb2_drop_closes_tsdb_releases_lock_and_registry_has_zero_arc_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(prometheus::Registry::new());
+        let opts = TsdbOptions {
+            no_lockfile: false,
+            head: HeadOptions {
+                chunk_range_ms: 10_000,
+                registry: Some(Arc::clone(&reg)),
+                ..HeadOptions::default()
+            },
+            ..TsdbOptions::default()
+        };
+
+        let head_weak;
+        let blocks_weak;
+        {
+            let db = Tsdb::open_with_reload_interval(
+                dir.path(),
+                opts.clone(),
+                Duration::from_millis(25),
+            )
+            .unwrap();
+            head_weak = Arc::downgrade(&db.inner.head);
+            blocks_weak = Arc::downgrade(&db.inner.blocks);
+
+            let mut app = db.appender();
+            app.append_float(None, &[("__name__", "drop_test"), ("job", "a")], 1_000, 42.0)
+                .unwrap();
+            app.append_float(None, &[("__name__", "drop_test"), ("job", "a")], 15_000, 43.0)
+                .unwrap();
+            app.commit().unwrap();
+            db.compact().unwrap();
+
+            let mut app2 = db.appender();
+            app2.append_float(None, &[("__name__", "drop_test_head"), ("job", "b")], 25_000, 99.0)
+                .unwrap();
+            app2.commit().unwrap();
+            assert!(dir.path().join("lock").exists());
+            // Intentionally drop db without calling db.close().
+        }
+
+        assert!(
+            head_weak.upgrade().is_none(),
+            "Registry FnGaugeCollector must not leak Arc<Head> after Tsdb drop"
+        );
+        assert!(
+            blocks_weak.upgrade().is_none(),
+            "Registry FnGaugeCollector must not leak Arc<RwLock<Vec<Arc<Block>>>> after Tsdb drop"
+        );
+        assert!(
+            !dir.path().join("lock").exists(),
+            "<dir>/lock must be released when Tsdb is dropped without explicit close()"
+        );
+
+        let lowest_ts = reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "prometheus_tsdb_lowest_timestamp")
+            .unwrap()
+            .get_metric()[0]
+            .get_gauge()
+            .get_value();
+        assert_eq!(lowest_ts, i64::MAX as f64);
+
+        // Immediate reopen succeeds and preserves both compacted and WAL-buffered head data.
+        let mut opts2 = TsdbOptions::default();
+        opts2.head.chunk_range_ms = 10_000;
+        let db2 = Tsdb::open_with_reload_interval(dir.path(), opts2, Duration::ZERO).unwrap();
+        let q = db2.querier(0, 30_000);
+        let res = q
+            .select(
+                true,
+                &[LabelMatcher::new(MatchType::RegexMatch, "__name__", "drop_test.*").unwrap()],
+            )
+            .unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].samples.len(), 2);
+        assert_eq!(res[1].samples.len(), 1);
+        assert_eq!(res[1].samples[0].value, SampleValue::Float(99.0));
+
+        // Explicit close() followed by Drop must be idempotent.
+        db2.close().unwrap();
+        drop(db2);
+        assert!(!dir.path().join("lock").exists());
+    }
+
+    #[test]
+    fn w35_tsdb7_closed_tsdb_rejects_maintenance_and_compaction_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Tsdb::open_with_reload_interval(dir.path(), TsdbOptions::default(), Duration::ZERO)
+            .unwrap();
+        {
+            let mut app = db.appender();
+            app.append_float(None, &[("__name__", "m")], 1_000, 1.0).unwrap();
+            app.commit().unwrap();
+        }
+        db.close().unwrap();
+
+        assert!(matches!(db.reload_blocks(), Err(TsdbError::Closed)));
+        assert!(matches!(db.compact_blocks(), Err(TsdbError::Closed)));
+        assert!(matches!(db.compact_ooo_head(), Err(TsdbError::Closed)));
+        assert!(matches!(db.clean_tombstones(), Err(TsdbError::Closed)));
+        assert!(matches!(
+            db.compact_head_range_without_truncation(0, 10_000),
+            Err(TsdbError::Closed)
+        ));
+        let snap_dir = tempfile::tempdir().unwrap();
+        assert!(matches!(db.snapshot(snap_dir.path(), true), Err(TsdbError::Closed)));
+        assert!(matches!(db.truncate(5_000), Err(TsdbError::Closed)));
+        // compact() intentionally stays Ok(Vec::new()) when closed.
+        assert_eq!(db.compact().unwrap(), Vec::<Ulid>::new());
+    }
+
+    #[test]
+    fn w35_tsdb9_and_tsdb10_open_cleans_chunk_snapshot_tmp_dirs_and_chunks_head_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_snap = dir.path().join("chunk_snapshot.000005.0000001234.tmp");
+        fs::create_dir_all(&tmp_snap).unwrap();
+        fs::write(tmp_snap.join("00000000"), b"leftover").unwrap();
+
+        let chunks_dir = dir.path().join("chunks_head");
+        fs::create_dir_all(&chunks_dir).unwrap();
+        let tmp_chunk = chunks_dir.join(".000007.tmp");
+        fs::write(&tmp_chunk, vec![0u8; 4096]).unwrap();
+
+        let db = Tsdb::open_with_reload_interval(dir.path(), TsdbOptions::default(), Duration::ZERO)
+            .unwrap();
+        assert!(!tmp_snap.exists(), "stale chunk_snapshot.*.tmp dir must be removed on Tsdb::open");
+        assert!(!tmp_chunk.exists(), "stale chunks_head/.NNNNNN.tmp file must be removed on Tsdb::open");
         db.close().unwrap();
     }
 }

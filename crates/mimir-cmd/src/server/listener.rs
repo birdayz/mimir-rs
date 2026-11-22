@@ -151,7 +151,7 @@ impl Drop for ConnGuard {
 /// Accept loop state (Go `LimitListener(CountingListener(listener))`).
 pub struct Acceptor {
     listener: TcpListener,
-    opts: AcceptOptions,
+    opts: Arc<AcceptOptions>,
     limit: Option<Arc<Semaphore>>,
 }
 
@@ -211,7 +211,7 @@ impl Acceptor {
         let limit = (opts.conn_limit > 0).then(|| Arc::new(Semaphore::new(opts.conn_limit)));
         Self {
             listener,
-            opts,
+            opts: Arc::new(opts),
             limit,
         }
     }
@@ -264,6 +264,10 @@ impl Acceptor {
 
     pub fn options(&self) -> &AcceptOptions {
         &self.opts
+    }
+
+    pub fn options_arc(&self) -> Arc<AcceptOptions> {
+        Arc::clone(&self.opts)
     }
 }
 

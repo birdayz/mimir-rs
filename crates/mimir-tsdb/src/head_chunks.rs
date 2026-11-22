@@ -158,6 +158,30 @@ pub fn head_chunk_file_path(dir: &Path, seq: usize) -> PathBuf {
     dir.join(format!("{seq:06}"))
 }
 
+fn cleanup_tmp_chunk_files(dir: &Path) -> Result<(), HeadChunksError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let fname = entry.file_name();
+        let Some(name_str) = fname.to_str() else {
+            continue;
+        };
+        if name_str.starts_with('.') && name_str.ends_with(".tmp") {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(HeadChunksError::Io(e)),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn list_chunk_files(dir: &Path) -> Result<BTreeMap<usize, PathBuf>, HeadChunksError> {
     let mut res = BTreeMap::new();
     if !dir.exists() {
@@ -320,6 +344,7 @@ impl HeadChunksWriter {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
+        cleanup_tmp_chunk_files(&dir)?;
         let mut files = list_chunk_files(&dir)?;
         repair_last_chunk_file(&mut files)?;
         let seq = files.keys().next_back().copied().unwrap_or(0);
@@ -762,6 +787,10 @@ impl HeadChunksWriter {
         if min_seq > self.seq {
             self.seq = min_seq;
         }
+    }
+
+    pub fn close_mut(&mut self) -> Result<(), HeadChunksError> {
+        self.close_inner()
     }
 
     pub fn close(mut self) -> Result<(), HeadChunksError> {

@@ -44,7 +44,8 @@ use mimir_common::native_histogram::Histogram;
 use mimir_config::GoDuration;
 use parking_lot::Mutex;
 use rand::Rng;
-use tokio::sync::watch;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{watch, Notify};
 use tokio::task::JoinSet;
 use tower::ServiceExt;
 
@@ -102,6 +103,7 @@ struct Conn {
     id: u64,
     active: AtomicUsize,
     idle_since: Mutex<Instant>,
+    idle_notify: Notify,
 }
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -413,7 +415,6 @@ pub async fn serve(
         cfg.stats_tracking,
         cfg.report_grpc_status,
     ));
-    let acceptor = Arc::new(acceptor);
     let routes = routes.prepare();
     let mut conns: JoinSet<()> = JoinSet::new();
     let mut accept_backoff = Duration::from_millis(5);
@@ -441,22 +442,35 @@ pub async fn serve(
                         continue;
                     }
                 };
-                let acc = Arc::clone(&acceptor);
+                let opts = acceptor.options_arc();
                 let cfg = cfg.clone();
                 let routes = routes.clone();
                 let cache = Arc::clone(&cache);
-                let shutdown = shutdown.clone();
+                let mut shutdown = shutdown.clone();
                 conns.spawn(async move {
-                    let Ok(accepted) = finish_accept(stream, addr, guard, acc.options()).await else { return };
+                    let accepted = tokio::select! {
+                        biased;
+                        _ = super::wait_shutdown(&mut shutdown) => return,
+                        res = finish_accept(stream, addr, guard, &opts) => match res {
+                            Ok(a) => a,
+                            Err(_) => return,
+                        },
+                    };
                     let remote = accepted.remote_addr;
                     let _guard = accepted.guard;
                     let io = PrefixedIo::new(accepted.prefix, accepted.stream);
                     if let Some(tls) = cfg.tls.clone() {
                         // grpc-go's default ConnectionTimeout for the handshake is 120s.
                         let hs = tokio_rustls::TlsAcceptor::from(tls).accept(io);
-                        if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(120), hs).await {
-                            serve_conn(s, remote, cfg, routes, cache, shutdown).await;
-                        }
+                        let tls_stream = tokio::select! {
+                            biased;
+                            _ = super::wait_shutdown(&mut shutdown) => return,
+                            res = tokio::time::timeout(Duration::from_secs(120), hs) => match res {
+                                Ok(Ok(s)) => s,
+                                _ => return,
+                            },
+                        };
+                        serve_conn(tls_stream, remote, cfg, routes, cache, shutdown).await;
                     } else {
                         serve_conn(io, remote, cfg, routes, cache, shutdown).await;
                     }
@@ -465,6 +479,9 @@ pub async fn serve(
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
         }
     }
+    // Drop the acceptor immediately so the listening socket closes before draining in-flight
+    // connections (matching grpc-go Server.GracefulStop).
+    drop(acceptor);
     while conns.join_next().await.is_some() {}
 }
 
@@ -479,7 +496,7 @@ fn jittered(d: Duration) -> Duration {
 }
 
 async fn serve_conn<T>(
-    io: T,
+    mut io: T,
     remote: SocketAddr,
     cfg: GrpcServerConfig,
     routes: tonic::service::Routes,
@@ -488,10 +505,41 @@ async fn serve_conn<T>(
 ) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let mut preface_buf = [0u8; 24];
+    let read_preface = async {
+        let mut filled = 0usize;
+        while filled < H2_PREFACE.len() {
+            match io.read(&mut preface_buf[filled..]).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => {
+                    filled += n;
+                    // Reject short non-H2 probes immediately instead of holding the socket for 120s.
+                    if preface_buf[..filled] != H2_PREFACE[..filled] {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    };
+    let preface_ok = tokio::select! {
+        biased;
+        _ = super::wait_shutdown(&mut shutdown) => false,
+        res = tokio::time::timeout(Duration::from_secs(120), read_preface) => {
+            matches!(res, Ok(true))
+        }
+    };
+    if !preface_ok {
+        return;
+    }
+    let io = PrefixedIo::new(preface_buf.to_vec(), io);
+
     let conn_state = Arc::new(Conn {
         id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
         active: AtomicUsize::new(0),
         idle_since: Mutex::new(Instant::now()),
+        idle_notify: Notify::new(),
     });
     let svc = {
         let conn_state = Arc::clone(&conn_state);
@@ -545,8 +593,35 @@ async fn serve_conn<T>(
             _ = conn.as_mut() => return,
             _ = super::wait_shutdown(&mut shutdown) => {
                 conn.as_mut().graceful_shutdown();
-                let _ = conn.as_mut().await;
-                return;
+                // grpc-go GracefulStop waits up to 5s on an idle transport after GOAWAY
+                // (default keepalive_timeout is 20s -> 5s; smaller values allow fast shutdown/tests).
+                let idle_grace = if cfg.keepalive_timeout.is_zero() {
+                    Duration::from_secs(5)
+                } else {
+                    cfg.keepalive_timeout.min(Duration::from_secs(5))
+                };
+                loop {
+                    let notified = conn_state.idle_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if conn_state.active.load(Ordering::Acquire) > 0 {
+                        tokio::select! {
+                            _ = conn.as_mut() => return,
+                            _ = &mut notified => {}
+                        }
+                    } else {
+                        let sleep = tokio::time::sleep(idle_grace);
+                        tokio::pin!(sleep);
+                        tokio::select! {
+                            _ = conn.as_mut() => return,
+                            _ = &mut sleep => {
+                                if conn_state.active.load(Ordering::Acquire) == 0 {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             _ = sleep_until_opt(age_deadline) => {
                 conn.as_mut().graceful_shutdown();
@@ -664,6 +739,7 @@ impl RpcGuard {
         }
         if self.conn.active.fetch_sub(1, Ordering::AcqRel) == 1 {
             *self.conn.idle_since.lock() = Instant::now();
+            self.conn.idle_notify.notify_one();
         }
         if self.suppressed {
             return;
@@ -1383,6 +1459,7 @@ mod tests {
                 id: 1,
                 active: AtomicUsize::new(0),
                 idle_since: Mutex::new(Instant::now()),
+                idle_notify: Notify::new(),
             }),
             cache,
             cfg,
@@ -1691,6 +1768,7 @@ mod tests {
             id: 7,
             active: AtomicUsize::new(0),
             idle_since: Mutex::new(Instant::now()),
+            idle_notify: Notify::new(),
         });
         let routes = tonic::service::Routes::new(EchoIngesterSvc).prepare();
 
@@ -1835,5 +1913,228 @@ mod tests {
             mimir_ingester::circuit_breaker::BreakerState::HalfOpen
         );
         assert_eq!(read_cb.recorded_successes(), 0);
+    }
+
+    fn grpc_test_server(
+        keepalive_timeout: Duration,
+    ) -> (
+        Acceptor,
+        GrpcServerConfig,
+        GrpcContext,
+        SocketAddr,
+    ) {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+        let reg = prometheus::Registry::new();
+        let metrics = ServerMetrics::new(&reg, true, true).unwrap();
+        let gauge = metrics.tcp_connections.with_label_values(&["grpc"]);
+        let acceptor = Acceptor::new(
+            listener,
+            crate::server::listener::AcceptOptions {
+                conn_limit: 0,
+                connections_gauge: gauge,
+                proxy_protocol: false,
+                proxy_header_timeout: Duration::ZERO,
+            },
+        );
+        let cfg = GrpcServerConfig {
+            max_concurrent_streams: 100,
+            keepalive_time: None,
+            keepalive_timeout,
+            max_connection_idle: None,
+            max_connection_age: None,
+            max_connection_age_grace: None,
+            tls: None,
+            stats_tracking: true,
+            report_grpc_status: true,
+            cluster_validation: None,
+            multitenancy_enabled: false,
+            no_auth_tenant: "anonymous".to_string(),
+            tap_ingester: None,
+        };
+        let ctx = GrpcContext {
+            metrics,
+            logger: Arc::new(VecLogger::default()),
+        };
+        (acceptor, cfg, ctx, addr)
+    }
+
+    #[tokio::test]
+    async fn cmd_01_grpc_serve_shuts_down_immediately_with_unprefaced_tcp_conn() {
+        let (acceptor, cfg, ctx, addr) = grpc_test_server(Duration::from_secs(5));
+        let routes = tonic::service::Routes::new(HangingSvc);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv = tokio::spawn(serve(acceptor, cfg, routes, ctx, shutdown_rx));
+
+        // Raw TCP connection that sends nothing (and one that sends partial preface).
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut partial = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        partial.write_all(b"PRI * HTTP/2.0\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let start = Instant::now();
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), srv)
+            .await
+            .expect("grpc server must shut down immediately on un-prefaced raw TCP conns")
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn cmd_01_02_grpc_serve_drops_listener_immediately_and_drains_inflight_rpc() {
+        #[derive(Clone)]
+        struct SlowDrainSvc {
+            entered: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+            release: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        }
+        impl tonic::server::NamedService for SlowDrainSvc {
+            const NAME: &'static str = "test.Drain";
+        }
+        impl tower::Service<http::Request<tonic::body::BoxBody>> for SlowDrainSvc {
+            type Response = http::Response<tonic::body::BoxBody>;
+            type Error = std::convert::Infallible;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    if let Some(tx) = entered.lock().take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = release.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    Ok(tonic::Status::ok("done").into_http())
+                })
+            }
+        }
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let svc = SlowDrainSvc {
+            entered: Arc::new(Mutex::new(Some(entered_tx))),
+            release: Arc::new(tokio::sync::Mutex::new(Some(release_rx))),
+        };
+        let (acceptor, cfg, ctx, addr) = grpc_test_server(Duration::from_secs(5));
+        let routes = tonic::service::Routes::new(svc);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv = tokio::spawn(serve(acceptor, cfg, routes, ctx, shutdown_rx));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut client, conn) = h2::client::handshake(tcp).await.unwrap();
+        let client_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/test.Drain/Slow"))
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let (resp_fut, mut send_stream) = client.send_request(req, false).unwrap();
+        send_stream.send_data(Bytes::new(), true).unwrap();
+        entered_rx.await.unwrap();
+
+        // Trigger shutdown while RPC is active.
+        let _ = shutdown_tx.send(true);
+        // Listener must close immediately (new connects get ConnectionRefused).
+        let mut refused = false;
+        for _ in 0..40 {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    refused = true;
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(_) => {
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "gRPC listening port must close immediately on shutdown");
+        assert!(!srv.is_finished(), "gRPC server must wait for active RPC to finish");
+
+        // Release active RPC -> response completes cleanly and server finishes draining.
+        let _ = release_tx.send(());
+        let resp = tokio::time::timeout(Duration::from_secs(2), resp_fut)
+            .await
+            .expect("active RPC response must finish")
+            .unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            tonic::Status::from_header_map(resp.headers()).unwrap().code(),
+            tonic::Code::Ok
+        );
+        drop(client);
+        let _ = client_task.await;
+        tokio::time::timeout(Duration::from_secs(2), srv)
+            .await
+            .expect("grpc server must exit cleanly after active RPC drains")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cmd_01_grpc_serve_closes_idle_client_fast_and_bounds_frozen_h2_client() {
+        // 1) Normal idle HTTP/2 client closes cleanly in <500ms.
+        let (acceptor, cfg, ctx, addr) = grpc_test_server(Duration::from_secs(5));
+        let routes = tonic::service::Routes::new(HangingSvc);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv = tokio::spawn(serve(acceptor, cfg, routes, ctx, shutdown_rx));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (_client, conn) = h2::client::handshake(tcp).await.unwrap();
+        let client_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let start = Instant::now();
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), srv)
+            .await
+            .expect("idle h2 client must drain cleanly")
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let _ = client_task.await;
+
+        // 2) Frozen HTTP/2 client (sent preface + SETTINGS, then stops reading/replying to GOAWAY)
+        // must still be bounded by idle_grace (cfg.keepalive_timeout.min(5s)).
+        let (acceptor, cfg, ctx, addr) = grpc_test_server(Duration::from_millis(120));
+        let routes = tonic::service::Routes::new(HangingSvc);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv = tokio::spawn(serve(acceptor, cfg, routes, ctx, shutdown_rx));
+
+        let mut raw = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        // HTTP/2 client preface + empty client SETTINGS frame (9-byte header: len=0, type=4, flags=0, stream=0).
+        raw.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+        // Wait deterministically for the server's initial HTTP/2 SETTINGS frame header so we know
+        // the server has completed preface read and entered hyper HTTP/2 serve_connection.
+        let mut srv_hdr = [0u8; 9];
+        tokio::time::timeout(Duration::from_secs(2), raw.read_exact(&mut srv_hdr))
+            .await
+            .expect("server must send initial HTTP/2 SETTINGS frame")
+            .unwrap();
+
+        let start = Instant::now();
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), srv)
+            .await
+            .expect("frozen h2 client must close within bounded idle_grace")
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(90), "elapsed {:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

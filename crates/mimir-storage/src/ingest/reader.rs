@@ -1373,6 +1373,7 @@ impl SingleClusterPartitionReader {
         let ctx = RuntimeFailureCtx {
             partition: self.partition_id,
             state: Arc::clone(&self.state),
+            client: Arc::clone(&self.client),
             offset_watcher: Arc::clone(&self.offset_watcher),
             committer: Arc::clone(&self.committer),
             offset_reader: Arc::clone(&self.offset_reader),
@@ -1395,15 +1396,23 @@ impl SingleClusterPartitionReader {
     }
 
     async fn start_inner(&self) -> Result<Arc<FetchLoop>, ReaderError> {
-        if self.kafka_cfg.auto_create_topic_enabled {
-            let topic_ref = [self.kafka_cfg.topic.as_str()];
-            create_topics(&self.kafka_cfg, &topic_ref)
-                .await
-                .map_err(ReaderError::Startup)?;
-        }
-
         let startup_stop_rx = self.stop_tx.subscribe();
         let canceled = |rx: &watch::Receiver<bool>| rx.has_changed().is_err() || *rx.borrow();
+
+        if self.kafka_cfg.auto_create_topic_enabled {
+            let topic_ref = [self.kafka_cfg.topic.as_str()];
+            let mut stop_rx = startup_stop_rx.clone();
+            tokio::select! {
+                biased;
+                res = stop_rx.wait_for(|v| *v) => {
+                    let _ = res;
+                    return Err(ReaderError::Canceled);
+                }
+                r = create_topics(&self.kafka_cfg, &topic_ref) => {
+                    r.map_err(ReaderError::Startup)?;
+                }
+            }
+        }
 
         // getStartOffset(): resolving the start offset is retried with a dskit backoff
         // (min 100ms, max 2s, 10 retries); configuration errors are returned immediately.
@@ -1420,7 +1429,16 @@ impl SingleClusterPartitionReader {
                 if canceled(&stop_rx) {
                     return Err(ReaderError::Canceled);
                 }
-                match self.get_start_offset().await {
+                let mut call_stop_rx = startup_stop_rx.clone();
+                let offset_res = tokio::select! {
+                    biased;
+                    res = call_stop_rx.wait_for(|v| *v) => {
+                        let _ = res;
+                        return Err(ReaderError::Canceled);
+                    }
+                    r = self.get_start_offset() => r,
+                };
+                match offset_res {
                     Ok(v) => {
                         resolved = Some(v);
                         break;
@@ -1432,10 +1450,10 @@ impl SingleClusterPartitionReader {
                     }
                 }
                 tokio::select! {
-                    res = stop_rx.changed() => {
-                        if res.is_err() || *stop_rx.borrow() {
-                            return Err(ReaderError::Canceled);
-                        }
+                    biased;
+                    res = stop_rx.wait_for(|v| *v) => {
+                        let _ = res;
+                        return Err(ReaderError::Canceled);
                     }
                     _ = retry.wait() => {}
                 }
@@ -1762,6 +1780,12 @@ impl SingleClusterPartitionReader {
     }
 
     pub async fn stop(&self) {
+        // Idempotent: a reader already terminated (or already torn down via fail_and_stop
+        // after tasks exited) must not re-run stop_dependencies() and re-dial Kafka or repeat
+        // the pre-commit fsync.
+        if self.state() == ReaderState::Terminated {
+            return;
+        }
         let was_failed = self.state() == ReaderState::Failed;
         if !was_failed {
             self.state
@@ -1775,7 +1799,9 @@ impl SingleClusterPartitionReader {
         if let Some(handle) = self.task.lock().await.take() {
             let _ = handle.await;
         }
-        self.stop_dependencies().await;
+        if !was_failed && !self.client.is_closed() {
+            self.stop_dependencies().await;
+        }
         if !was_failed && self.state() != ReaderState::Failed {
             self.state
                 .store(ReaderState::Terminated as u8, Ordering::SeqCst);
@@ -1789,6 +1815,7 @@ impl SingleClusterPartitionReader {
             RuntimeFailureCtx {
                 partition: self.partition_id,
                 state: Arc::clone(&self.state),
+                client: Arc::clone(&self.client),
                 offset_watcher: Arc::clone(&self.offset_watcher),
                 committer: Arc::clone(&self.committer),
                 offset_reader: Arc::clone(&self.offset_reader),
@@ -1822,6 +1849,7 @@ impl SingleClusterPartitionReader {
         if let Some(f) = fetcher {
             f.stop().await;
         }
+        self.client.close().await;
     }
 
     /// Waits until `target_offset` has been consumed by this reader, or `timeout` expires.
@@ -2084,6 +2112,7 @@ impl Cancel {
 struct RuntimeFailureCtx {
     partition: i32,
     state: Arc<AtomicU8>,
+    client: Arc<KafkaClient>,
     offset_watcher: Arc<PartitionOffsetWatcher>,
     committer: Arc<PartitionCommitter>,
     offset_reader: Arc<SingleClusterPartitionOffsetReader>,
@@ -2116,6 +2145,7 @@ impl RuntimeFailureCtx {
         } else {
             self.fallback_fetcher.stop().await;
         }
+        self.client.close().await;
         let _ = self.failure_tx.send(Some(err_msg));
     }
 }
@@ -3889,6 +3919,446 @@ mod tests {
         );
 
         reader.stop().await;
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn w35_stor01_stop_interrupts_unreachable_get_start_offset_and_create_topics_and_closes_client() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        struct NoOpConsumer;
+        impl RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        // Case A: blocked inside get_start_offset() with last_produced_offset_retry_timeout = 0
+        // (infinite retry) against a blackhole broker that accepts TCP but never responds.
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let accepted_a = Arc::new(AtomicUsize::new(0));
+        let eof_a = Arc::new(AtomicUsize::new(0));
+        let accepted_a_srv = Arc::clone(&accepted_a);
+        let eof_a_srv = Arc::clone(&eof_a);
+        let srv_a = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener_a.accept().await else {
+                    break;
+                };
+                accepted_a_srv.fetch_add(1, Ordering::SeqCst);
+                let eof_cnt = Arc::clone(&eof_a_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 256];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => {
+                                eof_cnt.fetch_add(1, Ordering::SeqCst);
+                                break;
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut cfg_a = KafkaConfig {
+            address: StringSliceCSV(vec![addr_a.to_string()]),
+            topic: "unreachable-a".to_string(),
+            auto_create_topic_enabled: false,
+            fetch_concurrency_max: 0,
+            ..Default::default()
+        };
+        cfg_a.dial_timeout = mimir_config::GoDuration::from_secs(30);
+        cfg_a.last_produced_offset_retry_timeout = mimir_config::GoDuration::ZERO;
+        let client_a = Arc::new(KafkaClient::from_config(&cfg_a).unwrap());
+        let reader_a = Arc::new(
+            SingleClusterPartitionReader::with_client(
+                cfg_a,
+                0,
+                "inst-a",
+                None,
+                Arc::clone(&client_a),
+                Arc::new(NoOpConsumer),
+                None,
+            )
+            .unwrap(),
+        );
+
+        let rx_a = reader_a.start_async_with_result().await;
+        // Wait until get_start_offset() has dialed the blackhole broker and is waiting for response.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while accepted_a.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "reader never dialed broker");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let t0 = Instant::now();
+        reader_a.stop().await;
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stop() must interrupt blocked get_start_offset() in <2s, took {elapsed:?}"
+        );
+        let start_res = rx_a.await.unwrap();
+        assert!(
+            matches!(start_res, Err(ReaderError::Canceled)),
+            "expected ReaderError::Canceled, got {start_res:?}"
+        );
+        assert!(client_a.is_closed(), "KafkaClient must be marked closed");
+        assert_eq!(
+            client_a.active_conn_count().await,
+            0,
+            "KafkaClient pooled connections must be cleared"
+        );
+        let eof_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while eof_a.load(Ordering::SeqCst) < accepted_a.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < eof_deadline,
+                "broker sockets did not close after stop()"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        srv_a.abort();
+
+        // Case B: blocked inside create_topics() when auto_create_topic_enabled = true.
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let accepted_b = Arc::new(AtomicUsize::new(0));
+        let eof_b = Arc::new(AtomicUsize::new(0));
+        let accepted_b_srv = Arc::clone(&accepted_b);
+        let eof_b_srv = Arc::clone(&eof_b);
+        let srv_b = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener_b.accept().await else {
+                    break;
+                };
+                accepted_b_srv.fetch_add(1, Ordering::SeqCst);
+                let eof_cnt = Arc::clone(&eof_b_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 256];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => {
+                                eof_cnt.fetch_add(1, Ordering::SeqCst);
+                                break;
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut cfg_b = KafkaConfig {
+            address: StringSliceCSV(vec![addr_b.to_string()]),
+            topic: "unreachable-b".to_string(),
+            auto_create_topic_enabled: true,
+            fetch_concurrency_max: 0,
+            ..Default::default()
+        };
+        cfg_b.dial_timeout = mimir_config::GoDuration::from_secs(30);
+        cfg_b.last_produced_offset_retry_timeout = mimir_config::GoDuration::from_secs(30);
+        let client_b = Arc::new(KafkaClient::from_config(&cfg_b).unwrap());
+        let reader_b = Arc::new(
+            SingleClusterPartitionReader::with_client(
+                cfg_b,
+                0,
+                "inst-b",
+                None,
+                Arc::clone(&client_b),
+                Arc::new(NoOpConsumer),
+                None,
+            )
+            .unwrap(),
+        );
+
+        let rx_b = reader_b.start_async_with_result().await;
+        let deadline_b = tokio::time::Instant::now() + Duration::from_secs(2);
+        while accepted_b.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline_b, "create_topics never dialed broker");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let t1 = Instant::now();
+        reader_b.stop().await;
+        let elapsed_b = t1.elapsed();
+        assert!(
+            elapsed_b < Duration::from_secs(2),
+            "stop() must interrupt blocked create_topics() in <2s, took {elapsed_b:?}"
+        );
+        let start_res_b = rx_b.await.unwrap();
+        assert!(
+            matches!(start_res_b, Err(ReaderError::Canceled)),
+            "expected ReaderError::Canceled, got {start_res_b:?}"
+        );
+        assert!(client_b.is_closed(), "KafkaClient must be marked closed");
+        assert_eq!(client_b.active_conn_count().await, 0);
+        let eof_deadline_b = tokio::time::Instant::now() + Duration::from_secs(1);
+        while eof_b.load(Ordering::SeqCst) < accepted_b.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < eof_deadline_b,
+                "create_topics broker sockets did not close after stop()"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        srv_b.abort();
+    }
+
+    #[tokio::test]
+    async fn w35_stor02_stop_dependencies_and_fail_and_stop_close_client_with_live_reader_arc() {
+        use bytes::BufMut;
+        use kafka_protocol::messages::api_versions_response::ApiVersion;
+        use kafka_protocol::messages::metadata_response::{
+            MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+        };
+        use kafka_protocol::messages::{
+            ApiKey, ApiVersionsRequest, ApiVersionsResponse, BrokerId, FetchRequest, FetchResponse,
+            ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
+            RequestHeader, ResponseHeader, TopicName,
+        };
+        use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+        use kafka_protocol::messages::list_offsets_response::{
+            ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+        };
+        use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        struct NoOpConsumer;
+        impl RecordBatchConsumer for NoOpConsumer {
+            fn consume(
+                &self,
+                _records: Vec<FetchedRecord>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let active_conns = Arc::new(AtomicUsize::new(0));
+        let active_conns_srv = Arc::clone(&active_conns);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let conns = Arc::clone(&active_conns_srv);
+                conns.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    struct DecOnDrop(Arc<AtomicUsize>);
+                    impl Drop for DecOnDrop {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                    let _guard = DecOnDrop(conns);
+                    let (mut rd, mut wr) = sock.into_split();
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if rd.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut payload = vec![0u8; len];
+                        if rd.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        let mut buf = bytes::Bytes::from(payload);
+                        let req_hdr_ver = if i16::from_be_bytes([buf[0], buf[1]]) == ApiKey::ApiVersions as i16 {
+                            let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                            ApiVersionsRequest::header_version(ver)
+                        } else {
+                            let key = ApiKey::try_from(i16::from_be_bytes([buf[0], buf[1]])).unwrap();
+                            let ver = i16::from_be_bytes([buf[2], buf[3]]);
+                            match key {
+                                ApiKey::Metadata => MetadataRequest::header_version(ver),
+                                ApiKey::ListOffsets => ListOffsetsRequest::header_version(ver),
+                                ApiKey::Fetch => FetchRequest::header_version(ver),
+                                _ => 1,
+                            }
+                        };
+                        let req_hdr = RequestHeader::decode(&mut buf, req_hdr_ver).unwrap();
+                        let api_key = ApiKey::try_from(req_hdr.request_api_key).unwrap();
+                        let ver = req_hdr.request_api_version;
+
+                        let mut out = bytes::BytesMut::new();
+                        out.put_u32(0);
+                        let resp_hdr_ver = if api_key == ApiKey::ApiVersions {
+                            0
+                        } else {
+                            api_key.response_header_version(ver)
+                        };
+                        let mut resp_hdr = ResponseHeader::default();
+                        resp_hdr.correlation_id = req_hdr.correlation_id;
+                        resp_hdr.encode(&mut out, resp_hdr_ver).unwrap();
+
+                        match api_key {
+                            ApiKey::ApiVersions => {
+                                let _ = ApiVersionsRequest::decode(&mut buf, ver);
+                                let mut resp = ApiVersionsResponse::default();
+                                for (k, mn, mx) in [
+                                    (ApiKey::ApiVersions as i16, 0, 3),
+                                    (ApiKey::Metadata as i16, 1, 12),
+                                    (ApiKey::ListOffsets as i16, 1, 7),
+                                    (ApiKey::Fetch as i16, 4, 12),
+                                ] {
+                                    let mut av = ApiVersion::default();
+                                    av.api_key = k;
+                                    av.min_version = mn;
+                                    av.max_version = mx;
+                                    resp.api_keys.push(av);
+                                }
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Metadata => {
+                                let _ = MetadataRequest::decode(&mut buf, ver);
+                                let mut resp = MetadataResponse::default();
+                                let mut b = MetadataResponseBroker::default();
+                                b.node_id = BrokerId(0);
+                                b.host = StrBytes::from_static_str("127.0.0.1");
+                                b.port = addr.port() as i32;
+                                resp.brokers.push(b);
+                                resp.controller_id = BrokerId(0);
+                                let mut t = MetadataResponseTopic::default();
+                                t.name = Some(TopicName(StrBytes::from_static_str("stor02")));
+                                let mut p = MetadataResponsePartition::default();
+                                p.partition_index = 0;
+                                p.leader_id = BrokerId(0);
+                                t.partitions.push(p);
+                                resp.topics.push(t);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::ListOffsets => {
+                                let _ = ListOffsetsRequest::decode(&mut buf, ver);
+                                let mut resp = ListOffsetsResponse::default();
+                                let mut topic = ListOffsetsTopicResponse::default();
+                                topic.name = TopicName(StrBytes::from_static_str("stor02"));
+                                let mut part = ListOffsetsPartitionResponse::default();
+                                part.partition_index = 0;
+                                part.offset = 0;
+                                topic.partitions.push(part);
+                                resp.topics.push(topic);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            ApiKey::Fetch => {
+                                let _ = FetchRequest::decode(&mut buf, ver);
+                                let mut resp = FetchResponse::default();
+                                let mut ft = FetchableTopicResponse::default();
+                                ft.topic = TopicName(StrBytes::from_static_str("stor02"));
+                                let mut pd = PartitionData::default();
+                                pd.partition_index = 0;
+                                ft.partitions.push(pd);
+                                resp.responses.push(ft);
+                                resp.encode(&mut out, ver).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let frame_len = (out.len() - 4) as u32;
+                        out[0..4].copy_from_slice(&frame_len.to_be_bytes());
+                        if wr.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut cfg = KafkaConfig {
+            address: StringSliceCSV(vec![addr.to_string()]),
+            topic: "stor02".to_string(),
+            auto_create_topic_enabled: false,
+            fetch_concurrency_max: 0,
+            ..Default::default()
+        };
+        cfg.target_consumer_lag_at_startup = mimir_config::GoDuration::ZERO;
+        cfg.max_consumer_lag_at_startup = mimir_config::GoDuration::ZERO;
+
+        // 1. stop_dependencies() must close KafkaClient even while an extra Arc<SingleClusterPartitionReader> is alive.
+        let client1 = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let reader1 = Arc::new(
+            SingleClusterPartitionReader::with_client(
+                cfg.clone(),
+                0,
+                "",
+                None,
+                Arc::clone(&client1),
+                Arc::new(NoOpConsumer),
+                None,
+            )
+            .unwrap(),
+        );
+        let reader1_keepalive = Arc::clone(&reader1);
+        reader1.start().await.unwrap();
+        assert!(!client1.is_closed());
+        assert!(client1.active_conn_count().await >= 1);
+        assert!(active_conns.load(Ordering::SeqCst) >= 1);
+
+        let _ = reader1.stop_tx.send(true);
+        if let Some(h) = reader1.task.lock().await.take() {
+            let _ = h.await;
+        }
+        reader1.stop_dependencies().await;
+        assert!(
+            client1.is_closed(),
+            "stop_dependencies() must close KafkaClient even with live Arc<SingleClusterPartitionReader>"
+        );
+        assert_eq!(client1.active_conn_count().await, 0);
+        let deadline1 = tokio::time::Instant::now() + Duration::from_secs(1);
+        while active_conns.load(Ordering::SeqCst) > 0 {
+            assert!(tokio::time::Instant::now() < deadline1, "TCP connections leaked after stop_dependencies()");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(reader1_keepalive);
+
+        // 2. RuntimeFailureCtx::fail_and_stop() must close KafkaClient even while an extra Arc<SingleClusterPartitionReader> is alive.
+        let client2 = Arc::new(KafkaClient::from_config(&cfg).unwrap());
+        let reader2 = Arc::new(
+            SingleClusterPartitionReader::with_client(
+                cfg,
+                0,
+                "",
+                None,
+                Arc::clone(&client2),
+                Arc::new(NoOpConsumer),
+                None,
+            )
+            .unwrap(),
+        );
+        let reader2_keepalive = Arc::clone(&reader2);
+        let mut failure_rx = reader2.subscribe_failure();
+        reader2.start().await.unwrap();
+        assert!(!client2.is_closed());
+        assert!(client2.active_conn_count().await >= 1);
+        assert!(active_conns.load(Ordering::SeqCst) >= 1);
+
+        reader2
+            .simulate_runtime_failure_for_test("simulated stor02 failure".to_string())
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), failure_rx.wait_for(|v| v.is_some()))
+            .await
+            .expect("failure_tx must be notified")
+            .unwrap();
+        assert!(
+            client2.is_closed(),
+            "fail_and_stop() must close KafkaClient even with live Arc<SingleClusterPartitionReader>"
+        );
+        assert_eq!(client2.active_conn_count().await, 0);
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(1);
+        while active_conns.load(Ordering::SeqCst) > 0 {
+            assert!(tokio::time::Instant::now() < deadline2, "TCP connections leaked after fail_and_stop()");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(reader2_keepalive);
         srv.abort();
     }
 }

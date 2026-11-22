@@ -423,7 +423,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TimedIo<T> {
 /// Serves `router` on `acceptor` until `shutdown` flips to true, then shuts down gracefully
 /// within `graceful_shutdown_timeout` (Go `http.Server.Shutdown(ctx)`).
 pub async fn serve(acceptor: Acceptor, cfg: HttpServerConfig, router: Router, mut shutdown: watch::Receiver<bool>) {
-    let acceptor = Arc::new(acceptor);
     let mut conns: JoinSet<()> = JoinSet::new();
     let mut accept_backoff = Duration::from_millis(5);
     loop {
@@ -450,20 +449,31 @@ pub async fn serve(acceptor: Acceptor, cfg: HttpServerConfig, router: Router, mu
                         continue;
                     }
                 };
-                let acc = Arc::clone(&acceptor);
+                let opts = acceptor.options_arc();
                 let cfg = cfg.clone();
                 let router = router.clone();
-                let shutdown = shutdown.clone();
+                let mut shutdown = shutdown.clone();
                 conns.spawn(async move {
-                    let Ok(accepted) = finish_accept(stream, addr, guard, acc.options()).await else { return };
+                    let accepted = tokio::select! {
+                        biased;
+                        _ = super::wait_shutdown(&mut shutdown) => return,
+                        res = finish_accept(stream, addr, guard, &opts) => match res {
+                            Ok(a) => a,
+                            Err(_) => return,
+                        },
+                    };
                     let remote = accepted.remote_addr;
                     let _guard = accepted.guard;
                     let io = PrefixedIo::new(accepted.prefix, accepted.stream);
                     if let Some(tls) = cfg.tls.clone() {
                         let hs = tokio_rustls::TlsAcceptor::from(tls).accept(io);
-                        let tls_stream = match tokio::time::timeout(handshake_timeout(&cfg), hs).await {
-                            Ok(Ok(s)) => s,
-                            _ => return,
+                        let tls_stream = tokio::select! {
+                            biased;
+                            _ = super::wait_shutdown(&mut shutdown) => return,
+                            res = tokio::time::timeout(handshake_timeout(&cfg), hs) => match res {
+                                Ok(Ok(s)) => s,
+                                _ => return,
+                            },
                         };
                         let h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
                         serve_conn(tls_stream, h2, remote, cfg, router, shutdown).await;
@@ -475,8 +485,9 @@ pub async fn serve(acceptor: Acceptor, cfg: HttpServerConfig, router: Router, mu
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
         }
     }
-    // Stop accepting (listener dropped with the acceptor once all tasks finish), let connections
-    // finish their in-flight requests, and abort what is left after the graceful timeout.
+    // Drop the acceptor immediately so the listening socket closes before draining in-flight
+    // connections (matching Go http.Server.Shutdown).
+    drop(acceptor);
     let drain = async { while conns.join_next().await.is_some() {} };
     if tokio::time::timeout(cfg.graceful_shutdown_timeout, drain).await.is_err() {
         conns.abort_all();
@@ -645,5 +656,137 @@ mod tests {
         assert_eq!(go_quote(b"GET / HTTP/1.1\r\nHost: x\r\n"), r#""GET / HTTP/1.1\r\nHost: x\r\n""#);
         assert_eq!(go_quote(b"a\"b\\c\x00\x7f\xff"), r#""a\"b\\c\x00\x7f\xff""#);
         assert_eq!(go_quote("ü\u{200b}".as_bytes()), "\"ü\\u200b\"");
+    }
+
+    #[tokio::test]
+    async fn cmd_02_http_serve_drops_listener_immediately_while_inflight_request_drains() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reg = prometheus::Registry::new();
+        let gauge = prometheus::Gauge::new("test_http_conns", "test").unwrap();
+        reg.register(Box::new(gauge.clone())).unwrap();
+        let acceptor = Acceptor::new(
+            listener,
+            crate::server::listener::AcceptOptions {
+                conn_limit: 0,
+                connections_gauge: gauge,
+                proxy_protocol: false,
+                proxy_header_timeout: Duration::ZERO,
+            },
+        );
+        let cfg = HttpServerConfig {
+            read_timeout: Duration::from_secs(5),
+            read_header_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(5),
+            tls: None,
+            graceful_shutdown_timeout: Duration::from_secs(5),
+            zero_response_logger: None,
+        };
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let router = Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let entered_tx = Arc::clone(&entered_tx);
+                let release_rx = Arc::clone(&release_rx);
+                async move {
+                    if let Some(tx) = entered_tx.lock().take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = release_rx.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    "drained-ok"
+                }
+            }),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv = tokio::spawn(serve(acceptor, cfg, router, shutdown_rx));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        entered_rx.await.unwrap();
+
+        // Trigger shutdown while the HTTP handler is blocked in-flight.
+        let _ = shutdown_tx.send(true);
+        // The listening socket must close immediately (before the in-flight request drains).
+        let mut refused = false;
+        for _ in 0..40 {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    refused = true;
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(_) => {
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "listening port must close immediately on HTTP shutdown");
+        assert!(!srv.is_finished(), "server must wait for in-flight HTTP request");
+
+        // Unblock the in-flight request and verify it completes cleanly before serve returns.
+        let _ = release_tx.send(());
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.contains("200 OK") && resp.contains("drained-ok"), "unexpected response: {resp}");
+        tokio::time::timeout(Duration::from_secs(2), srv)
+            .await
+            .expect("http server must exit after drain")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cmd_01_http_serve_aborts_pre_handshake_proxy_conn_immediately_on_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reg = prometheus::Registry::new();
+        let gauge = prometheus::Gauge::new("test_http_proxy_conns", "test").unwrap();
+        reg.register(Box::new(gauge.clone())).unwrap();
+        let acceptor = Acceptor::new(
+            listener,
+            crate::server::listener::AcceptOptions {
+                conn_limit: 0,
+                connections_gauge: gauge,
+                proxy_protocol: true,
+                proxy_header_timeout: Duration::from_secs(60),
+            },
+        );
+        let cfg = HttpServerConfig {
+            read_timeout: Duration::from_secs(5),
+            read_header_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(5),
+            tls: None,
+            graceful_shutdown_timeout: Duration::from_secs(5),
+            zero_response_logger: None,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv = tokio::spawn(serve(acceptor, cfg, Router::new(), shutdown_rx));
+
+        // Connect and send nothing so finish_accept blocks waiting on PROXY header.
+        let _silent_client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let start = Instant::now();
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), srv)
+            .await
+            .expect("http server must abort pre-handshake connection immediately")
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

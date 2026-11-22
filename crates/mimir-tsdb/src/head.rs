@@ -4798,7 +4798,10 @@ impl Head {
         let mut snapshot_ref_series: HashMap<u64, Arc<SeriesEntry>> = HashMap::new();
         if self.enable_memory_snapshot_on_shutdown.load(Ordering::Acquire) {
             if let Ok(Some((snap_dir, snap_idx, snap_offset))) = Self::last_chunk_snapshot(&self.dir) {
-                let wal_behind = pre_open_wal_last.is_some_and(|last| last < snap_idx);
+                // In Go Prometheus, wlog.NewSize creates empty segment 00000000 before Head.Init
+                // calls wlog.Segments(), so an empty wal/ reports endAt == 0 (0 < snap_idx iff snap_idx > 0).
+                let wal_behind = !disable_wal
+                    && pre_open_wal_last.map_or(snap_idx > 0, |last| last < snap_idx);
                 if wal_behind {
                     let _ = Self::delete_chunk_snapshots(&self.dir, usize::MAX, usize::MAX);
                 } else {
@@ -4963,8 +4966,8 @@ impl Head {
     ) -> Result<(), HeadError> {
         let mut start_from = snapshot_pos.map_or(0usize, |(idx, _)| idx);
         let mut global_missing_series_refs: HashSet<u64> = HashSet::new();
-        if snapshot_pos.is_none() {
-            if let Some((cp_dir, cp_idx)) = last_checkpoint(wal_dir)? {
+        if let Some((cp_dir, cp_idx)) = last_checkpoint(wal_dir)? {
+            if snapshot_pos.is_none_or(|(s_idx, _)| cp_idx >= s_idx) {
                 // A corrupted checkpoint is passed to the WAL repair like any other error
                 // (Go: `backfill checkpoint: %w`).
                 let mut r = WlogReader::open_dir(&cp_dir)?;
@@ -10737,6 +10740,9 @@ impl Head {
         prepublished_evicting: bool,
         require_stale: bool,
     ) -> Result<usize, HeadError> {
+        if self.is_closed() {
+            return Err(HeadError::Closed);
+        }
         let _snap_guard = self.chunk_snapshot_mtx.lock();
         if self.min_time() > maxt_inclusive {
             return Ok(0);
@@ -10863,6 +10869,9 @@ impl Head {
         maxt: i64,
         matchers: &[LabelMatcher],
     ) -> Result<(), HeadError> {
+        if self.is_closed() {
+            return Err(HeadError::Closed);
+        }
         let h_min = self.min_time();
         let h_max = self.max_time();
         let mint = mint.max(h_min);
@@ -12744,9 +12753,11 @@ impl Head {
     /// Writes a chunk snapshot directory `chunk_snapshot.NNNNNN.OOOOOOOOOO` (Go `Head.ChunkSnapshot`).
     pub fn chunk_snapshot(&self) -> Result<Option<PathBuf>, HeadError> {
         let _snap_guard = self.chunk_snapshot_mtx.lock();
-        // Flush sealed head chunks first so `cold.extra_head_chunks` are persisted in
-        // `chunks_head/` before recording only the active chunk per series in the snapshot.
-        self.mmap_head_chunks()?;
+        // Flush sealed head chunks first (when called on an open Head) so `cold.extra_head_chunks`
+        // are persisted in `chunks_head/` before recording only the active chunk per series.
+        if !self.closed.load(Ordering::Acquire) {
+            self.mmap_head_chunks()?;
+        }
         let (wlast, woffset) = {
             let wal_guard = self.wal.lock();
             let Some(ref wal) = *wal_guard else {
@@ -13038,10 +13049,18 @@ impl Head {
         }
         self.finish_deleted_series_cleanup(all_entries);
         self.tombstones.truncate_before(i64::MAX);
+        self.exemplars.clear();
+        self.has_any_metadata.store(false, Ordering::Release);
+        self.wal_expiries.lock().clear();
+        self.wbl_pinned_refs.lock().clear();
+        self.ooo_unflushed_series.lock().clear();
+        self.has_ooo_unflushed.store(false, Ordering::Release);
         self.min_time.store(i64::MAX, Ordering::Release);
         self.max_time.store(i64::MIN, Ordering::Release);
         self.min_ooo_time.store(i64::MAX, Ordering::Release);
         self.max_ooo_time.store(i64::MIN, Ordering::Release);
+        self.last_wal_truncation_time.store(i64::MIN, Ordering::Release);
+        self.last_memory_truncation_time.store(i64::MIN, Ordering::Release);
         self.last_series_id.store(0, Ordering::Release);
     }
 
@@ -13050,26 +13069,49 @@ impl Head {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        if !self.read_only {
-            self.mmap_head_chunks()?;
-            if self.enable_memory_snapshot_on_shutdown.load(Ordering::Acquire) {
-                self.chunk_snapshot()?;
+        let mut first_err: Option<HeadError> = None;
+        let mut record_err = |err: HeadError| {
+            if first_err.is_none() {
+                first_err = Some(err);
             }
+        };
+        if !self.read_only {
             if self.enable_fast_startup.load(Ordering::Acquire) && self.wal.lock().is_some() {
                 let _ = self.write_series_state_file(true);
             }
+            if let Err(e) = self.mmap_head_chunks() {
+                record_err(e.into());
+            }
         }
-        if let Some(cw) = self.chunk_writer.lock().take() {
-            cw.close()?;
+        if let Some(ref mut cw) = *self.chunk_writer.lock() {
+            if let Err(e) = cw.close_mut() {
+                record_err(e.into());
+            }
         }
-        if let Some(wal) = self.wal.lock().take() {
-            wal.close()?;
+        if let Some(ref mut wal) = *self.wal.lock() {
+            if let Err(e) = wal.close_if_open() {
+                record_err(e.into());
+            }
         }
-        if let Some(wbl) = self.wbl.lock().take() {
-            wbl.close()?;
+        if let Some(ref mut wbl) = *self.wbl.lock() {
+            if let Err(e) = wbl.close_if_open() {
+                record_err(e.into());
+            }
         }
         *self.chunk_reader.write() = None;
-        Ok(())
+        drop(record_err);
+        if first_err.is_none()
+            && !self.read_only
+            && self.enable_memory_snapshot_on_shutdown.load(Ordering::Acquire)
+        {
+            if let Err(e) = self.chunk_snapshot() {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 
@@ -13707,6 +13749,10 @@ impl<'a> CommitContext<'a> {
 
     fn finish(mut self, apply_err: Option<HeadError>) -> Result<(), HeadError> {
         let _ = (self.hist_oob, self.hist_too_old);
+        if self.head.is_closed() {
+            drop(self.ooo_wbl_guard.take());
+            return Err(HeadError::Closed);
+        }
         let m = &self.head.metrics;
         m.out_of_order_samples
             .with_label_values(&["float"])
@@ -15599,16 +15645,22 @@ impl<'a> HeadAppender<'a> {
 
         let compact_notifier = self.compact_notifier;
         let head = self.head;
-        let res = self.commit_inner();
+        let res = if self.head.is_closed() {
+            Err(HeadError::Closed)
+        } else {
+            self.commit_inner()
+        };
         if self.append_id > 0 {
             let aid = std::mem::take(&mut self.append_id);
             self.head.iso.close_append(aid);
         }
         self.release_remaining_pending_commits();
         self.return_scratch();
-        if let Some(notifier) = compact_notifier {
-            if head.is_compactable() {
-                notifier.notify_compact();
+        if res.is_ok() {
+            if let Some(notifier) = compact_notifier {
+                if head.is_compactable() {
+                    notifier.notify_compact();
+                }
             }
         }
         res
@@ -15623,7 +15675,10 @@ impl<'a> HeadAppender<'a> {
             return Ok(());
         }
         if apps.len() == 1 {
-            return apps.into_iter().next().unwrap().commit();
+            if let Some(app) = apps.into_iter().next() {
+                return app.commit();
+            }
+            return Ok(());
         }
         if apps.iter().any(|a| a.closed) {
             return Err(HeadError::AppenderClosed);
@@ -15643,6 +15698,11 @@ impl<'a> HeadAppender<'a> {
                 a.return_scratch();
             }
         };
+
+        if apps.iter().any(|a| a.head.is_closed()) {
+            finish_all(&mut apps);
+            return Err(HeadError::Closed);
+        }
 
         let same_head = apps.iter().all(|a| std::ptr::eq(a.head, apps[0].head));
         if same_head {
@@ -15812,7 +15872,8 @@ impl<'a> HeadAppender<'a> {
         if self.series_refs.is_empty() {
             return;
         }
-        if let Some(ref mut wal) = *self.head.wal.lock() {
+        if !self.head.is_closed() {
+            if let Some(ref mut wal) = *self.head.wal.lock() {
             let enc = RecordEncoder::new(self.head.opts.enable_st_storage);
             let rec = enc.series(&self.series_refs, Vec::new());
             if let Err(rb_err) = wal.log(&[&rec]) {
@@ -15822,6 +15883,7 @@ impl<'a> HeadAppender<'a> {
                     rollback_err = %rb_err,
                     "failed to persist newly created series' declaration to the WAL on both commit and rollback retry"
                 );
+                }
             }
         }
         self.series_refs.clear();
@@ -16413,6 +16475,9 @@ impl<'a> HeadAppender<'a> {
     }
 
     fn log_wal(&mut self) -> Result<(), HeadError> {
+        if self.head.is_closed() {
+            return Err(HeadError::Closed);
+        }
         let wal_compression = self.head.opts.wal_compression;
         let enc = RecordEncoder::new(self.head.opts.enable_st_storage);
 
@@ -21028,5 +21093,332 @@ mod tests {
             }
         }
         head.close().unwrap();
+    }
+
+    #[test]
+    fn w35_tsdb1_head_close_closes_all_writers_on_error_and_snapshots_after_closing() {
+        // Part A: when WAL close fails, chunk_writer and wbl are still closed, and chunk_snapshot is skipped.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = HeadOptions {
+                ooo_time_window_ms: 10_000,
+                samples_per_chunk: 4,
+                ..HeadOptions::default()
+            };
+            let head = Head::open_with_snapshot(dir.path(), opts, i64::MIN, true).unwrap();
+            {
+                let mut app = head.appender();
+                for i in 0..10i64 {
+                    app.append_float(None, &[("__name__", "m_err")], 1_000 + i * 100, i as f64)
+                        .unwrap();
+                }
+                app.commit().unwrap();
+            }
+            {
+                let mut app = head.appender();
+                app.append_float(None, &[("__name__", "m_err")], 500, 99.0).unwrap();
+                app.commit().unwrap();
+            }
+            // Make wal.close_mut() fail during page flush.
+            {
+                let mut wal = head.wal.lock();
+                wal.as_mut().unwrap().set_write_fault_hook(Some(Arc::new(|_| {
+                    crate::head_chunks::WriteFaultAction::Error(io::ErrorKind::StorageFull)
+                })));
+            }
+            let close_err = head.close().unwrap_err();
+            assert!(matches!(close_err, HeadError::Wlog(_)));
+            // chunk_writer and wbl must still be Some(closed) and reject writes with Closed!
+            {
+                let mut cw = head.chunk_writer.lock();
+                let cw_ref = cw.as_mut().expect("chunk_writer must remain Some(closed)");
+                assert!(matches!(
+                    cw_ref.write_raw_chunk_bytes(1, 0, 1, Encoding::Xor.as_u8(), &[], false),
+                    Err(HeadChunksError::Closed)
+                ));
+            }
+            {
+                let mut wbl = head.wbl.lock();
+                let wbl_ref = wbl.as_mut().expect("wbl must remain Some(closed)");
+                assert!(matches!(wbl_ref.log(&[&[1u8]]), Err(WlogError::Closed)));
+            }
+            assert!(
+                Head::last_chunk_snapshot(dir.path()).unwrap().is_none(),
+                "chunk_snapshot must NOT run if any writer close fails"
+            );
+        }
+
+        // Part B: normal close() flushes wal, leaves wal Some(closed) with exact last_segment_and_offset(),
+        // then runs chunk_snapshot() with that exact offset, and reopen recovers cleanly.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = HeadOptions {
+                ooo_time_window_ms: 10_000,
+                ..HeadOptions::default()
+            };
+            let head = Head::open_with_snapshot(dir.path(), opts.clone(), i64::MIN, true).unwrap();
+            {
+                let mut app = head.appender();
+                for i in 0..10i64 {
+                    app.append_float(None, &[("__name__", "m_ok")], 1_000 + i * 100, i as f64)
+                        .unwrap();
+                }
+                app.commit().unwrap();
+            }
+            head.close().unwrap();
+
+            let (wal_seg, wal_off) = {
+                let wal = head.wal.lock();
+                wal.as_ref()
+                    .expect("wal must stay Some(closed)")
+                    .last_segment_and_offset()
+                    .unwrap()
+            };
+            assert!(wal_off > 0 && wal_off % crate::wlog::PAGE_SIZE == 0);
+            let (_, snap_idx, snap_off) = Head::last_chunk_snapshot(dir.path()).unwrap().unwrap();
+            assert_eq!(snap_idx, wal_seg.unwrap_or(0));
+            assert_eq!(snap_off, wal_off);
+
+            let reopened = Head::open_with_snapshot(dir.path(), opts, i64::MIN, true).unwrap();
+            let e = reopened.get_entry_by_sorted_pairs(&[("__name__", "m_ok")]).unwrap();
+            let got = read_head_float_samples(&reopened, e.ref_id);
+            assert_eq!(got.len(), 10);
+            reopened.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn w35_tsdb6_closed_head_rejects_commit_commit_batch_delete_and_evict() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = Head::open(dir.path(), HeadOptions::default(), i64::MIN).unwrap();
+        let pairs = [("__name__", "closed_write"), ("job", "api")];
+        let ref_id = {
+            let mut app = head.appender();
+            let r = app.append_float(None, &pairs, 1_000, 1.0).unwrap();
+            app.commit().unwrap();
+            r
+        };
+        let entry = head.get_entry_by_sorted_pairs(&pairs).unwrap();
+
+        let mut app_pending = head.appender();
+        app_pending.append_float(Some(ref_id), &pairs, 2_000, 2.0).unwrap();
+
+        let mut b1 = head.appender();
+        b1.append_float(Some(ref_id), &pairs, 3_000, 3.0).unwrap();
+        let mut b2 = head.appender();
+        b2.append_float(Some(ref_id), &pairs, 4_000, 4.0).unwrap();
+
+        head.close().unwrap();
+
+        assert!(matches!(app_pending.commit(), Err(HeadError::Closed)));
+        assert!(matches!(head.appender().commit(), Err(HeadError::Closed)));
+        assert!(matches!(HeadAppender::commit_batch(vec![b1, b2]), Err(HeadError::Closed)));
+        assert_eq!(entry.pending_commits_count(), 0);
+        assert!(matches!(
+            head.delete(0, 5_000, &[LabelMatcher::new(MatchType::Equal, "__name__", "closed_write").unwrap()]),
+            Err(HeadError::Closed)
+        ));
+        assert!(matches!(
+            head.evict_series_refs_inner(&[ref_id], 5_000, None, false, false),
+            Err(HeadError::Closed)
+        ));
+    }
+
+    #[test]
+    fn w35_tsdb3_snapshot_superseded_by_later_checkpoint_reopens_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            wal_segment_size: crate::wlog::PAGE_SIZE,
+            ..HeadOptions::default()
+        };
+
+        // 1. Write enough series/samples to advance WAL beyond segment 0 and snapshot at seg N >= 1.
+        let pad = "x".repeat(80);
+        {
+            let head = Head::open_with_snapshot(dir.path(), opts.clone(), i64::MIN, true).unwrap();
+            for s in 0..500u64 {
+                let mut app = head.appender();
+                let job = format!("s{s:04}_{pad}");
+                app.append_float(
+                    None,
+                    &[("__name__", "snap_ckpt"), ("job", job.as_str())],
+                    1_000,
+                    s as f64,
+                )
+                .unwrap();
+                app.commit().unwrap();
+            }
+            head.close().unwrap();
+        }
+        let (snap_path, snap_idx, _) = Head::last_chunk_snapshot(dir.path()).unwrap().unwrap();
+        assert!(snap_idx >= 1, "expected snapshot at segment >= 1, got {snap_idx}");
+        let snap_backup = tempfile::tempdir().unwrap();
+        let snap_dir_copy = snap_backup.path().join(snap_path.file_name().unwrap());
+        fs::create_dir_all(&snap_dir_copy).unwrap();
+        for ent in fs::read_dir(&snap_path).unwrap() {
+            let ent = ent.unwrap();
+            fs::copy(ent.path(), snap_dir_copy.join(ent.file_name())).unwrap();
+        }
+
+        // 2. Reopen without shutdown snapshot, advance WAL well past snap_idx, truncate -> checkpoint M > snap_idx,
+        //    then write more samples into segment M+1 without updating chunk_snapshot (crash simulation).
+        {
+            let head = Head::open_with_snapshot(dir.path(), opts.clone(), i64::MIN, false).unwrap();
+            for round in 0..3u64 {
+                for s in 0..250u64 {
+                    let mut app = head.appender();
+                    let job = format!("post_{round}_{s:04}_{pad}");
+                    app.append_float(
+                        None,
+                        &[("__name__", "snap_ckpt_post"), ("job", job.as_str())],
+                        20_000 + (round as i64) * 1_000,
+                        s as f64,
+                    )
+                    .unwrap();
+                    app.commit().unwrap();
+                }
+            }
+            head.truncate(15_000).unwrap();
+            {
+                let mut app = head.appender();
+                app.append_float(
+                    None,
+                    &[("__name__", "snap_ckpt_tail"), ("job", "final")],
+                    30_000,
+                    777.0,
+                )
+                .unwrap();
+                app.commit().unwrap();
+            }
+            head.close().unwrap();
+        }
+
+        // Restore the older chunk_snapshot.NNNNNN.* (from seg N < checkpoint M) to simulate SIGKILL before snapshot update.
+        let _ = Head::delete_chunk_snapshots(dir.path(), usize::MAX, usize::MAX);
+        let restored_snap = dir.path().join(snap_dir_copy.file_name().unwrap());
+        fs::create_dir_all(&restored_snap).unwrap();
+        for ent in fs::read_dir(&snap_dir_copy).unwrap() {
+            let ent = ent.unwrap();
+            fs::copy(ent.path(), restored_snap.join(ent.file_name())).unwrap();
+        }
+        let (_, cp_idx) = crate::wlog::last_checkpoint(&dir.path().join("wal")).unwrap().unwrap();
+        assert!(cp_idx >= snap_idx, "expected checkpoint {cp_idx} >= snapshot {snap_idx}");
+
+        // 3. Reopen with snapshot enabled: must replay checkpoint M and segments > M without NotFound on deleted seg N.
+        let reopened = Head::open_with_snapshot(dir.path(), opts, i64::MIN, true).unwrap();
+        let e_tail = reopened
+            .get_entry_by_sorted_pairs(&[("__name__", "snap_ckpt_tail"), ("job", "final")])
+            .expect("tail series after checkpoint must be recovered");
+        assert_eq!(read_head_float_samples(&reopened, e_tail.ref_id), vec![(30_000, 777.0)]);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn w35_tsdb4_orphaned_chunk_snapshot_with_empty_wal_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let orphan_snap = dir.path().join("chunk_snapshot.000001.0000000100");
+        fs::create_dir_all(&orphan_snap).unwrap();
+        fs::write(orphan_snap.join("00000000"), b"corrupt_or_orphan").unwrap();
+
+        let reg = Arc::new(prometheus::Registry::new());
+        let opts = HeadOptions {
+            registry: Some(Arc::clone(&reg)),
+            ..HeadOptions::default()
+        };
+        let head = Head::open_with_snapshot(dir.path(), opts, i64::MIN, true).unwrap();
+        assert!(
+            Head::last_chunk_snapshot(dir.path()).unwrap().is_none(),
+            "orphaned chunk_snapshot with empty wal/ must be deleted on open"
+        );
+        let snap_err_metric = reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "prometheus_tsdb_snapshot_replay_error_total")
+            .unwrap()
+            .get_metric()[0]
+            .get_counter()
+            .get_value();
+        assert_eq!(snap_err_metric, 0.0);
+        head.close().unwrap();
+    }
+
+    #[test]
+    fn w35_tsdb5_corrupt_chunk_snapshot_resets_exemplars_and_ooo_metadata_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = HeadOptions {
+            enable_exemplar_storage: true,
+            max_exemplars: 16,
+            ooo_time_window_ms: 10_000,
+            ..HeadOptions::default()
+        };
+
+        // 1. Write series + metadata + exemplar and create chunk_snapshot.000000.<off>.
+        {
+            let head = Head::open_with_snapshot(dir.path(), opts.clone(), i64::MIN, true).unwrap();
+            let mut app = head.appender();
+            app.append_float(None, &[("__name__", "snap_ex"), ("job", "a")], 1_000, 1.0)
+                .unwrap();
+            app.update_metadata(
+                None,
+                &[("__name__", "snap_ex"), ("job", "a")],
+                "snap_ex",
+                crate::record::MetricType::Counter,
+                "requests",
+                "total requests",
+            )
+            .unwrap();
+            app.append_exemplar(
+                None,
+                &[("__name__", "snap_ex"), ("job", "a")],
+                Exemplar::new(Labels::from_pairs([("trace_id", "abc")]), 1.0, 1_000),
+            )
+            .unwrap();
+            app.commit().unwrap();
+            head.close().unwrap();
+        }
+
+        // 2. Remove WAL so fallback replays nothing, and append corrupt trailing bytes to the snapshot
+        //    AFTER the valid series/metadata/exemplar records so partial state IS populated before erroring.
+        fs::remove_dir_all(dir.path().join("wal")).unwrap();
+        let (snap_dir, _, _) = Head::last_chunk_snapshot(dir.path()).unwrap().unwrap();
+        let seg0 = crate::wlog::segment_name(&snap_dir, 0);
+        let mut snap_bytes = fs::read(&seg0).unwrap();
+        // Append an invalid record header/CRC at the end of the snapshot segment.
+        snap_bytes.extend_from_slice(&[0x01, 0x00, 0x05, 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5]);
+        fs::write(&seg0, snap_bytes).unwrap();
+
+        let reg = Arc::new(prometheus::Registry::new());
+        let opts2 = HeadOptions {
+            registry: Some(Arc::clone(&reg)),
+            ..opts
+        };
+        let head2 = Head::open_with_snapshot(dir.path(), opts2, i64::MIN, true).unwrap();
+        let snap_err_metric = reg
+            .gather()
+            .into_iter()
+            .find(|mf| mf.get_name() == "prometheus_tsdb_snapshot_replay_error_total")
+            .unwrap()
+            .get_metric()[0]
+            .get_counter()
+            .get_value();
+        assert_eq!(snap_err_metric, 1.0);
+        assert_eq!(head2.num_series(), 0);
+        assert!(
+            head2
+                .exemplars()
+                .select(i64::MIN, i64::MAX, &[&[LabelMatcher::new(MatchType::Equal, "__name__", "snap_ex").unwrap()]])
+                .is_empty(),
+            "exemplars populated during partial snapshot replay must be cleared on error"
+        );
+        assert!(!head2.has_any_metadata.load(Ordering::Acquire));
+        assert!(head2.wal_expiries.lock().is_empty());
+        assert!(head2.wbl_pinned_refs.lock().is_empty());
+        assert_eq!(head2.min_ooo_time(), i64::MAX);
+        assert_eq!(head2.max_ooo_time(), i64::MIN);
+        assert_eq!(head2.last_wal_truncation_time.load(Ordering::Acquire), i64::MIN);
+        assert_eq!(head2.last_memory_truncation_time.load(Ordering::Acquire), i64::MIN);
+        head2.close().unwrap();
     }
 }

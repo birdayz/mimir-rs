@@ -13,7 +13,7 @@
 //! - github.com/grafana/mimir/pkg/storage/ingest/DESIGN.md
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1057,6 +1057,8 @@ pub struct KafkaClient {
     /// kprom client hooks (`kgo.WithHooks(metrics)`), set once by the client's owner.
     kprom: OnceLock<Arc<KpromMetrics>>,
     extended_metrics: Option<KafkaClientExtendedMetrics>,
+    closed: AtomicBool,
+    close_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl KafkaClient {
@@ -1095,6 +1097,8 @@ impl KafkaClient {
             any_broker: parking_lot::Mutex::new(AnyBrokerRotation::default()),
             kprom: OnceLock::new(),
             extended_metrics: None,
+            closed: AtomicBool::new(false),
+            close_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1142,10 +1146,22 @@ impl KafkaClient {
 
     /// Closes all pooled broker connections and aborts their background reader/writer tasks.
     pub async fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         let mut map = self.conns_by_addr.lock().await;
+        self.close_epoch.fetch_add(1, Ordering::AcqRel);
         for (_, conn) in map.drain() {
             conn.mark_dead();
         }
+    }
+
+    /// Returns `true` once [`Self::close`] has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_conn_count(&self) -> usize {
+        self.conns_by_addr.lock().await.len()
     }
 
     /// `kgo.NodeName` of the broker a connection to `addr` belongs to.
@@ -1402,6 +1418,7 @@ impl KafkaClient {
         addr: &str,
         kind: ConnKind,
     ) -> Result<Arc<BrokerConn>, KafkaClientError> {
+        let start_epoch = self.close_epoch.load(Ordering::Acquire);
         let key = (addr.to_string(), kind);
         {
             let mut map = self.conns_by_addr.lock().await;
@@ -1464,6 +1481,13 @@ impl KafkaClient {
         })?;
 
         let mut map = self.conns_by_addr.lock().await;
+        if self.close_epoch.load(Ordering::Acquire) != start_epoch {
+            conn.mark_dead();
+            return Err(KafkaClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "kafka client closed during connect",
+            )));
+        }
         if let Some(existing) = map.get(&key) {
             if existing.is_alive() {
                 conn.mark_dead();

@@ -804,6 +804,10 @@ impl WlogWriter {
         self.close_inner()
     }
 
+    pub(crate) fn close_if_open(&mut self) -> Result<(), WlogError> {
+        self.close_inner()
+    }
+
     pub fn close(mut self) -> Result<(), WlogError> {
         self.close_inner()
     }
