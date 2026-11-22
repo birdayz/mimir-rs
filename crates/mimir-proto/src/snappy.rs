@@ -10,6 +10,34 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// Name registered for the Snappy gRPC compressor (`grpc-encoding: snappy`).
 pub const SNAPPY_ENCODING_NAME: &str = "snappy";
 
+/// Snappy gRPC compressor matching `github.com/grafana/dskit/grpcencoding/snappy`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SnappyCompressor;
+
+impl SnappyCompressor {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn name(&self) -> &'static str {
+        SNAPPY_ENCODING_NAME
+    }
+
+    pub fn compress(&self, input: &[u8]) -> std::io::Result<Vec<u8>> {
+        compress_framed(input)
+    }
+
+    pub fn decompress(&self, input: &[u8]) -> std::io::Result<Vec<u8>> {
+        decompress_framed(input)
+    }
+
+    pub fn decompress_bounded(&self, input: &[u8], max_out_len: usize) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        decompress_framed_bounded_into(input, &mut out, max_out_len)?;
+        Ok(out)
+    }
+}
+
 const CHUNK_TYPE_COMPRESSED: u8 = 0x00;
 const CHUNK_TYPE_UNCOMPRESSED: u8 = 0x01;
 const CHUNK_TYPE_PADDING: u8 = 0xfe;

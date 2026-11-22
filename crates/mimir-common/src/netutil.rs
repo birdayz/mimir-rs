@@ -286,7 +286,7 @@ fn is6(ip: IpAddr) -> bool {
 }
 
 /// `net.ParseCIDR(s)`, returning only the IP.
-fn parse_cidr_ip(s: &str) -> Result<IpAddr, String> {
+pub fn parse_cidr_ip(s: &str) -> Result<IpAddr, String> {
     let (addr, len) = s
         .split_once('/')
         .ok_or_else(|| format!("invalid CIDR address: {s}"))?;
