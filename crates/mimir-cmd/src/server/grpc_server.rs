@@ -49,7 +49,7 @@ use tokio::task::JoinSet;
 use tower::ServiceExt;
 
 use super::body::{BodyObserver, GrpcFrameCounter, TrackedBody};
-use super::listener::{finish_accept, Acceptor, PrefixedIo};
+use super::listener::{finish_accept, is_fatal_accept_error, Acceptor, PrefixedIo};
 use super::metrics::ServerMetrics;
 
 #[derive(Clone)]
@@ -416,12 +416,31 @@ pub async fn serve(
     let acceptor = Arc::new(acceptor);
     let routes = routes.prepare();
     let mut conns: JoinSet<()> = JoinSet::new();
+    let mut accept_backoff = Duration::from_millis(5);
     loop {
+        while conns.try_join_next().is_some() {}
         tokio::select! {
             biased;
             _ = super::wait_shutdown(&mut shutdown) => break,
             res = acceptor.accept() => {
-                let Ok((stream, addr, guard)) = res else { continue };
+                let (stream, addr, guard) = match res {
+                    Ok(v) => {
+                        accept_backoff = Duration::from_millis(5);
+                        v
+                    }
+                    Err(err) => {
+                        tracing::error!(err = %err, "grpc server accept error");
+                        if is_fatal_accept_error(&err) {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = super::wait_shutdown(&mut shutdown) => break,
+                            _ = tokio::time::sleep(accept_backoff) => {}
+                        }
+                        accept_backoff = (accept_backoff * 2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                };
                 let acc = Arc::clone(&acceptor);
                 let cfg = cfg.clone();
                 let routes = routes.clone();

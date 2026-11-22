@@ -1346,15 +1346,51 @@ fn install_shutdown_signal(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("install SIGINT handler");
+        let sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            Ok(s) => Some(s),
+            Err(err) => {
+                logger.log(
+                    LogLevel::Error,
+                    &[
+                        ("msg", "failed to install SIGTERM handler"),
+                        ("err", &err.to_string()),
+                    ],
+                );
+                None
+            }
+        };
+        let sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        {
+            Ok(s) => Some(s),
+            Err(err) => {
+                logger.log(
+                    LogLevel::Error,
+                    &[
+                        ("msg", "failed to install SIGINT handler"),
+                        ("err", &err.to_string()),
+                    ],
+                );
+                None
+            }
+        };
         Box::pin(async move {
-            tokio::select! {
-                _ = sigterm.recv() => {}
-                _ = sigint.recv() => {}
+            match (sigterm, sigint) {
+                (Some(mut term), Some(mut int)) => {
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                    }
+                }
+                (Some(mut term), None) => {
+                    let _ = term.recv().await;
+                }
+                (None, Some(mut int)) => {
+                    let _ = int.recv().await;
+                }
+                (None, None) => {
+                    std::future::pending::<()>().await;
+                }
             }
             // dskit signals/signals.go Handler.Loop()
             logger.log(

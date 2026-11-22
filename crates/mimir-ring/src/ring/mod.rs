@@ -546,14 +546,25 @@ impl Ring {
         };
 
         if cmp == CompareResult::Equal || cmp == CompareResult::EqualButStatesAndTimestamps {
+            let mut updated_metrics = false;
+            let mut resolved = false;
             {
                 let mut inner = self.inner.write();
-                inner.ring_desc = ring_desc;
+                let cmp_locked = inner.ring_desc.ring_compare(&ring_desc);
+                if cmp_locked == CompareResult::Equal
+                    || cmp_locked == CompareResult::EqualButStatesAndTimestamps
+                {
+                    inner.ring_desc = ring_desc.clone();
+                    updated_metrics = cmp_locked != CompareResult::Equal;
+                    resolved = true;
+                }
             }
-            if cmp != CompareResult::Equal {
-                self.update_ring_metrics();
+            if resolved {
+                if updated_metrics {
+                    self.update_ring_metrics();
+                }
+                return;
             }
-            return;
         }
 
         self.set_ring_state_from_desc(ring_desc, true, true, true);

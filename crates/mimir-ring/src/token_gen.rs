@@ -483,8 +483,20 @@ impl SpreadMinimizingTokenGenerator {
     }
 
     pub fn generate_tokens_by_instance_id(&self) -> Result<Vec<Vec<u32>>, TokenGenError> {
+        const MAX_SPREAD_MINIMIZING_INSTANCES: usize =
+            (TOTAL_TOKENS_COUNT as usize) / OPTIMAL_TOKENS_PER_INSTANCE;
+        let instance_count = self.instance_id.checked_add(1).ok_or_else(|| {
+            TokenGenError::SpreadMinimizing(format!("instance_id {} overflow", self.instance_id))
+        })?;
+        if instance_count > MAX_SPREAD_MINIMIZING_INSTANCES {
+            return Err(TokenGenError::SpreadMinimizing(format!(
+                "instance_id {} exceeds max {}",
+                self.instance_id,
+                MAX_SPREAD_MINIMIZING_INSTANCES - 1
+            )));
+        }
         let first_instance_tokens = self.generate_first_instance_tokens();
-        let mut tokens_by_instance_id: Vec<Vec<u32>> = vec![Vec::new(); self.instance_id + 1];
+        let mut tokens_by_instance_id: Vec<Vec<u32>> = vec![Vec::new(); instance_count];
         tokens_by_instance_id[0] = first_instance_tokens.clone();
 
         if self.instance_id == 0 {
@@ -545,15 +557,17 @@ impl SpreadMinimizingTokenGenerator {
                     .map(|t| t.ownership)
                     .unwrap_or(0.0);
                 if highest_token_ownership <= optimal_token_ownership as f64 {
-                    let popped = instance_queue.pop().expect("peeked above");
-                    ignored_instances.push(popped);
+                    if let Some(popped) = instance_queue.pop() {
+                        ignored_instances.push(popped);
+                    }
                     continue;
                 }
 
-                let token = tokens_queues[highest_instance_id]
-                    .peek()
-                    .expect("checked above")
-                    .item;
+                let Some(token) = tokens_queues[highest_instance_id].peek().map(|t| t.item) else {
+                    return Err(TokenGenError::SpreadMinimizing(format!(
+                        "token queue for instance {highest_instance_id} unexpectedly empty"
+                    )));
+                };
                 let new_token = self.calculate_new_token(token, optimal_token_ownership)?;
                 tokens.push(new_token);
                 curr_instance_token_queue
@@ -563,17 +577,13 @@ impl SpreadMinimizingTokenGenerator {
                 let new_token_ownership = token_distance(new_token, token.token) as f64;
                 curr_instance_ownership += old_token_ownership - new_token_ownership;
 
-                {
-                    let top_tok = tokens_queues[highest_instance_id]
-                        .peek_mut()
-                        .expect("non-empty");
+                if let Some(top_tok) = tokens_queues[highest_instance_id].peek_mut() {
                     top_tok.item.prev_token = new_token;
                     top_tok.ownership = new_token_ownership;
                 }
                 tokens_queues[highest_instance_id].fix(0);
 
-                {
-                    let top_inst = instance_queue.peek_mut().expect("non-empty");
+                if let Some(top_inst) = instance_queue.peek_mut() {
                     top_inst.ownership =
                         top_inst.ownership - old_token_ownership + new_token_ownership;
                 }
@@ -615,9 +625,18 @@ pub fn parse_instance_id(instance_id: &str) -> Result<(String, usize), TokenGenE
 impl TokenGenerator for SpreadMinimizingTokenGenerator {
     fn generate_tokens(&self, requested_tokens_count: usize, all_taken_tokens: &[u32]) -> Vec<u32> {
         let used: HashSet<u32> = all_taken_tokens.iter().copied().collect();
-        let all_tokens = self
-            .generate_all_tokens()
-            .expect("spread minimizing token generation failed");
+        let all_tokens = match self.generate_all_tokens() {
+            Ok(tokens) => tokens,
+            Err(err) => {
+                tracing::error!(
+                    %err,
+                    instance_id = self.instance_id,
+                    zone_id = self.zone_id,
+                    "spread minimizing token generation failed"
+                );
+                return Vec::new();
+            }
+        };
         let mut unique_tokens = Vec::with_capacity(requested_tokens_count);
         for token in all_tokens {
             if unique_tokens.len() >= requested_tokens_count {
