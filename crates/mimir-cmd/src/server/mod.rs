@@ -22,6 +22,7 @@ pub mod http_middleware;
 pub mod http_server;
 pub mod listener;
 pub mod metrics;
+pub mod proxyproto;
 pub mod tls;
 pub mod web;
 
