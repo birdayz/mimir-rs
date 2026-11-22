@@ -11,7 +11,8 @@ mod merge;
 mod provider;
 
 pub use provider::{
-    is_url, sanitize_url_for_metrics, RuntimeConfigHttpObserver, CLUSTER_VALIDATION_LABEL_HEADER,
+    is_url, sanitize_url_for_metrics, sanitize_url_for_metrics_checked, HttpProvider,
+    HttpProviderError, RuntimeConfigHttpObserver, CLUSTER_VALIDATION_LABEL_HEADER,
     RUNTIME_CONFIG_USER_AGENT,
 };
 
@@ -148,11 +149,81 @@ fn parse_config_source(entry: &str) -> Result<ConfigSource, ConfigError> {
 }
 
 /// `assignSourceIDs` from `dskit/runtimeconfig/config_source.go`.
+/// Per-source failure tolerance parameter (`dskit/runtimeconfig/config_source.go:sourceParameter`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceParameter {
+    OptionalOnStartup,
+    OptionalKeepLastValueOnFailure,
+}
+
+impl SourceParameter {
+    pub fn tolerates_failure(&self, initial: bool) -> bool {
+        match self {
+            Self::OptionalOnStartup => initial,
+            Self::OptionalKeepLastValueOnFailure => true,
+        }
+    }
+
+    pub fn keeps_last_value_on_failure(&self) -> bool {
+        matches!(self, Self::OptionalKeepLastValueOnFailure)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OptionalOnStartup => "optional-on-startup",
+            Self::OptionalKeepLastValueOnFailure => "optional-keep-last-value-on-failure",
+        }
+    }
+}
+
+/// Public representation of a parsed runtime config source (`dskit/runtimeconfig/config_source.go`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedConfigSource {
+    pub path: String,
+    pub parameters: Vec<SourceParameter>,
+    pub source_id: String,
+}
+
+pub fn parse_config_source_entry(entry: &str) -> Result<ParsedConfigSource, ConfigError> {
+    let cs = parse_config_source(entry)?;
+    let parameters = match cs.policy {
+        FailurePolicy::Strict => Vec::new(),
+        FailurePolicy::OptionalOnStartup => vec![SourceParameter::OptionalOnStartup],
+        FailurePolicy::OptionalKeepLastValueOnFailure => {
+            vec![SourceParameter::OptionalKeepLastValueOnFailure]
+        }
+    };
+    Ok(ParsedConfigSource {
+        path: cs.path,
+        parameters,
+        source_id: cs.source_id,
+    })
+}
+
+pub fn assign_config_source_ids(sources: &mut [ParsedConfigSource]) -> Result<(), ConfigError> {
+    let mut internal: Vec<ConfigSource> = sources
+        .iter()
+        .map(|s| ConfigSource {
+            path: s.path.clone(),
+            policy: FailurePolicy::Strict,
+            source_id: s.source_id.clone(),
+            provider: Provider::File,
+            last_value: None,
+            last_digest: None,
+        })
+        .collect();
+    assign_source_ids(&mut internal)?;
+    for (dst, src) in sources.iter_mut().zip(internal) {
+        dst.source_id = src.source_id;
+    }
+    Ok(())
+}
+
 fn assign_source_ids(sources: &mut [ConfigSource]) -> Result<(), ConfigError> {
     let mut occurrences: HashMap<String, usize> = HashMap::new();
     for src in sources.iter_mut() {
         src.source_id = if is_url(&src.path) {
-            sanitize_url_for_metrics(&src.path)
+            sanitize_url_for_metrics_checked(&src.path)?
         } else {
             src.path.clone()
         };
@@ -1049,6 +1120,385 @@ fn strip_rc(e: ConfigError) -> String {
 }
 
 impl Drop for RuntimeConfigManager {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Generic dskit/runtimeconfig Manager<T> (Preprocessor, Loader, MapLoader, unstarted lifecycle)
+// ---------------------------------------------------------------------------------------------
+
+pub type RuntimeConfigPreprocessor =
+    Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
+pub type RuntimeConfigLoader<T> = Arc<dyn Fn(&[u8]) -> Result<T, String> + Send + Sync>;
+pub type RuntimeConfigMapLoader<T> =
+    Arc<dyn Fn(&serde_yaml::Mapping) -> Result<T, String> + Send + Sync>;
+
+pub struct GenericRuntimeConfigOptions<T> {
+    pub cfg: RuntimeConfigConfig,
+    pub preprocessor: Option<RuntimeConfigPreprocessor>,
+    pub loader: Option<RuntimeConfigLoader<T>>,
+    pub map_loader: Option<RuntimeConfigMapLoader<T>>,
+    pub observer: Option<Arc<dyn RuntimeConfigObserver>>,
+    pub http_observer: Option<Arc<dyn RuntimeConfigHttpObserver>>,
+}
+
+/// Generic runtime config manager matching `dskit/runtimeconfig.Manager` lifecycle:
+/// `new()` validates sources without loading (`get_config()` is `None`), `start()` performs the
+/// initial load, `start_reloader()` polls periodically, and `stop()` shuts down and closes
+/// listener channels.
+pub struct GenericRuntimeConfigManager<T: Clone + Send + Sync + 'static> {
+    cfg: RuntimeConfigConfig,
+    preprocessor: Option<RuntimeConfigPreprocessor>,
+    loader: Option<RuntimeConfigLoader<T>>,
+    map_loader: Option<RuntimeConfigMapLoader<T>>,
+    sources: RwLock<Vec<ConfigSource>>,
+    current: RwLock<Option<T>>,
+    last_hash: RwLock<Option<String>>,
+    listeners: parking_lot::Mutex<Vec<(u64, tokio::sync::mpsc::Sender<T>)>>,
+    next_listener_id: parking_lot::Mutex<u64>,
+    http_observer: Arc<RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>>,
+    stop_signal: Arc<(StdMutex<bool>, Condvar)>,
+    reloader: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    observer: Option<Arc<dyn RuntimeConfigObserver>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> GenericRuntimeConfigManager<T> {
+    pub fn new(opts: GenericRuntimeConfigOptions<T>) -> Result<Arc<Self>, ConfigError> {
+        if opts.cfg.file.0.is_empty() {
+            return Err(ConfigError::RuntimeConfig("LoadPath is empty".to_string()));
+        }
+
+        let mut sources = Vec::with_capacity(opts.cfg.file.0.len());
+        for entry in &opts.cfg.file.0 {
+            sources.push(parse_config_source(entry)?);
+        }
+        assign_source_ids(&mut sources)?;
+
+        let http_observer: Arc<RwLock<Option<Arc<dyn RuntimeConfigHttpObserver>>>> =
+            Arc::new(RwLock::new(opts.http_observer));
+        let mut http: Option<Arc<HttpFetcher>> = None;
+        for src in &mut sources {
+            if is_url(&src.path) {
+                if http.is_none() {
+                    http = Some(HttpFetcher::new(&opts.cfg, Arc::clone(&http_observer))?);
+                }
+                src.provider = Provider::Http(Arc::clone(http.as_ref().expect("set above")));
+            }
+        }
+
+        Ok(Arc::new(Self {
+            cfg: opts.cfg,
+            preprocessor: opts.preprocessor,
+            loader: opts.loader,
+            map_loader: opts.map_loader,
+            sources: RwLock::new(sources),
+            current: RwLock::new(None),
+            last_hash: RwLock::new(None),
+            listeners: parking_lot::Mutex::new(Vec::new()),
+            next_listener_id: parking_lot::Mutex::new(1),
+            http_observer,
+            stop_signal: Arc::new((StdMutex::new(false), Condvar::new())),
+            reloader: parking_lot::Mutex::new(None),
+            observer: opts.observer,
+        }))
+    }
+
+    pub fn start(&self) -> Result<(), ConfigError> {
+        self.load_internal(true).map_err(|e| match e {
+            ConfigError::RuntimeConfig(msg) => {
+                ConfigError::RuntimeConfig(format!("failed to load runtime config: {msg}"))
+            }
+            other => other,
+        })
+    }
+
+    pub fn reload(&self) -> Result<(), ConfigError> {
+        self.load_internal(false)
+    }
+
+    pub fn start_reloader(self: &Arc<Self>) {
+        let mut guard = self.reloader.lock();
+        if guard.is_some() {
+            return;
+        }
+        {
+            let (lock, _) = &*self.stop_signal;
+            if *lock.lock().unwrap_or_else(|e| e.into_inner()) {
+                return;
+            }
+        }
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let stop_signal = Arc::clone(&self.stop_signal);
+        let period = self
+            .cfg
+            .period
+            .as_std()
+            .filter(|d| !d.is_zero())
+            .unwrap_or_else(|| Duration::from_secs(10));
+
+        let handle = thread::spawn(move || {
+            let (lock, cvar) = &*stop_signal;
+            let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while !*stopped {
+                let (next_guard, _) = cvar
+                    .wait_timeout_while(stopped, period, |s| !*s)
+                    .unwrap_or_else(|e| e.into_inner());
+                stopped = next_guard;
+                if *stopped {
+                    break;
+                }
+                drop(stopped);
+                let Some(mgr) = weak.upgrade() else {
+                    return;
+                };
+                let _ = mgr.reload();
+                drop(mgr);
+                stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+            }
+        });
+        *guard = Some(handle);
+    }
+
+    pub fn stop(&self) {
+        {
+            let (lock, cvar) = &*self.stop_signal;
+            let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *stopped = true;
+            cvar.notify_all();
+        }
+        self.listeners.lock().clear();
+        if let Some(handle) = self.reloader.lock().take() {
+            if handle.thread().id() != thread::current().id() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    pub fn get_config(&self) -> Option<T> {
+        self.current.read().clone()
+    }
+
+    pub fn config_hash(&self) -> Option<String> {
+        self.last_hash.read().clone()
+    }
+
+    pub fn source_ids(&self) -> Vec<String> {
+        self.sources
+            .read()
+            .iter()
+            .map(|s| s.source_id.clone())
+            .collect()
+    }
+
+    pub fn source_last_values(&self) -> Vec<Option<Vec<u8>>> {
+        self.sources
+            .read()
+            .iter()
+            .map(|s| s.last_value.clone())
+            .collect()
+    }
+
+    pub fn create_listener_channel(&self, buffer: usize) -> (u64, tokio::sync::mpsc::Receiver<T>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer.max(1));
+        let mut next = self.next_listener_id.lock();
+        let id = *next;
+        *next += 1;
+        self.listeners.lock().push((id, tx));
+        (id, rx)
+    }
+
+    pub fn close_listener_channel(&self, id: u64) {
+        self.listeners.lock().retain(|(entry_id, _)| *entry_id != id);
+    }
+
+    pub fn set_http_observer(&self, observer: Arc<dyn RuntimeConfigHttpObserver>) {
+        *self.http_observer.write() = Some(observer);
+    }
+
+    fn call_listeners(&self, value: &T) {
+        self.listeners.lock().retain(|(_, tx)| {
+            !matches!(
+                tx.try_send(value.clone()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            )
+        });
+    }
+
+    fn load_internal(&self, initial: bool) -> Result<(), ConfigError> {
+        let mut statuses = Vec::new();
+        let mut applied_hash = None;
+        let result = self.load_sources(initial, &mut statuses, &mut applied_hash);
+        if let Some(observer) = &self.observer {
+            observer.on_load(&RuntimeConfigLoadEvent {
+                initial,
+                sources: &statuses,
+                result: &result,
+                applied_hash: applied_hash.as_deref(),
+            });
+        }
+        result
+    }
+
+    fn load_sources(
+        &self,
+        initial: bool,
+        statuses: &mut Vec<RuntimeConfigSourceStatus>,
+        applied_hash: &mut Option<String>,
+    ) -> Result<(), ConfigError> {
+        let mut sources = self.sources.write();
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        struct Loaded {
+            raw: Option<Vec<u8>>,
+            read_ok: bool,
+            digest: Option<[u8; 32]>,
+        }
+        let mut loaded = Vec::with_capacity(sources.len());
+
+        for src in sources.iter() {
+            let mut status = RuntimeConfigSourceStatus {
+                source: src.source_id.clone(),
+                name: src.path.clone(),
+                parameters: policy_parameters(&src.policy),
+                error: None,
+                tolerated: false,
+            };
+            let read_res = match src.provider.read(&src.path, &src.source_id) {
+                Ok(buf) => match &self.preprocessor {
+                    Some(pp) => pp(&buf).map_err(|e| format!("preprocess {:?}: {e}", src.path)),
+                    None => Ok(buf),
+                },
+                Err(err) => Err(format!("read {:?}: {err}", src.path)),
+            };
+
+            match read_res {
+                Ok(buf) => {
+                    statuses.push(status);
+                    let digest = sha256(&buf);
+                    loaded.push(Loaded {
+                        raw: Some(buf),
+                        read_ok: true,
+                        digest: Some(digest),
+                    });
+                }
+                Err(err) => {
+                    let tolerate = match src.policy {
+                        FailurePolicy::Strict => false,
+                        FailurePolicy::OptionalOnStartup => initial,
+                        FailurePolicy::OptionalKeepLastValueOnFailure => true,
+                    };
+                    status.error = Some(err.clone());
+                    status.tolerated = tolerate;
+                    statuses.push(status);
+                    if !tolerate {
+                        return Err(ConfigError::RuntimeConfig(err));
+                    }
+                    match (&src.policy, &src.last_value) {
+                        (FailurePolicy::OptionalKeepLastValueOnFailure, Some(prev)) => {
+                            loaded.push(Loaded {
+                                raw: Some(prev.clone()),
+                                read_ok: false,
+                                digest: Some(sha256(prev)),
+                            })
+                        }
+                        _ => loaded.push(Loaded {
+                            raw: None,
+                            read_ok: false,
+                            digest: None,
+                        }),
+                    }
+                }
+            }
+        }
+
+        if !initial
+            && sources
+                .iter()
+                .zip(&loaded)
+                .all(|(src, l)| src.last_digest == l.digest)
+        {
+            return Ok(());
+        }
+
+        let mut merged = Mapping::new();
+        let mut hash_merged = Mapping::new();
+        for (i, (src, l)) in sources.iter().zip(&loaded).enumerate() {
+            let Some(raw) = &l.raw else { continue };
+            let fail = |statuses: &mut Vec<RuntimeConfigSourceStatus>, msg: String| {
+                if let Some(st) = statuses.get_mut(i) {
+                    st.error = Some(msg.clone());
+                    st.tolerated = false;
+                }
+                ConfigError::RuntimeConfig(msg)
+            };
+            let file = match merge::unmarshal_maybe_gzipped(&src.path, raw) {
+                Ok(f) => f,
+                Err(e) => return Err(fail(statuses, format!("unmarshal {:?}: {e}", src.path))),
+            };
+            let mut hash_file = file.clone();
+            if merge::decoded_as_json(&src.path, raw) {
+                for (_, v) in hash_file.iter_mut() {
+                    numbers_to_f64(v);
+                }
+            }
+            merged = match merge::merge_config_maps(&merged, &file, "") {
+                Ok(m) => m,
+                Err(e) => {
+                    return Err(fail(
+                        statuses,
+                        format!("can't merge {:?} on top of the previous providers: {e}", src.path),
+                    ))
+                }
+            };
+            if let Ok(m) = merge::merge_config_maps(&hash_merged, &hash_file, "") {
+                hash_merged = m;
+            }
+        }
+
+        let (val, hash) = if let Some(ref map_loader) = self.map_loader {
+            let mut buf = Vec::new();
+            for (src, l) in sources.iter().zip(&loaded) {
+                let Some(digest) = l.digest else { continue };
+                buf.extend_from_slice(&(src.path.len() as u64).to_be_bytes());
+                buf.extend_from_slice(src.path.as_bytes());
+                buf.extend_from_slice(&digest);
+            }
+            let hash = sha256_hex(&buf);
+            let val = map_loader(&merged)
+                .map_err(|e| ConfigError::RuntimeConfig(format!("load file: {e}")))?;
+            (val, hash)
+        } else {
+            let marshalled = crate::yaml_v3_emit::marshal_generic(&Value::Mapping(hash_merged))
+                .map_err(|e| ConfigError::RuntimeConfig(format!("marshal file: {e}")))?;
+            let hash = sha256_hex(marshalled.as_bytes());
+            let loader = self.loader.as_ref().ok_or_else(|| {
+                ConfigError::RuntimeConfig("runtime config loader not configured".to_string())
+            })?;
+            let val = loader(marshalled.as_bytes())
+                .map_err(|e| ConfigError::RuntimeConfig(format!("load file: {e}")))?;
+            (val, hash)
+        };
+
+        *self.current.write() = Some(val.clone());
+        self.call_listeners(&val);
+        *self.last_hash.write() = Some(hash.clone());
+        *applied_hash = Some(hash);
+
+        for (src, l) in sources.iter_mut().zip(loaded) {
+            src.last_digest = l.digest;
+            if l.read_ok && src.policy == FailurePolicy::OptionalKeepLastValueOnFailure {
+                src.last_value = l.raw;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for GenericRuntimeConfigManager<T> {
     fn drop(&mut self) {
         self.stop();
     }
