@@ -893,7 +893,19 @@ impl Header {
     }
 
     fn format_version2(&self) -> Result<Vec<u8>, ProxyError> {
-        let mut buf = Vec::with_capacity(16 + self.raw_tlvs.len() + 36);
+        let base_len = if self.transport_protocol.is_unspec() {
+            LENGTH_UNSPEC
+        } else if self.transport_protocol.is_ipv4() {
+            LENGTH_V4
+        } else if self.transport_protocol.is_ipv6() {
+            LENGTH_V6
+        } else if self.transport_protocol.is_unix() {
+            LENGTH_UNIX
+        } else {
+            LENGTH_UNSPEC
+        };
+        let validated_len = add_tlv_len(base_len, self.raw_tlvs.len())?;
+        let mut buf = Vec::with_capacity(16 + usize::from(validated_len));
         buf.extend_from_slice(SIGV2);
         buf.push(self.command.to_byte());
         buf.push(self.transport_protocol.to_byte());
@@ -1232,6 +1244,7 @@ pub struct ProxyAsyncBufReader<R> {
     buf: Vec<u8>,
     r: usize,
     w: usize,
+    consumed: usize,
     eof: bool,
     pending_err: Option<io::Error>,
 }
@@ -1247,6 +1260,7 @@ impl<R> ProxyAsyncBufReader<R> {
             buf: vec![0u8; size.max(MIN_READ_BUFFER_SIZE)],
             r: 0,
             w: 0,
+            consumed: 0,
             eof: false,
             pending_err: None,
         }
@@ -1254,6 +1268,10 @@ impl<R> ProxyAsyncBufReader<R> {
 
     pub fn buffered(&self) -> usize {
         self.w - self.r
+    }
+
+    pub fn consumed_bytes(&self) -> usize {
+        self.consumed
     }
 
     pub fn into_inner_and_buffered(self) -> (R, Vec<u8>) {
@@ -1321,6 +1339,7 @@ impl<R: AsyncRead + Unpin> ProxyAsyncBufReader<R> {
         }
         let b = self.buf[self.r];
         self.r += 1;
+        self.consumed = self.consumed.saturating_add(1);
         Ok(b)
     }
 
@@ -1346,6 +1365,7 @@ impl<R: AsyncRead + Unpin> ProxyAsyncBufReader<R> {
         let n = out.len().min(self.w - self.r);
         out[..n].copy_from_slice(&self.buf[self.r..self.r + n]);
         self.r += n;
+        self.consumed = self.consumed.saturating_add(n);
         Ok(n)
     }
 
@@ -1371,6 +1391,7 @@ impl<R: AsyncRead + Unpin> ProxyAsyncBufReader<R> {
             }
             let take = n.min(self.buffered());
             self.r += take;
+            self.consumed = self.consumed.saturating_add(take);
             n -= take;
         }
         Ok(())
@@ -1895,7 +1916,13 @@ async fn parse_version2_async<R: AsyncRead + Unpin>(
     Ok(header)
 }
 
-/// Async read with timeout; timeout maps to `ErrNoProxyProtocol` matching Go `ReadHeaderTimeout`.
+/// Async read with timeout.
+///
+/// Mirrors Go `go-proxyproto` `ReadHeaderTimeout`: a timeout while peeking before a PROXY
+/// signature is matched maps to `ProxyError::NoProxyProtocol` (leaving any buffered raw bytes
+/// intact), whereas a timeout after signature bytes have already been consumed fails the
+/// connection with `TimedOut` so partial PROXY headers cannot leak stripped bytes into upper
+/// protocols.
 pub async fn read_header_timeout_async<R: AsyncRead + Unpin>(
     reader: &mut ProxyAsyncBufReader<R>,
     timeout: Duration,
@@ -1903,9 +1930,19 @@ pub async fn read_header_timeout_async<R: AsyncRead + Unpin>(
     if timeout.is_zero() {
         return read_async(reader).await;
     }
+    let before = reader.consumed_bytes();
     match tokio::time::timeout(timeout, read_async(reader)).await {
         Ok(res) => res,
-        Err(_) => Err(ProxyError::NoProxyProtocol),
+        Err(_) => {
+            if reader.consumed_bytes() > before {
+                Err(ProxyError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "proxyproto: timeout reading PROXY header",
+                )))
+            } else {
+                Err(ProxyError::NoProxyProtocol)
+            }
+        }
     }
 }
 
@@ -2591,6 +2628,7 @@ impl<C: StreamConn> ProxyConn<C> {
                 }
                 return res.map_err(ProxyError::Io);
             }
+            let _ = br.read(&mut [])?;
             if let Some(old) = self.buf_reader.take() {
                 let (c, _) = old.into_inner_and_buffered();
                 self.conn = Some(c);

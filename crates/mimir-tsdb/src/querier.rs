@@ -463,6 +463,11 @@ impl<'a> TsdbQuerier<'a> {
         }
     }
 
+    pub fn with_closed(mut self, closed: &'a AtomicBool) -> Self {
+        self.closed = Some(closed);
+        self
+    }
+
     pub fn with_last_garbage_collected_mmap_ref(
         mut self,
         last_garbage_collected_mmap_ref: &'a AtomicU64,
@@ -1169,10 +1174,11 @@ impl<'a> TsdbQuerier<'a> {
                         continue;
                     };
                     let chks = match entry.head_snapshot {
-                        Some(snap) => h.series_final_chunks_from_snapshot(
+                        Some(snap) => h.series_final_chunks_from_snapshot_with_tx_isolation(
                             entry.head_entry.as_deref(),
                             r,
                             snap,
+                            tx_iso,
                         )?,
                         None => match entry.head_entry {
                             Some(ref head_entry) => h.series_final_chunks_for_entry_with_tx_isolation(
@@ -1331,7 +1337,9 @@ impl<'a> TsdbQuerier<'a> {
                 if tag == 0 {
                     if let Some(h) = head {
                         let chks = match head_snap.take() {
-                            Some(snap) => h.series_final_chunks_from_snapshot(None, r, snap)?,
+                            Some(snap) => h.series_final_chunks_from_snapshot_with_tx_isolation(
+                                None, r, snap, tx_iso,
+                            )?,
                             None => h.series_final_chunks_only_with_tx_isolation(
                                 r, mint, maxt, head_iso, tx_iso,
                             )?,
@@ -1811,6 +1819,11 @@ impl<'a> TsdbChunkQuerier<'a> {
             inner: TsdbQuerier::with_blocks_lock_and_closed(head, blocks_lock, closed, mint, maxt),
             unordered: true,
         }
+    }
+
+    pub fn with_closed(mut self, closed: &'a AtomicBool) -> Self {
+        self.inner = self.inner.with_closed(closed);
+        self
     }
 
     pub fn with_last_garbage_collected_mmap_ref(

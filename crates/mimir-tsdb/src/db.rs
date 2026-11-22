@@ -604,7 +604,6 @@ struct TsdbInner {
     opts: TsdbOptions,
     extra: TsdbExtraOptions,
     retention: RwLock<RetentionSettings>,
-    ooo_was_enabled: AtomicBool,
     configured_block_reload_interval: Duration,
     compaction_delay: Mutex<Duration>,
     dir_lock: Mutex<Option<DirLocker>>,
@@ -862,7 +861,6 @@ impl Tsdb {
         } else {
             opts.compaction_delay
         };
-        let ooo_was_enabled = AtomicBool::new(opts.head.ooo_time_window_ms > 0 || head.min_ooo_time() != i64::MAX);
         let compactor_override = Mutex::new(extra.compactor_override.clone());
         let bg_stop = Arc::new((Mutex::new(false), Condvar::new()));
         let inner = Arc::new(TsdbInner {
@@ -870,7 +868,6 @@ impl Tsdb {
             opts,
             extra,
             retention: RwLock::new(retention_init),
-            ooo_was_enabled,
             configured_block_reload_interval: block_reload_interval,
             compaction_delay: Mutex::new(init_delay),
             dir_lock: Mutex::new(dir_lock),
@@ -1344,6 +1341,7 @@ impl Tsdb {
                 .cloned()
                 .collect();
             return TsdbQuerier::new(Some(&self.inner.head), blocks, mint, maxt)
+                .with_closed(&self.inner.closed)
                 .with_last_garbage_collected_mmap_ref(&self.inner.last_garbage_collected_mmap_ref);
         }
         TsdbQuerier::with_blocks_lock_and_closed(
@@ -1368,6 +1366,7 @@ impl Tsdb {
                 .cloned()
                 .collect();
             return TsdbChunkQuerier::new(Some(&self.inner.head), blocks, mint, maxt)
+                .with_closed(&self.inner.closed)
                 .with_last_garbage_collected_mmap_ref(&self.inner.last_garbage_collected_mmap_ref);
         }
         TsdbChunkQuerier::with_blocks_lock_and_closed(
@@ -1477,9 +1476,9 @@ impl TsdbInner {
         if max_bytes <= 0 {
             return deletable;
         }
-        let mut blocks_size = head_size as i64;
+        let mut blocks_size = i64::try_from(head_size).unwrap_or(i64::MAX);
         for (i, &(_uid, sz)) in blocks_newest_first.iter().enumerate() {
-            blocks_size = blocks_size.saturating_add(sz as i64);
+            blocks_size = blocks_size.saturating_add(i64::try_from(sz).unwrap_or(i64::MAX));
             if blocks_size > max_bytes {
                 for &(d_uid, _) in &blocks_newest_first[i..] {
                     deletable.insert(d_uid);
@@ -2176,9 +2175,6 @@ impl TsdbInner {
             cfg.ooo_time_window_ms.unwrap_or(0).max(0)
         };
         self.head.set_ooo_time_window(ooo_ms)?;
-        if !self.ooo_was_enabled.load(Ordering::Acquire) && ooo_ms > 0 {
-            self.ooo_was_enabled.store(true, Ordering::Release);
-        }
         if let Some(max_ex) = cfg.max_exemplars {
             self.head.set_max_exemplars(max_ex);
         }
@@ -2273,7 +2269,7 @@ impl TsdbInner {
         if self.closed.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        if !self.ooo_was_enabled.load(Ordering::Acquire) {
+        if !self.head.ooo_was_enabled() {
             return Ok(Vec::new());
         }
         let snap = self.head.collect_ooo_compaction_candidates_with_watermark()?;
@@ -2835,7 +2831,9 @@ impl TsdbReadOnly {
 
     pub fn block(&self, block_id: &str) -> Result<Arc<Block>, TsdbError> {
         self.ensure_open()?;
-        let bdir = self.dir.join(block_id);
+        let uid = Ulid::from_string(block_id)
+            .map_err(|_| TsdbError::Other(format!("invalid block ID {block_id}")))?;
+        let bdir = self.dir.join(uid.to_string());
         if !bdir.exists() {
             return Err(TsdbError::Other(format!("invalid block ID {block_id}")));
         }

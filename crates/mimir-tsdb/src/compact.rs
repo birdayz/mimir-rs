@@ -861,6 +861,9 @@ pub(crate) fn slice_chunk_prefix(
         return Ok(None);
     }
     let samples = decode_chunk_samples(enc)?;
+    if samples.is_empty() {
+        return Ok(None);
+    }
     if stop_after >= samples.len() {
         let mint = samples.first().map_or(i64::MIN, |s| s.t);
         let maxt = samples.last().map_or(i64::MIN, |s| s.t);

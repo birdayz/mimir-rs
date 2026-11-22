@@ -4119,6 +4119,7 @@ pub struct Head {
     enable_st_as_zero_sample: AtomicBool,
     enable_memory_snapshot_on_shutdown: AtomicBool,
     enable_fast_startup: AtomicBool,
+    ooo_was_enabled: AtomicBool,
     deleted_series_since_symbol_gc: AtomicU64,
     symbol_arena_baseline_bytes: AtomicU64,
     symbol_gc_arena_growth_threshold: AtomicU64,
@@ -4564,6 +4565,7 @@ impl Head {
             enable_st_as_zero_sample: AtomicBool::new(false),
             enable_memory_snapshot_on_shutdown: AtomicBool::new(enable_memory_snapshot_on_shutdown),
             enable_fast_startup: AtomicBool::new(false),
+            ooo_was_enabled: AtomicBool::new(opts.ooo_time_window_ms > 0),
             deleted_series_since_symbol_gc: AtomicU64::new(0),
             symbol_arena_baseline_bytes: AtomicU64::new(0),
             symbol_gc_arena_growth_threshold: AtomicU64::new(DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES),
@@ -4641,6 +4643,9 @@ impl Head {
             disable_wal,
             false,
         )?;
+        if head.min_ooo_time() != i64::MAX {
+            head.ooo_was_enabled.store(true, Ordering::Release);
+        }
 
         let mut chunk_writer = HeadChunksWriter::with_options(
             &chunks_dir,
@@ -4736,6 +4741,7 @@ impl Head {
             enable_st_as_zero_sample: AtomicBool::new(false),
             enable_memory_snapshot_on_shutdown: AtomicBool::new(false),
             enable_fast_startup: AtomicBool::new(false),
+            ooo_was_enabled: AtomicBool::new(false),
             deleted_series_since_symbol_gc: AtomicU64::new(0),
             symbol_arena_baseline_bytes: AtomicU64::new(0),
             symbol_gc_arena_growth_threshold: AtomicU64::new(DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES),
@@ -6009,6 +6015,29 @@ impl Head {
             }
         }
 
+        /// RAII ticket ensuring any dropped, errored, or panicked worker aborts the barrier
+        /// so the coordinator can never hang in `WalBarrier::wait`.
+        struct WalBarrierTicket {
+            barrier: Arc<WalBarrier>,
+            arrived: bool,
+        }
+        impl WalBarrierTicket {
+            fn new(barrier: Arc<WalBarrier>) -> Self {
+                Self { barrier, arrived: false }
+            }
+            fn arrive(mut self) {
+                self.arrived = true;
+                self.barrier.arrive();
+            }
+        }
+        impl Drop for WalBarrierTicket {
+            fn drop(&mut self) {
+                if !self.arrived {
+                    self.barrier.abort();
+                }
+            }
+        }
+
         enum WalWorkerMsg {
             AttachMmapped {
                 entry: Arc<SeriesEntry>,
@@ -6017,7 +6046,7 @@ impl Head {
                 is_duplicate: bool,
             },
             SampleJobs(Vec<WalSampleJob>),
-            Barrier(Arc<WalBarrier>),
+            Barrier(WalBarrierTicket),
             AddTombstone {
                 ref_id: u64,
                 interval: Interval,
@@ -6256,12 +6285,8 @@ impl Head {
                             }
                         }
                     }
-                    // Drain any trailing Barrier messages if exiting early.
-                    while let Ok(msg) = rx.try_recv() {
-                        if let WalWorkerMsg::Barrier(b) = msg {
-                            b.abort();
-                        }
-                    }
+                    // Drop rx explicitly so any unread WalBarrierTicket aborts atomically via Drop.
+                    drop(rx);
 
                     if mint <= maxt {
                         self.update_min_max_time(mint, maxt);
@@ -6306,7 +6331,7 @@ impl Head {
                             }
                         }
                         if worker_txs[idx]
-                            .send(WalWorkerMsg::Barrier(Arc::clone(&barrier)))
+                            .send(WalWorkerMsg::Barrier(WalBarrierTicket::new(Arc::clone(&barrier))))
                             .is_err()
                         {
                             *failed_outer = true;
@@ -7264,9 +7289,17 @@ impl Head {
     }
 
     /// Dynamically updates the out-of-order time window (and opens WBL if needed).
+    /// Returns true if OOO ingestion is or was ever enabled on this Head (or OOO chunks were replayed).
+    pub fn ooo_was_enabled(&self) -> bool {
+        self.ooo_was_enabled.load(Ordering::Acquire)
+    }
+
     pub fn set_ooo_time_window(&self, ms: i64) -> Result<(), HeadError> {
         let clamped = ms.max(0);
         self.ooo_time_window_ms.store(clamped, Ordering::Release);
+        if clamped > 0 {
+            self.ooo_was_enabled.store(true, Ordering::Release);
+        }
         self.exemplars.set_ooo_time_window(clamped);
         if clamped > 0 && !self.disable_wal && !self.read_only {
             let mut wbl_guard = self.wbl.lock();
@@ -7541,8 +7574,9 @@ impl Head {
         &self,
         hook: Option<AfterSeriesLookupHook>,
     ) {
-        self.has_after_series_lookup_hook.store(hook.is_some(), Ordering::Release);
+        let present = hook.is_some();
         *self.after_series_lookup_hook.lock() = hook;
+        self.has_after_series_lookup_hook.store(present, Ordering::Release);
     }
 
     #[doc(hidden)]
@@ -11869,6 +11903,16 @@ impl Head {
         ref_id: u64,
         snapshot: HeadChunkSnapshot,
     ) -> Result<Vec<ChunkMeta>, HeadError> {
+        self.series_final_chunks_from_snapshot_with_tx_isolation(entry_opt, ref_id, snapshot, None)
+    }
+
+    pub fn series_final_chunks_from_snapshot_with_tx_isolation(
+        &self,
+        entry_opt: Option<&SeriesEntry>,
+        ref_id: u64,
+        snapshot: HeadChunkSnapshot,
+        tx_iso: Option<&IsolationStateInfo>,
+    ) -> Result<Vec<ChunkMeta>, HeadError> {
         let min_times = match snapshot {
             HeadChunkSnapshot::Precomputed(chks) => return Ok(chks),
             HeadChunkSnapshot::InOrderByMinTime(min_times) => min_times,
@@ -11888,6 +11932,7 @@ impl Head {
                 &looked_up
             }
         };
+        let effective_tx_iso = tx_iso.filter(|_| !self.iso.is_disabled());
 
         'retry: loop {
             if self.is_closed() {
@@ -11899,27 +11944,55 @@ impl Head {
                     self.metrics.chunk_reads_of_removed_series.inc();
                     return Ok(Vec::new());
                 }
-                let mut pos = 0u64;
-                let mut mmapped_in_order = Vec::new();
-                for mc in st.mmapped() {
-                    if min_times.contains(&mc.min_time) {
-                        mmapped_in_order.push((pos, *mc));
-                        pos += 1;
+                if let Some(iso_info) = effective_tx_iso {
+                    let (mm, hc) = if let Some(s) = self.txs_stripe(ref_id) {
+                        let map = s.lock();
+                        st.collect_in_order_chunks_for_tx_iso(
+                            map.get(&ref_id),
+                            i64::MIN,
+                            i64::MAX,
+                            Some(iso_info),
+                        )?
+                    } else {
+                        st.collect_in_order_chunks_for_tx_iso(
+                            None,
+                            i64::MIN,
+                            i64::MAX,
+                            Some(iso_info),
+                        )?
+                    };
+                    let mm_filt: Vec<(u64, MmappedChunk, Option<usize>)> = mm
+                        .into_iter()
+                        .filter(|(_, mc, _)| min_times.contains(&mc.min_time))
+                        .collect();
+                    let hc_filt: Vec<ChunkMeta> = hc
+                        .into_iter()
+                        .filter(|c| min_times.contains(&c.min_time))
+                        .collect();
+                    (mm_filt, hc_filt)
+                } else {
+                    let mut pos = 0u64;
+                    let mut mmapped_in_order = Vec::new();
+                    for mc in st.mmapped() {
+                        if min_times.contains(&mc.min_time) {
+                            mmapped_in_order.push((pos, *mc, None));
+                            pos += 1;
+                        }
                     }
+                    let mut head_chks = Vec::new();
+                    st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
+                        if min_times.contains(&hc_min) {
+                            head_chks.push(ChunkMeta {
+                                ref_id: pos,
+                                min_time: hc_min,
+                                max_time: hc_max,
+                                chunk: Some(hc_chunk),
+                            });
+                            pos += 1;
+                        }
+                    });
+                    (mmapped_in_order, head_chks)
                 }
-                let mut head_chks = Vec::new();
-                st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
-                    if min_times.contains(&hc_min) {
-                        head_chks.push(ChunkMeta {
-                            ref_id: pos,
-                            min_time: hc_min,
-                            max_time: hc_max,
-                            chunk: Some(hc_chunk),
-                        });
-                        pos += 1;
-                    }
-                });
-                (mmapped_in_order, head_chks)
             };
 
             if mmapped_in_order.is_empty() {
@@ -11935,14 +12008,29 @@ impl Head {
             }
 
             let mut chks = Vec::with_capacity(mmapped_in_order.len() + head_chks.len());
-            for (sort_ref, mc) in mmapped_in_order {
+            for (sort_ref, mc, trim) in mmapped_in_order {
                 match r.chunk(mc.ref_id) {
-                    Ok(enc) => chks.push(ChunkMeta {
-                        ref_id: sort_ref,
-                        min_time: mc.min_time,
-                        max_time: mc.max_time,
-                        chunk: Some(enc),
-                    }),
+                    Ok(enc) => {
+                        if let Some(stop_after) = trim {
+                            if let Some((sliced, s_min, s_max)) =
+                                crate::compact::slice_chunk_prefix(&enc, stop_after)?
+                            {
+                                chks.push(ChunkMeta {
+                                    ref_id: sort_ref,
+                                    min_time: s_min,
+                                    max_time: s_max,
+                                    chunk: Some(sliced),
+                                });
+                            }
+                        } else {
+                            chks.push(ChunkMeta {
+                                ref_id: sort_ref,
+                                min_time: mc.min_time,
+                                max_time: mc.max_time,
+                                chunk: Some(enc),
+                            });
+                        }
+                    }
                     Err(e) if !r.has_file(mc.ref_id.unpack().0 as usize) => {
                         drop(chunk_reader_guard);
                         if self.is_closed() {
@@ -13854,9 +13942,11 @@ impl<'a> HeadAppender<'a> {
     ) -> Result<Arc<SeriesEntry>, HeadError> {
         if let Some(r) = series_ref {
             let looked = self.head.series.get_by_id(r);
-            let hook = self.head.after_series_lookup_hook.lock().clone();
-            if let Some(hook) = hook {
-                hook(looked.as_deref());
+            if self.head.has_after_series_lookup_hook.load(Ordering::Acquire) {
+                let hook = self.head.after_series_lookup_hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook(looked.as_deref());
+                }
             }
             if let Some(e) = looked {
                 if !e.is_gced() {
@@ -15376,7 +15466,8 @@ impl<'a> HeadAppender<'a> {
         let head = self.head;
         let res = self.commit_inner();
         if self.append_id > 0 {
-            self.head.iso.close_append(self.append_id);
+            let aid = std::mem::take(&mut self.append_id);
+            self.head.iso.close_append(aid);
         }
         self.release_remaining_pending_commits();
         self.return_scratch();
@@ -15410,7 +15501,8 @@ impl<'a> HeadAppender<'a> {
         let finish_all = |apps: &mut Vec<HeadAppender<'_>>| {
             for a in apps.iter_mut() {
                 if a.append_id > 0 {
-                    a.head.iso.close_append(a.append_id);
+                    let aid = std::mem::take(&mut a.append_id);
+                    a.head.iso.close_append(aid);
                 }
                 a.release_remaining_pending_commits();
                 a.return_scratch();
@@ -16177,7 +16269,8 @@ impl<'a> HeadAppender<'a> {
             Ok(())
         };
         if self.append_id > 0 {
-            self.head.iso.close_append(self.append_id);
+            let aid = std::mem::take(&mut self.append_id);
+            self.head.iso.close_append(aid);
         }
         self.release_remaining_pending_commits();
         self.return_scratch();
@@ -16575,6 +16668,10 @@ impl Drop for HeadAppender<'_> {
                 );
             }
         } else {
+            if self.append_id > 0 {
+                let aid = std::mem::take(&mut self.append_id);
+                self.head.iso.close_append(aid);
+            }
             self.release_remaining_pending_commits();
             self.return_scratch();
         }
@@ -19458,6 +19555,7 @@ mod tests {
                 enable_st_as_zero_sample: AtomicBool::new(false),
                 enable_memory_snapshot_on_shutdown: AtomicBool::new(false),
                 enable_fast_startup: AtomicBool::new(false),
+                ooo_was_enabled: AtomicBool::new(false),
                 deleted_series_since_symbol_gc: AtomicU64::new(0),
                 symbol_arena_baseline_bytes: AtomicU64::new(0),
                 symbol_gc_arena_growth_threshold: AtomicU64::new(DEFAULT_SYMBOL_GC_ARENA_GROWTH_BYTES),

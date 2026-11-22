@@ -550,8 +550,8 @@ where
                     let cancel_orig = cancel_ctx.clone();
                     let f_call = Arc::clone(&f_inner);
                     async move {
-                        let (hook_ctx, hook_cancel) = ictx.with_cancel_cause_hook(move || {
-                            cancel_orig.cancel(None);
+                        let (hook_ctx, hook_cancel) = ictx.with_cancel_cause_hook(move |cause| {
+                            cancel_orig.cancel(cause);
                             inflight_rm.remove_instance(idx, pos);
                             if inflight_rm.all_instances_completed() {
                                 cancel_w_rm.cancel(Some(Arc::new(SimpleError(

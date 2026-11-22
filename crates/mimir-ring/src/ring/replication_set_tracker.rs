@@ -92,6 +92,8 @@ impl std::error::Error for ErrResultNotNeeded {}
 // RingContext (Go context.Context with WithCancelCause / WithTimeoutCause / WithValue)
 // ---------------------------------------------------------------------------
 
+type OnCancelHook = Box<dyn FnOnce(Option<BoxDynError>) + Send + Sync>;
+
 struct CancelState {
     canceled: AtomicBool,
     base_err: Mutex<Option<ContextError>>,
@@ -101,7 +103,7 @@ struct CancelState {
     notify: Notify,
     children: Mutex<Vec<Weak<CancelState>>>,
     parent: Option<Arc<CancelState>>,
-    on_cancel: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
+    on_cancel: Mutex<Option<OnCancelHook>>,
 }
 
 impl fmt::Debug for CancelState {
@@ -132,6 +134,10 @@ impl CancelState {
                                 .unwrap_or_else(|| Arc::new(ContextError::DeadlineExceeded)),
                         );
                     }
+                }
+                let cur_cause = self.cause.lock().clone();
+                if let Some(cb) = self.on_cancel.lock().take() {
+                    cb(cur_cause);
                 }
                 self.notify.notify_waiters();
                 self.propagate_cancel();
@@ -167,8 +173,9 @@ impl CancelState {
                     *c = Some(cause.unwrap_or_else(|| Arc::new(ContextError::Canceled)));
                 }
             }
+            let cur_cause = self.cause.lock().clone();
             if let Some(cb) = self.on_cancel.lock().take() {
-                cb();
+                cb(cur_cause);
             }
             self.notify.notify_waiters();
             self.propagate_cancel();
@@ -239,14 +246,14 @@ impl RingContext {
 
     pub fn with_cancel_cause_hook<F>(&self, on_cancel: F) -> (Self, CancelCauseFunc)
     where
-        F: FnOnce() + Send + Sync + 'static,
+        F: FnOnce(Option<BoxDynError>) + Send + Sync + 'static,
     {
         self.with_cancel_cause_inner(Some(Box::new(on_cancel)))
     }
 
     fn with_cancel_cause_inner(
         &self,
-        on_cancel: Option<Box<dyn FnOnce() + Send + Sync>>,
+        on_cancel: Option<OnCancelHook>,
     ) -> (Self, CancelCauseFunc) {
         let child_state = Arc::new(CancelState {
             canceled: AtomicBool::new(false),
@@ -259,17 +266,23 @@ impl RingContext {
             parent: Some(Arc::clone(&self.state)),
             on_cancel: Mutex::new(on_cancel),
         });
-        {
+        // Check deadline/parent cancellation BEFORE locking `self.state.children` to avoid
+        // re-entrantly locking `self.state.children` inside `propagate_cancel`.
+        let mut parent_done = self.state.is_done();
+        if !parent_done {
             let mut children = self.state.children.lock();
-            if self.state.is_done() {
-                child_state.cancel_with(
-                    self.state.base_err.lock().clone(),
-                    self.state.cause.lock().clone(),
-                );
+            if self.state.canceled.load(Ordering::Acquire) {
+                parent_done = true;
             } else {
                 children.retain(|w| w.strong_count() > 0);
                 children.push(Arc::downgrade(&child_state));
             }
+        }
+        if parent_done {
+            child_state.cancel_with(
+                self.state.base_err.lock().clone(),
+                self.state.cause.lock().clone(),
+            );
         }
         let cancel = CancelCauseFunc {
             state: Arc::clone(&child_state),
@@ -312,17 +325,21 @@ impl RingContext {
             parent: Some(Arc::clone(&self.state)),
             on_cancel: Mutex::new(None),
         });
-        {
+        let mut parent_done = self.state.is_done();
+        if !parent_done {
             let mut children = self.state.children.lock();
-            if self.state.is_done() {
-                child_state.cancel_with(
-                    self.state.base_err.lock().clone(),
-                    self.state.cause.lock().clone(),
-                );
+            if self.state.canceled.load(Ordering::Acquire) {
+                parent_done = true;
             } else {
                 children.retain(|w| w.strong_count() > 0);
                 children.push(Arc::downgrade(&child_state));
             }
+        }
+        if parent_done {
+            child_state.cancel_with(
+                self.state.base_err.lock().clone(),
+                self.state.cause.lock().clone(),
+            );
         }
         child_state.check_deadline_expired();
         let cancel = CancelCauseFunc {
@@ -379,13 +396,17 @@ impl RingContext {
                 return;
             }
             let notified = self.state.notify.notified();
+            tokio::pin!(notified);
+            // Register in the waiter list BEFORE re-checking state so a concurrent
+            // cancel_with() -> notify_waiters() can never lose the wakeup.
+            notified.as_mut().enable();
             if self.state.is_done() {
                 return;
             }
             match self.state.deadline {
                 Some(dl) => {
                     tokio::select! {
-                        _ = notified => {}
+                        _ = notified.as_mut() => {}
                         _ = tokio::time::sleep_until(dl) => {
                             self.state.check_deadline_expired();
                             return;
@@ -589,7 +610,10 @@ impl ReplicationSetResultTracker for DefaultResultTracker {
         ctx: &RingContext,
         instance_idx: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BoxDynError>> + Send + '_>> {
-        let mut rx = self.release_txs[instance_idx].1.clone();
+        let Some((_, rx)) = self.release_txs.get(instance_idx) else {
+            return Box::pin(async { Err(Arc::new(ErrResultNotNeeded) as BoxDynError) });
+        };
+        let mut rx = rx.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
             loop {
@@ -862,8 +886,13 @@ impl ReplicationSetResultTracker for ZoneAwareResultTracker {
         ctx: &RingContext,
         instance_idx: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BoxDynError>> + Send + '_>> {
-        let zone = self.instances[instance_idx].zone.clone();
-        let mut rx = self.zone_release_txs[&zone].1.clone();
+        let Some(inst) = self.instances.get(instance_idx) else {
+            return Box::pin(async { Err(Arc::new(ErrResultNotNeeded) as BoxDynError) });
+        };
+        let Some((_, rx)) = self.zone_release_txs.get(&inst.zone) else {
+            return Box::pin(async { Err(Arc::new(ErrResultNotNeeded) as BoxDynError) });
+        };
+        let mut rx = rx.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
             loop {
@@ -931,10 +960,13 @@ impl ZoneAwareContextTracker {
 impl ReplicationSetContextTracker for ZoneAwareContextTracker {
     fn context_for(&self, instance_idx: usize) -> (RingContext, CancelCauseFunc) {
         let inner = self.inner.lock();
-        (
-            inner.contexts[&instance_idx].clone(),
-            inner.cancel_funcs[&instance_idx].clone(),
-        )
+        if let (Some(c), Some(cf)) = (
+            inner.contexts.get(&instance_idx),
+            inner.cancel_funcs.get(&instance_idx),
+        ) {
+            return (c.clone(), cf.clone());
+        }
+        RingContext::background().with_cancel_cause()
     }
 
     fn cancel_context_for(&self, instance_idx: usize, cause: Option<BoxDynError>) {

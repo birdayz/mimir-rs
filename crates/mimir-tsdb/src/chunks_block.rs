@@ -200,10 +200,12 @@ impl BlockChunksWriter {
         let mut first_batch = true;
 
         for (i, chk) in chunks.iter().enumerate() {
-            let encoded = chk
-                .chunk
-                .as_ref()
-                .expect("ChunkMeta.chunk must be populated before write_chunks");
+            let encoded = chk.chunk.as_ref().ok_or_else(|| {
+                BlockChunksError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ChunkMeta.chunk must be populated before write_chunks",
+                ))
+            })?;
             let data_len = encoded.as_bytes().len();
             let chk_size =
                 MAX_CHUNK_LENGTH_FIELD_SIZE + CHUNK_ENCODING_SIZE + data_len + CRC_SIZE;
@@ -236,14 +238,16 @@ impl BlockChunksWriter {
         let last_batch_idx = batches.len() - 1;
         for (bi, range) in batches.into_iter().enumerate() {
             for chk in &mut chunks[range] {
-                let encoded = chk
-                    .chunk
-                    .as_ref()
-                    .expect("ChunkMeta.chunk must be populated before write_chunks");
+                let encoded = chk.chunk.as_ref().ok_or_else(|| {
+                    BlockChunksError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ChunkMeta.chunk must be populated before write_chunks",
+                    ))
+                })?;
                 let data = encoded.as_bytes();
 
                 // BlockChunkRef uses 0-based segment index (`self.seq - 1`).
-                let seg_idx = (self.seq - 1) as u32;
+                let seg_idx = (self.seq.saturating_sub(1)) as u32;
                 chk.ref_id = BlockChunkRef::new(seg_idx, self.pos as u32).as_u64();
 
                 let ulen = put_uvarint(&mut len_buf, data.len() as u64);
@@ -251,7 +255,12 @@ impl BlockChunksWriter {
                 let crc = crc32c::crc32c(&enc_byte);
                 let crc = crc32c::crc32c_append(crc, data);
 
-                let w = self.cur_writer.as_mut().unwrap();
+                let w = self.cur_writer.as_mut().ok_or_else(|| {
+                    BlockChunksError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "chunk writer is closed",
+                    ))
+                })?;
                 w.write_all(&len_buf[..ulen])?;
                 w.write_all(&enc_byte)?;
                 w.write_all(data)?;

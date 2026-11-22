@@ -209,7 +209,10 @@ where
         )));
     }
 
-    let expected_per_inst = keys.len() * (r.replication_factor() + 1) / instances_count;
+    let expected_per_inst = keys
+        .len()
+        .saturating_mul(r.replication_factor().saturating_add(1))
+        / instances_count;
     let mut item_trackers: Vec<Arc<ItemTracker>> = Vec::with_capacity(keys.len());
 
     struct BatchInstance {
@@ -235,7 +238,7 @@ where
             }
         };
 
-        let min_success = (rs.instances.len() - rs.max_errors) as i32;
+        let min_success = rs.instances.len().saturating_sub(rs.max_errors) as i32;
         let max_failures = rs.max_errors as i32;
         let it = Arc::new(ItemTracker::new(
             min_success,
