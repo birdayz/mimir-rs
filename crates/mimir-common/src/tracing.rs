@@ -2129,16 +2129,16 @@ mod tests {
         assert!(j_dbg.jaeger_debug_id.is_some());
 
         assert!(parse_traceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
-        // W3C Trace Context §3.2.2.3: all 8-bit lowercase hex flags 00..=ff are valid,
-        // preserving all 8 bits while bit 0 determines sampled.
-        let tp_ff = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff").unwrap();
-        assert!(tp_ff.is_sampled());
-        assert_eq!(tp_ff.trace_flags, 0xff);
-        assert_eq!(tp_ff.to_traceparent(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff");
-        let tp_04 = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04").unwrap();
-        assert!(!tp_04.is_sampled());
-        assert_eq!(tp_04.trace_flags, 0x04);
-        assert_eq!(tp_04.to_traceparent(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04");
+        // Go OTel trace_context.go:108-114: version 00 rejects reserved flag bits (> 0x03),
+        // while future versions (01..=fe) accept 00..=ff and mask to sampled|random (0x03).
+        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff").is_none());
+        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04").is_none());
+        let tp_v1_ff = parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff").unwrap();
+        assert!(tp_v1_ff.is_sampled());
+        assert_eq!(tp_v1_ff.trace_flags, 0x03);
+        let tp_v1_04 = parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04").unwrap();
+        assert!(!tp_v1_04.is_sampled());
+        assert_eq!(tp_v1_04.trace_flags, 0x00);
         assert!(parse_uber_trace_id("0:70e8b02d28e4337b:0:1").is_none());
 
         let tp_random_sampled = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03").unwrap();

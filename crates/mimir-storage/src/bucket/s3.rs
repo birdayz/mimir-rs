@@ -1339,8 +1339,11 @@ impl S3Bucket {
                     }))));
                 }
                 marker = next_marker;
-            } else if !page.next_continuation_token.is_empty() {
-                if page.is_truncated && page.next_continuation_token == token {
+            } else {
+                if page.is_truncated
+                    && (page.next_continuation_token.is_empty()
+                        || page.next_continuation_token == token)
+                {
                     return Err(S3BucketError::new(S3Error::Response(Box::new(client::ErrorResponse {
                         code: "NotImplemented".into(),
                         message: "Truncated V2 list response did not advance continuation token".into(),

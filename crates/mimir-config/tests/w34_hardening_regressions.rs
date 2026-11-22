@@ -70,3 +70,30 @@ ingester_client: 123
         "expected clean ConfigError, got: {msg2}"
     );
 }
+
+#[test]
+fn yaml_v3_rejects_merge_sequence_billion_laughs_and_deep_alias_chain() {
+    let mut merge_bomb = String::from("a0: &a0 { k: 1 }\n");
+    for i in 1..=20 {
+        merge_bomb.push_str(&format!("a{i}: &a{i} {{ <<: [*a{}, *a{}] }}\n", i - 1, i - 1));
+    }
+    let doc = mimir_config::yaml_v3::parse_first_document(merge_bomb.as_bytes())
+        .expect("parse merge bomb")
+        .expect("doc present");
+    assert!(
+        mimir_config::yaml_v3::doc_to_serde_value(&doc).is_err(),
+        "merge-sequence Billion Laughs must be rejected by doc_to_serde_value"
+    );
+
+    let mut chain = String::from("a0: &a0 x\n");
+    for i in 1..=350 {
+        chain.push_str(&format!("a{i}: &a{i} [*a{}]\n", i - 1));
+    }
+    let doc_chain = mimir_config::yaml_v3::parse_first_document(chain.as_bytes())
+        .expect("parse deep alias chain")
+        .expect("doc present");
+    assert!(
+        mimir_config::yaml_v3::doc_to_serde_value(&doc_chain).is_err(),
+        "350-deep alias chain must be rejected by MAX_ALIAS_DEPTH"
+    );
+}

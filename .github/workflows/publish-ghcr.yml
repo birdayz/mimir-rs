@@ -60,7 +60,7 @@ jobs:
           build-args: |
             SOURCE_DATE_EPOCH=0
             version=${{ steps.meta.outputs.version }}
-            branch=main
+            branch=${{ github.ref_name }}
             revision=${{ steps.meta.outputs.short_sha }}
           outputs: type=image,name=ghcr.io/birdayz/mimir-rs,push-by-digest=true,name-canonical=true,rewrite-timestamp=true,push=true
 

@@ -27,7 +27,7 @@ check_no_duplicated_pins() {
     echo "$hits" >&2
     exit 1
   fi
-  hits="$(grep -rnE '(^|[^0-9a-fA-F])[0-9a-f]{40}([^0-9a-fA-F]|$)' "$ROOT/.github/workflows" "$ROOT/scripts" || true)"
+  hits="$(grep -rnF "$UPSTREAM_MIMIR_REF" "$ROOT/.github/workflows" "$ROOT/scripts" || true)"
   if [[ -n "$hits" ]]; then
     echo "ERROR: found hardcoded 40-char commit SHA pin in workflows/scripts (use UPSTREAM_MIMIR instead):" >&2
     echo "$hits" >&2

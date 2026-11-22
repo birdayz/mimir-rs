@@ -2142,7 +2142,6 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
         return Err(DecodeError::OddNumberOfLabelRefs);
     }
 
-    let budget_before_series_labels = budget.used;
     label_bytes_arena.reserve(
         scratch
             .rw2_label_refs
@@ -2208,8 +2207,9 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
 
     let mut raw_label_bytes_range = None;
     let label_bytes_end = if bad_utf8 {
+        let discarded = label_bytes_arena.len().saturating_sub(label_bytes_start);
         label_bytes_arena.truncate(label_bytes_start);
-        budget.used = budget_before_series_labels;
+        budget.used = budget.used.saturating_sub(discarded);
         append_raw_rw2_labels_from_refs(
             &scratch.rw2_label_refs,
             symbol_offset,
@@ -2220,8 +2220,9 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
         raw_label_bytes_range = Some(label_bytes_start..label_bytes_arena.len());
         label_bytes_start
     } else if !labels_sorted_unique && dropped_empty {
+        let discarded = label_bytes_arena.len().saturating_sub(label_bytes_start);
         label_bytes_arena.truncate(label_bytes_start);
-        budget.used = budget_before_series_labels;
+        budget.used = budget.used.saturating_sub(discarded);
         append_raw_rw2_labels_from_refs(
             &scratch.rw2_label_refs,
             symbol_offset,

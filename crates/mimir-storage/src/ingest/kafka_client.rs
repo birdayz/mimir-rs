@@ -876,6 +876,26 @@ impl BrokerConn {
         let frame_len = (body.len() - 4) as u32;
         body[0..4].copy_from_slice(&frame_len.to_be_bytes());
 
+        // Reserve channel capacity BEFORE inserting into self.pending so dropping/cancelling
+        // this future while write_tx is full never leaves a phantom tombstone for an unsent frame.
+        let permit = match tokio::time::timeout(send_timeout, self.write_tx.reserve()).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => {
+                if let Some(ref k) = self.kprom {
+                    let n = self.node.read().clone();
+                    k.on_write_error(&n);
+                }
+                return Err(KafkaClientError::ConnectionClosed);
+            }
+            Err(_) => {
+                if let Some(ref k) = self.kprom {
+                    let n = self.node.read().clone();
+                    k.on_write_error(&n);
+                }
+                return Err(KafkaClientError::RequestTimeout(send_timeout));
+            }
+        };
+
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(
             corr_id,
@@ -884,7 +904,7 @@ impl BrokerConn {
                 tombstoned_at: None,
             },
         );
-        let mut guard = PendingGuard {
+        let guard = PendingGuard {
             conn: self,
             corr_id,
             completed: false,
@@ -905,43 +925,8 @@ impl BrokerConn {
             timing: timing.clone(),
             track_metrics,
         };
-        match tokio::time::timeout(send_timeout, self.write_tx.send(outbound)).await {
-            Ok(Ok(())) => Ok((rx, guard, written, timing, enqueued_at)),
-            Ok(Err(_)) => {
-                // Frame was never queued into write_tx, so remove corr_id cleanly without a tombstone.
-                guard.completed = true;
-                let now_empty = {
-                    let mut map = self.pending.lock();
-                    map.remove(&corr_id);
-                    map.is_empty()
-                };
-                if now_empty {
-                    self.pending_drained.notify_waiters();
-                }
-                if let Some(ref k) = self.kprom {
-                    let n = self.node.read().clone();
-                    k.on_write_error(&n);
-                }
-                Err(KafkaClientError::ConnectionClosed)
-            }
-            Err(_) => {
-                // Frame was never queued into write_tx, so remove corr_id cleanly without a tombstone.
-                guard.completed = true;
-                let now_empty = {
-                    let mut map = self.pending.lock();
-                    map.remove(&corr_id);
-                    map.is_empty()
-                };
-                if now_empty {
-                    self.pending_drained.notify_waiters();
-                }
-                if let Some(ref k) = self.kprom {
-                    let n = self.node.read().clone();
-                    k.on_write_error(&n);
-                }
-                Err(KafkaClientError::RequestTimeout(send_timeout))
-            }
-        }
+        permit.send(outbound);
+        Ok((rx, guard, written, timing, enqueued_at))
     }
 
     #[allow(clippy::too_many_arguments)]

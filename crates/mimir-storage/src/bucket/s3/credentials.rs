@@ -220,18 +220,23 @@ pub fn split_credential_process_args(command: &str) -> Result<Vec<String>, Strin
     let mut args = Vec::new();
     let mut cur = String::new();
     let mut in_token = false;
-    let mut quote: Option<char> = None;
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+    let mut quote: Option<Quote> = None;
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
         match quote {
-            Some('\'') => {
+            Some(Quote::Single) => {
                 if c == '\'' {
                     quote = None;
                 } else {
                     cur.push(c);
                 }
             }
-            Some('"') => {
+            Some(Quote::Double) => {
                 if c == '"' {
                     quote = None;
                 } else if c == '\\' {
@@ -249,15 +254,17 @@ pub fn split_credential_process_args(command: &str) -> Result<Vec<String>, Strin
                     cur.push(c);
                 }
             }
-            Some(_) => unreachable!(),
             None => {
                 if c.is_whitespace() {
                     if in_token {
                         args.push(std::mem::take(&mut cur));
                         in_token = false;
                     }
-                } else if c == '\'' || c == '"' {
-                    quote = Some(c);
+                } else if c == '\'' {
+                    quote = Some(Quote::Single);
+                    in_token = true;
+                } else if c == '"' {
+                    quote = Some(Quote::Double);
                     in_token = true;
                 } else if c == '\\' {
                     let next = chars

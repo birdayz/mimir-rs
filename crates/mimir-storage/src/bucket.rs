@@ -746,7 +746,7 @@ impl BucketClient {
                 }
                 .await;
                 if let Some(t) = timer {
-                    t.finish_upload(result.is_ok(), 0);
+                    t.finish_upload(result.is_ok(), if result.is_ok() { len } else { 0 });
                 }
                 result
             }

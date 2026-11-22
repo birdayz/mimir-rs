@@ -1039,12 +1039,12 @@ impl HeadChunksReader {
 
     /// Drops any mapped or active segments with sequence strictly greater than `max_keep_seq`
     /// (must be called before unlinking rolled-back segments on disk).
-    pub(crate) fn drop_segments_after(&mut self, max_keep_seq: usize) {
+    pub(crate) fn drop_segments_from(&mut self, min_drop_seq: usize) {
         let to_drop: Vec<usize> = self
             .files
             .keys()
             .copied()
-            .filter(|&seq| seq > max_keep_seq)
+            .filter(|&seq| seq >= min_drop_seq)
             .collect();
         for seq in to_drop {
             self.files.remove(&seq);
@@ -1052,7 +1052,7 @@ impl HeadChunksReader {
         if self
             .active_file
             .as_ref()
-            .is_some_and(|(s, _)| *s > max_keep_seq)
+            .is_some_and(|(s, _)| *s >= min_drop_seq)
         {
             self.active_file = None;
         }
@@ -1377,17 +1377,21 @@ impl HeadChunksReader {
     where
         F: FnMut(HeadChunkRecord, u8) -> Result<(), HeadChunksError>,
     {
+        let mut active_emitted = false;
         for (&seq, mmap) in &self.files {
-            if let Some((active_seq, ref arf)) = self.active_file {
-                if active_seq < seq {
-                    let bytes = Self::read_active_file_bytes(arf)?;
-                    Self::iterate_slice_raw(&self.dir, active_seq, &bytes, &mut f)?;
+            if !active_emitted {
+                if let Some((active_seq, ref arf)) = self.active_file {
+                    if active_seq < seq {
+                        let bytes = Self::read_active_file_bytes(arf)?;
+                        Self::iterate_slice_raw(&self.dir, active_seq, &bytes, &mut f)?;
+                        active_emitted = true;
+                    }
                 }
             }
             Self::iterate_slice_raw(&self.dir, seq, mmap, &mut f)?;
         }
-        if let Some((active_seq, ref arf)) = self.active_file {
-            if self.files.keys().next_back().is_none_or(|&max_s| active_seq > max_s) {
+        if !active_emitted {
+            if let Some((active_seq, ref arf)) = self.active_file {
                 let bytes = Self::read_active_file_bytes(arf)?;
                 Self::iterate_slice_raw(&self.dir, active_seq, &bytes, &mut f)?;
             }

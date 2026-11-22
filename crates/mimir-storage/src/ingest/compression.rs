@@ -233,7 +233,10 @@ fn decompress_zstd(raw: &[u8], max_bytes: usize) -> Result<Bytes> {
             return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
         }
     }
-    let decoder = zstd::stream::read::Decoder::new(raw).context("zstd decompress record batch")?;
+    let mut decoder = zstd::stream::read::Decoder::new(raw).context("zstd decompress record batch")?;
+    decoder
+        .window_log_max(23)
+        .context("zstd configure window_log_max")?;
     let cap = raw
         .len()
         .saturating_mul(4)

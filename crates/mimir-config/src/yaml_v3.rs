@@ -794,6 +794,7 @@ fn load_types() -> Result<Types, String> {
 #[derive(Debug)]
 struct Fail(String);
 
+const MAX_ALIAS_DEPTH: usize = 64;
 const ALIAS_RATIO_RANGE_LOW: usize = 400_000;
 const ALIAS_RATIO_RANGE_HIGH: usize = 4_000_000;
 const ALIAS_RATIO_RANGE: f64 = (ALIAS_RATIO_RANGE_HIGH - ALIAS_RATIO_RANGE_LOW) as f64;
@@ -913,6 +914,10 @@ impl<'a> Decoder<'a> {
                 let target = node.alias.ok_or_else(|| {
                     Fail(format!("yaml: unknown anchor '{}' referenced", node.value))
                 })?;
+                if self.alias_depth >= MAX_ALIAS_DEPTH {
+                    self.aliases.remove(&n);
+                    return Err(Fail("yaml: document contains excessive alias nesting".to_string()));
+                }
                 self.alias_depth += 1;
                 let good = self.unmarshal(target, ty);
                 self.alias_depth -= 1;
@@ -1404,6 +1409,11 @@ impl<'a> Decoder<'a> {
                 return Err(Fail(msg));
             }
             if is_alias {
+                if self.alias_depth >= MAX_ALIAS_DEPTH {
+                    self.aliases.remove(&tgt);
+                    self.merged_fields = saved;
+                    return Err(Fail("yaml: document contains excessive alias nesting".to_string()));
+                }
                 self.alias_depth += 1;
             }
             let count_res = self.count_and_check_aliases();
@@ -1701,11 +1711,39 @@ fn doc_scalar_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<
     }
 }
 
+#[derive(Default)]
+struct DocAliasBudget {
+    decode_count: usize,
+    alias_count: usize,
+    alias_depth: usize,
+    call_depth: usize,
+    active_aliases: HashSet<usize>,
+}
+
+impl DocAliasBudget {
+    fn tick(&mut self) -> Result<(), String> {
+        self.decode_count = self.decode_count.saturating_add(1);
+        if self.alias_depth > 0 {
+            self.alias_count = self.alias_count.saturating_add(1);
+        }
+        if self.alias_count > 100
+            && self.decode_count > 1000
+            && (self.alias_count as f64) / (self.decode_count as f64)
+                > allowed_alias_ratio(self.decode_count)
+        {
+            return Err("yaml: document contains excessive aliasing".to_string());
+        }
+        Ok(())
+    }
+}
+
 fn collect_merged_pairs(
     doc: &Document,
     n: usize,
     visited: &mut HashSet<usize>,
+    budget: &mut DocAliasBudget,
 ) -> Result<Vec<(usize, usize)>, String> {
+    budget.tick()?;
     let n = doc_deref(doc, n);
     if !visited.insert(n) {
         return Err("yaml: anchor value contains itself".to_string());
@@ -1727,23 +1765,36 @@ fn collect_merged_pairs(
         }
     }
     if let Some(mv) = merge_val {
+        let mv_is_alias = doc.node(mv).kind == Kind::Alias;
         let mv = doc_deref(doc, mv);
         let mnode = doc.node(mv);
-        let mut targets = Vec::new();
+        let mut targets: Vec<(usize, bool)> = Vec::new();
         match mnode.kind {
-            Kind::Mapping => targets.push(mv),
+            Kind::Mapping => targets.push((mv, mv_is_alias)),
             Kind::Sequence => {
                 for &c in &mnode.content {
+                    let c_is_alias = mv_is_alias || doc.node(c).kind == Kind::Alias;
                     let cn = doc_deref(doc, c);
                     if doc.node(cn).kind == Kind::Mapping {
-                        targets.push(cn);
+                        targets.push((cn, c_is_alias));
                     }
                 }
             }
             _ => {}
         }
-        for tgt in targets {
-            let merged = match collect_merged_pairs(doc, tgt, visited) {
+        for (tgt, is_alias) in targets {
+            if is_alias {
+                if budget.alias_depth >= MAX_ALIAS_DEPTH {
+                    visited.remove(&n);
+                    return Err("yaml: document contains excessive alias nesting".to_string());
+                }
+                budget.alias_depth += 1;
+            }
+            let merged_res = collect_merged_pairs(doc, tgt, visited, budget);
+            if is_alias {
+                budget.alias_depth -= 1;
+            }
+            let merged = match merged_res {
                 Ok(m) => m,
                 Err(e) => {
                     visited.remove(&n);
@@ -1763,14 +1814,6 @@ fn collect_merged_pairs(
     Ok(explicit_keys)
 }
 
-#[derive(Default)]
-struct DocAliasBudget {
-    decode_count: usize,
-    alias_count: usize,
-    alias_depth: usize,
-    active_aliases: HashSet<usize>,
-}
-
 fn doc_node_to_yaml(
     doc: &Document,
     t: &Types,
@@ -1778,21 +1821,30 @@ fn doc_node_to_yaml(
     ty: usize,
     budget: &mut DocAliasBudget,
 ) -> Result<serde_yaml::Value, String> {
+    if budget.call_depth >= 128 {
+        return Err("yaml: document exceeds maximum nesting depth".to_string());
+    }
+    budget.call_depth += 1;
+    let res = doc_node_to_yaml_inner(doc, t, n, ty, budget);
+    budget.call_depth -= 1;
+    res
+}
+
+fn doc_node_to_yaml_inner(
+    doc: &Document,
+    t: &Types,
+    n: usize,
+    ty: usize,
+    budget: &mut DocAliasBudget,
+) -> Result<serde_yaml::Value, String> {
     use serde_yaml::{Mapping, Value};
-    budget.decode_count = budget.decode_count.saturating_add(1);
-    if budget.alias_depth > 0 {
-        budget.alias_count = budget.alias_count.saturating_add(1);
-    }
-    if budget.alias_count > 100
-        && budget.decode_count > 1000
-        && (budget.alias_count as f64) / (budget.decode_count as f64)
-            > allowed_alias_ratio(budget.decode_count)
-    {
-        return Err("yaml: document contains excessive aliasing".to_string());
-    }
+    budget.tick()?;
 
     let node = doc.node(n);
     if node.kind == Kind::Alias {
+        if budget.alias_depth >= MAX_ALIAS_DEPTH {
+            return Err("yaml: document contains excessive alias nesting".to_string());
+        }
         if !budget.active_aliases.insert(n) {
             return Err(format!("yaml: anchor '{}' value contains itself", node.value));
         }
@@ -1832,7 +1884,7 @@ fn doc_node_to_yaml(
         }
         Kind::Mapping => {
             let mut merge_visited = HashSet::new();
-            let pairs = collect_merged_pairs(doc, n, &mut merge_visited)?;
+            let pairs = collect_merged_pairs(doc, n, &mut merge_visited, budget)?;
             let mut out = Mapping::with_capacity(pairs.len());
             if info.name == "activeseriesmodel.CustomTrackersConfig" {
                 for (k, v) in pairs {

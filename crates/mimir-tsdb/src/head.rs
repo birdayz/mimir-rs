@@ -2541,16 +2541,12 @@ impl SeriesState {
         Ok((inserted, chunk_created, mmap_refs, write_epoch))
     }
 
-    fn write_sealed_head_chunks(
-        &mut self,
-        ref_id: u64,
-        writer: &mut HeadChunksWriter,
-    ) -> Result<Vec<MmappedChunk>, HeadChunksError> {
+    fn clone_compacted_sealed_head_chunks(&mut self) -> Vec<(i64, i64, EncodedChunk)> {
         let Some(ref mut cold) = self.cold else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         if cold.extra_head_chunks.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let mut out = Vec::with_capacity(cold.extra_head_chunks.len());
         for mc in &mut cold.extra_head_chunks {
@@ -2562,16 +2558,9 @@ impl SeriesState {
                 EncodedChunk::FloatHistogram(ref mut c) => c.compact(),
                 EncodedChunk::FloatHistogramSt(ref mut c) => c.compact(),
             }
-            let r = writer.write_chunk(ref_id, mc.min_time, mc.max_time, &mc.chunk, false)?;
-            out.push(MmappedChunk {
-                ref_id: r,
-                min_time: mc.min_time,
-                max_time: mc.max_time,
-                num_samples: mc.chunk.num_samples() as u16,
-                encoding: mc.chunk.encoding(),
-            });
+            out.push((mc.min_time, mc.max_time, mc.chunk.clone()));
         }
-        Ok(out)
+        out
     }
 
     fn promote_sealed_head_chunks(&mut self, mmapped: Vec<MmappedChunk>) {
@@ -5222,10 +5211,12 @@ impl Head {
         writer: &mut HeadChunksWriter,
         snap: crate::head_chunks::HeadChunksSnapshot,
     ) {
+        // Drop snap.seq itself as well as all subsequent segments before rollback_snapshot
+        // truncates snap.seq via set_len, so no live Mmap can ever hit SIGBUS.
         {
             let mut guard = self.chunk_reader.write();
             if let Some(ref mut reader) = *guard {
-                reader.drop_segments_after(snap.seq);
+                reader.drop_segments_from(snap.seq.max(1));
             }
         }
         writer.rollback_snapshot(snap);
@@ -9025,75 +9016,77 @@ impl Head {
         let _mmap_guard = self.mmap_mtx.lock();
         let mut count = 0usize;
         let mut max_mmapped_chunks = 0usize;
-        let mut pending: Vec<(Arc<SeriesEntry>, Vec<MmappedChunk>)> = Vec::new();
-        let mut cw_snap: Option<crate::head_chunks::HeadChunksSnapshot> = None;
+        // Stage 1: Compact and collect sealed head chunks under `entry.inner` ONLY (without
+        // holding `chunk_writer`), preserving lock order and keeping `chunk_writer` contention
+        // strictly bounded to disk I/O.
+        type StagedSealedChunks = (Arc<SeriesEntry>, Vec<(i64, i64, EncodedChunk)>);
+        let mut staged: Vec<StagedSealedChunks> = Vec::new();
         let mut entries = Vec::with_capacity(256);
         for stripe in &self.series.stripes {
             entries.clear();
             StripeSeries::collect_stripe_into(stripe, &mut entries);
             for entry in entries.drain(..) {
-                // Lock order: entry.inner -> chunk_writer (matching commit()).
                 let mut st = entry.inner.lock();
                 if st.head_chunks_len() > 1 {
-                    let mut writer_guard = self.chunk_writer.lock();
-                    let Some(ref mut writer) = *writer_guard else {
-                        return Ok(count);
-                    };
-                    if cw_snap.is_none() {
-                        // Flush any pre-existing buffered chunks before taking a rollback
-                        // snapshot so a failure below never rolls back unrelated writes or
-                        // leaves partially written sealed chunks on disk.
-                        writer.flush()?;
-                        cw_snap = Some(writer.take_snapshot());
-                    }
-                    let mmapped = match st.write_sealed_head_chunks(entry.ref_id, writer) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            if let Some(snap) = cw_snap {
-                                self.rollback_chunk_writer(writer, snap);
-                            }
-                            return Err(e);
-                        }
-                    };
-                    drop(writer_guard);
+                    let sealed = st.clone_compacted_sealed_head_chunks();
                     drop(st);
-                    if !mmapped.is_empty() {
-                        count += mmapped.len();
-                        max_mmapped_chunks = max_mmapped_chunks.max(mmapped.len());
-                        pending.push((entry, mmapped));
+                    if !sealed.is_empty() {
+                        staged.push((entry, sealed));
                     }
                 }
             }
         }
 
-        if count > 0 {
-            let Some(snap) = cw_snap else {
-                return Ok(0);
-            };
+        if !staged.is_empty() {
+            // Stage 2: Hold `chunk_writer` continuously across flush -> take_snapshot ->
+            // write all staged chunks -> flush -> refresh_chunk_reader so concurrent OOO
+            // appenders cannot interleave writes inside the rollback snapshot window.
+            let mut pending: Vec<(Arc<SeriesEntry>, Vec<MmappedChunk>)> =
+                Vec::with_capacity(staged.len());
             {
                 let mut writer_guard = self.chunk_writer.lock();
-                if let Some(ref mut writer) = *writer_guard {
-                    if writer.discard_epoch() != snap.discard_epoch {
-                        self.rollback_chunk_writer(writer, snap);
-                        return Err(HeadChunksError::Io(io::Error::other(
-                            "unflushed head chunks discarded by prior flush error",
-                        )));
+                let Some(ref mut writer) = *writer_guard else {
+                    return Ok(0);
+                };
+                writer.flush()?;
+                let snap = writer.take_snapshot();
+
+                for (entry, sealed) in staged {
+                    let mut mmapped = Vec::with_capacity(sealed.len());
+                    for (mint, maxt, chunk) in sealed {
+                        let r = match writer.write_chunk(entry.ref_id, mint, maxt, &chunk, false) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                self.rollback_chunk_writer(writer, snap);
+                                return Err(e);
+                            }
+                        };
+                        mmapped.push(MmappedChunk {
+                            ref_id: r,
+                            min_time: mint,
+                            max_time: maxt,
+                            num_samples: chunk.num_samples() as u16,
+                            encoding: chunk.encoding(),
+                        });
                     }
-                    if let Err(e) = writer.flush() {
-                        self.rollback_chunk_writer(writer, snap);
-                        return Err(e);
-                    }
+                    count += mmapped.len();
+                    max_mmapped_chunks = max_mmapped_chunks.max(mmapped.len());
+                    pending.push((entry, mmapped));
                 }
-            }
-            // Refresh mmap reader BEFORE exposing new mmapped_chunks on series state,
-            // so concurrent readers never observe a ChunkDiskMapperRef not yet in chunk_reader.
-            if let Err(e) = self.refresh_chunk_reader() {
-                let mut writer_guard = self.chunk_writer.lock();
-                if let Some(ref mut writer) = *writer_guard {
+
+                if let Err(e) = writer.flush() {
                     self.rollback_chunk_writer(writer, snap);
+                    return Err(e);
                 }
-                return Err(e);
+                // Refresh chunk_reader BEFORE releasing chunk_writer and BEFORE exposing
+                // mmapped_chunks on series state (lock order: chunk_writer -> chunk_reader.write).
+                if let Err(e) = self.refresh_chunk_reader_with_active(writer.active_file_seq()) {
+                    self.rollback_chunk_writer(writer, snap);
+                    return Err(e);
+                }
             }
+
+            // Stage 3: Expose newly mmapped chunks on each series.
             for (entry, mmapped) in pending {
                 let mut st = entry.inner.lock();
                 st.promote_sealed_head_chunks(mmapped);

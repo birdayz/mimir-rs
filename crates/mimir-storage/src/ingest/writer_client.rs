@@ -271,7 +271,7 @@ struct QueuedItem {
 
 #[derive(Default)]
 struct PartitionQueue {
-    batches: VecDeque<(Vec<QueuedItem>, Option<tokio::sync::OwnedSemaphorePermit>)>,
+    batches: VecDeque<Vec<QueuedItem>>,
     worker_active: bool,
 }
 
@@ -449,7 +449,7 @@ impl KafkaWriterClient {
         {
             let mut pqs = self.partition_queues.lock();
             for pq in pqs.values_mut() {
-                for (items, _permit) in pq.batches.drain(..) {
+                for items in pq.batches.drain(..) {
                     drained.extend(items);
                 }
             }
@@ -578,11 +578,10 @@ impl KafkaWriterClient {
 
             let mut first_permit_opt = Some(first_permit);
             for ((topic, partition), items) in groups {
-                let pre_permit = first_permit_opt.take();
                 let should_spawn = {
                     let mut pqs = this_strong.partition_queues.lock();
                     let pq = pqs.entry((topic.clone(), partition)).or_default();
-                    pq.batches.push_back((items, pre_permit));
+                    pq.batches.push_back(items);
                     if pq.worker_active {
                         false
                     } else {
@@ -591,13 +590,19 @@ impl KafkaWriterClient {
                     }
                 };
                 if should_spawn {
+                    // Only hand the pre-acquired permit to a newly spawned idle partition worker
+                    // (never park permits inside pq.batches behind an active worker!).
+                    let initial_permit = first_permit_opt.take();
                     let sem = Arc::clone(&inflight_sem);
                     let weak_this = Arc::downgrade(&this_strong);
                     tokio::spawn(async move {
-                        Self::run_partition_worker(weak_this, sem, topic, partition).await;
+                        Self::run_partition_worker(weak_this, sem, topic, partition, initial_permit)
+                            .await;
                     });
                 }
             }
+            // If every group already had an active worker, release first_permit immediately.
+            drop(first_permit_opt);
         }
     }
 
@@ -606,6 +611,7 @@ impl KafkaWriterClient {
         sem: Arc<Semaphore>,
         topic: String,
         partition: i32,
+        mut initial_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         loop {
             let Some(this) = weak_this.upgrade() else {
@@ -626,14 +632,15 @@ impl KafkaWriterClient {
                     None => None,
                 }
             };
-            let Some((items, pre_permit)) = next else {
+            let Some(items) = next else {
                 return;
             };
             if this.closed.load(Ordering::SeqCst) {
+                drop(initial_permit.take());
                 this.fail_items_with_err(items, ProducerError::Closed);
                 continue;
             }
-            let _permit = match pre_permit {
+            let _permit = match initial_permit.take() {
                 Some(p) => p,
                 None => {
                     let earliest_enqueue = items
@@ -924,7 +931,7 @@ impl KafkaWriterClient {
         {
             let mut pqs = self.partition_queues.lock();
             if let Some(pq) = pqs.get_mut(&(topic.to_string(), partition)) {
-                for (items, _permit) in pq.batches.drain(..) {
+                for items in pq.batches.drain(..) {
                     same_partition_items.extend(items);
                 }
             }

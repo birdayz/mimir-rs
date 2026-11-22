@@ -742,10 +742,16 @@ impl RustlsStream {
                     return Err("send the report to the stats server: unexpected EOF during TLS handshake".to_string());
                 }
                 let mut cursor = Cursor::new(&rbuf[..n]);
-                conn.read_tls(&mut cursor)
-                    .map_err(|e| format!("send the report to the stats server: {e}"))?;
-                conn.process_new_packets()
-                    .map_err(|e| format!("send the report to the stats server: {e}"))?;
+                while (cursor.position() as usize) < n {
+                    let before = cursor.position();
+                    conn.read_tls(&mut cursor)
+                        .map_err(|e| format!("send the report to the stats server: {e}"))?;
+                    conn.process_new_packets()
+                        .map_err(|e| format!("send the report to the stats server: {e}"))?;
+                    if cursor.position() == before {
+                        break;
+                    }
+                }
             }
         }
         // Flush any remaining Finished/ticket bytes produced at handshake completion.
