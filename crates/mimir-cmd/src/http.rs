@@ -43,6 +43,8 @@ pub struct AppHttpState {
     pub cost_attribution_registry: Option<(String, Registry)>,
 }
 
+pub type ConfigHandlerFn = Arc<dyn Fn(&Value, &Value, Option<&str>) -> Response + Send + Sync>;
+
 /// Exact `GET`-only route matching Gorilla `mux` `Methods("GET")` (rejecting `HEAD` with 405).
 fn get_only<H, T, S>(handler: H) -> MethodRouter<S>
 where
@@ -83,6 +85,13 @@ async fn reject_head_on_gorilla_mux_routes(
 
 /// Builds the full Axum HTTP router (with `server.http_path_prefix` honored).
 pub fn build_http_router(state: AppHttpState) -> Router {
+    build_http_router_with_custom_config(state, None)
+}
+
+pub fn build_http_router_with_custom_config(
+    state: AppHttpState,
+    custom_config_handler: Option<ConfigHandlerFn>,
+) -> Router {
     let register_instrumentation = state.config.server.register_instrumentation;
     // Go registers /memberlist whenever the memberlist-kv module is initialised (a dependency of
     // the ingester ring); it answers "This instance doesn't use memberlist." without a KV.
@@ -107,7 +116,15 @@ pub fn build_http_router(state: AppHttpState) -> Router {
     let mut router = Router::new()
         .route("/ready", any(ready_handler))
         .route("/services", get_only(services_handler))
-        .route("/config", get_only(config_handler))
+        .route(
+            "/config",
+            get_only({
+                let custom = custom_config_handler.clone();
+                move |st: AxumState<AppHttpState>, raw_query: RawQuery| {
+                    config_handler_with_custom(st, raw_query, custom.clone())
+                }
+            }),
+        )
         .route("/api/v1/status/buildinfo", get_only(buildinfo_handler))
         .route("/api/v1/status/config", get_only(status_config_handler))
         .route("/api/v1/status/flags", get_only(status_flags_handler))
@@ -726,6 +743,62 @@ fn extract_mode_query(raw: Option<&str>) -> Option<String> {
     values.remove("mode").and_then(|mut v| v.drain(..).next())
 }
 
+/// `pkg/api/handlers.go`: `DefaultConfigHandler` for generic YAML `Value`s.
+pub fn default_config_handler_values(
+    actual_val: &Value,
+    default_val: &Value,
+    mode: Option<&str>,
+) -> Response {
+    let yaml = match mode {
+        Some("diff") => {
+            if !default_val.is_mapping() || !actual_val.is_mapping() {
+                let bad = if !actual_val.is_mapping() { actual_val } else { default_val };
+                let tag = match bad {
+                    Value::String(s) => format!("!!str `{s}`"),
+                    Value::Number(n) => format!("!!int `{n}`"),
+                    Value::Bool(b) => format!("!!bool `{b}`"),
+                    Value::Sequence(_) => "!!seq".to_string(),
+                    Value::Null => "!!null".to_string(),
+                    Value::Tagged(_) | Value::Mapping(_) => "value".to_string(),
+                };
+                return go_http_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("yaml: unmarshal errors:\n  line 1: cannot unmarshal {tag} into map[string]interface {{}}"),
+                );
+            }
+            let diff = diff_yaml_values(default_val, actual_val)
+                .unwrap_or_else(|| Value::Mapping(Mapping::new()));
+            yaml_v3_emit::marshal_generic(&diff)
+        }
+        Some("defaults") => yaml_v3_emit::marshal_struct(default_val),
+        _ => yaml_v3_emit::marshal_struct(actual_val),
+    };
+
+    match yaml {
+        Ok(yaml) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            yaml,
+        )
+            .into_response(),
+        Err(err) => go_http_error(StatusCode::INTERNAL_SERVER_ERROR, &err),
+    }
+}
+
+async fn config_handler_with_custom(
+    AxumState(st): AxumState<AppHttpState>,
+    RawQuery(raw_query): RawQuery,
+    custom: Option<ConfigHandlerFn>,
+) -> Response {
+    let mode = extract_mode_query(raw_query.as_deref());
+    if let Some(custom_fn) = custom {
+        let def = effective_config_yaml(&st.default_config);
+        let act = effective_config_yaml(&st.config);
+        return custom_fn(&act, &def, mode.as_deref());
+    }
+    config_handler(AxumState(st), RawQuery(raw_query)).await
+}
+
 async fn config_handler(
     AxumState(st): AxumState<AppHttpState>,
     RawQuery(raw_query): RawQuery,
@@ -1107,128 +1180,175 @@ async fn memberlist_handler(
     resp
 }
 
-struct IndexLink {
-    desc: &'static str,
-    path: &'static str,
-    dangerous: bool,
+pub const SERVICE_STATUS_WEIGHT: u8 = 0;
+pub const CONFIG_WEIGHT: u8 = 1;
+pub const RUNTIME_CONFIG_WEIGHT: u8 = 2;
+pub const DEFAULT_WEIGHT: u8 = 3;
+pub const MEMBERLIST_WEIGHT: u8 = 4;
+pub const DANGEROUS_WEIGHT: u8 = 5;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexPageLink {
+    pub desc: String,
+    pub path: String,
+    pub dangerous: bool,
 }
 
-struct IndexGroup {
-    weight: u8,
-    desc: &'static str,
-    links: Vec<IndexLink>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexPageLinkGroup {
+    pub weight: u8,
+    pub desc: String,
+    pub links: Vec<IndexPageLink>,
 }
 
-async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
-    // pkg/api/handlers.go & pkg/api/api.go: relative paths so `-server.path-prefix` works cleanly.
-    let mut groups: Vec<IndexGroup> = vec![
-        IndexGroup {
-            weight: 0,
-            desc: "Overview",
-            links: vec![IndexLink {
-                desc: "Services' status",
-                path: "services",
+pub struct IndexPageContent {
+    pub base_url: String,
+    elements: parking_lot::Mutex<Vec<IndexPageLinkGroup>>,
+}
+
+impl IndexPageContent {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            elements: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn add_links(&self, weight: u8, group_desc: &str, links: Vec<IndexPageLink>) {
+        let mut guard = self.elements.lock();
+        if let Some(group) = guard.iter_mut().find(|g| g.desc == group_desc) {
+            group.links.extend(links);
+            return;
+        }
+        guard.push(IndexPageLinkGroup {
+            weight,
+            desc: group_desc.to_string(),
+            links,
+        });
+    }
+
+    pub fn get_content(&self) -> Vec<IndexPageLinkGroup> {
+        let mut els = self.elements.lock().clone();
+        els.sort_by(|a, b| a.weight.cmp(&b.weight).then_with(|| a.desc.cmp(&b.desc)));
+        els
+    }
+}
+
+pub fn resolve_base_url(base_url: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        format!("{}{}", base_url.trim_end_matches('/'), path)
+    } else {
+        path.to_string()
+    }
+}
+
+pub fn build_index_page_content(st: &AppHttpState) -> IndexPageContent {
+    let pc = IndexPageContent::new(&st.config.server.http_path_prefix);
+    pc.add_links(
+        SERVICE_STATUS_WEIGHT,
+        "Overview",
+        vec![IndexPageLink {
+            desc: "Services' status".to_string(),
+            path: "services".to_string(),
+            dangerous: false,
+        }],
+    );
+    pc.add_links(
+        CONFIG_WEIGHT,
+        "Current config",
+        vec![
+            IndexPageLink {
+                desc: "Including the default values".to_string(),
+                path: "config".to_string(),
                 dangerous: false,
-            }],
-        },
-        IndexGroup {
-            weight: 1,
-            desc: "Current config",
-            links: vec![
-                IndexLink {
-                    desc: "Including the default values",
-                    path: "config",
-                    dangerous: false,
-                },
-                IndexLink {
-                    desc: "Only values that differ from the defaults",
-                    path: "config?mode=diff",
-                    dangerous: false,
-                },
-            ],
-        },
-    ];
+            },
+            IndexPageLink {
+                desc: "Only values that differ from the defaults".to_string(),
+                path: "config?mode=diff".to_string(),
+                dangerous: false,
+            },
+        ],
+    );
 
     if st.runtime_config.is_some() {
-        groups.push(IndexGroup {
-            weight: 2,
-            desc: "Current runtime config",
-            links: vec![
-                IndexLink {
-                    desc: "Entire runtime config (including overrides)",
-                    path: "runtime_config",
+        pc.add_links(
+            RUNTIME_CONFIG_WEIGHT,
+            "Current runtime config",
+            vec![
+                IndexPageLink {
+                    desc: "Entire runtime config (including overrides)".to_string(),
+                    path: "runtime_config".to_string(),
                     dangerous: false,
                 },
-                IndexLink {
-                    desc: "Only values that differ from the defaults",
-                    path: "runtime_config?mode=diff",
+                IndexPageLink {
+                    desc: "Only values that differ from the defaults".to_string(),
+                    path: "runtime_config?mode=diff".to_string(),
                     dangerous: false,
                 },
             ],
-        });
+        );
     }
 
     if let Some(ref ing) = st.ingester {
         let mut links = Vec::new();
         if ing.partition_ring_watcher.is_some() {
-            links.push(IndexLink {
-                desc: "Partition ring status",
-                path: "ingester/partition-ring",
+            links.push(IndexPageLink {
+                desc: "Partition ring status".to_string(),
+                path: "ingester/partition-ring".to_string(),
                 dangerous: false,
             });
         }
-        links.push(IndexLink {
-            desc: "Ingester Tenants",
-            path: "ingester/tenants",
+        links.push(IndexPageLink {
+            desc: "Ingester Tenants".to_string(),
+            path: "ingester/tenants".to_string(),
             dangerous: true,
         });
         if ing.instance_ring.is_some() {
-            links.push(IndexLink {
-                desc: "Ring status",
-                path: "ingester/ring",
+            links.push(IndexPageLink {
+                desc: "Ring status".to_string(),
+                path: "ingester/ring".to_string(),
                 dangerous: false,
             });
         }
-        groups.push(IndexGroup {
-            weight: 3,
-            desc: "Ingester",
-            links,
-        });
+        pc.add_links(DEFAULT_WEIGHT, "Ingester", links);
     }
 
     if st.memberlist_kv.is_some() || st.ingester.is_some() {
-        groups.push(IndexGroup {
-            weight: 4,
-            desc: "Memberlist",
-            links: vec![IndexLink {
-                desc: "Status",
-                path: "memberlist",
+        pc.add_links(
+            MEMBERLIST_WEIGHT,
+            "Memberlist",
+            vec![IndexPageLink {
+                desc: "Status".to_string(),
+                path: "memberlist".to_string(),
                 dangerous: false,
             }],
-        });
+        );
     }
 
     if st.ingester.is_some() {
-        groups.push(IndexGroup {
-            weight: 5,
-            desc: "Dangerous",
-            links: vec![
-                IndexLink {
-                    desc: "Trigger a flush of data from ingester to storage",
-                    path: "ingester/flush",
+        pc.add_links(
+            DANGEROUS_WEIGHT,
+            "Dangerous",
+            vec![
+                IndexPageLink {
+                    desc: "Trigger a flush of data from ingester to storage".to_string(),
+                    path: "ingester/flush".to_string(),
                     dangerous: true,
                 },
-                IndexLink {
-                    desc: "Trigger ingester shutdown",
-                    path: "ingester/shutdown",
+                IndexPageLink {
+                    desc: "Trigger ingester shutdown".to_string(),
+                    path: "ingester/shutdown".to_string(),
                     dangerous: true,
                 },
             ],
-        });
+        );
     }
 
-    groups.sort_by(|a, b| a.weight.cmp(&b.weight).then_with(|| a.desc.cmp(b.desc)));
+    pc
+}
 
+pub fn render_index_html(content: &IndexPageContent) -> String {
+    let groups = content.get_content();
     let mut html = String::from(
         r#"<!DOCTYPE html>
 <html>
@@ -1259,13 +1379,14 @@ async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
     for g in &groups {
         html.push_str(&format!(
             "    <div class=\"row service-row border-bottom py-3\">\n        <div class=\"col-sm-3 text-start text-sm-end\"><h2>{}</h2></div>\n        <div class=\"col-sm-9\">\n            <ul class=\"my-0 list-unstyled\">\n",
-            html_escape(g.desc)
+            html_escape(&g.desc)
         ));
         for l in &g.links {
+            let href = resolve_base_url(&content.base_url, &l.path);
             html.push_str(&format!(
                 "                <li><a href=\"{}\">{}</a>",
-                html_escape(l.path),
-                html_escape(l.desc)
+                html_escape(&href),
+                html_escape(&l.desc)
             ));
             if l.dangerous {
                 html.push_str(" <span class=\"badge bg-danger rounded-pill align-middle\">Dangerous</span>");
@@ -1276,7 +1397,12 @@ async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
     }
 
     html.push_str("</div>\n</body>\n</html>");
-    Html(html).into_response()
+    html
+}
+
+async fn index_handler(AxumState(st): AxumState<AppHttpState>) -> Response {
+    let pc = build_index_page_content(&st);
+    Html(render_index_html(&pc)).into_response()
 }
 
 const STATIC_BOOTSTRAP_JS: &[u8] = include_bytes!("../static/bootstrap-5.1.3.bundle.min.js");

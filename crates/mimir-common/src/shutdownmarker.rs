@@ -4,8 +4,8 @@
 //! - github.com/grafana/mimir/pkg/util/shutdownmarker/shutdown_marker.go
 //! - github.com/grafana/mimir/pkg/util/atomicfs/fsync.go
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -22,35 +22,8 @@ pub fn get_path(dir_path: impl AsRef<Path>) -> PathBuf {
 /// Atomically writes the shutdown marker file containing the current UTC RFC3339 timestamp,
 /// fsyncing both the temporary file and the containing directory (`atomicfs.CreateFile`).
 pub fn create(path: impl AsRef<Path>) -> io::Result<()> {
-    let final_path = path.as_ref();
-    let mut tmp_os = final_path.as_os_str().to_os_string();
-    tmp_os.push(".tmp");
-    let tmp_path = PathBuf::from(tmp_os);
-
     let timestamp = format_rfc3339_utc(SystemTime::now());
-    let write_res = (|| -> io::Result<()> {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        f.write_all(timestamp.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&tmp_path, final_path)?;
-        if let Some(parent) = final_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let dir = File::open(parent)?;
-                dir.sync_all()?;
-            }
-        }
-        Ok(())
-    })();
-
-    if write_res.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    write_res
+    crate::atomicfs::create_file(path, timestamp.as_bytes())
 }
 
 /// Removes the shutdown marker file if it exists and fsyncs the containing directory.

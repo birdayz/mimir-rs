@@ -825,3 +825,457 @@ fn test_shutdown_marker_remove_when_parent_directory_does_not_exist() {
     let shutdown_marker_path = get_path(dir.path().join("missing"));
     remove(&shutdown_marker_path).unwrap();
 }
+
+// ============================================================================
+// pkg/util/atomicfs/fsync_test.go
+// ============================================================================
+
+// Upstream: pkg/util/atomicfs/fsync_test.go::TestCreateFile
+#[test]
+fn test_atomicfs_create_file() {
+    use std::io::Cursor;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("TestCreateFile");
+    mimir_common::atomicfs::create_file(&path, Cursor::new(b"test")).unwrap();
+
+    // Ensure the temporary file created by create_file has been removed.
+    let tmp_err = std::fs::metadata(mimir_common::atomicfs::temp_path(&path)).unwrap_err();
+    assert_eq!(tmp_err.kind(), io::ErrorKind::NotFound);
+
+    // Ensure the directory entry for the file exists.
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(entries.iter().any(|n| n == "TestCreateFile"));
+
+    // Check the contents of the file.
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(contents, "test");
+}
+
+// Upstream: pkg/util/atomicfs/fsync_test.go::TestCreate
+#[test]
+fn test_atomicfs_create() {
+    // success
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("TestCreate");
+        let mut f = mimir_common::atomicfs::create(&path).unwrap();
+        assert_eq!(f.write_str("test").unwrap(), 4);
+        f.close().unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(entries.iter().any(|n| n == "TestCreate"));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "test");
+    }
+
+    // duplicate close
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("TestCreate");
+        let mut f = mimir_common::atomicfs::create(&path).unwrap();
+        assert_eq!(f.write_str("test").unwrap(), 4);
+        f.close().unwrap();
+
+        let dup_err = f.close().unwrap_err();
+        assert!(mimir_common::atomicfs::is_closed_err(&dup_err));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "test");
+    }
+}
+
+// ============================================================================
+// pkg/util/log/rate_limit_test.go
+// ============================================================================
+
+type LoggedCall = (mimir_common::logging::LogLevel, Vec<(String, String)>);
+
+#[derive(Default)]
+struct RecordingLogger {
+    calls: parking_lot::Mutex<Vec<LoggedCall>>,
+}
+
+impl RecordingLogger {
+    fn count(&self) -> usize {
+        self.calls.lock().len()
+    }
+
+    fn take(&self) -> Vec<LoggedCall> {
+        std::mem::take(&mut *self.calls.lock())
+    }
+}
+
+impl mimir_common::logging::Logger for RecordingLogger {
+    fn log(&self, level: mimir_common::logging::LogLevel, kvs: &[(&str, &str)]) {
+        self.calls.lock().push((
+            level,
+            kvs.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        ));
+    }
+}
+
+// Upstream: pkg/util/log/rate_limit_test.go::TestRateLimitedLogger
+#[test]
+fn test_rate_limited_logger() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let limit_interval = Duration::from_secs(1);
+    let test_duration = Duration::from_secs(10);
+    let attempted_calls = 1000u32;
+    let expected_actual_calls = 10usize;
+
+    let test_start = Instant::now();
+    let fake_now = Arc::new(parking_lot::Mutex::new(test_start));
+    let clock = {
+        let fake_now = Arc::clone(&fake_now);
+        Arc::new(move || *fake_now.lock())
+    };
+
+    let mock_logger = Arc::new(RecordingLogger::default());
+    let rl = mimir_common::logging::IntervalRateLimitedLogger::new_with_clock(
+        limit_interval,
+        mock_logger.clone(),
+        clock,
+    );
+
+    let time_step = test_duration / attempted_calls;
+    let test_end = test_start + test_duration + Duration::from_nanos(1);
+    while *fake_now.lock() < test_end {
+        mimir_common::logging::Logger::log(&rl, mimir_common::logging::LogLevel::Info, &[]);
+        *fake_now.lock() += time_step;
+    }
+
+    assert_eq!(mock_logger.count(), expected_actual_calls);
+}
+
+// Upstream: pkg/util/log/rate_limit_test.go::TestRateLimitedLogger_Burst
+#[test]
+fn test_rate_limited_logger_burst() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let limit_interval = Duration::from_secs(1);
+    let expected_actual_calls = 2usize;
+
+    let test_start = Instant::now();
+    let fake_now = Arc::new(parking_lot::Mutex::new(test_start));
+    let clock = {
+        let fake_now = Arc::clone(&fake_now);
+        Arc::new(move || *fake_now.lock())
+    };
+
+    let mock_logger = Arc::new(RecordingLogger::default());
+    let rl = mimir_common::logging::IntervalRateLimitedLogger::new_with_clock(
+        limit_interval,
+        mock_logger.clone(),
+        clock,
+    );
+
+    *fake_now.lock() = test_start + Duration::from_nanos(1);
+    mimir_common::logging::Logger::log(&rl, mimir_common::logging::LogLevel::Info, &[]);
+
+    // Only one of these should go through because we don't have a leaky bucket.
+    *fake_now.lock() = test_start + limit_interval * 3;
+    mimir_common::logging::Logger::log(&rl, mimir_common::logging::LogLevel::Info, &[]);
+    mimir_common::logging::Logger::log(&rl, mimir_common::logging::LogLevel::Info, &[]);
+    mimir_common::logging::Logger::log(&rl, mimir_common::logging::LogLevel::Info, &[]);
+
+    assert_eq!(mock_logger.count(), expected_actual_calls);
+}
+
+// ============================================================================
+// pkg/util/log/sampler_test.go
+// ============================================================================
+
+#[derive(Debug)]
+struct PlainError(String);
+
+impl fmt::Display for PlainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl StdError for PlainError {}
+
+// Upstream: pkg/util/log/sampler_test.go::TestSampler_Sample
+#[test]
+fn test_sampler_sample() {
+    const ERROR_SAMPLE_RATE: i64 = 5;
+    let sampler = mimir_common::logging::Sampler::new(ERROR_SAMPLE_RATE).unwrap();
+    assert!(sampler.sample());
+    for _ in 1..ERROR_SAMPLE_RATE {
+        assert!(!sampler.sample());
+    }
+    assert!(sampler.sample());
+}
+
+// Upstream: pkg/util/log/sampler_test.go::TestSampledError_Error
+#[test]
+fn test_sampled_error_error() {
+    const ERROR_SAMPLE_RATE: i64 = 5;
+    let sampler = mimir_common::logging::Sampler::new(ERROR_SAMPLE_RATE).unwrap();
+    let err = PlainError("this is an occurrence of error with id 1".to_string());
+    let sampled_err = sampler.wrap_error(err);
+    assert_eq!(
+        sampled_err.to_string(),
+        "this is an occurrence of error with id 1"
+    );
+}
+
+// Upstream: pkg/util/log/sampler_test.go::TestSampledError_ShouldLog
+#[test]
+fn test_sampled_error_should_log() {
+    use mimir_common::logging::OptionalLogging;
+
+    const ERROR_SAMPLE_RATE: i64 = 5;
+    let sampler = mimir_common::logging::Sampler::new(ERROR_SAMPLE_RATE).unwrap();
+    let err = PlainError("this is an occurrence of error with id 1".to_string());
+    let sampled_err = sampler.wrap_error(err);
+
+    let (should_log, reason) = sampled_err.should_log();
+    assert!(should_log);
+    assert_eq!(reason, format!("sampled 1/{ERROR_SAMPLE_RATE}"));
+
+    for _ in 1..ERROR_SAMPLE_RATE {
+        let (should_log, reason) = sampled_err.should_log();
+        assert!(!should_log);
+        assert_eq!(reason, format!("sampled 1/{ERROR_SAMPLE_RATE}"));
+    }
+
+    let (should_log, reason) = sampled_err.should_log();
+    assert!(should_log);
+    assert_eq!(reason, format!("sampled 1/{ERROR_SAMPLE_RATE}"));
+}
+
+// Upstream: pkg/util/log/sampler_test.go::TestSampledError_ShouldImplementOptionalLoggingInterface
+#[test]
+fn test_sampled_error_should_implement_optional_logging_interface() {
+    use mimir_common::logging::{OptionalLogging, SampledError, Sampler};
+
+    fn assert_optional_logging<T: OptionalLogging + StdError>(_t: &T) {}
+
+    let sampler = Sampler::new(5).unwrap();
+    let err = PlainError("this is an occurrence of error with id 1".to_string());
+    let sampled_err: SampledError<PlainError> = sampler.wrap_error(err);
+    assert_optional_logging(&sampled_err);
+}
+
+// Upstream: pkg/util/log/sampler_test.go::TestNilSampler
+#[test]
+fn test_nil_sampler() {
+    use mimir_common::logging::{wrap_error_with_sampler, SampledError, Sampler};
+
+    let sampler = Sampler::new(0);
+    assert!(sampler.is_none());
+    let wrapped = wrap_error_with_sampler(sampler.as_ref(), PlainError("error".to_string()));
+    assert_eq!(wrapped.to_string(), "error");
+    assert!(wrapped.downcast_ref::<SampledError<PlainError>>().is_none());
+    assert!(wrapped.downcast_ref::<PlainError>().is_some());
+}
+
+// ============================================================================
+// pkg/util/log/slogadapter_test.go
+// ============================================================================
+
+// Upstream: pkg/util/log/slogadapter_test.go::TestSlogFromGoKit
+#[test]
+fn test_slog_from_gokit() {
+    use std::sync::Arc;
+    use mimir_common::logging::{slog_from_gokit, LevelFilterLogger, LogLevel};
+
+    let levels = [
+        LogLevel::Debug,
+        LogLevel::Info,
+        LogLevel::Warn,
+        LogLevel::Error,
+    ];
+
+    // enabled for the right slog levels when go-kit level configured
+    for (i, &lvl) in levels.iter().enumerate() {
+        let m_logger = Arc::new(RecordingLogger::default());
+        let filtered = LevelFilterLogger::new(m_logger.clone(), lvl);
+        let slogger = slog_from_gokit(filtered);
+
+        for (j, &sl) in levels.iter().enumerate() {
+            if j >= i {
+                assert!(slogger.enabled(sl), "expected {sl:?} enabled for {lvl:?}");
+            } else {
+                assert!(!slogger.enabled(sl), "expected {sl:?} disabled for {lvl:?}");
+            }
+        }
+        assert_eq!(m_logger.count(), 0, "probe should be intercepted by LevelFilterLogger");
+    }
+
+    // enabled for the right slog levels when go-kit level not configured
+    {
+        let m_logger = Arc::new(RecordingLogger::default());
+        let slogger = slog_from_gokit(m_logger.clone());
+        for &sl in &levels {
+            assert!(slogger.enabled(sl), "expected {sl:?} enabled");
+        }
+        let calls = m_logger.take();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1[0].0, "probe");
+    }
+
+    // wraps go-kit logger
+    {
+        let m_logger = Arc::new(RecordingLogger::default());
+        let slogger = slog_from_gokit(m_logger.clone());
+        let _ = m_logger.take(); // consume probe call
+
+        slogger.debug("test", &[("attr", "value")]);
+        slogger.info("test", &[("attr", "value")]);
+        slogger.warn("test", &[("attr", "value")]);
+        slogger.error("test", &[("attr", "value")]);
+
+        let calls = m_logger.take();
+        assert_eq!(calls.len(), 4);
+        for (idx, &expected_lvl) in levels.iter().enumerate() {
+            assert_eq!(calls[idx].0, expected_lvl);
+            assert_eq!(
+                calls[idx].1,
+                vec![
+                    ("msg".to_string(), "test".to_string()),
+                    ("attr".to_string(), "value".to_string()),
+                ]
+            );
+        }
+    }
+}
+
+// ============================================================================
+// pkg/util/limiter/memory_consumption_test.go (tracing panic)
+// ============================================================================
+
+// Upstream: pkg/util/limiter/memory_consumption_test.go::TestMemoryConsumptionTracker_NegativeMemoryConsumptionPanicWithTracing
+#[tokio::test]
+async fn test_memory_consumption_tracker_negative_memory_consumption_panic_with_tracing() {
+    use mimir_common::tracing::{current_trace_id, parse_traceparent, with_trace_context};
+    use mimir_proto::client::streaming::{MemoryConsumptionSource, MemoryConsumptionTracker};
+
+    let ctx = parse_traceparent("00-00000000000000010000000000000002-0000000000000003-01")
+        .unwrap();
+
+    with_trace_context(ctx, async {
+        let trace_id = current_trace_id();
+        assert_eq!(trace_id.as_deref(), Some("00000000000000010000000000000002"));
+        let tracker = MemoryConsumptionTracker::new_with_details(0, None, "foo + bar", trace_id);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracker.decrease_memory_consumption_by_source(10, MemoryConsumptionSource::IngesterChunks);
+        }));
+        let msg = res.unwrap_err().downcast::<String>().unwrap();
+        assert_eq!(
+            *msg,
+            "Estimated memory consumption of all instances of ingester chunks in this query is 0 bytes when trying to return 10 bytes. This indicates something has been returned to a pool more than once, which is a bug. The affected query is: foo + bar (trace ID: 00000000000000010000000000000002)"
+        );
+    })
+    .await;
+}
+
+// ============================================================================
+// pkg/usagestats/{stats,report,reporter}_test.go
+// ============================================================================
+
+// Upstream: pkg/usagestats/stats_test.go::TestCounter
+#[test]
+fn test_usagestats_counter() {
+    let c = mimir_common::usagestats::CounterStat::default();
+    c.inc(100);
+    c.inc(200);
+    c.inc(300);
+    std::thread::sleep(Duration::from_secs(1));
+    c.update_rate();
+    let v = c.value();
+    assert_eq!(v["total"], serde_json::json!(600));
+    let rate = v["rate"].as_f64().unwrap();
+    assert!(rate >= 550.0, "expected rate >= 550, got {rate}");
+    c.reset();
+    assert_eq!(c.value()["total"], serde_json::json!(0));
+    assert_eq!(c.value()["rate"], serde_json::json!(0.0));
+}
+
+// Upstream: pkg/usagestats/report_test.go::TestBuildReport
+#[test]
+fn test_usagestats_build_report() {
+    use mimir_common::usagestats::{
+        build_report_with_version, get_and_reset_counter, get_int, get_string, set_target,
+        ClusterSeed, PrometheusVersion,
+    };
+
+    let cluster_created_at = SystemTime::now() - Duration::from_secs(3600);
+    let seed = ClusterSeed {
+        uid: "test".to_string(),
+        created_at: cluster_created_at,
+    };
+    let report_at = SystemTime::now();
+    let report_interval = Duration::from_secs(3600);
+
+    set_target("all");
+    let version = PrometheusVersion {
+        version: "dev-version".to_string(),
+        branch: "dev-branch".to_string(),
+        revision: "dev-revision".to_string(),
+        build_user: String::new(),
+        build_date: String::new(),
+        go_version: "go1.23".to_string(),
+    };
+
+    get_string("custom_string").set("my_value");
+    get_int("custom_int").set(111);
+    get_and_reset_counter("custom_counter").inc(222);
+
+    let report = build_report_with_version(&seed, report_at, report_interval, version);
+    assert_eq!(report.cluster_id, "test");
+    assert_eq!(report.created_at, cluster_created_at);
+    assert_eq!(report.interval, report_at);
+    assert_eq!(report.interval_period, report_interval.as_secs_f64());
+    assert_eq!(report.target, "all");
+    assert_eq!(report.edition, "oss");
+    assert_eq!(report.mode, "classic");
+    assert!(report.metrics["memstats"].is_object());
+    assert_eq!(report.version.version, "dev-version");
+    assert_eq!(report.version.branch, "dev-branch");
+    assert_eq!(report.version.revision, "dev-revision");
+    assert_eq!(report.version.go_version, "go1.23");
+    assert_eq!(report.metrics["custom_string"], "my_value");
+    assert_eq!(report.metrics["custom_int"], 111);
+    assert!(report.metrics["custom_counter"].is_object());
+    assert_eq!(report.metrics["custom_counter"]["total"], 222);
+}
+
+// Upstream: pkg/usagestats/reporter_test.go::TestGetNextReportAt
+#[test]
+fn test_usagestats_get_next_report_at() {
+    use std::time::UNIX_EPOCH;
+    use mimir_common::usagestats::get_next_report_at;
+
+    let at = |ns: u64| UNIX_EPOCH + Duration::from_nanos(ns);
+    const H: u64 = 3_600_000_000_000;
+    const M: u64 = 60_000_000_000;
+    const MS: u64 = 1_000_000;
+    let hour = Duration::from_secs(3600);
+
+    // createdAt aligned with interval and now
+    assert_eq!(get_next_report_at(hour, at(H), at(2 * H)), at(2 * H));
+    // createdAt aligned with interval
+    assert_eq!(get_next_report_at(hour, at(H), at(2 * H + 1)), at(3 * H));
+    // createdAt not aligned
+    assert_eq!(
+        get_next_report_at(hour, at(H + 18 * M + 20 * MS), at(2 * H + 1)),
+        at(2 * H + 18 * M + 20 * MS)
+    );
+}
+

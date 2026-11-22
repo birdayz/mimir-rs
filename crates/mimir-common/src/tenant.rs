@@ -162,16 +162,21 @@ pub fn valid_tenant_id_bytes(bytes: &[u8]) -> Result<(), TenantError> {
 
 /// Validates tenant metadata characters and length.
 pub fn valid_metadata(s: &str) -> Result<(), TenantError> {
-    for &b in s.as_bytes() {
+    valid_metadata_bytes(s.as_bytes())
+}
+
+/// Byte-slice variant of [`valid_metadata`].
+pub fn valid_metadata_bytes(bytes: &[u8]) -> Result<(), TenantError> {
+    for &b in bytes {
         if !VALID_METADATA_CHARS[b as usize] {
             return Err(TenantError::MetadataUnsupportedCharacter {
-                metadata: s.to_string(),
+                metadata: String::from_utf8_lossy(bytes).into_owned(),
                 ch: char::from(b),
             });
         }
     }
-    if s.len() > MAX_METADATA_LENGTH {
-        return Err(TenantError::MetadataTooLong { len: s.len() });
+    if bytes.len() > MAX_METADATA_LENGTH {
+        return Err(TenantError::MetadataTooLong { len: bytes.len() });
     }
     Ok(())
 }
@@ -238,6 +243,17 @@ impl Metadata {
         Self {
             source: source.into(),
         }
+    }
+
+    /// Byte-slice variant of [`Metadata::parse`].
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, TenantError> {
+        valid_metadata_bytes(bytes)?;
+        // valid_metadata_bytes accepts only ASCII bytes, so UTF-8 conversion is lossless.
+        let s = std::str::from_utf8(bytes).map_err(|_| TenantError::MalformedMetadata {
+            raw: String::from_utf8_lossy(bytes).into_owned(),
+            reason: "invalid UTF-8".to_string(),
+        })?;
+        Self::parse(s)
     }
 
     /// Validates and constructs a [`Metadata`].
@@ -424,6 +440,27 @@ pub fn parse_single_tenant_id(org_id: &str) -> Result<String, TenantError> {
         }
     }
     Ok(tenant_id.to_string())
+}
+
+/// Byte-slice variant of [`parse_with_metadata`].
+pub fn parse_with_metadata_bytes(org_ids: &[u8]) -> Result<(String, Metadata), TenantError> {
+    let mut parts = org_ids.split(|&b| b == TENANT_IDS_SEPARATOR as u8);
+    let first = parts.next().unwrap_or(b"");
+    let (tenant_bytes, meta_bytes) = match first.iter().position(|&b| b == METADATA_SEPARATOR as u8) {
+        Some(idx) => (&first[..idx], &first[idx..]),
+        None => (first, &first[first.len()..]),
+    };
+    valid_tenant_id_bytes(tenant_bytes)?;
+    for next_org_id in parts {
+        if first != next_org_id {
+            return Err(TenantError::TooManyOrgIDs);
+        }
+    }
+    let metadata = Metadata::parse_bytes(meta_bytes)?;
+    Ok((
+        String::from_utf8_lossy(tenant_bytes).into_owned(),
+        metadata,
+    ))
 }
 
 /// Extracts a single tenant ID and optional metadata from an orgID string.
