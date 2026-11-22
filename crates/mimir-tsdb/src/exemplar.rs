@@ -255,6 +255,15 @@ impl CircularExemplarStorage {
         self.inner.read().max_exemplars
     }
 
+    /// Resets the circular buffer and per-series index while preserving capacity and OOO window.
+    pub fn clear(&self) {
+        let mut inner = self.inner.write();
+        inner.exemplars.clear();
+        inner.next_index = 0;
+        inner.index.clear();
+        self.compute_metrics(&inner);
+    }
+
     pub fn out_of_order_count(&self) -> u64 {
         self.inner.read().out_of_order_count
     }
