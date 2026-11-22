@@ -82,11 +82,13 @@ fn allowed_cluster_labels(cfg: &ServerConfig) -> Vec<String> {
 /// Wraps an HTTP router with Go `HTTPServer.SetKeepAlivesEnabled(false)` emulation: emits
 /// `Connection: close` on HTTP responses once `shutdown_requested` is set (HTTP listener only).
 pub fn with_shutdown_close_layer(router: Router, shutdown_requested: Arc<AtomicBool>) -> Router {
-    router.layer(axum::middleware::map_response(
-        move |mut resp: axum::response::Response| {
+    router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
             let flag = Arc::clone(&shutdown_requested);
             async move {
-                if flag.load(Ordering::Acquire) {
+                let is_pre_h2 = req.version() < http::Version::HTTP_2;
+                let mut resp = next.run(req).await;
+                if is_pre_h2 && flag.load(Ordering::Acquire) {
                     resp.headers_mut().insert(
                         http::header::CONNECTION,
                         http::header::HeaderValue::from_static("close"),
@@ -457,6 +459,10 @@ pub struct RunningServers {
 }
 
 impl RunningServers {
+    pub fn subscribe_stopped(&self) -> watch::Receiver<bool> {
+        self.stopped_rx.clone()
+    }
+
     pub fn shutdown_handle(&self) -> ServerShutdownHandle {
         ServerShutdownHandle {
             shutdown_tx: Arc::clone(&self.shutdown_tx),
@@ -501,5 +507,38 @@ mod tests {
 
         let srv = Server::new(&cfg, &Registry::new(), Arc::new(NoopLogger));
         assert!(srv.is_ok(), "plaintext server should not fail on Go TLS options: {:?}", srv.err());
+    }
+
+    #[tokio::test]
+    async fn cmd_02_with_shutdown_close_layer_only_sets_connection_close_below_http2() {
+        use tower::ServiceExt;
+
+        let shutdown_requested = Arc::new(AtomicBool::new(true));
+        let app = with_shutdown_close_layer(
+            Router::new().route("/ok", axum::routing::get(|| async { "ok" })),
+            shutdown_requested,
+        );
+
+        let req_h1 = http::Request::builder()
+            .uri("/ok")
+            .version(http::Version::HTTP_11)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_h1 = app.clone().oneshot(req_h1).await.unwrap();
+        assert_eq!(
+            resp_h1.headers().get(http::header::CONNECTION).and_then(|v| v.to_str().ok()),
+            Some("close")
+        );
+
+        let req_h2 = http::Request::builder()
+            .uri("/ok")
+            .version(http::Version::HTTP_2)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_h2 = app.oneshot(req_h2).await.unwrap();
+        assert!(
+            resp_h2.headers().get(http::header::CONNECTION).is_none(),
+            "RFC 9113 forbids Connection header on HTTP/2 responses"
+        );
     }
 }
