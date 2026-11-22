@@ -333,21 +333,28 @@ impl PropagationDelayTracker {
         });
 
         let period = beacon_interval.max(Duration::from_nanos(1));
-        let initial_nanos = rand::thread_rng().gen_range(1..=(period.as_nanos().min(u64::MAX as u128) as u64));
-        let start_at = tokio::time::Instant::now() + Duration::from_nanos(initial_nanos);
-        let mut ticker = tokio::time::interval_at(start_at, period);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let period_ns = period.as_nanos().min(u64::MAX as u128) as u64;
+        let initial_ns = rand::thread_rng().gen_range(1..=period_ns);
+        let mut next_tick = tokio::time::Instant::now() + Duration::from_nanos(initial_ns);
+        // Apply a small +/-5% per-tick jitter after the first tick so two fast nodes sharing a
+        // beacon_interval cannot phase-lock on Tokio's 1ms timer wheel and starve each other of
+        // peer beacons.
+        let jitter_ns = (period_ns / 20).max(1);
 
         loop {
             tokio::select! {
                 biased;
                 _ = ctx.canceled() => break,
-                _ = ticker.tick() => {
+                _ = tokio::time::sleep_until(next_tick) => {
                     tokio::select! {
                         biased;
                         _ = ctx.canceled() => break,
                         _ = self.on_beacon_interval() => {}
                     }
+                    let min_ns = period_ns.saturating_sub(jitter_ns).max(1);
+                    let max_ns = period_ns.saturating_add(jitter_ns);
+                    let step_ns = rand::thread_rng().gen_range(min_ns..=max_ns);
+                    next_tick = tokio::time::Instant::now() + Duration::from_nanos(step_ns);
                 }
             }
         }

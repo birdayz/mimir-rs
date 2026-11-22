@@ -126,6 +126,14 @@ impl GoMetrics {
         });
     }
 
+    /// Whether a summary/sample metric family exists (test helper).
+    pub fn has_sample(&self, name: &str) -> bool {
+        self.families
+            .lock()
+            .get(name)
+            .is_some_and(|f| !f.series.is_empty())
+    }
+
     /// Current value of a counter or gauge series (test helper).
     pub fn value(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
         let fams = self.families.lock();

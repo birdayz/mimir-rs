@@ -160,6 +160,9 @@ struct DbMetrics {
     retention_limit_bytes: prometheus::Gauge,
     retention_limit_percentage: prometheus::Gauge,
     retention_limit_seconds: prometheus::Gauge,
+    stale_series_compactions_triggered: prometheus::Counter,
+    stale_series_compactions_failed: prometheus::Counter,
+    stale_series_compaction_duration: SingleHistogram,
     selected_series_compactions_triggered: prometheus::Counter,
     selected_series_compactions_failed: prometheus::Counter,
     selected_series_compaction_duration: SingleHistogram,
@@ -191,17 +194,17 @@ impl DbMetrics {
             "prometheus_tsdb_size_retentions_total",
             "The number of times that blocks were deleted because the maximum number of bytes was exceeded.",
         );
-        let _ = counter(
+        let stale_series_compactions_triggered = counter(
             reg,
             "prometheus_tsdb_stale_series_compactions_triggered_total",
             "Total number of triggered stale series compactions.",
         );
-        let _ = counter(
+        let stale_series_compactions_failed = counter(
             reg,
             "prometheus_tsdb_stale_series_compactions_failed_total",
             "Total number of stale series compactions that failed.",
         );
-        let _ = native_histogram(
+        let stale_series_compaction_duration = native_histogram(
             reg,
             "prometheus_tsdb_stale_series_compaction_duration_seconds",
             "Duration of stale series compaction runs.",
@@ -283,6 +286,9 @@ impl DbMetrics {
                 "prometheus_tsdb_retention_limit_seconds",
                 "How long to retain samples in storage.",
             ),
+            stale_series_compactions_triggered,
+            stale_series_compactions_failed,
+            stale_series_compaction_duration,
             selected_series_compactions_triggered: counter(
                 reg,
                 "prometheus_tsdb_selected_series_compactions_triggered_total",
@@ -425,6 +431,7 @@ struct TsdbInner {
     enable_overlapping_compaction: AtomicBool,
     block_postings_cache_force: AtomicBool,
     block_postings_cache_shared: AtomicBool,
+    compact_head_view_before_evict_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     metrics: DbMetrics,
 }
 
@@ -621,6 +628,7 @@ impl Tsdb {
             enable_overlapping_compaction: AtomicBool::new(false),
             block_postings_cache_force: AtomicBool::new(false),
             block_postings_cache_shared: AtomicBool::new(false),
+            compact_head_view_before_evict_hook: Mutex::new(None),
             metrics,
         });
         let bg_handle = if !block_reload_interval.is_zero() {
@@ -831,6 +839,25 @@ impl Tsdb {
     /// its max time, then evicts them from Head.
     pub fn compact_selected_series(&self, refs: &[u64]) -> Result<Vec<Ulid>, TsdbError> {
         self.inner.compact_selected_series(refs)
+    }
+
+    /// Go `DB.CompactStaleHead`: writes stale series without OOO data into blocks and
+    /// evicts those that remain stale and unmodified.
+    pub fn compact_stale_head(&self) -> Result<Vec<Ulid>, TsdbError> {
+        self.inner.compact_stale_head()
+    }
+
+    #[doc(hidden)]
+    pub fn set_compact_head_view_before_evict_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.inner.compact_head_view_before_evict_hook.lock() = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn try_lock_compaction_for_test(&self) -> bool {
+        self.inner.compact_mtx.try_lock().is_some()
     }
 
     /// Truncates Head memory and WAL older than `mint`.
@@ -1817,6 +1844,147 @@ impl TsdbInner {
         Ok(())
     }
 
+    fn compact_head_view_locked(
+        &self,
+        refs: &[u64],
+        stale_only: bool,
+    ) -> Result<Vec<Ulid>, TsdbError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ((candidates, data_mint, data_maxt), fingerprints) =
+            self.head.collect_selected_compaction_candidates_with_fingerprints(refs)?;
+        if fingerprints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let head_maxt = self.head.max_time();
+        let mut created = Vec::new();
+        if !candidates.is_empty() && data_mint <= data_maxt && self.head.initialized() {
+            let range = self.head.options().chunk_range_ms;
+            let intervals = self
+                .head
+                .collect_selected_compaction_intervals(&candidates, range);
+            let range128 = range as i128;
+            let end_t = floor_align_i128(data_maxt, range) + range128;
+            let mut t = floor_align_i128(data_mint, range);
+            let write_res = (|| -> Result<(), TsdbError> {
+                while t <= data_maxt as i128 {
+                    let mint = t.max(i64::MIN as i128) as i64;
+                    let maxt = (t + range128).min(i64::MAX as i128) as i64;
+                    let maxt_inclusive = if t + range128 > i64::MAX as i128 {
+                        i64::MAX
+                    } else {
+                        maxt.saturating_sub(1)
+                    };
+                    match next_interval_action(&intervals, mint, maxt_inclusive) {
+                        IntervalAction::Done => {
+                            self.record_skipped_empty_windows((end_t - t) / range128);
+                            break;
+                        }
+                        IntervalAction::SkipTo(next_mint) => {
+                            let next_t = floor_align_i128(next_mint, range);
+                            self.record_skipped_empty_windows(
+                                (next_t.min(end_t) - t) / range128,
+                            );
+                            t = next_t;
+                            continue;
+                        }
+                        IntervalAction::Overlaps => {}
+                    }
+                    let mut compaction = BlockMetaCompaction::default();
+                    if stale_only {
+                        compaction.set_stale_series();
+                    } else {
+                        compaction.set_selected_series();
+                    }
+                    compaction.parents.push(BlockDesc {
+                        ulid: Ulid::nil(),
+                        min_time: 0,
+                        max_time: 0,
+                    });
+                    let meta = self.timed_write(|| {
+                        write_head_block_streaming_with_options(
+                            &self.dir,
+                            mint,
+                            maxt,
+                            maxt_inclusive,
+                            candidates.clone(),
+                            compaction,
+                            false,
+                            self.opts.max_block_chunk_segment_size,
+                            Some(&self.metrics.compactor),
+                            |ref_id, chks, tombs| {
+                                self.head
+                                    .load_series_in_order_chunks_into(
+                                        ref_id,
+                                        mint,
+                                        maxt_inclusive,
+                                        chks,
+                                        tombs,
+                                    )
+                                    .map_err(|e| {
+                                        CompactError::Io(io::Error::other(e.to_string()))
+                                    })
+                            },
+                        )
+                    })?;
+                    t += range128;
+                    if let Some(meta) = meta {
+                        created.push(meta.ulid);
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = write_res {
+                for uid in &created {
+                    let _ = fs::remove_dir_all(self.dir.join(uid.to_string()));
+                }
+                return Err(e);
+            }
+        }
+        if let Some(hook) = self.compact_head_view_before_evict_hook.lock().take() {
+            hook();
+        }
+        if !created.is_empty() {
+            struct ClearEvictingGuard<'a>(&'a Head);
+            impl Drop for ClearEvictingGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.set_evicting_series(None);
+                }
+            }
+            let fps_arc = Arc::new(fingerprints);
+            let evicting = Arc::new(EvictedSeries::new(
+                refs.to_vec(),
+                head_maxt,
+                Some(Arc::clone(&fps_arc)),
+            ));
+            let _evict_guard = ClearEvictingGuard(&self.head);
+            self.reload_after_write_with_hook(&created, || {
+                self.head.set_evicting_series(Some(Arc::clone(&evicting)));
+            })?;
+            if stale_only {
+                self.head.evict_stale_series_refs_with_fingerprints_prepublished(
+                    refs,
+                    head_maxt,
+                    &fps_arc,
+                )?;
+            } else {
+                self.head.evict_series_refs_with_fingerprints_prepublished(
+                    refs,
+                    head_maxt,
+                    &fps_arc,
+                )?;
+            }
+        } else if stale_only {
+            self.head
+                .truncate_stale_series(refs, head_maxt, &fingerprints)?;
+        } else {
+            self.head
+                .evict_series_refs_with_fingerprints(refs, head_maxt, &fingerprints)?;
+        }
+        Ok(created)
+    }
+
     fn compact_selected_series(&self, refs: &[u64]) -> Result<Vec<Ulid>, TsdbError> {
         if refs.is_empty() {
             return Ok(Vec::new());
@@ -1827,128 +1995,32 @@ impl TsdbInner {
         }
         self.metrics.selected_series_compactions_triggered.inc();
         let start = Instant::now();
-        let res = (|| -> Result<Vec<Ulid>, TsdbError> {
-            let ((candidates, data_mint, data_maxt), fingerprints) =
-                self.head.collect_selected_compaction_candidates_with_fingerprints(refs)?;
-            if fingerprints.is_empty() {
-                return Ok(Vec::new());
-            }
-            let head_maxt = self.head.max_time();
-            let mut created = Vec::new();
-            if !candidates.is_empty() && data_mint <= data_maxt && self.head.initialized() {
-                let range = self.head.options().chunk_range_ms;
-                let intervals = self
-                    .head
-                    .collect_selected_compaction_intervals(&candidates, range);
-                let range128 = range as i128;
-                let end_t = floor_align_i128(data_maxt, range) + range128;
-                let mut t = floor_align_i128(data_mint, range);
-                let write_res = (|| -> Result<(), TsdbError> {
-                    while t <= data_maxt as i128 {
-                        let mint = t.max(i64::MIN as i128) as i64;
-                        let maxt = (t + range128).min(i64::MAX as i128) as i64;
-                        let maxt_inclusive = if t + range128 > i64::MAX as i128 {
-                            i64::MAX
-                        } else {
-                            maxt.saturating_sub(1)
-                        };
-                        match next_interval_action(&intervals, mint, maxt_inclusive) {
-                            IntervalAction::Done => {
-                                self.record_skipped_empty_windows((end_t - t) / range128);
-                                break;
-                            }
-                            IntervalAction::SkipTo(next_mint) => {
-                                let next_t = floor_align_i128(next_mint, range);
-                                self.record_skipped_empty_windows(
-                                    (next_t.min(end_t) - t) / range128,
-                                );
-                                t = next_t;
-                                continue;
-                            }
-                            IntervalAction::Overlaps => {}
-                        }
-                        let mut compaction = BlockMetaCompaction::default();
-                        compaction.set_selected_series();
-                        compaction.parents.push(BlockDesc {
-                            ulid: Ulid::nil(),
-                            min_time: 0,
-                            max_time: 0,
-                        });
-                        let meta = self.timed_write(|| {
-                            write_head_block_streaming_with_options(
-                                &self.dir,
-                                mint,
-                                maxt,
-                                maxt_inclusive,
-                                candidates.clone(),
-                                compaction,
-                                false,
-                                self.opts.max_block_chunk_segment_size,
-                                Some(&self.metrics.compactor),
-                                |ref_id, chks, tombs| {
-                                    self.head
-                                        .load_series_in_order_chunks_into(
-                                            ref_id,
-                                            mint,
-                                            maxt_inclusive,
-                                            chks,
-                                            tombs,
-                                        )
-                                        .map_err(|e| {
-                                            CompactError::Io(io::Error::other(e.to_string()))
-                                        })
-                                },
-                            )
-                        })?;
-                        t += range128;
-                        // No block when the window holds no data for the selected series.
-                        if let Some(meta) = meta {
-                            created.push(meta.ulid);
-                        }
-                    }
-                    Ok(())
-                })();
-                if let Err(e) = write_res {
-                    for uid in &created {
-                        let _ = fs::remove_dir_all(self.dir.join(uid.to_string()));
-                    }
-                    return Err(e);
-                }
-            }
-            if !created.is_empty() {
-                struct ClearEvictingGuard<'a>(&'a Head);
-                impl Drop for ClearEvictingGuard<'_> {
-                    fn drop(&mut self) {
-                        self.0.set_evicting_series(None);
-                    }
-                }
-                let fps_arc = Arc::new(fingerprints);
-                let evicting = Arc::new(EvictedSeries::new(
-                    refs.to_vec(),
-                    head_maxt,
-                    Some(Arc::clone(&fps_arc)),
-                ));
-                let _evict_guard = ClearEvictingGuard(&self.head);
-                self.reload_after_write_with_hook(&created, || {
-                    self.head.set_evicting_series(Some(Arc::clone(&evicting)));
-                })?;
-                self.head.evict_series_refs_with_fingerprints_prepublished(
-                    refs,
-                    head_maxt,
-                    &fps_arc,
-                )?;
-            } else {
-                self.head
-                    .evict_series_refs_with_fingerprints(refs, head_maxt, &fingerprints)?;
-            }
-            Ok(created)
-        })();
+        let res = self.compact_head_view_locked(refs, false);
         match &res {
             Ok(_) => self
                 .metrics
                 .selected_series_compaction_duration
                 .observe(start.elapsed().as_secs_f64()),
             Err(_) => self.metrics.selected_series_compactions_failed.inc(),
+        }
+        res
+    }
+
+    fn compact_stale_head(&self) -> Result<Vec<Ulid>, TsdbError> {
+        let _guard = self.compact_mtx.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        self.metrics.stale_series_compactions_triggered.inc();
+        let start = Instant::now();
+        let refs = self.head.stale_series_refs_no_ooo();
+        let res = self.compact_head_view_locked(&refs, true);
+        match &res {
+            Ok(_) => self
+                .metrics
+                .stale_series_compaction_duration
+                .observe(start.elapsed().as_secs_f64()),
+            Err(_) => self.metrics.stale_series_compactions_failed.inc(),
         }
         res
     }

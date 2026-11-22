@@ -186,12 +186,10 @@ struct RefLeaksTrackerInner {
 
 impl RefLeaksTrackerInner {
     fn unmap(&self, aligned_len: usize) {
-        let prev = self
-            .inflight_instrumented_bytes
+        self.inflight_instrumented_bytes
             .fetch_sub(aligned_len as u64, Ordering::SeqCst);
-        let new_inflight = prev.saturating_sub(aligned_len as u64);
         self.inflight_instrumented_bytes_metric
-            .set(new_inflight as f64);
+            .sub(aligned_len as f64);
     }
 
     fn drain_expired_delayed_unmaps(&self) {
@@ -237,7 +235,7 @@ impl RefLeaksTracker {
         match self.inner.as_ref() {
             Some(i) => {
                 i.drain_expired_delayed_unmaps();
-                i.inflight_instrumented_bytes_metric.get()
+                i.inflight_instrumented_bytes.load(Ordering::SeqCst) as f64
             }
             None => 0.0,
         }
@@ -270,7 +268,7 @@ impl RefLeaksTracker {
         }
 
         inner.instrumented_buffers_total_metric.inc();
-        inner.inflight_instrumented_bytes_metric.set(inflight as f64);
+        inner.inflight_instrumented_bytes_metric.add(aligned_len as f64);
 
         Some(TrackedBuffer::new_instrumented(
             Bytes::copy_from_slice(data),

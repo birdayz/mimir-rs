@@ -78,7 +78,7 @@ async fn decrypt_remote_state<R: AsyncRead + Unpin + Send>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StreamFirstByte {
+pub enum StreamFirstByte {
     Eof,
     Next,
     Byte(u8),
@@ -86,7 +86,7 @@ pub(super) enum StreamFirstByte {
 
 /// memberlist `RemoveLabelHeaderFromStream`: reads and strips the optional `[HasLabel, len, label]`
 /// prefix on an accepted inbound stream before checking the label and before reading/decompressing.
-pub(super) async fn remove_label_header_from_stream<R: AsyncRead + Unpin + Send>(
+pub async fn remove_label_header_from_stream<R: AsyncRead + Unpin + Send>(
     reader: &mut R,
 ) -> Result<(String, StreamFirstByte), String> {
     let mut b = [0u8; 1];
@@ -103,18 +103,24 @@ pub(super) async fn remove_label_header_from_stream<R: AsyncRead + Unpin + Send>
     }
 
     let mut sz = [0u8; 1];
-    reader
-        .read_exact(&mut sz)
-        .await
-        .map_err(|e| format!("read label size: {e}"))?;
+    match reader.read_exact(&mut sz).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err("cannot decode label; stream has been truncated".to_string());
+        }
+        Err(e) => return Err(format!("read label size: {e}")),
+    }
     if sz[0] == 0 {
         return Err("label header cannot be empty when present".to_string());
     }
     let mut lbuf = vec![0u8; sz[0] as usize];
-    reader
-        .read_exact(&mut lbuf)
-        .await
-        .map_err(|e| format!("read label: {e}"))?;
+    match reader.read_exact(&mut lbuf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err("cannot decode label; stream has been truncated".to_string());
+        }
+        Err(e) => return Err(format!("read label: {e}")),
+    }
     let label = String::from_utf8(lbuf).map_err(|e| format!("label utf8: {e}"))?;
     Ok((label, StreamFirstByte::Next))
 }
@@ -143,12 +149,24 @@ impl From<String> for StreamReadError {
 /// memberlist `readStream`: reads the stream message type (or uses `first_byte` if already
 /// peeked by `remove_label_header_from_stream`), decrypts if `Encrypt`, and decompresses if `Compress`.
 /// Does NOT strip `HasLabel` (Go `readStream` never strips label headers).
+#[cfg(test)]
 pub(super) async fn read_stream_with_first_byte<R: AsyncRead + Unpin + Send>(
     reader: &mut R,
     first_byte: Option<u8>,
     stream_label: &str,
     go_metrics: Option<&GoMetrics>,
     decrypt: Option<&StreamDecryptFn>,
+) -> Result<(MessageType, Option<Vec<u8>>), StreamReadError> {
+    read_stream_with_first_byte_verified(reader, first_byte, stream_label, go_metrics, decrypt, true).await
+}
+
+pub(super) async fn read_stream_with_first_byte_verified<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+    first_byte: Option<u8>,
+    stream_label: &str,
+    go_metrics: Option<&GoMetrics>,
+    decrypt: Option<&StreamDecryptFn>,
+    gossip_verify_incoming: bool,
 ) -> Result<(MessageType, Option<Vec<u8>>), StreamReadError> {
     let first = match first_byte {
         Some(v) => v,
@@ -183,6 +201,10 @@ pub(super) async fn read_stream_with_first_byte<R: AsyncRead + Unpin + Send>(
         msg_type = MessageType::try_from(plain[0])
             .map_err(|v| StreamReadError::Other(format!("unsupported inner stream msgType {v}")))?;
         plain_body = Some(plain[1..].to_vec());
+    } else if decrypt.is_some() && gossip_verify_incoming {
+        return Err(StreamReadError::Other(
+            "encryption is configured but remote state is not encrypted".to_string(),
+        ));
     }
 
     if msg_type == MessageType::Compress {

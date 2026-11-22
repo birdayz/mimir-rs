@@ -147,7 +147,7 @@ pub struct StreamTracker {
 }
 
 impl StreamTracker {
-    fn new() -> prometheus::Result<Self> {
+    pub fn new() -> prometheus::Result<Self> {
         Ok(Self {
             desc: Desc::new(
                 "grpc_concurrent_streams_by_conn_max".to_string(),
@@ -242,7 +242,47 @@ pub fn make_label_value(path: &str) -> String {
 /// `-server.report-grpc-codes-in-instrumentation-label-enabled` by default). With the option
 /// disabled, dskit reports `success` / `cancel` / `error`.
 pub fn grpc_status_label(code: i32, report_grpc_status: bool) -> String {
+    instrumentation_status_code_to_string(code, report_grpc_status, false)
+}
+
+/// Ported from `dskit/middleware/grpc_instrumentation.go` (`instrumentationLabel`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InstrumentationLabelConfig {
+    pub report_grpc_status: bool,
+    pub mask_http_status: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstrumentationOption {
+    ReportGrpcStatus,
+}
+
+pub fn apply_instrumentation_options(
+    mask_http_statuses: bool,
+    options: &[InstrumentationOption],
+) -> InstrumentationLabelConfig {
+    let mut cfg = InstrumentationLabelConfig {
+        report_grpc_status: false,
+        mask_http_status: mask_http_statuses,
+    };
+    for opt in options {
+        match opt {
+            InstrumentationOption::ReportGrpcStatus => cfg.report_grpc_status = true,
+        }
+    }
+    cfg
+}
+
+/// Ported from `dskit/middleware/grpc_instrumentation.go` (`statusCodeToString`).
+pub fn instrumentation_status_code_to_string(
+    code: i32,
+    report_grpc_status: bool,
+    mask_http_status: bool,
+) -> String {
     if (100..600).contains(&code) {
+        if mask_http_status {
+            return format!("{}xx", code / 100);
+        }
         return code.to_string();
     }
     if report_grpc_status {
@@ -269,9 +309,178 @@ pub fn grpc_status_label(code: i32, report_grpc_status: bool) -> String {
         .to_string();
     }
     match code {
-        0 => "success".to_string(),
+        0 => {
+            if mask_http_status {
+                "2xx".to_string()
+            } else {
+                "success".to_string()
+            }
+        }
         1 => "cancel".to_string(),
         _ => "error".to_string(),
+    }
+}
+
+/// Ported from `dskit/middleware/grpc_instrumentation.go` (`errorToStatusCode`).
+pub fn error_to_grpc_status_code(err: Option<&(dyn std::error::Error + 'static)>) -> i32 {
+    let Some(e) = err else {
+        return 0;
+    };
+    // Check direct or wrapped tonic::Status or context cancellation.
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(node) = cur {
+        if let Some(st) = node.downcast_ref::<tonic::Status>() {
+            if let Some(http_resp) = mimir_proto::grpcutilpb::extract_http_response(st) {
+                return http_resp.code;
+            }
+            if let Ok(rpc_st) = mimir_proto::grpcutilpb::decode_status_details(st) {
+                if (100..600).contains(&rpc_st.code) {
+                    return rpc_st.code;
+                }
+            }
+            return st.code() as i32;
+        }
+        if node.to_string() == "context canceled" {
+            return tonic::Code::Cancelled as i32;
+        }
+        cur = node.source();
+    }
+    tonic::Code::Unknown as i32
+}
+
+/// Trait abstracting a gRPC client stream for `StreamClientInstrumentInterceptor`.
+pub trait MockableClientStream: Send + Sync {
+    fn send_msg(&mut self) -> Result<(), StreamOpError>;
+    fn recv_msg(&mut self) -> Result<(), StreamOpError>;
+    fn header(&mut self) -> Result<(), StreamOpError>;
+    fn close_send(&mut self) -> Result<(), StreamOpError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamOpError {
+    Eof,
+    Cancelled,
+    Other(String),
+}
+
+impl std::fmt::Display for StreamOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eof => f.write_str("EOF"),
+            Self::Cancelled => f.write_str("context canceled"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for StreamOpError {}
+
+/// Ported from `dskit/middleware/grpc_instrumentation.go` (`instrumentedClientStream`).
+pub struct InstrumentedClientStream<S> {
+    inner: S,
+    metric: HistogramVec,
+    method: String,
+    server_streams: bool,
+    start: std::time::Instant,
+    label_cfg: InstrumentationLabelConfig,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl<S> InstrumentedClientStream<S> {
+    pub fn new(
+        inner: S,
+        metric: HistogramVec,
+        method: impl Into<String>,
+        server_streams: bool,
+        options: &[InstrumentationOption],
+    ) -> Self {
+        Self {
+            inner,
+            metric,
+            method: method.into(),
+            server_streams,
+            start: std::time::Instant::now(),
+            label_cfg: apply_instrumentation_options(true, options),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn finish_with_error(&self, err: Option<&StreamOpError>) {
+        if self
+            .finished
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let code = match err {
+            None => 0,
+            Some(StreamOpError::Cancelled) => tonic::Code::Cancelled as i32,
+            Some(StreamOpError::Eof) => 0,
+            Some(StreamOpError::Other(_)) => tonic::Code::Unknown as i32,
+        };
+        let label = instrumentation_status_code_to_string(
+            code,
+            self.label_cfg.report_grpc_status,
+            self.label_cfg.mask_http_status,
+        );
+        self.metric
+            .with_label_values(&[&self.method, &label])
+            .observe(self.start.elapsed().as_secs_f64());
+    }
+
+    pub fn cancel(&self) {
+        self.finish_with_error(Some(&StreamOpError::Cancelled));
+    }
+
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+}
+
+impl<S: MockableClientStream> MockableClientStream for InstrumentedClientStream<S> {
+    fn send_msg(&mut self) -> Result<(), StreamOpError> {
+        let res = self.inner.send_msg();
+        match &res {
+            Ok(()) | Err(StreamOpError::Eof) => {}
+            Err(e) => self.finish_with_error(Some(e)),
+        }
+        res
+    }
+
+    fn recv_msg(&mut self) -> Result<(), StreamOpError> {
+        let res = self.inner.recv_msg();
+        if !self.server_streams {
+            self.finish_with_error(res.as_ref().err());
+            return res;
+        }
+        match &res {
+            Ok(()) => {}
+            Err(StreamOpError::Eof) => self.finish_with_error(None),
+            Err(e) => self.finish_with_error(Some(e)),
+        }
+        res
+    }
+
+    fn header(&mut self) -> Result<(), StreamOpError> {
+        let res = self.inner.header();
+        if let Err(ref e) = res {
+            self.finish_with_error(Some(e));
+        }
+        res
+    }
+
+    fn close_send(&mut self) -> Result<(), StreamOpError> {
+        let res = self.inner.close_send();
+        if let Err(ref e) = res {
+            self.finish_with_error(Some(e));
+        }
+        res
     }
 }
 

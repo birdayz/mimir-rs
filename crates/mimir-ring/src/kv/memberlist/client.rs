@@ -15,7 +15,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,11 +40,13 @@ use super::mergeable::Mergeable;
 use super::metrics::KvMetrics;
 use super::node_meta::{encode_node_metadata, NodeRole};
 use super::queue::{Broadcast, TransmitLimitedQueue};
+use super::security::{
+    encrypt_overhead, encrypt_payload, ip_allowed, IpNet, Keyring, MAX_ENCRYPTION_VERSION,
+};
 use super::stream::{
     default_hostname, read_msgpack_map_bytes, read_push_pull_from_stream,
-    read_stream_with_first_byte, read_user_msg_from_stream, remove_label_header_from_stream,
-    StreamReadError,
-    StreamDecryptFn, StreamFirstByte,
+    read_stream_with_first_byte_verified, read_user_msg_from_stream,
+    remove_label_header_from_stream, StreamDecryptFn, StreamFirstByte, StreamReadError,
 };
 use super::suspicion::Awareness;
 use super::tcp_transport::{MemberlistConn, ReceivedPacket, TcpTransport};
@@ -52,11 +54,13 @@ use crate::kv::KeyDeleted;
 use super::wire::{
     add_label_header, compress_payload, decode_ack_resp, decode_alive, decode_compound_message,
     decode_dead, decode_indirect_ping, decode_nack_resp, decode_ping, decode_push_pull,
-    decode_suspect, decompress_buffer, encode_ack_resp, encode_err_resp, encode_push_pull,
-    make_compound_messages, remove_label_header, unwrap_crc32, wrap_crc32, AckResp, Alive,
-    CompressionType, ErrResp, MessageType, NodeStateType, PushNodeState, COMPOUND_HEADER_OVERHEAD,
-    COMPOUND_OVERHEAD, LABEL_MAX_SIZE, PROTOCOL_VERSION_2_COMPATIBLE, PROTOCOL_VERSION_MAX,
-    PROTOCOL_VERSION_MIN,
+    decode_suspect, decompress_buffer, encode_ack_resp, encode_err_resp, encode_ping,
+    encode_push_pull, encode_user_msg_stream, make_compound_messages, remove_label_header,
+    resolve_compression_type, unwrap_crc32, wrap_crc32, AckResp, Alive, CompressionType, ErrResp,
+    Dead, MessageType, NackResp, NodeStateType, Ping, PushNodeState, Suspect,
+    COMPOUND_HEADER_OVERHEAD,
+    COMPOUND_OVERHEAD, LABEL_MAX_SIZE, META_MAX_SIZE, PROTOCOL_VERSION_2_COMPATIBLE,
+    PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN,
 };
 use super::zone_aware::ZoneAwareNodeSelection;
 use crate::dns::{DnsProvider, Provider, GOLANG_RESOLVER_TYPE};
@@ -64,6 +68,9 @@ use crate::kv::{BoxFuture, CasFn, CasOutcome, Codec, KvClient, KvError};
 
 #[path = "state.rs"]
 mod state;
+pub use state::{move_dead_nodes, push_pull_scale, random_offset, shuffle_nodes, suspicion_timeout, AckCallback, MemberlistBroadcast};
+
+pub type DisableTcpPingsFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 use state::{AckHandler, NodeTable, Timing};
 
 /// dskit `maxCasRetries`.
@@ -302,6 +309,56 @@ struct Handoff {
     from: String,
 }
 
+/// Go `memberlist.EventDelegate`.
+pub trait EventDelegate: Send + Sync {
+    fn notify_join(&self, node: &NodeState);
+    fn notify_leave(&self, node: &NodeState);
+    fn notify_update(&self, node: &NodeState);
+}
+
+/// Go `memberlist.ConflictDelegate`.
+pub trait ConflictDelegate: Send + Sync {
+    fn notify_conflict(&self, existing: &NodeState, other: &NodeState);
+}
+
+/// Go `memberlist.MergeDelegate`.
+pub trait MergeDelegate: Send + Sync {
+    fn notify_merge(&self, peers: &[NodeState]) -> Result<(), String>;
+}
+
+/// Go `memberlist.PingDelegate`.
+pub trait PingDelegate: Send + Sync {
+    fn ack_payload(&self) -> Vec<u8>;
+    fn notify_ping_complete(&self, other: &NodeState, rtt: Duration, payload: &[u8]);
+}
+
+/// Go `memberlist.NodeSelectionDelegate`.
+pub trait NodeSelectionDelegate: Send + Sync {
+    fn select_nodes(&self, nodes: &[&NodeState]) -> (Vec<usize>, Option<usize>);
+}
+
+/// Go `memberlist.AliveDelegate`.
+pub trait AliveDelegate: Send + Sync {
+    fn notify_alive(&self, peer: &NodeState) -> Result<(), String>;
+}
+
+/// Go `memberlist.Delegate` (optional override for unit tests).
+pub trait MemberlistDelegate: Send + Sync {
+    fn node_meta(&self, limit: usize) -> Vec<u8>;
+    fn notify_msg(&self, msg: &[u8]);
+    fn get_broadcasts(&self, overhead: usize, limit: usize) -> Vec<Vec<u8>>;
+    fn local_state(&self, join: bool) -> Vec<u8>;
+    fn merge_remote_state(&self, buf: &[u8], join: bool);
+}
+
+/// Go `memberlist.ipPort`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IpPort {
+    pub ip: Option<IpAddr>,
+    pub port: u16,
+    pub node_name: String,
+}
+
 /// Options that dskit exposes only to tests / embedders (unexported `KVConfig` fields and the
 /// injected `DNSProvider`).
 #[derive(Clone)]
@@ -319,6 +376,40 @@ pub struct KvOptions {
     pub max_cas_retries: Option<usize>,
     /// Optional hook run at the start of `join_members_on_startup` (tests only).
     pub before_join_members_on_startup_hook: Option<Arc<dyn Fn(ServiceContext) -> BoxFuture<'static, ()> + Send + Sync>>,
+    /// Optional memberlist protocol version override (default `PROTOCOL_VERSION_2_COMPATIBLE`).
+    pub protocol_version: Option<u8>,
+    pub delegate_protocol_version: u8,
+    pub delegate_protocol_min: u8,
+    pub delegate_protocol_max: u8,
+    pub secret_key: Option<Vec<u8>>,
+    pub keyring: Option<Arc<Keyring>>,
+    pub gossip_verify_incoming: bool,
+    pub gossip_verify_outgoing: bool,
+    pub cidrs_allowed: Option<Vec<IpNet>>,
+    pub disable_tcp_pings: bool,
+    pub disable_tcp_pings_for_node: Option<DisableTcpPingsFn>,
+    pub require_node_names: bool,
+    pub udp_buffer_size: Option<usize>,
+    pub push_pull_nodes: Option<usize>,
+    pub indirect_checks: Option<usize>,
+    pub suspicion_mult: Option<usize>,
+    pub suspicion_max_timeout_mult: Option<usize>,
+    pub probe_timeout: Option<Duration>,
+    pub queue_check_interval: Option<Duration>,
+    pub use_transport_bind_port: bool,
+    pub skip_schedule: bool,
+    pub skip_set_alive: bool,
+    pub validate_compression_algo: bool,
+    pub dns_config_path: Option<String>,
+    pub logger_configured: bool,
+    pub log_output_configured: bool,
+    pub event_delegate: Option<Arc<dyn EventDelegate>>,
+    pub conflict_delegate: Option<Arc<dyn ConflictDelegate>>,
+    pub merge_delegate: Option<Arc<dyn MergeDelegate>>,
+    pub ping_delegate: Option<Arc<dyn PingDelegate>>,
+    pub alive_delegate: Option<Arc<dyn AliveDelegate>>,
+    pub memberlist_delegate: Option<Arc<dyn MemberlistDelegate>>,
+    pub node_selection_delegate: Option<Arc<dyn NodeSelectionDelegate>>,
 }
 
 impl Default for KvOptions {
@@ -334,6 +425,39 @@ impl Default for KvOptions {
             stream_decryptor: None,
             max_cas_retries: None,
             before_join_members_on_startup_hook: None,
+            protocol_version: None,
+            delegate_protocol_version: 0,
+            delegate_protocol_min: 0,
+            delegate_protocol_max: 0,
+            secret_key: None,
+            keyring: None,
+            gossip_verify_incoming: true,
+            gossip_verify_outgoing: true,
+            cidrs_allowed: None,
+            disable_tcp_pings: true,
+            disable_tcp_pings_for_node: None,
+            require_node_names: false,
+            udp_buffer_size: None,
+            push_pull_nodes: None,
+            indirect_checks: None,
+            suspicion_mult: None,
+            suspicion_max_timeout_mult: None,
+            probe_timeout: None,
+            queue_check_interval: None,
+            use_transport_bind_port: false,
+            skip_schedule: false,
+            skip_set_alive: false,
+            validate_compression_algo: false,
+            dns_config_path: None,
+            logger_configured: false,
+            log_output_configured: false,
+            event_delegate: None,
+            conflict_delegate: None,
+            merge_delegate: None,
+            ping_delegate: None,
+            alive_delegate: None,
+            memberlist_delegate: None,
+            node_selection_delegate: None,
         }
     }
 }
@@ -393,6 +517,30 @@ pub struct MemberlistKv {
     max_cas_retries: usize,
     before_join_hook: Option<Arc<dyn Fn(ServiceContext) -> BoxFuture<'static, ()> + Send + Sync>>,
     propagation_tracker: Mutex<Option<Arc<super::propagation_tracker::PropagationDelayTracker>>>,
+    protocol_version: u8,
+    delegate_protocol_version: u8,
+    delegate_protocol_min: u8,
+    delegate_protocol_max: u8,
+    keyring: Option<Arc<Keyring>>,
+    gossip_verify_incoming: bool,
+    gossip_verify_outgoing: bool,
+    cidrs_allowed: Option<Vec<IpNet>>,
+    disable_tcp_pings: bool,
+    disable_tcp_pings_for_node: Option<DisableTcpPingsFn>,
+    require_node_names: bool,
+    udp_buffer_size: usize,
+    bound_port: AtomicU16,
+    use_transport_bind_port: bool,
+    skip_schedule: bool,
+    skip_set_alive: bool,
+    event_delegate: RwLock<Option<Arc<dyn EventDelegate>>>,
+    conflict_delegate: Option<Arc<dyn ConflictDelegate>>,
+    merge_delegate: Option<Arc<dyn MergeDelegate>>,
+    ping_delegate: Option<Arc<dyn PingDelegate>>,
+    alive_delegate: Option<Arc<dyn AliveDelegate>>,
+    custom_delegate: Option<Arc<dyn MemberlistDelegate>>,
+    node_selection_delegate: Option<Arc<dyn NodeSelectionDelegate>>,
+    dns_config_path: Option<String>,
 }
 
 /// Process-wide go-metrics sink (Go `metrics.NewGlobal` replaces the global sink).
@@ -428,10 +576,46 @@ impl MemberlistKv {
             node_name = format!("{node_name}-{}", generate_random_suffix());
         }
 
-        let compression_algo = match cfg.compression_algorithm.as_str() {
-            "snappy" => CompressionType::Snappy,
-            _ => CompressionType::Lzw,
+        if opts.logger_configured && opts.log_output_configured {
+            return Err(KvError::InvalidConfig(
+                "cannot specify both LogOutput and Logger; please choose a single log configuration setting".to_string(),
+            ));
+        }
+
+        let protocol_version = opts.protocol_version.unwrap_or(PROTOCOL_VERSION_2_COMPATIBLE);
+        if protocol_version < PROTOCOL_VERSION_MIN {
+            return Err(KvError::InvalidConfig(format!(
+                "protocol version '{protocol_version}' too low. Must be in range: [{PROTOCOL_VERSION_MIN}, {PROTOCOL_VERSION_MAX}]"
+            )));
+        }
+        if protocol_version > PROTOCOL_VERSION_MAX {
+            return Err(KvError::InvalidConfig(format!(
+                "protocol version '{protocol_version}' too high. Must be in range: [{PROTOCOL_VERSION_MIN}, {PROTOCOL_VERSION_MAX}]"
+            )));
+        }
+
+        let compression_algo = if opts.validate_compression_algo {
+            resolve_compression_type(&cfg.compression_algorithm).map_err(KvError::InvalidConfig)?
+        } else {
+            match cfg.compression_algorithm.as_str() {
+                "snappy" => CompressionType::Snappy,
+                _ => CompressionType::Lzw,
+            }
         };
+
+        let mut keyring = opts.keyring;
+        if let Some(sk) = opts.secret_key.as_ref().filter(|s| !s.is_empty()) {
+            match &keyring {
+                None => {
+                    let kr = Keyring::new(&[], Some(sk)).map_err(KvError::InvalidConfig)?;
+                    keyring = Some(Arc::new(kr));
+                }
+                Some(kr) => {
+                    kr.add_key(sk).map_err(KvError::InvalidConfig)?;
+                    kr.use_key(sk).map_err(KvError::InvalidConfig)?;
+                }
+            }
+        }
 
         let (node_meta, zone_select, push_pull_nodes) = if cfg.zone_aware_routing.enabled {
             let role = NodeRole::parse(&cfg.zone_aware_routing.role).map_err(KvError::InvalidConfig)?;
@@ -462,31 +646,40 @@ impl MemberlistKv {
         };
 
         let d = |g: mimir_config::GoDuration| g.as_std().unwrap_or(Duration::ZERO);
-        let (probe_interval, probe_timeout) = match opts.probe_interval {
+        let (probe_interval, default_probe_timeout) = match opts.probe_interval {
             Some(p) if !p.is_zero() => (p, p / 2),
             _ => (Duration::from_secs(5), Duration::from_secs(2)),
         };
+        let probe_timeout = opts.probe_timeout.unwrap_or(default_probe_timeout);
         let timing = Timing {
             probe_interval,
             probe_timeout,
-            indirect_checks: 3,
-            suspicion_mult: 4,
-            suspicion_max_timeout_mult: 6,
+            indirect_checks: opts.indirect_checks.unwrap_or(3),
+            suspicion_mult: opts.suspicion_mult.unwrap_or(4),
+            suspicion_max_timeout_mult: opts.suspicion_max_timeout_mult.unwrap_or(6),
             awareness_max_multiplier: 8,
             gossip_interval: d(cfg.gossip_interval),
             gossip_nodes: cfg.gossip_nodes.max(0) as usize,
             gossip_to_the_dead_time: d(cfg.gossip_to_dead_nodes_time),
             dead_node_reclaim_time: d(cfg.dead_node_reclaim_time),
             push_pull_interval: d(cfg.pull_push_interval),
-            push_pull_nodes,
+            push_pull_nodes: opts.push_pull_nodes.unwrap_or(push_pull_nodes),
             retransmit_mult: cfg.retransmit_factor.max(0) as usize,
             tcp_timeout: d(cfg.stream_timeout),
             handoff_queue_depth: cfg.received_messages_queue_size.max(0) as usize,
-            queue_check_interval: Duration::from_secs(30),
+            queue_check_interval: opts.queue_check_interval.unwrap_or(Duration::from_secs(30)),
         };
 
         let go_metrics = global_go_metrics();
-        let stream_decryptor = opts.stream_decryptor;
+        let stream_decryptor = opts.stream_decryptor.or_else(|| {
+            keyring.as_ref().map(|kr| {
+                let kr = Arc::clone(kr);
+                Arc::new(move |cipher: &[u8], aad: &[u8]| {
+                    let keys = kr.get_keys();
+                    super::security::decrypt_payload(&keys, cipher, aad)
+                }) as StreamDecryptFn
+            })
+        });
         let max_cas_retries = opts.max_cas_retries.unwrap_or(MAX_CAS_RETRIES);
         let before_join_hook = opts.before_join_members_on_startup_hook;
         let (leave_tx, leave_rx) = mpsc::channel(1);
@@ -559,6 +752,30 @@ impl MemberlistKv {
                 max_cas_retries,
                 before_join_hook,
                 propagation_tracker: Mutex::new(None),
+                protocol_version,
+                delegate_protocol_version: opts.delegate_protocol_version,
+                delegate_protocol_min: opts.delegate_protocol_min,
+                delegate_protocol_max: opts.delegate_protocol_max,
+                keyring,
+                gossip_verify_incoming: opts.gossip_verify_incoming,
+                gossip_verify_outgoing: opts.gossip_verify_outgoing,
+                cidrs_allowed: opts.cidrs_allowed,
+                disable_tcp_pings: opts.disable_tcp_pings,
+                disable_tcp_pings_for_node: opts.disable_tcp_pings_for_node,
+                require_node_names: opts.require_node_names,
+                udp_buffer_size: opts.udp_buffer_size.unwrap_or(UDP_BUFFER_SIZE),
+                bound_port: AtomicU16::new(if cfg.bind_port > 0 { cfg.bind_port as u16 } else { MEMBERLIST_DEFAULT_BIND_PORT }),
+                use_transport_bind_port: opts.use_transport_bind_port,
+                skip_schedule: opts.skip_schedule,
+                skip_set_alive: opts.skip_set_alive,
+                event_delegate: RwLock::new(opts.event_delegate),
+                conflict_delegate: opts.conflict_delegate,
+                merge_delegate: opts.merge_delegate,
+                ping_delegate: opts.ping_delegate,
+                alive_delegate: opts.alive_delegate,
+                custom_delegate: opts.memberlist_delegate,
+                node_selection_delegate: opts.node_selection_delegate,
+                dns_config_path: opts.dns_config_path,
                 cfg,
             }
         });
@@ -668,7 +885,49 @@ impl MemberlistKv {
     }
 
     pub(crate) fn bind_port(&self) -> u16 {
-        MEMBERLIST_DEFAULT_BIND_PORT
+        if self.use_transport_bind_port {
+            self.bound_port.load(Ordering::Acquire)
+        } else {
+            MEMBERLIST_DEFAULT_BIND_PORT
+        }
+    }
+
+    pub fn encryption_enabled(&self) -> bool {
+        if let Some(kr) = &self.keyring {
+            return !kr.get_keys().is_empty();
+        }
+        self.stream_decryptor.is_some()
+    }
+
+    pub fn encryption_version(&self) -> u8 {
+        if self.protocol_version == 1 {
+            0
+        } else {
+            MAX_ENCRYPTION_VERSION
+        }
+    }
+
+    pub fn protocol_version(&self) -> u8 {
+        self.protocol_version
+    }
+
+    pub fn build_vsn_array(&self) -> Vec<u8> {
+        vec![
+            PROTOCOL_VERSION_MIN,
+            PROTOCOL_VERSION_MAX,
+            self.protocol_version,
+            self.delegate_protocol_min,
+            self.delegate_protocol_max,
+            self.delegate_protocol_version,
+        ]
+    }
+
+    fn encryption_keys(&self) -> Vec<Vec<u8>> {
+        self.keyring.as_ref().map(|k| k.get_keys()).unwrap_or_default()
+    }
+
+    fn primary_key(&self) -> Option<Vec<u8>> {
+        self.keyring.as_ref().and_then(|k| k.get_primary_key())
     }
 
     fn label_overhead(&self) -> usize {
@@ -706,12 +965,19 @@ impl MemberlistKv {
         let (ip, port) = transport
             .final_advertise_addr(&self.cfg.advertise_addr, self.cfg.advertise_port)
             .map_err(|e| format!("failed to create memberlist: failed to get final advertise address: {e}"))?;
+        if self.use_transport_bind_port {
+            self.bound_port.store(transport.auto_bind_port(), Ordering::Release);
+        }
         let _ = self.transport.set(transport);
         *self.advertise.write() = (ip, port);
 
         self.spawn_listeners(packet_rx, stream_rx);
-        self.set_alive();
-        self.schedule();
+        if !self.skip_set_alive {
+            self.set_alive();
+        }
+        if !self.skip_schedule {
+            self.schedule();
+        }
         self.delegate_ready.store(true, Ordering::Release);
 
         if !self.cfg.join_members.0.is_empty() {
@@ -823,7 +1089,7 @@ impl MemberlistKv {
             }
         }
         info!("leaving memberlist cluster");
-        if self.transport.get().is_some() {
+        if self.transport.get().is_some() && !self.skip_schedule {
             let timeout = self
                 .cfg
                 .broadcast_timeout_for_local_updates_on_shutdown
@@ -914,23 +1180,29 @@ impl MemberlistKv {
         }
     }
 
+    fn current_node_meta(&self) -> Option<Vec<u8>> {
+        if let Some(del) = &self.custom_delegate {
+            let meta = del.node_meta(META_MAX_SIZE);
+            assert!(
+                meta.len() <= META_MAX_SIZE,
+                "Node meta data provided is longer than the limit"
+            );
+            Some(meta)
+        } else {
+            self.node_meta.clone()
+        }
+    }
+
     /// memberlist `setAlive`: register ourselves (bootstrap alive message).
-    fn set_alive(&self) {
+    pub(crate) fn set_alive(&self) {
         let (addr, port) = self.advertise();
         let a = Alive {
             incarnation: self.incarnation.fetch_add(1, Ordering::AcqRel).wrapping_add(1),
             node: self.node_name.clone(),
             addr: ip_to_bytes(addr),
             port,
-            meta: self.node_meta.clone(),
-            vsn: vec![
-                PROTOCOL_VERSION_MIN,
-                PROTOCOL_VERSION_MAX,
-                PROTOCOL_VERSION_2_COMPATIBLE,
-                0,
-                0,
-                0,
-            ],
+            meta: self.current_node_meta(),
+            vsn: self.build_vsn_array(),
         };
         self.alive_node(&a, None, true);
     }
@@ -946,15 +1218,35 @@ impl MemberlistKv {
                 Ok(s) => self.suspect_node(&s),
                 Err(err) => error!(%err, from = %msg.from, "memberlist: Failed to decode suspect message"),
             },
-            MessageType::Alive => match decode_alive(&msg.buf) {
-                Ok(mut a) => {
-                    if a.port == 0 {
-                        a.port = self.bind_port();
+            MessageType::Alive => {
+                if let Some(cidrs) = self.cidrs_allowed.as_deref() {
+                    if msg.from != "pipe" {
+                        if let Some(ip) = msg.from.parse::<SocketAddr>().ok().map(|s| s.ip()).or_else(|| msg.from.parse::<IpAddr>().ok()) {
+                            if let Err(err) = ip_allowed(Some(cidrs), ip) {
+                                debug!(%err, from = %msg.from, "memberlist: Blocked alive message");
+                                return;
+                            }
+                        }
                     }
-                    self.alive_node(&a, None, false);
                 }
-                Err(err) => error!(%err, from = %msg.from, "memberlist: Failed to decode alive message"),
-            },
+                match decode_alive(&msg.buf) {
+                    Ok(mut a) => {
+                        if let Some(cidrs) = self.cidrs_allowed.as_deref() {
+                            if let Some(inner_ip) = bytes_to_ip(&a.addr) {
+                                if let Err(err) = ip_allowed(Some(cidrs), inner_ip) {
+                                    debug!(%err, from = %msg.from, "memberlist: Blocked alive.Addr message");
+                                    return;
+                                }
+                            }
+                        }
+                        if self.protocol_version < 2 || a.port == 0 {
+                            a.port = self.bind_port();
+                        }
+                        self.alive_node(&a, None, false);
+                    }
+                    Err(err) => error!(%err, from = %msg.from, "memberlist: Failed to decode alive message"),
+                }
+            }
             MessageType::Dead => match decode_dead(&msg.buf) {
                 Ok(d) => self.dead_node(&d),
                 Err(err) => error!(%err, from = %msg.from, "memberlist: Failed to decode dead message"),
@@ -982,6 +1274,26 @@ impl MemberlistKv {
             error!(label, from, "memberlist: discarding packet with unacceptable label");
             return;
         }
+        let decrypted_buf;
+        let buf = if self.encryption_enabled() {
+            let keys = self.encryption_keys();
+            match super::security::decrypt_payload(&keys, buf, label.as_bytes()) {
+                Ok(plain) => {
+                    decrypted_buf = plain;
+                    decrypted_buf.as_slice()
+                }
+                Err(err) => {
+                    if !self.gossip_verify_incoming {
+                        buf
+                    } else {
+                        error!(%err, from, "memberlist: Decrypt packet failed");
+                        return;
+                    }
+                }
+            }
+        } else {
+            buf
+        };
         let buf = match unwrap_crc32(buf) {
             Ok(b) => b,
             Err(err) => {
@@ -1030,7 +1342,7 @@ impl MemberlistKv {
                     Err(err) => error!(%err, from, "memberlist: Failed to decode indirect ping request"),
                 },
                 MessageType::AckResp => match decode_ack_resp(body) {
-                    Ok(ack) => self.invoke_ack_handler(&ack),
+                    Ok(ack) => self.invoke_ack_handler(&ack, Instant::now()),
                     Err(err) => error!(%err, from, "memberlist: Failed to decode ack response"),
                 },
                 MessageType::NackResp => match decode_nack_resp(body) {
@@ -1135,17 +1447,26 @@ impl MemberlistKv {
 
     /// memberlist `sendMsg`: piggybacks pending broadcasts on the message.
     pub(crate) async fn send_msg(&self, addr: &str, msg: Vec<u8>) -> Result<(), KvError> {
-        let bytes_avail = UDP_BUFFER_SIZE
-            .saturating_sub(msg.len() + COMPOUND_HEADER_OVERHEAD + self.label_overhead());
+        self.send_msg_named(addr, "", msg).await
+    }
+
+    pub(crate) async fn send_msg_named(&self, addr: &str, name: &str, msg: Vec<u8>) -> Result<(), KvError> {
+        let enc_overhead = if self.encryption_enabled() && self.gossip_verify_outgoing {
+            encrypt_overhead(self.encryption_version())
+        } else {
+            0
+        };
+        let bytes_avail = self.udp_buffer_size
+            .saturating_sub(msg.len() + COMPOUND_HEADER_OVERHEAD + self.label_overhead() + enc_overhead);
         let extra = self.get_broadcasts(COMPOUND_OVERHEAD, bytes_avail);
         if extra.is_empty() {
-            return self.raw_send_msg_packet(addr, None, msg).await;
+            return self.raw_send_msg_packet_named(addr, name, None, msg).await;
         }
         let mut msgs = Vec::with_capacity(1 + extra.len());
         msgs.push(msg);
         msgs.extend(extra);
         for compound in make_compound_messages(&msgs) {
-            self.raw_send_msg_packet(addr, None, compound).await?;
+            self.raw_send_msg_packet_named(addr, name, None, compound).await?;
         }
         Ok(())
     }
@@ -1157,6 +1478,21 @@ impl MemberlistKv {
         node: Option<&NodeState>,
         msg: Vec<u8>,
     ) -> Result<(), KvError> {
+        self.raw_send_msg_packet_named(addr, node.map(|n| n.name.as_str()).unwrap_or(""), node, msg).await
+    }
+
+    pub(crate) async fn raw_send_msg_packet_named(
+        &self,
+        addr: &str,
+        name: &str,
+        node: Option<&NodeState>,
+        msg: Vec<u8>,
+    ) -> Result<(), KvError> {
+        if name.is_empty() && self.require_node_names {
+            return Err(KvError::Other(
+                "memberlist: node names are required by configuration but one was not provided".to_string(),
+            ));
+        }
         let mut msg = self.maybe_compress(msg);
         let looked_up: Option<NodeState>;
         let node_ref = match node {
@@ -1175,11 +1511,42 @@ impl MemberlistKv {
         if node_ref.is_some_and(|n| n.pmax() >= 5) {
             msg = wrap_crc32(&msg);
         }
+        if self.encryption_enabled() && self.gossip_verify_outgoing {
+            if let Some(pk) = self.primary_key() {
+                let mut enc = Vec::new();
+                encrypt_payload(
+                    self.encryption_version(),
+                    &pk,
+                    &msg,
+                    self.cfg.cluster_label.as_bytes(),
+                    &mut enc,
+                )
+                .map_err(KvError::Other)?;
+                msg = enc;
+            }
+        }
         self.go_metrics
             .incr_counter(&["memberlist", "udp", "sent"], msg.len() as f64, &[]);
         let framed = add_label_header(&msg, &self.cfg.cluster_label).map_err(KvError::Other)?;
         self.transport().write_to(framed, addr.to_string()).await;
         Ok(())
+    }
+
+    /// memberlist `encryptLocalState`.
+    pub fn encrypt_local_state(&self, send_buf: &[u8], stream_label: &str) -> Result<Vec<u8>, String> {
+        let key = self
+            .primary_key()
+            .ok_or_else(|| "encryption enabled without primary key".to_string())?;
+        let enc_vsn = self.encryption_version();
+        let enc_len = super::security::encrypted_length(enc_vsn, send_buf.len()) as u32;
+        let mut buf = Vec::with_capacity(5 + enc_len as usize);
+        buf.push(MessageType::Encrypt as u8);
+        buf.extend_from_slice(&enc_len.to_be_bytes());
+        let mut aad = Vec::with_capacity(5 + stream_label.len());
+        aad.extend_from_slice(&buf[..5]);
+        aad.extend_from_slice(stream_label.as_bytes());
+        encrypt_payload(enc_vsn, &key, send_buf, &aad, &mut buf)?;
+        Ok(buf)
     }
 
     /// memberlist `rawSendMsgStream` (never writes a label header; outbound stream dials
@@ -1188,9 +1555,14 @@ impl MemberlistKv {
         &self,
         writer: &mut W,
         send_buf: Vec<u8>,
-        _label: &str,
+        label: &str,
     ) -> Result<(), io::Error> {
-        let send_buf = self.maybe_compress(send_buf);
+        let mut send_buf = self.maybe_compress(send_buf);
+        if self.encryption_enabled() && self.gossip_verify_outgoing {
+            send_buf = self
+                .encrypt_local_state(&send_buf, label)
+                .map_err(io::Error::other)?;
+        }
         self.go_metrics
             .incr_counter(&["memberlist", "tcp", "sent"], send_buf.len() as f64, &[]);
         writer.write_all(&send_buf).await?;
@@ -1236,12 +1608,13 @@ impl MemberlistKv {
             StreamFirstByte::Byte(b) => Some(b),
         };
 
-        let (msg_type, body_opt) = match read_stream_with_first_byte(
+        let (msg_type, body_opt) = match read_stream_with_first_byte_verified(
             &mut reader,
             first,
             &label,
             Some(&self.go_metrics),
             self.stream_decryptor.as_ref(),
+            self.encryption_enabled() && self.gossip_verify_incoming,
         )
         .await
         {
@@ -1367,6 +1740,27 @@ impl MemberlistKv {
         user_state: &[u8],
     ) -> Result<(), String> {
         self.verify_protocol(remote_nodes)?;
+        if join {
+            if let Some(merge_del) = &self.merge_delegate {
+                let nodes: Vec<NodeState> = remote_nodes
+                    .iter()
+                    .map(|n| {
+                        let vsn = if n.vsn.len() >= 6 { n.vsn.clone() } else { vec![0; 6] };
+                        NodeState {
+                            name: n.name.clone(),
+                            addr: n.addr.clone(),
+                            port: n.port,
+                            meta: n.meta.clone(),
+                            incarnation: n.incarnation,
+                            state: n.state,
+                            state_change: SystemTime::now(),
+                            vsn,
+                        }
+                    })
+                    .collect();
+                merge_del.notify_merge(&nodes)?;
+            }
+        }
         self.merge_state(remote_nodes);
         if !user_state.is_empty() {
             self.merge_remote_state(user_state, join);
@@ -1400,12 +1794,13 @@ impl MemberlistKv {
 
         let mut reader = BufReader::new(read_half);
         let read_fut = async {
-            let (msg_type, body_opt) = read_stream_with_first_byte(
+            let (msg_type, body_opt) = read_stream_with_first_byte_verified(
                 &mut reader,
                 None,
                 &label,
                 Some(&self.go_metrics),
                 self.stream_decryptor.as_ref(),
+                self.encryption_enabled() && self.gossip_verify_incoming,
             )
             .await
             .map_err(|e| KvError::Other(e.to_string()))?;
@@ -1465,13 +1860,15 @@ impl MemberlistKv {
         }
     }
 
-    /// memberlist `resolveAddr`.
-    async fn resolve_addr(&self, host_str: &str) -> Result<Vec<String>, String> {
+    /// memberlist `resolveAddr` returning structured `IpPort` entries.
+    pub async fn resolve_addr_ip_ports(&self, host_str: &str) -> Result<Vec<IpPort>, String> {
+        let mut node_name = String::new();
         let mut host_str = host_str;
         if let Some(idx) = host_str.find('/') {
             if idx == 0 {
                 return Err("empty node name provided".to_string());
             }
+            node_name = host_str[..idx].to_string();
             host_str = &host_str[idx + 1..];
         }
         let with_port = ensure_port(host_str, self.bind_port());
@@ -1479,14 +1876,43 @@ impl MemberlistKv {
             Some((h, p)) => (h.to_string(), p.to_string()),
             None => return Err(format!("address {with_port}: missing port in address")),
         };
+        if host.is_empty() {
+            return Err("lookup : empty host".to_string());
+        }
         let port: u16 = port.parse().map_err(|e| format!("strconv.ParseUint: parsing {port:?}: {e}"))?;
         if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, port).to_string()]);
+            return Ok(vec![IpPort {
+                ip: Some(ip),
+                port,
+                node_name,
+            }]);
+        }
+        if let Some(cfg_path) = &self.dns_config_path {
+            if let Ok(ips) = tcp_lookup_ip(cfg_path, &host, port, &node_name).await {
+                if !ips.is_empty() {
+                    return Ok(ips);
+                }
+            }
         }
         match tokio::net::lookup_host(crate::dns::join_host_port(&host, &port.to_string())).await {
-            Ok(addrs) => Ok(addrs.map(|a| a.to_string()).collect()),
+            Ok(addrs) => Ok(addrs
+                .map(|a| IpPort {
+                    ip: Some(a.ip()),
+                    port: a.port(),
+                    node_name: node_name.clone(),
+                })
+                .collect()),
             Err(err) => Err(format!("lookup {host}: {err}")),
         }
+    }
+
+    /// memberlist `resolveAddr`.
+    async fn resolve_addr(&self, host_str: &str) -> Result<Vec<String>, String> {
+        let entries = self.resolve_addr_ip_ports(host_str).await?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|e| e.ip.map(|ip| SocketAddr::new(ip, e.port).to_string()))
+            .collect())
     }
 
     /// memberlist `Join`: returns the number of nodes successfully contacted.
@@ -2420,9 +2846,12 @@ impl MemberlistKv {
     // --- memberlist Delegate: LocalState, MergeRemoteState, NotifyMsg, GetBroadcasts ---------------
 
     /// dskit `LocalState`.
-    pub fn local_state(&self, _join: bool) -> Vec<u8> {
+    pub fn local_state(&self, join: bool) -> Vec<u8> {
         if !self.delegate_ready.load(Ordering::Acquire) {
             return Vec::new();
+        }
+        if let Some(del) = &self.custom_delegate {
+            return del.local_state(join);
         }
         self.metrics.state_pulls.inc();
         let store = self.store.lock();
@@ -2503,8 +2932,12 @@ impl MemberlistKv {
     }
 
     /// dskit `MergeRemoteState`.
-    pub fn merge_remote_state(&self, mut data: &[u8], _join: bool) {
+    pub fn merge_remote_state(&self, mut data: &[u8], join: bool) {
         if !self.delegate_ready.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(del) = &self.custom_delegate {
+            del.merge_remote_state(data, join);
             return;
         }
         let received = SystemTime::now();
@@ -2576,6 +3009,10 @@ impl MemberlistKv {
     /// dskit `NotifyMsg`.
     pub fn notify_msg(&self, msg: &[u8]) {
         if !self.delegate_ready.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(del) = &self.custom_delegate {
+            del.notify_msg(msg);
             return;
         }
         self.metrics.received_broadcasts.inc();
@@ -2696,6 +3133,9 @@ impl MemberlistKv {
         if !self.delegate_ready.load(Ordering::Acquire) {
             return Vec::new();
         }
+        if let Some(del) = &self.custom_delegate {
+            return del.get_broadcasts(overhead, limit);
+        }
         let mut msgs = self.local_broadcasts.get_broadcasts(overhead, limit);
         let mut remaining = limit as i64;
         for m in &msgs {
@@ -2705,6 +3145,524 @@ impl MemberlistKv {
             msgs.extend(self.gossip_broadcasts.get_broadcasts(overhead, remaining as usize));
         }
         msgs
+    }
+
+    /// memberlist `sendPingAndWaitForAck`.
+    pub async fn send_ping_and_wait_for_ack(
+        &self,
+        addr: &str,
+        name: &str,
+        ping: Ping,
+        deadline: Instant,
+    ) -> Result<bool, String> {
+        if name.is_empty() && self.require_node_names {
+            return Err("memberlist: node names are required by configuration but one was not provided".to_string());
+        }
+        let now = Instant::now();
+        let rem = deadline.saturating_duration_since(now);
+        let Ok(mut conn) = self.transport().dial_timeout(addr, rem).await else {
+            return Ok(false);
+        };
+        let label = self.cfg.cluster_label.clone();
+        let (read_half, mut write_half) = conn.split();
+        let write_fut = async {
+            if !label.is_empty() {
+                let hdr = add_label_header(&[], &label).map_err(io::Error::other)?;
+                write_half.write_all(&hdr).await?;
+            }
+            let out = encode_ping(&ping);
+            self.send_raw_stream(&mut write_half, out, &label).await
+        };
+        let rem = deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(rem, write_fut)
+            .await
+            .map_err(|_| "i/o timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+
+        let mut reader = BufReader::new(read_half);
+        let rem = deadline.saturating_duration_since(Instant::now());
+        let read_fut = read_stream_with_first_byte_verified(
+            &mut reader,
+            None,
+            &label,
+            Some(&self.go_metrics),
+            self.stream_decryptor.as_ref(),
+            self.encryption_enabled() && self.gossip_verify_incoming,
+        );
+        let (msg_type, body_opt) = tokio::time::timeout(rem, read_fut)
+            .await
+            .map_err(|_| "i/o timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+
+        if msg_type != MessageType::AckResp {
+            return Err(format!("unexpected msgType ({}) from ping", msg_type as u8));
+        }
+        let ack = match body_opt {
+            Some(b) => decode_ack_resp(&b)?,
+            None => {
+                let b = read_msgpack_map_bytes(&mut reader).await?;
+                decode_ack_resp(&b)?
+            }
+        };
+        if ack.seq_no != ping.seq_no {
+            return Err(format!(
+                "sequence number from ack ({}) doesn't match ping ({})",
+                ack.seq_no, ping.seq_no
+            ));
+        }
+        Ok(true)
+    }
+
+    /// memberlist `Ping`.
+    pub async fn ping(&self, node: &str, addr: &str) -> Result<Duration, String> {
+        let (self_addr, self_port) = self.advertise();
+        let seq_no = self.sequence_num.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let ping = Ping {
+            seq_no,
+            node: node.to_string(),
+            source_addr: ip_to_bytes(self_addr),
+            source_port: self_port,
+            source_node: self.node_name.clone(),
+        };
+        let (ack_tx, mut ack_rx) = mpsc::channel(self.timing.indirect_checks + 1);
+        self.set_probe_channels(seq_no, ack_tx, None, self.timing.probe_interval);
+        let sent = Instant::now();
+        self.send_msg_named(addr, node, encode_ping(&ping))
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::select! {
+            v = ack_rx.recv() => {
+                if let Some(v) = v {
+                    if v.complete {
+                        return Ok(v.timestamp.saturating_duration_since(sent));
+                    }
+                }
+            }
+            _ = tokio::time::sleep(self.timing.probe_timeout) => {}
+        }
+        Err(format!("No response from node {node}"))
+    }
+
+    /// memberlist `UpdateNode`.
+    pub async fn update_node(&self, timeout: Duration) -> Result<(), String> {
+        let meta = self.current_node_meta();
+        let (addr, port) = {
+            let table = self.nodes.read();
+            let state = table
+                .map
+                .get(&self.node_name)
+                .ok_or_else(|| "local node not in node map".to_string())?;
+            (state.addr.clone(), state.port)
+        };
+        let a = Alive {
+            incarnation: self.incarnation.fetch_add(1, Ordering::AcqRel).wrapping_add(1),
+            node: self.node_name.clone(),
+            addr,
+            port,
+            meta,
+            vsn: self.build_vsn_array(),
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        self.alive_node(&a, Some(tx), true);
+        let any_alive = self
+            .nodes
+            .read()
+            .map
+            .values()
+            .any(|n| !n.dead_or_left() && n.name != self.node_name);
+        if any_alive {
+            if timeout.is_zero() {
+                let _ = rx.recv().await;
+            } else if tokio::time::timeout(timeout, rx.recv()).await.is_err() {
+                return Err("timeout waiting for update broadcast".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// memberlist `SendToAddress`.
+    pub async fn send_to_address(&self, addr: &str, name: &str, msg: &[u8]) -> Result<(), KvError> {
+        let mut buf = Vec::with_capacity(1 + msg.len());
+        buf.push(MessageType::User as u8);
+        buf.extend_from_slice(msg);
+        self.raw_send_msg_packet_named(addr, name, None, buf).await
+    }
+
+    /// memberlist `SendBestEffort`.
+    pub async fn send_best_effort(&self, to: &NodeState, msg: &[u8]) -> Result<(), KvError> {
+        let mut buf = Vec::with_capacity(1 + msg.len());
+        buf.push(MessageType::User as u8);
+        buf.extend_from_slice(msg);
+        self.raw_send_msg_packet_named(&to.address(), &to.name, Some(to), buf).await
+    }
+
+    /// memberlist `SendReliable`.
+    pub async fn send_reliable(&self, to: &NodeState, msg: &[u8]) -> Result<(), KvError> {
+        if to.name.is_empty() && self.require_node_names {
+            return Err(KvError::Other(
+                "memberlist: node names are required by configuration but one was not provided".to_string(),
+            ));
+        }
+        let timeout = self.timing.tcp_timeout;
+        let mut conn = self.transport().dial_timeout(&to.address(), timeout).await?;
+        let label = self.cfg.cluster_label.clone();
+        let (_r, mut write_half) = conn.split();
+        if !label.is_empty() {
+            let hdr = add_label_header(&[], &label).map_err(KvError::Other)?;
+            write_half.write_all(&hdr).await?;
+        }
+        let framed = encode_user_msg_stream(msg);
+        self.send_raw_stream(&mut write_half, framed, &label)
+            .await
+            .map_err(KvError::Io)
+    }
+
+    pub fn local_node(&self) -> Option<NodeState> {
+        self.nodes.read().map.get(&self.node_name).cloned()
+    }
+
+    pub fn set_event_delegate(&self, d: Option<Arc<dyn EventDelegate>>) {
+        *self.event_delegate.write() = d;
+    }
+
+    pub fn set_disable_tcp_pings_for_test(&self, _disabled: bool) {}
+
+    pub fn compression_type(&self) -> CompressionType {
+        self.compression_algo
+    }
+
+    pub fn est_num_nodes_pub(&self) -> usize {
+        self.est_num_nodes()
+    }
+
+    pub fn num_members_pub(&self) -> usize {
+        self.num_members()
+    }
+
+    pub fn health_score_pub(&self) -> i32 {
+        self.health_score()
+    }
+
+    pub fn awareness_apply_delta(&self, delta: i32) {
+        self.awareness.apply_delta(delta);
+    }
+
+    pub fn set_alive_for_test(&self) {
+        self.set_alive();
+    }
+
+    pub fn alive_node_for_test(&self, a: &Alive, bootstrap: bool) {
+        self.alive_node(a, None, bootstrap);
+    }
+
+    pub fn suspect_node_for_test(&self, s: &Suspect) {
+        self.suspect_node(s);
+    }
+
+    pub fn dead_node_for_test(&self, d: &Dead) {
+        self.dead_node(d);
+    }
+
+    pub fn merge_state_for_test(&self, remote: &[PushNodeState]) {
+        self.merge_state(remote);
+    }
+
+    pub fn insert_raw_node_for_test(&self, node: NodeState) {
+        let mut table = self.nodes.write();
+        if !table.map.contains_key(&node.name) {
+            table.order.push(node.name.clone());
+        }
+        table.map.insert(node.name.clone(), node);
+        self.num_nodes.store(table.order.len() as u32, Ordering::Release);
+    }
+
+    pub fn verify_protocol_for_test(&self, remote: &[PushNodeState]) -> Result<(), String> {
+        self.verify_protocol(remote)
+    }
+
+    pub async fn probe_for_test(&self) {
+        self.probe().await;
+    }
+
+    pub async fn probe_node_by_name_for_test(&self, name: &str) {
+        let node = self.nodes.read().map.get(name).cloned();
+        if let Some(n) = node {
+            self.probe_node(&n).await;
+        }
+    }
+
+    pub fn reset_nodes_for_test(&self) {
+        self.reset_nodes();
+    }
+
+    pub async fn gossip_for_test(&self) {
+        self.gossip().await;
+    }
+
+    pub async fn push_pull_for_test(&self) {
+        self.push_pull().await;
+    }
+
+    pub fn next_seq_no_for_test(&self) -> u32 {
+        self.sequence_num.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    }
+
+    pub fn sequence_num_for_test(&self) -> u32 {
+        self.sequence_num.load(Ordering::Acquire)
+    }
+
+    pub fn set_probe_channels_for_test(
+        &self,
+        seq_no: u32,
+        ack_tx: mpsc::Sender<(bool, Vec<u8>)>,
+        nack_tx: Option<mpsc::Sender<()>>,
+        timeout: Duration,
+    ) {
+        let (inner_tx, mut inner_rx) = mpsc::channel(4);
+        self.set_probe_channels(seq_no, inner_tx, nack_tx, timeout);
+        tokio::spawn(async move {
+            if let Some(msg) = inner_rx.recv().await {
+                let _ = ack_tx.try_send((msg.complete, msg.payload));
+            }
+        });
+    }
+
+    pub fn set_ack_handler_for_test(
+        &self,
+        seq_no: u32,
+        ack: AckCallback,
+        timeout: Duration,
+    ) {
+        self.set_ack_handler_public(seq_no, ack, timeout);
+    }
+
+    pub fn invoke_ack_handler_for_test(&self, ack: &AckResp) {
+        self.invoke_ack_handler(ack, Instant::now());
+    }
+
+    pub fn invoke_nack_handler_for_test(&self, nack: &NackResp) {
+        self.invoke_nack_handler(nack);
+    }
+
+    pub fn has_ack_handler_for_test(&self, seq_no: u32) -> bool {
+        self.ack_handlers.lock().contains_key(&seq_no)
+    }
+
+    pub fn get_node_state(&self, name: &str) -> Option<NodeState> {
+        self.nodes.read().map.get(name).cloned()
+    }
+
+    pub fn change_node_state_for_test(&self, name: &str, f: impl FnOnce(&mut NodeState)) {
+        let mut table = self.nodes.write();
+        if let Some(st) = table.map.get_mut(name) {
+            f(st);
+        }
+    }
+
+    pub fn ml_broadcasts_num_queued(&self) -> usize {
+        self.ml_broadcasts.num_queued()
+    }
+
+    pub fn ml_broadcasts_reset(&self) {
+        self.ml_broadcasts.reset();
+    }
+
+    pub fn ml_broadcasts_ordered(&self) -> Vec<(usize, Vec<u8>)> {
+        self.ml_broadcasts.ordered_view(true)
+    }
+
+    pub fn queue_ml_broadcast_for_test(&self, node: &str, msg: Vec<u8>) {
+        self.queue_ml_broadcast(node, msg, None);
+    }
+
+    pub async fn leave_cluster(&self, timeout: Duration) -> Result<(), String> {
+        self.leave(timeout).await
+    }
+
+    pub async fn raw_send_msg_packet_for_test(
+        &self,
+        addr: &str,
+        node: Option<&NodeState>,
+        msg: Vec<u8>,
+    ) -> Result<(), KvError> {
+        self.raw_send_msg_packet(addr, node, msg).await
+    }
+
+    pub async fn ingest_packet_for_test(&self, raw: &[u8], from: &str) {
+        self.ingest_packet(raw, from).await;
+    }
+
+    pub async fn handle_command_for_test(&self, buf: &[u8], from: &str) {
+        self.handle_command(buf, from, 0).await;
+    }
+
+    pub fn decrypt_remote_state_for_test(
+        &self,
+        data: &[u8],
+        stream_label: &str,
+    ) -> Result<Vec<u8>, String> {
+        if data.len() < 4 {
+            return Err("truncated encrypted state length".to_string());
+        }
+        let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        self.go_metrics
+            .add_sample(&["memberlist", "size", "remote"], len as f64, &[]);
+        if data.len() < 4 + len {
+            return Err("truncated encrypted state body".to_string());
+        }
+        let mut aad = Vec::with_capacity(5 + stream_label.len());
+        aad.push(MessageType::Encrypt as u8);
+        aad.extend_from_slice(&data[..4]);
+        aad.extend_from_slice(stream_label.as_bytes());
+        let keys = self.encryption_keys();
+        super::security::decrypt_payload(&keys, &data[4..4 + len], &aad)
+    }
+
+    pub fn go_metrics_has_sample(&self, name: &str) -> bool {
+        self.go_metrics.has_sample(name)
+    }
+
+    pub fn go_metrics_has_gauge(&self, name: &str, labels: &[(&str, &str)]) -> bool {
+        self.go_metrics.value(name, labels).is_some()
+    }
+
+    pub async fn ingest_stream_for_test(&self, conn: MemberlistConn) {
+        self.handle_conn(conn).await;
+    }
+
+    pub fn k_random_nodes_for_test(
+        &self,
+        k: usize,
+        use_selection: bool,
+        exclude: impl Fn(&NodeState) -> bool,
+    ) -> Vec<NodeState> {
+        self.k_random_nodes(k, use_selection, exclude)
+    }
+}
+
+/// Go `tcpLookupIP` against a custom resolv.conf `nameserver <ip[:port]>`.
+async fn tcp_lookup_ip(
+    dns_config_path: &str,
+    host: &str,
+    default_port: u16,
+    node_name: &str,
+) -> Result<Vec<IpPort>, String> {
+    if !host.contains('.') {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(dns_config_path).map_err(|e| e.to_string())?;
+    let mut server = None;
+    for line in content.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("nameserver") {
+            let s = rest.trim();
+            if !s.is_empty() {
+                server = Some(if super::wire::has_port(s) {
+                    s.to_string()
+                } else {
+                    crate::dns::join_host_port(s, "53")
+                });
+                break;
+            }
+        }
+    }
+    let Some(server) = server else {
+        return Ok(Vec::new());
+    };
+    let fqdn = host.trim_end_matches('.');
+    // Build minimal DNS query: ID=0x1234, RD=0, QDCOUNT=1, QTYPE=ANY(255), QCLASS=IN(1)
+    let mut pkt = vec![0x12, 0x34, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    for label in fqdn.split('.') {
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&[0x00, 255, 0x00, 0x01]);
+
+    let mut conn = tokio::net::TcpStream::connect(&server)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut tcp_req = Vec::with_capacity(2 + pkt.len());
+    tcp_req.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
+    tcp_req.extend_from_slice(&pkt);
+    conn.write_all(&tcp_req).await.map_err(|e| e.to_string())?;
+
+    let mut len_buf = [0u8; 2];
+    tokio::io::AsyncReadExt::read_exact(&mut conn, &mut len_buf)
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+    let mut resp = vec![0u8; resp_len];
+    tokio::io::AsyncReadExt::read_exact(&mut conn, &mut resp)
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.len() < 12 {
+        return Err("short dns response".to_string());
+    }
+    let qdcount = u16::from_be_bytes([resp[4], resp[5]]) as usize;
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+    let mut pos = 12usize;
+    let skip_name = |buf: &[u8], p: &mut usize| -> Result<(), String> {
+        loop {
+            let b = *buf.get(*p).ok_or("eof name")?;
+            if b & 0xc0 == 0xc0 {
+                *p += 2;
+                return Ok(());
+            }
+            *p += 1;
+            if b == 0 {
+                return Ok(());
+            }
+            *p += b as usize;
+        }
+    };
+    for _ in 0..qdcount {
+        skip_name(&resp, &mut pos)?;
+        pos += 4;
+    }
+    let mut out = Vec::new();
+    for _ in 0..ancount {
+        skip_name(&resp, &mut pos)?;
+        if pos + 10 > resp.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+        let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > resp.len() {
+            break;
+        }
+        let rdata = &resp[pos..pos + rdlen];
+        pos += rdlen;
+        if rtype == 1 && rdata.len() == 4 {
+            let ip = IpAddr::V4(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
+            out.push(IpPort {
+                ip: Some(ip),
+                port: default_port,
+                node_name: node_name.to_string(),
+            });
+        } else if rtype == 28 && rdata.len() == 16 {
+            let arr: [u8; 16] = rdata.try_into().expect("16");
+            let ip = IpAddr::V6(std::net::Ipv6Addr::from(arr));
+            out.push(IpPort {
+                ip: Some(ip),
+                port: default_port,
+                node_name: node_name.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn bytes_to_ip(addr: &[u8]) -> Option<IpAddr> {
+    if addr.len() == 4 {
+        let a: [u8; 4] = addr.try_into().ok()?;
+        Some(IpAddr::from(a))
+    } else if addr.len() == 16 {
+        let a: [u8; 16] = addr.try_into().ok()?;
+        Some(IpAddr::from(a).to_canonical())
+    } else {
+        None
     }
 }
 

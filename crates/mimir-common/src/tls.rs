@@ -111,6 +111,14 @@ pub struct ResolvedClientConfig {
     pub config: Arc<rustls::ClientConfig>,
     pub server_name: Option<ServerName<'static>>,
     pub insecure_skip_verify: bool,
+    ca_cert_count: Option<usize>,
+}
+
+impl ResolvedClientConfig {
+    /// Number of CA certificates loaded from `tls_ca_path`, or `None` when using host roots.
+    pub fn ca_cert_count(&self) -> Option<usize> {
+        self.ca_cert_count
+    }
 }
 
 impl fmt::Debug for ResolvedClientConfig {
@@ -317,8 +325,8 @@ impl ClientConfig {
         &self,
     ) -> Result<(ResolvedClientConfig, Option<Arc<CachedReloadingCert>>), TlsConfigError> {
         // Read CA certificates.
-        let ca_roots = if self.ca_path.is_empty() {
-            None
+        let (ca_roots, ca_cert_count) = if self.ca_path.is_empty() {
+            (None, None)
         } else {
             let pem = read_secret(&self.ca_path).map_err(|reason| TlsConfigError::LoadCa {
                 path: self.ca_path.clone(),
@@ -329,7 +337,8 @@ impl ClientConfig {
                 .filter_map(Result::ok)
                 .collect();
             let (_added, _ignored) = store.add_parsable_certificates(certs);
-            Some(Arc::new(store))
+            let len = store.len();
+            (Some(Arc::new(store)), Some(len))
         };
 
         // Read client certificate (same precedence of errors as dskit).
@@ -422,6 +431,7 @@ impl ClientConfig {
                 config: Arc::new(config),
                 server_name,
                 insecure_skip_verify: self.insecure_skip_verify,
+                ca_cert_count,
             },
             client_cert,
         ))

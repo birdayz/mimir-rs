@@ -267,6 +267,301 @@ fn decompress_snappy(src: &[u8], max_bytes: usize) -> Result<Bytes> {
     Ok(Bytes::from(out))
 }
 
+/// Ported from `kgo.CompressionCodec` / `kgo.CompressionCodecType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionCodecConfig {
+    pub codec: i8,
+    pub level: i32,
+}
+
+impl CompressionCodecConfig {
+    pub fn none() -> Self {
+        Self { codec: 0, level: 0 }
+    }
+    pub fn gzip() -> Self {
+        Self { codec: 1, level: -1 }
+    }
+    pub fn snappy() -> Self {
+        Self { codec: 2, level: 0 }
+    }
+    pub fn lz4() -> Self {
+        Self { codec: 3, level: 0 }
+    }
+    pub fn zstd() -> Self {
+        Self { codec: 4, level: 0 }
+    }
+    pub fn with_level(mut self, level: i32) -> Self {
+        self.level = level;
+        self
+    }
+    pub fn codec_type(self) -> Option<KafkaCompression> {
+        match self.codec {
+            0 => Some(KafkaCompression::None),
+            1 => Some(KafkaCompression::Gzip),
+            2 => Some(KafkaCompression::Snappy),
+            3 => Some(KafkaCompression::Lz4),
+            4 => Some(KafkaCompression::Zstd),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CompressFlag(pub u8);
+
+impl CompressFlag {
+    pub const NONE: Self = Self(0);
+    pub const DISABLE_ZSTD: Self = Self(1);
+}
+
+#[derive(Debug, Clone)]
+enum CompiledCodec {
+    None,
+    Gzip(flate2::Compression),
+    Snappy,
+    Lz4(u32),
+    Zstd(i32),
+}
+
+/// Ported from `kgo.DefaultCompressor`.
+#[derive(Debug, Clone)]
+pub struct Compressor {
+    codecs: Vec<CompiledCodec>,
+}
+
+impl Compressor {
+    pub fn new(codecs: &[CompressionCodecConfig]) -> Result<Option<Self>> {
+        if codecs.is_empty() {
+            return Ok(None);
+        }
+        let mut compiled = Vec::with_capacity(codecs.len());
+        for c in codecs {
+            let kt = c
+                .codec_type()
+                .ok_or_else(|| anyhow::anyhow!("unknown compression codec {}", c.codec))?;
+            match kt {
+                KafkaCompression::None => {
+                    // Matches franz-go: CodecNone stops considering further codecs.
+                    if compiled.is_empty() {
+                        return Ok(None);
+                    }
+                    compiled.push(CompiledCodec::None);
+                    break;
+                }
+                KafkaCompression::Gzip => {
+                    let lvl = if (1..=9).contains(&c.level) {
+                        flate2::Compression::new(c.level as u32)
+                    } else {
+                        flate2::Compression::default()
+                    };
+                    compiled.push(CompiledCodec::Gzip(lvl));
+                }
+                KafkaCompression::Snappy => {
+                    compiled.push(CompiledCodec::Snappy);
+                }
+                KafkaCompression::Lz4 => {
+                    // pierrec/lz4/v4 accepts arbitrary level ints (defaulting / clamping internally).
+                    let lvl = if c.level >= 0 { c.level as u32 } else { 0 };
+                    compiled.push(CompiledCodec::Lz4(lvl));
+                }
+                KafkaCompression::Zstd => {
+                    let lvl = if (1..=22).contains(&c.level) { c.level } else { 3 };
+                    compiled.push(CompiledCodec::Zstd(lvl));
+                }
+            }
+        }
+        Ok(Some(Self { codecs: compiled }))
+    }
+
+    pub fn compress(&self, src: &[u8], flags: CompressFlag) -> Result<(Vec<u8>, KafkaCompression)> {
+        for c in &self.codecs {
+            match c {
+                CompiledCodec::None => return Ok((src.to_vec(), KafkaCompression::None)),
+                CompiledCodec::Gzip(lvl) => {
+                    let mut out = Vec::new();
+                    let mut enc = GzEncoder::new(&mut out, *lvl);
+                    enc.write_all(src).context("gzip compress")?;
+                    enc.finish().context("gzip finish")?;
+                    return Ok((out, KafkaCompression::Gzip));
+                }
+                CompiledCodec::Snappy => {
+                    let max_len = snap::raw::max_compress_len(src.len());
+                    let mut out = vec![0u8; max_len];
+                    let n = SNAPPY_ENCODER
+                        .with(|enc| enc.borrow_mut().compress(src, &mut out))
+                        .context("snappy compress")?;
+                    out.truncate(n);
+                    return Ok((out, KafkaCompression::Snappy));
+                }
+                CompiledCodec::Lz4(_lvl) => {
+                    let mut frame_info = FrameInfo::new();
+                    frame_info.block_mode = BlockMode::Independent;
+                    let mut out = Vec::new();
+                    let mut enc = FrameEncoder::with_frame_info(frame_info, &mut out);
+                    enc.write_all(src).context("lz4 compress")?;
+                    enc.finish().context("lz4 finish")?;
+                    return Ok((out, KafkaCompression::Lz4));
+                }
+                CompiledCodec::Zstd(lvl) => {
+                    if (flags.0 & CompressFlag::DISABLE_ZSTD.0) != 0 {
+                        continue;
+                    }
+                    let mut out = Vec::new();
+                    zstd::stream::copy_encode(src, &mut out, *lvl).context("zstd compress")?;
+                    return Ok((out, KafkaCompression::Zstd));
+                }
+            }
+        }
+        Ok((src.to_vec(), KafkaCompression::None))
+    }
+}
+
+/// Ported from `kgo.PoolDecompressBytes`.
+pub trait DecompressPool: Send + Sync {
+    fn get_decompress_bytes(&self, compressed: &[u8], codec: KafkaCompression) -> Vec<u8>;
+    fn put_decompress_bytes(&self, buf: Vec<u8>);
+}
+
+/// Ported from `kgo.DefaultDecompressor`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Decompressor;
+
+impl Decompressor {
+    pub fn decompress(&self, src: &[u8], codec: KafkaCompression) -> Result<Vec<u8>> {
+        self.decompress_with_limit(src, codec, MAX_DECOMPRESSED_KAFKA_BATCH_BYTES, None)
+    }
+
+    pub fn decompress_with_limit(
+        &self,
+        src: &[u8],
+        codec: KafkaCompression,
+        max_bytes: usize,
+        pool: Option<&dyn DecompressPool>,
+    ) -> Result<Vec<u8>> {
+        if let Some(p) = pool {
+            let mut buf = p.get_decompress_bytes(src, codec);
+            let orig_len = buf.len();
+            let orig_cap = buf.capacity();
+            buf.clear();
+            let res = decompress_into(src, codec, max_bytes, &mut buf);
+            match res {
+                Ok(()) => Ok(buf),
+                Err(e) => {
+                    // Zero the pool's slice through its original capacity before returning it.
+                    let zero_len = orig_cap.max(buf.capacity());
+                    buf.resize(zero_len, 0);
+                    buf.fill(0);
+                    buf.truncate(orig_len);
+                    p.put_decompress_bytes(buf);
+                    Err(e)
+                }
+            }
+        } else {
+            let mut b = Bytes::copy_from_slice(src);
+            let out = decompress_record_batch_with_limit(&mut b, codec.to_protocol(), max_bytes)?;
+            Ok(out.to_vec())
+        }
+    }
+}
+
+fn decompress_into(
+    src: &[u8],
+    codec: KafkaCompression,
+    max_bytes: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    match codec {
+        KafkaCompression::None => {
+            if src.len() > max_bytes {
+                return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+            }
+            out.extend_from_slice(src);
+            Ok(())
+        }
+        KafkaCompression::Gzip => {
+            read_bounded(MultiGzDecoder::new(src), max_bytes, out, "gzip")
+        }
+        KafkaCompression::Snappy => {
+            if src.len() >= 16 && &src[..8] == XERIAL_MAGIC {
+                xerial_decode_into(out, src, max_bytes)
+            } else {
+                let dec_len = snap::raw::decompress_len(src).context("snappy raw decompress_len")?;
+                if dec_len > max_bytes {
+                    return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+                }
+                out.resize(dec_len, 0);
+                let actual = SNAPPY_DECODER
+                    .with(|dec| dec.borrow_mut().decompress(src, out))
+                    .context("snappy raw decompress")?;
+                out.truncate(actual);
+                Ok(())
+            }
+        }
+        KafkaCompression::Lz4 => {
+            read_bounded(FrameDecoder::new(src), max_bytes, out, "lz4")
+        }
+        KafkaCompression::Zstd => {
+            if let Ok(Some(sz)) = zstd::zstd_safe::get_frame_content_size(src) {
+                if sz > max_bytes as u64 {
+                    return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+                }
+            }
+            let decoder = zstd::stream::read::Decoder::new(src).context("zstd decompress")?;
+            read_bounded(decoder, max_bytes, out, "zstd")
+        }
+    }
+}
+
+/// Ported from `kgo.xerialDecode`.
+pub fn xerial_decode(dst: Option<Vec<u8>>, src: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut out = dst.unwrap_or_default();
+    out.clear();
+    xerial_decode_into(&mut out, src, max_bytes)?;
+    Ok(out)
+}
+
+fn xerial_decode_into(out: &mut Vec<u8>, src: &[u8], max_bytes: usize) -> Result<()> {
+    if src.len() < 16 || &src[..8] != XERIAL_MAGIC {
+        bail!("invalid xerial snappy header");
+    }
+    let mut rem = &src[16..];
+    if rem.is_empty() {
+        bail!("xerial snappy stream has no chunks");
+    }
+    SNAPPY_DECODER.with(|dec| {
+        let mut dec = dec.borrow_mut();
+        while !rem.is_empty() {
+            if rem.len() < 4 {
+                bail!("malformed xerial snappy chunk header");
+            }
+            let size = u32::from_be_bytes([rem[0], rem[1], rem[2], rem[3]]) as usize;
+            rem = &rem[4..];
+            if rem.len() < size {
+                bail!(
+                    "truncated xerial snappy chunk: expected {size}, got {}",
+                    rem.len()
+                );
+            }
+            let chunk = &rem[..size];
+            rem = &rem[size..];
+            let dec_len = snap::raw::decompress_len(chunk).context("snappy xerial chunk len")?;
+            let start = out.len();
+            let new_len = start
+                .checked_add(dec_len)
+                .ok_or(CompressionError::DecompressedSizeExceeded { limit: max_bytes })?;
+            if new_len > max_bytes {
+                return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+            }
+            out.resize(new_len, 0);
+            let actual = dec
+                .decompress(chunk, &mut out[start..])
+                .context("snappy xerial chunk decompress")?;
+            out.truncate(start + actual);
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

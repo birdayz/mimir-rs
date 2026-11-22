@@ -44,9 +44,10 @@ use client::{err_invalid_argument, Body, Client, ClientOptions, RequestMetadata,
 
 use super::s3utils;
 
-/// Mimir `SSEKMS` / `SSES3`.
+/// Mimir `SSEKMS` / `SSES3` / Thanos `SSEC`.
 pub const SSE_KMS: &str = "SSE-KMS";
 pub const SSE_S3: &str = "SSE-S3";
+pub const SSE_C: &str = "SSE-C";
 
 /// minio-go constants (`constants.go`).
 const ABS_MIN_PART_SIZE: u64 = 1024 * 1024 * 5;
@@ -59,16 +60,40 @@ const NUM_THREADS: usize = 4;
 
 pub use mimir_config::S3_SUPPORTED_STORAGE_CLASSES as SUPPORTED_STORAGE_CLASSES;
 
-/// minio-go `encrypt.ServerSide` (the variants Mimir can configure).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// minio-go `encrypt.ServerSide`.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ServerSideEncryption {
     /// `encrypt.NewSSE()`.
     S3,
     /// `encrypt.NewSSEKMS(key, context)`; `context` is the serialized JSON (None = no context).
     Kms { key_id: String, context: Option<Vec<u8>> },
+    /// `encrypt.NewSSEC(key)`: 256-bit (32-byte) customer-provided AES256 key.
+    C([u8; 32]),
+}
+
+impl std::fmt::Debug for ServerSideEncryption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::S3 => f.write_str("S3"),
+            Self::Kms { key_id, context } => f
+                .debug_struct("Kms")
+                .field("key_id", key_id)
+                .field("context", context)
+                .finish(),
+            Self::C(_) => f.write_str("C([REDACTED])"),
+        }
+    }
 }
 
 impl ServerSideEncryption {
+    /// `encrypt.NewSSEC`.
+    pub fn new_ssec(key: &[u8]) -> Result<Self, String> {
+        let arr: [u8; 32] = key
+            .try_into()
+            .map_err(|_| "encrypt: SSE-C key must be 256 bit long".to_string())?;
+        Ok(Self::C(arr))
+    }
+
     /// `ServerSide.Marshal`.
     pub fn marshal(&self, h: &mut HeaderMap) -> Result<(), String> {
         let set = |h: &mut HeaderMap, k: &'static str, v: &str| -> Result<(), String> {
@@ -91,6 +116,20 @@ impl ServerSideEncryption {
                         &base64::engine::general_purpose::STANDARD.encode(ctx),
                     )?;
                 }
+            }
+            ServerSideEncryption::C(key) => {
+                let key_md5 = Md5::digest(key);
+                set(h, "x-amz-server-side-encryption-customer-algorithm", "AES256")?;
+                set(
+                    h,
+                    "x-amz-server-side-encryption-customer-key",
+                    &base64::engine::general_purpose::STANDARD.encode(key),
+                )?;
+                set(
+                    h,
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    &base64::engine::general_purpose::STANDARD.encode(key_md5),
+                )?;
             }
         }
         Ok(())
@@ -665,6 +704,12 @@ impl S3Bucket {
         self.default_sse.as_ref()
     }
 
+    /// Configures the default server-side encryption (e.g. `ServerSideEncryption::new_ssec`).
+    pub fn with_default_sse(mut self, sse: Option<ServerSideEncryption>) -> Self {
+        self.default_sse = sse;
+        self
+    }
+
     pub fn effective_sse<'a>(
         &'a self,
         override_sse: Option<&'a ServerSideEncryption>,
@@ -782,6 +827,7 @@ impl S3Bucket {
         part_number: u64,
         body: Body,
         md5_base64: String,
+        sse: Option<&ServerSideEncryption>,
     ) -> Result<String, S3Error> {
         if body.len() > MAX_PART_SIZE {
             return Err(err_entity_too_large(body.len(), MAX_PART_SIZE));
@@ -791,6 +837,9 @@ impl S3Bucket {
             ("partNumber".into(), part_number.to_string()),
             ("uploadId".into(), upload_id.to_string()),
         ];
+        if let Some(s @ ServerSideEncryption::C(_)) = sse {
+            s.marshal(&mut meta.custom_header).map_err(S3Error::Other)?;
+        }
         meta.body = body;
         meta.content_md5_base64 = md5_base64;
         meta.stream_sha256 = true;
@@ -914,7 +963,14 @@ impl S3Bucket {
                         ((n - 1) * part_size, part_size)
                     };
                     let etag = self
-                        .upload_part(name, &upload_id, n, source.section(offset, len), String::new())
+                        .upload_part(
+                            name,
+                            &upload_id,
+                            n,
+                            source.section(offset, len),
+                            String::new(),
+                            opts.sse.as_ref(),
+                        )
                         .await?;
                     results.lock().push((n, etag));
                 }
@@ -979,7 +1035,10 @@ impl S3Bucket {
             } else {
                 String::new()
             };
-            match self.upload_part(name, &upload_id, n, Body::Bytes(data), md5).await {
+            match self
+                .upload_part(name, &upload_id, n, Body::Bytes(data), md5, opts.sse.as_ref())
+                .await
+            {
                 Ok(etag) => parts.push((n, etag)),
                 Err(e) => {
                     abort_guard.disarm();
@@ -1016,6 +1075,10 @@ impl S3Bucket {
         }
         self.bucket_check().map_err(S3BucketError::new)?;
         check_valid_object_name(name).map_err(S3BucketError::new)?;
+        if let Some(s @ ServerSideEncryption::C(_)) = &self.default_sse {
+            s.marshal(&mut headers)
+                .map_err(|e| S3BucketError::new(S3Error::Other(e)))?;
+        }
         let mut meta = RequestMetadata::new(&self.name, name);
         meta.custom_header = headers;
         meta.content_sha256_hex = signer::EMPTY_SHA256_HEX.to_string();
@@ -1047,6 +1110,9 @@ impl S3Bucket {
             ));
         }
         let mut meta = RequestMetadata::new(&self.name, name);
+        if let Some(s @ ServerSideEncryption::C(_)) = &self.default_sse {
+            s.marshal(&mut meta.custom_header).map_err(S3Error::Other)?;
+        }
         meta.content_sha256_hex = signer::EMPTY_SHA256_HEX.to_string();
         let resp = self.client.execute_method("HEAD", meta).await?;
         if resp.status != 200 && resp.status != 206 {

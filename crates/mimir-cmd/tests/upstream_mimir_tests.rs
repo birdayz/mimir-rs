@@ -1000,7 +1000,8 @@ ingester:
       store: inmemory
     instance_id: ingester-0
     instance_addr: 127.0.0.1
-    min_ready_duration: 30s
+    observe_period: 30s
+    min_ready_duration: 0s
     replication_factor: 1
 blocks_storage:
   backend: filesystem

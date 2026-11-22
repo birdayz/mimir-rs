@@ -29,12 +29,47 @@ use super::super::wire::{
     Dead, IndirectPingReq, MessageType, NackResp, NodeStateType, Ping, PushNodeState, Suspect,
     COMPOUND_HEADER_OVERHEAD, COMPOUND_OVERHEAD, USER_MSG_OVERHEAD,
 };
-use super::{format_ip_port, ip_to_bytes, MemberlistKv, NodeState, UDP_BUFFER_SIZE};
+use super::{format_ip_port, ip_to_bytes, MemberlistKv, NodeState};
 
 /// Go `pushPullScaleThreshold`.
 const PUSH_PULL_SCALE_THRESHOLD: usize = 32;
 
 /// Memberlist protocol timing (Go `memberlist.Config` as built by dskit `buildMemberlistConfig`).
+/// Go `moveDeadNodes`.
+pub fn move_dead_nodes(nodes: &mut [NodeState], gossip_to_the_dead_time: Duration) -> usize {
+    let mut num_dead = 0usize;
+    let n = nodes.len();
+    let mut i = 0usize;
+    while i < n - num_dead {
+        if !nodes[i].dead_or_left() {
+            i += 1;
+            continue;
+        }
+        let elapsed = SystemTime::now()
+            .duration_since(nodes[i].state_change)
+            .unwrap_or(Duration::ZERO);
+        if elapsed <= gossip_to_the_dead_time {
+            i += 1;
+            continue;
+        }
+        nodes.swap(i, n - num_dead - 1);
+        num_dead += 1;
+    }
+    n - num_dead
+}
+
+pub fn shuffle_nodes<T>(nodes: &mut [T]) {
+    nodes.shuffle(&mut rand::thread_rng());
+}
+
+pub fn random_offset(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        rand::thread_rng().gen_range(0..n)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Timing {
     pub probe_interval: Duration,
@@ -72,24 +107,31 @@ impl NodeTable {
 /// Go `ackMessage`.
 pub(crate) struct AckMessage {
     pub complete: bool,
+    pub payload: Vec<u8>,
+    pub timestamp: Instant,
 }
+
+pub type AckCallback = Box<dyn FnOnce(&[u8], Instant) + Send>;
 
 /// Go `ackHandler`.
 pub(crate) struct AckHandler {
-    pub ack: Box<dyn FnOnce() + Send>,
+    pub ack: AckCallback,
     pub nack: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Go `memberlistBroadcast`: named by node, replaces older broadcasts about the same node.
-pub(crate) struct MemberlistBroadcast {
+pub struct MemberlistBroadcast {
     pub node: String,
     pub msg: Vec<u8>,
     pub notify: Option<mpsc::Sender<()>>,
 }
 
 impl Broadcast for MemberlistBroadcast {
-    fn invalidates(&self, _other: &dyn Broadcast) -> bool {
-        false
+    fn invalidates(&self, other: &dyn Broadcast) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<MemberlistBroadcast>()
+            .is_some_and(|mb| self.node == mb.node)
     }
     fn message(&self) -> &[u8] {
         &self.msg
@@ -108,7 +150,7 @@ impl Broadcast for MemberlistBroadcast {
 }
 
 /// Go `suspicionTimeout`.
-pub(crate) fn suspicion_timeout(suspicion_mult: usize, n: usize, interval: Duration) -> Duration {
+pub fn suspicion_timeout(suspicion_mult: usize, n: usize, interval: Duration) -> Duration {
     let node_scale = (n.max(1) as f64).log10().max(1.0);
     // Go: time.Duration(suspicionMult) * time.Duration(nodeScale*1000) * interval / 1000
     let ns = suspicion_mult as u128 * ((node_scale * 1000.0) as u128) * interval.as_nanos() / 1000;
@@ -116,7 +158,7 @@ pub(crate) fn suspicion_timeout(suspicion_mult: usize, n: usize, interval: Durat
 }
 
 /// Go `pushPullScale`.
-pub(crate) fn push_pull_scale(interval: Duration, n: usize) -> Duration {
+pub fn push_pull_scale(interval: Duration, n: usize) -> Duration {
     if n <= PUSH_PULL_SCALE_THRESHOLD {
         return interval;
     }
@@ -249,8 +291,12 @@ impl MemberlistKv {
         let mut nodes: Vec<&NodeState> = table.ordered();
         let mut k_nodes: Vec<NodeState> = Vec::with_capacity(k);
         if use_selection {
-            if let Some(sel) = &self.zone_select {
-                let (selected, preferred) = sel.select_nodes(&nodes);
+            let selection = if let Some(sel) = &self.node_selection_delegate {
+                Some(sel.select_nodes(&nodes))
+            } else {
+                self.zone_select.as_ref().map(|sel| sel.select_nodes(&nodes))
+            };
+            if let Some((selected, preferred)) = selection {
                 if let Some(p) = preferred {
                     if k > 0 && !exclude(nodes[p]) {
                         k_nodes.push(nodes[p].clone());
@@ -275,6 +321,18 @@ impl MemberlistKv {
                 continue;
             }
             k_nodes.push(state.clone());
+        }
+        // Exhaustive randomized fallback when the fast 3*n sample-with-replacement pass
+        // didn't fill k (e.g. small clusters where (1 - 1/n)^(3n) is non-negligible).
+        if k_nodes.len() < k {
+            let mut rem: Vec<&NodeState> = nodes
+                .into_iter()
+                .filter(|state| !exclude(state) && !k_nodes.iter().any(|kn| kn.name == state.name))
+                .collect();
+            rem.shuffle(&mut rng);
+            for state in rem.into_iter().take(k - k_nodes.len()) {
+                k_nodes.push(state.clone());
+            }
         }
         k_nodes
     }
@@ -380,8 +438,12 @@ impl MemberlistKv {
     ) {
         let ack_tx2 = ack_tx.clone();
         let handler = AckHandler {
-            ack: Box::new(move || {
-                let _ = ack_tx2.try_send(AckMessage { complete: true });
+            ack: Box::new(move |payload, timestamp| {
+                let _ = ack_tx2.try_send(AckMessage {
+                    complete: true,
+                    payload: payload.to_vec(),
+                    timestamp,
+                });
             }),
             nack: nack_tx.map(|tx| {
                 Arc::new(move || {
@@ -396,12 +458,21 @@ impl MemberlistKv {
             if let Some(kv) = me.upgrade() {
                 kv.ack_handlers.lock().remove(&seq_no);
             }
-            let _ = ack_tx.try_send(AckMessage { complete: false });
+            let _ = ack_tx.try_send(AckMessage {
+                complete: false,
+                payload: Vec::new(),
+                timestamp: Instant::now(),
+            });
         });
     }
 
     /// Go `setAckHandler`.
-    fn set_ack_handler(&self, seq_no: u32, ack: Box<dyn FnOnce() + Send>, timeout: Duration) {
+    pub(crate) fn set_ack_handler_public(
+        &self,
+        seq_no: u32,
+        ack: AckCallback,
+        timeout: Duration,
+    ) {
         self.ack_handlers
             .lock()
             .insert(seq_no, AckHandler { ack, nack: None });
@@ -415,10 +486,10 @@ impl MemberlistKv {
     }
 
     /// Go `invokeAckHandler`.
-    pub(crate) fn invoke_ack_handler(&self, ack: &AckResp) {
+    pub(crate) fn invoke_ack_handler(&self, ack: &AckResp, timestamp: Instant) {
         let h = self.ack_handlers.lock().remove(&ack.seq_no);
         if let Some(h) = h {
-            (h.ack)();
+            (h.ack)(ack.payload.as_deref().unwrap_or(&[]), timestamp);
         }
     }
 
@@ -479,10 +550,15 @@ impl MemberlistKv {
 
         // Wait for response or probe timeout.
         let probe_timeout = self.timing.probe_timeout;
+        let deadline = started + probe_interval;
         tokio::select! {
             v = ack_rx.recv() => {
                 if let Some(v) = v {
                     if v.complete {
+                        if let Some(pd) = &self.ping_delegate {
+                            let rtt = v.timestamp.saturating_duration_since(started);
+                            pd.notify_ping_complete(node, rtt, &v.payload);
+                        }
                         self.awareness.apply_delta(awareness_delta);
                         self.go_metrics.measure_since(&["memberlist", "probeNode"], started, &[]);
                         return;
@@ -519,9 +595,43 @@ impl MemberlistKv {
             let _ = self.send_msg(&peer.address(), encode_indirect_ping(&ind)).await;
         }
 
-        // DisableTcpPings = true in dskit: no TCP fallback. Wait for acks or the (scaled) timeout.
+        let disable_tcp = self.disable_tcp_pings
+            || self
+                .disable_tcp_pings_for_node
+                .as_ref()
+                .is_some_and(|f| f(&node.name));
+        let fallback_rx = if !disable_tcp && node.pmax() >= 3 {
+            if let Some(kv) = self.self_arc() {
+                let (ftx, frx) = tokio::sync::oneshot::channel();
+                let target_addr = node.address();
+                let target_name = node.name.clone();
+                let ping_clone = ping.clone();
+                tokio::spawn(async move {
+                    let ok = kv
+                        .send_ping_and_wait_for_ack(&target_addr, &target_name, ping_clone, deadline)
+                        .await
+                        .unwrap_or(false);
+                    let _ = ftx.send(ok);
+                });
+                Some(frx)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if let Some(v) = ack_rx.recv().await {
             if v.complete {
+                self.awareness.apply_delta(awareness_delta);
+                self.go_metrics.measure_since(&["memberlist", "probeNode"], started, &[]);
+                return;
+            }
+        }
+
+        if let Some(frx) = fallback_rx {
+            if let Ok(true) = frx.await {
+                warn!(node = %node.name, "memberlist: Was able to connect over TCP but UDP probes failed");
                 self.awareness.apply_delta(awareness_delta);
                 self.go_metrics.measure_since(&["memberlist", "probeNode"], started, &[]);
                 return;
@@ -592,7 +702,14 @@ impl MemberlistKv {
                 NodeStateType::Left => true,
             }
         });
-        let bytes_avail = UDP_BUFFER_SIZE - COMPOUND_HEADER_OVERHEAD - self.label_overhead();
+        let enc_overhead = if self.encryption_enabled() && self.gossip_verify_outgoing {
+            super::super::security::encrypt_overhead(self.encryption_version())
+        } else {
+            0
+        };
+        let bytes_avail = self
+            .udp_buffer_size
+            .saturating_sub(COMPOUND_HEADER_OVERHEAD + self.label_overhead() + enc_overhead);
         for node in k_nodes {
             let msgs = self.get_broadcasts(COMPOUND_OVERHEAD, bytes_avail);
             if msgs.is_empty() {
@@ -652,9 +769,10 @@ impl MemberlistKv {
             warn!(node = %p.node, from, "memberlist: Got ping for unexpected node");
             return;
         }
+        let payload = self.ping_delegate.as_ref().map(|pd| pd.ack_payload());
         let ack = AckResp {
             seq_no: p.seq_no,
-            payload: None,
+            payload,
         };
         let addr = if !p.source_addr.is_empty() && p.source_port > 0 {
             format_ip_port(&p.source_addr, p.source_port)
@@ -686,9 +804,9 @@ impl MemberlistKv {
             let ind_addr = ind_addr.clone();
             let seq = ind.seq_no;
             let acked_cb = Arc::clone(&acked);
-            self.set_ack_handler(
+            self.set_ack_handler_public(
                 local_seq,
-                Box::new(move || {
+                Box::new(move |_payload, _ts| {
                     acked_cb.0.store(true, Ordering::Release);
                     acked_cb.1.notify_waiters();
                     if let Some(kv) = me.upgrade() {
@@ -758,7 +876,6 @@ impl MemberlistKv {
 
     /// Go `aliveNode`.
     pub(crate) fn alive_node(&self, a: &Alive, notify: Option<mpsc::Sender<()>>, bootstrap: bool) {
-        let mut table = self.nodes.write();
         if self.has_left() && a.node == self.node_name {
             return;
         }
@@ -769,89 +886,173 @@ impl MemberlistKv {
                 return;
             }
         }
-
-        let mut updates_node = false;
-        if !table.map.contains_key(&a.node) {
-            let state = NodeState {
+        if let Some(alive_del) = &self.alive_delegate {
+            if a.vsn.len() < 6 {
+                warn!(node = %a.node, "memberlist: ignoring alive message because Vsn is not present");
+                return;
+            }
+            let node = NodeState {
                 name: a.node.clone(),
                 addr: a.addr.clone(),
                 port: a.port,
                 meta: a.meta.clone(),
-                incarnation: 0,
-                state: NodeStateType::Dead,
+                incarnation: a.incarnation,
+                state: NodeStateType::Alive,
                 state_change: SystemTime::now(),
-                vsn: if a.vsn.len() > 5 { a.vsn.clone() } else { vec![0; 6] },
+                vsn: a.vsn.clone(),
             };
-            table.map.insert(a.node.clone(), state);
-            let n = table.order.len();
-            let offset = if n == 0 { 0 } else { rand::thread_rng().gen_range(0..n as u32) as usize };
-            table.order.push(a.node.clone());
-            table.order.swap(offset, n);
-            self.num_nodes.fetch_add(1, Ordering::AcqRel);
-        } else {
-            let state = table.map.get(&a.node).expect("present");
-            if state.addr != a.addr || state.port != a.port {
-                let reclaim = self.timing.dead_node_reclaim_time;
-                let can_reclaim = !reclaim.is_zero()
-                    && SystemTime::now()
-                        .duration_since(state.state_change)
-                        .unwrap_or(Duration::ZERO)
-                        > reclaim;
-                if state.state == NodeStateType::Left
-                    || (state.state == NodeStateType::Dead && can_reclaim)
+            if let Err(err) = alive_del.notify_alive(&node) {
+                warn!(node = %a.node, %err, "memberlist: ignoring alive message");
+                return;
+            }
+        }
+
+        enum PendingEvent {
+            Join(NodeState),
+            Update(NodeState),
+        }
+
+        let pending_event = {
+            let mut table = self.nodes.write();
+            if self.has_left() && a.node == self.node_name {
+                return;
+            }
+
+            let mut updates_node = false;
+            if !table.map.contains_key(&a.node) {
+                if let Some(cidrs) = self.cidrs_allowed.as_deref() {
+                    if let Some(ip) = super::bytes_to_ip(&a.addr) {
+                        if let Err(err) = super::super::security::ip_allowed(Some(cidrs), ip) {
+                            warn!(node = %a.node, %err, "memberlist: Rejected node");
+                            return;
+                        }
+                    }
+                }
+                let state = NodeState {
+                    name: a.node.clone(),
+                    addr: a.addr.clone(),
+                    port: a.port,
+                    meta: a.meta.clone(),
+                    incarnation: 0,
+                    state: NodeStateType::Dead,
+                    state_change: SystemTime::now(),
+                    vsn: if a.vsn.len() > 5 { a.vsn.clone() } else { vec![0; 6] },
+                };
+                table.map.insert(a.node.clone(), state);
+                let n = table.order.len();
+                let offset = if n == 0 { 0 } else { rand::thread_rng().gen_range(0..n as u32) as usize };
+                table.order.push(a.node.clone());
+                table.order.swap(offset, n);
+                self.num_nodes.fetch_add(1, Ordering::AcqRel);
+            } else {
+                let state = table.map.get(&a.node).expect("present");
+                if state.addr != a.addr || state.port != a.port {
+                    if let Some(cidrs) = self.cidrs_allowed.as_deref() {
+                        if let Some(ip) = super::bytes_to_ip(&a.addr) {
+                            if let Err(err) = super::super::security::ip_allowed(Some(cidrs), ip) {
+                                warn!(node = %a.node, %err, "memberlist: Rejected IP update");
+                                return;
+                            }
+                        }
+                    }
+                    let reclaim = self.timing.dead_node_reclaim_time;
+                    let can_reclaim = !reclaim.is_zero()
+                        && SystemTime::now()
+                            .duration_since(state.state_change)
+                            .unwrap_or(Duration::ZERO)
+                            > reclaim;
+                    if state.state == NodeStateType::Left
+                        || (state.state == NodeStateType::Dead && can_reclaim)
+                    {
+                        info!(node = %state.name, "memberlist: Updating address for left or failed node");
+                        updates_node = true;
+                    } else {
+                        error!(
+                            node = %state.name,
+                            mine = %state.address(),
+                            theirs = %format_ip_port(&a.addr, a.port),
+                            "memberlist: Conflicting address"
+                        );
+                        let existing_clone = state.clone();
+                        let other = NodeState {
+                            name: a.node.clone(),
+                            addr: a.addr.clone(),
+                            port: a.port,
+                            meta: a.meta.clone(),
+                            incarnation: a.incarnation,
+                            state: NodeStateType::Alive,
+                            state_change: SystemTime::now(),
+                            vsn: if a.vsn.len() > 5 { a.vsn.clone() } else { vec![0; 6] },
+                        };
+                        drop(table);
+                        if let Some(cd) = &self.conflict_delegate {
+                            cd.notify_conflict(&existing_clone, &other);
+                        }
+                        return;
+                    }
+                }
+            }
+
+            let is_local = a.node == self.node_name;
+            let state_inc = table.map[&a.node].incarnation;
+            if a.incarnation <= state_inc && !is_local && !updates_node {
+                return;
+            }
+            if a.incarnation < state_inc && is_local {
+                return;
+            }
+            if let Some(t) = table.timers.remove(&a.node) {
+                t.stop();
+            }
+
+            let state = table.map.get_mut(&a.node).expect("present");
+            let old_state = state.state;
+            let old_meta = state.meta.clone();
+            if !bootstrap && is_local {
+                if a.incarnation == state.incarnation
+                    && a.meta.as_deref().unwrap_or_default() == state.meta.as_deref().unwrap_or_default()
+                    && a.vsn == state.vsn
                 {
-                    info!(node = %state.name, "memberlist: Updating address for left or failed node");
-                    updates_node = true;
-                } else {
-                    error!(
-                        node = %state.name,
-                        mine = %state.address(),
-                        theirs = %format_ip_port(&a.addr, a.port),
-                        "memberlist: Conflicting address"
-                    );
                     return;
+                }
+                self.refute(state, a.incarnation);
+                warn!(node = %a.node, "memberlist: Refuting an alive message");
+            } else {
+                self.queue_ml_broadcast(&a.node, encode_alive(a), notify);
+                if !a.vsn.is_empty() {
+                    state.vsn = a.vsn.clone();
+                }
+                state.incarnation = a.incarnation;
+                state.meta = a.meta.clone();
+                state.addr = a.addr.clone();
+                state.port = a.port;
+                if state.state != NodeStateType::Alive {
+                    state.state = NodeStateType::Alive;
+                    state.state_change = SystemTime::now();
+                }
+            }
+            self.go_metrics
+                .incr_counter(&["memberlist", "msg", "alive"], 1.0, &[]);
+            if old_state == NodeStateType::Dead || old_state == NodeStateType::Left {
+                Some(PendingEvent::Join(state.clone()))
+            } else if old_meta.as_deref().unwrap_or_default()
+                != state.meta.as_deref().unwrap_or_default()
+            {
+                Some(PendingEvent::Update(state.clone()))
+            } else {
+                None
+            }
+        };
+
+        if let Some(ev) = pending_event {
+            let ed = self.event_delegate.read().clone();
+            if let Some(ed) = ed {
+                match ev {
+                    PendingEvent::Join(n) => ed.notify_join(&n),
+                    PendingEvent::Update(n) => ed.notify_update(&n),
                 }
             }
         }
-
-        let is_local = a.node == self.node_name;
-        let state_inc = table.map[&a.node].incarnation;
-        if a.incarnation <= state_inc && !is_local && !updates_node {
-            return;
-        }
-        if a.incarnation < state_inc && is_local {
-            return;
-        }
-        if let Some(t) = table.timers.remove(&a.node) {
-            t.stop();
-        }
-
-        let state = table.map.get_mut(&a.node).expect("present");
-        if !bootstrap && is_local {
-            if a.incarnation == state.incarnation
-                && a.meta.as_deref().unwrap_or_default() == state.meta.as_deref().unwrap_or_default()
-                && a.vsn == state.vsn
-            {
-                return;
-            }
-            self.refute(state, a.incarnation);
-            warn!(node = %a.node, "memberlist: Refuting an alive message");
-        } else {
-            self.queue_ml_broadcast(&a.node, encode_alive(a), notify);
-            if !a.vsn.is_empty() {
-                state.vsn = a.vsn.clone();
-            }
-            state.incarnation = a.incarnation;
-            state.meta = a.meta.clone();
-            state.addr = a.addr.clone();
-            state.port = a.port;
-            if state.state != NodeStateType::Alive {
-                state.state = NodeStateType::Alive;
-                state.state_change = SystemTime::now();
-            }
-        }
-        self.go_metrics
-            .incr_counter(&["memberlist", "msg", "alive"], 1.0, &[]);
     }
 
     /// Go `suspectNode`.
@@ -965,6 +1166,12 @@ impl MemberlistKv {
             NodeStateType::Dead
         };
         state.state_change = SystemTime::now();
+        let left_node = state.clone();
+        drop(table);
+        let ed = self.event_delegate.read().clone();
+        if let Some(ed) = ed {
+            ed.notify_leave(&left_node);
+        }
     }
 
     /// Go `mergeState`.
@@ -1011,32 +1218,55 @@ impl MemberlistKv {
             }
             out
         };
-        let mut all: Vec<(String, [u8; 6])> = remote.iter().map(|r| (r.name.clone(), vsn6(&r.vsn))).collect();
-        let locals: Vec<(String, [u8; 6])> =
-            table.map.values().map(|n| (n.name.clone(), vsn6(&n.vsn))).collect();
-        for (_, v) in all.iter().chain(locals.iter()) {
-            if v[1] == 0 {
+        for rn in remote {
+            if rn.state != NodeStateType::Alive || rn.vsn.is_empty() {
                 continue;
             }
+            let v = vsn6(&rn.vsn);
             maxpmin = maxpmin.max(v[0]);
             minpmax = minpmax.min(v[1]);
             maxdmin = maxdmin.max(v[3]);
             mindmax = mindmax.min(v[4]);
         }
-        all.extend(locals);
-        for (name, v) in all {
-            if v[1] == 0 {
+        for n in table.map.values() {
+            if n.state != NodeStateType::Alive {
                 continue;
             }
+            let v = vsn6(&n.vsn);
+            maxpmin = maxpmin.max(v[0]);
+            minpmax = minpmax.min(v[1]);
+            maxdmin = maxdmin.max(v[3]);
+            mindmax = mindmax.min(v[4]);
+        }
+        for rn in remote {
+            let v = vsn6(&rn.vsn);
             let (pcur, dcur) = (v[2], v[5]);
             if pcur < maxpmin || pcur > minpmax {
                 return Err(format!(
-                    "Node '{name}' protocol version ({pcur}) is incompatible: [{maxpmin}, {minpmax}]"
+                    "Node '{}' protocol version ({pcur}) is incompatible: [{maxpmin}, {minpmax}]",
+                    rn.name
                 ));
             }
             if dcur < maxdmin || dcur > mindmax {
                 return Err(format!(
-                    "Node '{name}' delegate protocol version ({dcur}) is incompatible: [{maxdmin}, {mindmax}]"
+                    "Node '{}' delegate protocol version ({dcur}) is incompatible: [{maxdmin}, {mindmax}]",
+                    rn.name
+                ));
+            }
+        }
+        for n in table.map.values() {
+            let v = vsn6(&n.vsn);
+            let (pcur, dcur) = (v[2], v[5]);
+            if pcur < maxpmin || pcur > minpmax {
+                return Err(format!(
+                    "Node '{}' protocol version ({pcur}) is incompatible: [{maxpmin}, {minpmax}]",
+                    n.name
+                ));
+            }
+            if dcur < maxdmin || dcur > mindmax {
+                return Err(format!(
+                    "Node '{}' delegate protocol version ({dcur}) is incompatible: [{maxdmin}, {mindmax}]",
+                    n.name
                 ));
             }
         }

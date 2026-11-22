@@ -457,6 +457,12 @@ pub fn encode_user_msg_stream(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+pub fn compress_payload_raw(algo: u8, input: &[u8]) -> Result<Vec<u8>, String> {
+    let algo = CompressionType::try_from(algo)
+        .map_err(|a| format!("memberlist: cannot compress with unknown algorithm {a}"))?;
+    compress_payload(algo, input)
+}
+
 pub fn compress_payload(algo: CompressionType, input: &[u8]) -> Result<Vec<u8>, String> {
     let encoded = match algo {
         CompressionType::Lzw => lzw_compress(input),
@@ -472,6 +478,33 @@ pub fn compress_payload(algo: CompressionType, input: &[u8]) -> Result<Vec<u8>, 
     write_str_legacy(&mut out, "Buf");
     write_raw_legacy(&mut out, &encoded);
     Ok(out)
+}
+
+pub fn compression_type_label(algo: Option<CompressionType>) -> &'static str {
+    match algo {
+        Some(CompressionType::Lzw) => "lzw",
+        Some(CompressionType::Snappy) => "snappy",
+        None => "unknown",
+    }
+}
+
+pub fn resolve_compression_type(algo: &str) -> Result<CompressionType, String> {
+    match algo {
+        "" | "lzw" => Ok(CompressionType::Lzw),
+        "snappy" => Ok(CompressionType::Snappy),
+        other => Err(format!("memberlist: unknown CompressionAlgorithm {other:?}")),
+    }
+}
+
+pub fn decompress_payload(msg: &[u8]) -> (Option<CompressionType>, Result<Vec<u8>, String>) {
+    match decode_compressed_payload(msg) {
+        Ok(cp) => {
+            let algo = Some(cp.algo);
+            let res = decompress_buffer(cp.algo, &cp.buf);
+            (algo, res)
+        }
+        Err(err) => (None, Err(format!("msgpack decode error: {err}"))),
+    }
 }
 
 pub fn decompress_buffer(algo: CompressionType, buf: &[u8]) -> Result<Vec<u8>, String> {
@@ -1046,6 +1079,57 @@ pub fn decode_user_msg_stream(buf: &[u8]) -> Result<&[u8], String> {
 }
 
 // --- Framing helpers: label, CRC32, compound ---
+
+pub fn label_overhead(label: &str) -> usize {
+    if label.is_empty() {
+        0
+    } else {
+        2 + label.len()
+    }
+}
+
+pub const MAX_POOLED_PUSH_PULL_BUF_CAP: usize = 32 * 1024 * 1024;
+pub const PUSH_PULL_BUF_INITIAL_CAP: usize = 64 * 1024;
+
+static PUSH_PULL_BUF_POOL: parking_lot::Mutex<Vec<Vec<u8>>> = parking_lot::Mutex::new(Vec::new());
+
+pub fn get_push_pull_buffer() -> Vec<u8> {
+    let mut b = PUSH_PULL_BUF_POOL
+        .lock()
+        .pop()
+        .unwrap_or_else(|| Vec::with_capacity(PUSH_PULL_BUF_INITIAL_CAP));
+    b.clear();
+    if b.capacity() < PUSH_PULL_BUF_INITIAL_CAP {
+        b.reserve(PUSH_PULL_BUF_INITIAL_CAP - b.capacity());
+    }
+    b
+}
+
+pub fn release_push_pull_buffer(mut b: Vec<u8>) {
+    if b.capacity() > MAX_POOLED_PUSH_PULL_BUF_CAP {
+        return;
+    }
+    b.clear();
+    let mut pool = PUSH_PULL_BUF_POOL.lock();
+    if pool.len() < 16 {
+        pool.push(b);
+    }
+}
+
+pub fn has_port(s: &str) -> bool {
+    if s.rfind('[') == Some(0) {
+        return s.rfind(':') > s.rfind(']');
+    }
+    s.matches(':').count() == 1
+}
+
+pub fn ensure_port(s: &str, port: u16) -> String {
+    if has_port(s) {
+        return s.to_string();
+    }
+    let trimmed = s.trim_start_matches('[').trim_end_matches(']');
+    crate::dns::join_host_port(trimmed, &port.to_string())
+}
 
 pub fn add_label_header(buf: &[u8], label: &str) -> Result<Vec<u8>, String> {
     if label.is_empty() {

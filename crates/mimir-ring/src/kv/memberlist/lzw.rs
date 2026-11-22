@@ -18,6 +18,34 @@ const EOF_CODE: u32 = CLEAR_CODE + 1; // 257
 const MAX_WIDTH: u32 = 12;
 const DECODER_INVALID_CODE: u16 = 0xffff;
 
+pub const MAX_POOLED_LZW_BUFFER_CAP: usize = 128 * 1024;
+const LZW_BUFFER_INITIAL_CAP: usize = 4096;
+
+static LZW_BUF_POOL: parking_lot::Mutex<Vec<Vec<u8>>> = parking_lot::Mutex::new(Vec::new());
+
+pub fn get_lzw_buffer() -> Vec<u8> {
+    let mut b = LZW_BUF_POOL
+        .lock()
+        .pop()
+        .unwrap_or_else(|| Vec::with_capacity(LZW_BUFFER_INITIAL_CAP));
+    b.clear();
+    if b.capacity() < LZW_BUFFER_INITIAL_CAP {
+        b.reserve(LZW_BUFFER_INITIAL_CAP - b.capacity());
+    }
+    b
+}
+
+pub fn release_lzw_buffer(mut b: Vec<u8>) {
+    if b.capacity() > MAX_POOLED_LZW_BUFFER_CAP {
+        return;
+    }
+    b.clear();
+    let mut pool = LZW_BUF_POOL.lock();
+    if pool.len() < 64 {
+        pool.push(b);
+    }
+}
+
 /// Standard IEEE 802.3 CRC-32 (`0xedb88320` reflected polynomial), matching Go `crc32.ChecksumIEEE`.
 pub fn crc32_ieee(data: &[u8]) -> u32 {
     const POLY: u32 = 0xedb8_8320;
