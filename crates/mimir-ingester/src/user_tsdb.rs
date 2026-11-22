@@ -653,6 +653,7 @@ impl UserTsdb {
                 .tsdb
                 .shared_postings_for_matchers_cache
                 .then(|| shared_metrics.get_or_init_shared_block_cache(blocks_cfg)),
+            compaction_delay: Duration::ZERO,
         };
 
         if let Some(ref reg) = tsdb_prom_reg {
