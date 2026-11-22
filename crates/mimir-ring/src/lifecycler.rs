@@ -1737,6 +1737,7 @@ impl Lifecycler {
                             *ps_cb.lock() = InstanceState::Pending;
                             ring_desc.ingesters.insert(id.clone(), inst);
                         } else {
+                            let prev_ts = inst.timestamp;
                             let mut toks = inst.tokens.clone();
                             info!(
                                 state = inst.instance_state().as_str_name(),
@@ -1784,7 +1785,12 @@ impl Lifecycler {
                             if orig.as_ref() == Some(&inst) {
                                 needs_write = false;
                             } else {
-                                inst.timestamp = system_time_to_unix_secs(SystemTime::now());
+                                let now_s = system_time_to_unix_secs(SystemTime::now());
+                                inst.timestamp = if prev_ts == now_s {
+                                    now_s.saturating_add(1)
+                                } else {
+                                    now_s
+                                };
                                 ring_desc.ingesters.insert(id.clone(), inst);
                             }
                         }

@@ -532,9 +532,6 @@ impl PartitionInstanceLifecycler {
                             _ = ctx.canceled() => return Err(ServiceError::Canceled),
                         }
                     }
-                    if ctx.is_canceled() {
-                        return Err(ServiceError::Canceled);
-                    }
                     l.running.store(true, Ordering::Release);
                     Ok(())
                 })
