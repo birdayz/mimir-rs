@@ -111,6 +111,14 @@ func main() {
 		out, err = cmdReadSTTSDB(input)
 	case "format-propagation-tracker":
 		out, err = cmdFormatPropagationTracker(input)
+	case "fast-regex-check":
+		out, err = cmdFastRegexCheck(input)
+	case "yaml-v3-check":
+		out, err = cmdYamlV3Check(input)
+	case "traceparent-check":
+		out, err = cmdTraceparentCheck(input)
+	case "ring-merge-check":
+		out, err = cmdRingMergeCheck(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}

@@ -42,6 +42,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute build version
+        id: meta
+        run: |
+          echo "version=$(./scripts/build-version.sh "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -53,7 +59,9 @@ jobs:
           no-cache: true
           build-args: |
             SOURCE_DATE_EPOCH=0
-            revision=${{ github.sha }}
+            version=${{ steps.meta.outputs.version }}
+            branch=main
+            revision=${{ steps.meta.outputs.short_sha }}
           outputs: type=image,name=ghcr.io/birdayz/mimir-rs,push-by-digest=true,name-canonical=true,rewrite-timestamp=true,push=true
 
       - name: Export digest
@@ -75,6 +83,9 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
@@ -96,13 +107,16 @@ jobs:
         run: |
           AMD64_DIGEST=$(cat /tmp/digests/amd64)
           ARM64_DIGEST=$(cat /tmp/digests/arm64)
+          BUILD_VERSION=$(./scripts/build-version.sh "$GITHUB_SHA")
           SHORT_SHA="${GITHUB_SHA::7}"
           echo "amd64 digest: ${AMD64_DIGEST}"
           echo "arm64 digest: ${ARM64_DIGEST}"
+          echo "build version: ${BUILD_VERSION}"
           docker buildx imagetools create \
             -t "ghcr.io/birdayz/mimir-rs:${GITHUB_SHA}" \
             -t "ghcr.io/birdayz/mimir-rs:${SHORT_SHA}" \
+            -t "ghcr.io/birdayz/mimir-rs:${BUILD_VERSION}" \
             -t "ghcr.io/birdayz/mimir-rs:main" \
             "ghcr.io/birdayz/mimir-rs@${AMD64_DIGEST}" \
             "ghcr.io/birdayz/mimir-rs@${ARM64_DIGEST}"
-          docker buildx imagetools inspect "ghcr.io/birdayz/mimir-rs:${GITHUB_SHA}"
+          docker buildx imagetools inspect "ghcr.io/birdayz/mimir-rs:${BUILD_VERSION}"
