@@ -2,6 +2,10 @@
 //!
 //! Ported from github.com/prometheus/prometheus/tsdb/record/record.go.
 
+use std::sync::Arc;
+
+use hashbrown::HashMap;
+use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::chunkenc::histogram_model::{
@@ -182,14 +186,82 @@ pub enum DecodedRecord {
     Unknown(u8),
 }
 
+const MAX_METADATA_INTERN_ENTRIES: usize = 8192;
+
+/// Metadata record with interned `Arc<str>` strings matching Go `RecordDecoder.metaStrings`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InternedRefMetadata {
+    pub ref_id: u64,
+    pub metric_type: u8,
+    pub unit: Arc<str>,
+    pub help: Arc<str>,
+}
+
 /// Decoder for Prometheus TSDB WAL/WBL records (`record.Decoder`).
 #[derive(Debug, Default)]
-pub struct RecordDecoder;
+pub struct RecordDecoder {
+    meta_strings: Mutex<HashMap<Box<str>, Arc<str>>>,
+}
 
 impl RecordDecoder {
     #[inline]
     pub fn new() -> Self {
-        Self
+        Self {
+            meta_strings: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn intern_metadata_string(&self, b: &[u8]) -> Arc<str> {
+        let s = String::from_utf8_lossy(b);
+        let mut guard = self.meta_strings.lock();
+        if let Some(existing) = guard.get(s.as_ref()) {
+            return Arc::clone(existing);
+        }
+        if guard.len() >= MAX_METADATA_INTERN_ENTRIES {
+            guard.clear();
+        }
+        let arc: Arc<str> = Arc::from(s.as_ref());
+        guard.insert(s.into_owned().into_boxed_str(), Arc::clone(&arc));
+        arc
+    }
+
+    pub fn metadata_interned(&self, rec: &[u8]) -> Result<Vec<InternedRefMetadata>, RecordError> {
+        let mut dec = Decbuf::new(rec);
+        let typ = dec.byte()?;
+        if typ != RecordType::Metadata as u8 {
+            return Err(RecordError::InvalidType {
+                found: typ,
+                expected: "Metadata(6)",
+            });
+        }
+        let empty: Arc<str> = Arc::from("");
+        let mut out = Vec::new();
+        while !dec.is_empty() {
+            let ref_id = dec.uvarint64()?;
+            let metric_type = dec.byte()?;
+            let num_fields = dec.uvarint()?;
+            let mut unit = Arc::clone(&empty);
+            let mut help = Arc::clone(&empty);
+            for _ in 0..num_fields {
+                let field_name = dec.uvarint_bytes()?;
+                let field_val = dec.uvarint_bytes()?;
+                if field_val.is_empty() {
+                    continue;
+                }
+                if field_name == UNIT_META_NAME.as_bytes() {
+                    unit = self.intern_metadata_string(field_val);
+                } else if field_name == HELP_META_NAME.as_bytes() {
+                    help = self.intern_metadata_string(field_val);
+                }
+            }
+            out.push(InternedRefMetadata {
+                ref_id,
+                metric_type,
+                unit,
+                help,
+            });
+        }
+        Ok(out)
     }
 
     #[inline]
@@ -502,8 +574,10 @@ impl RecordDecoder {
         while !dec.is_empty() {
             let dref = dec.varint64()?;
             let dtime = dec.varint64()?;
+            let t = base_time.wrapping_add(dtime);
             let mut h = decode_histogram(dec)?;
             if !is_known_schema(h.schema) {
+                tracing::warn!(schema = h.schema, timestamp = t, "skipping histogram with unknown schema in WAL record");
                 continue;
             }
             if h.schema > EXPONENTIAL_SCHEMA_MAX && h.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
@@ -512,7 +586,7 @@ impl RecordDecoder {
             out.push(RefHistogramSample {
                 ref_id: base_ref.wrapping_add(dref as u64),
                 st: 0,
-                t: base_time.wrapping_add(dtime),
+                t,
                 h,
             });
         }
@@ -548,6 +622,7 @@ impl RecordDecoder {
 
             let mut h = decode_histogram(dec)?;
             if !is_known_schema(h.schema) {
+                tracing::warn!(schema = h.schema, timestamp = t, "skipping histogram with unknown schema in WAL record");
                 continue;
             }
             if h.schema > EXPONENTIAL_SCHEMA_MAX && h.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
@@ -598,8 +673,10 @@ impl RecordDecoder {
         while !dec.is_empty() {
             let dref = dec.varint64()?;
             let dtime = dec.varint64()?;
+            let t = base_time.wrapping_add(dtime);
             let mut fh = decode_float_histogram(dec)?;
             if !is_known_schema(fh.schema) {
+                tracing::warn!(schema = fh.schema, timestamp = t, "skipping histogram with unknown schema in WAL record");
                 continue;
             }
             if fh.schema > EXPONENTIAL_SCHEMA_MAX && fh.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
@@ -608,7 +685,7 @@ impl RecordDecoder {
             out.push(RefFloatHistogramSample {
                 ref_id: base_ref.wrapping_add(dref as u64),
                 st: 0,
-                t: base_time.wrapping_add(dtime),
+                t,
                 fh,
             });
         }
@@ -644,6 +721,7 @@ impl RecordDecoder {
 
             let mut fh = decode_float_histogram(dec)?;
             if !is_known_schema(fh.schema) {
+                tracing::warn!(schema = fh.schema, timestamp = t, "skipping histogram with unknown schema in WAL record");
                 continue;
             }
             if fh.schema > EXPONENTIAL_SCHEMA_MAX && fh.schema <= EXPONENTIAL_SCHEMA_MAX_RESERVED {
@@ -937,6 +1015,97 @@ pub fn encode_float_histogram(buf: &mut Encbuf, h: &FloatHistogram) {
         for &v in &h.custom_values {
             buf.put_be_f64(v);
         }
+    }
+}
+
+/// Pool of cleared record buffers matching `tsdb/record/buffers.go` (`BuffersPool`).
+#[derive(Debug, Default)]
+pub struct BuffersPool {
+    series: Mutex<Vec<Vec<RefSeries>>>,
+    samples: Mutex<Vec<Vec<RefSample>>>,
+    exemplars: Mutex<Vec<Vec<RefExemplar>>>,
+    histograms: Mutex<Vec<Vec<Option<RefHistogramSample>>>>,
+    float_histograms: Mutex<Vec<Vec<Option<RefFloatHistogramSample>>>>,
+    metadata: Mutex<Vec<Vec<RefMetadata>>>,
+}
+
+impl BuffersPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get_ref_series(&self, capacity: usize) -> Vec<RefSeries> {
+        self.series
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(capacity))
+    }
+
+    pub fn put_ref_series(&self, mut b: Vec<RefSeries>) {
+        b.clear();
+        self.series.lock().push(b);
+    }
+
+    pub fn get_samples(&self, capacity: usize) -> Vec<RefSample> {
+        self.samples
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(capacity))
+    }
+
+    pub fn put_samples(&self, mut b: Vec<RefSample>) {
+        b.clear();
+        self.samples.lock().push(b);
+    }
+
+    pub fn get_exemplars(&self, capacity: usize) -> Vec<RefExemplar> {
+        self.exemplars
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(capacity))
+    }
+
+    pub fn put_exemplars(&self, mut b: Vec<RefExemplar>) {
+        b.clear();
+        self.exemplars.lock().push(b);
+    }
+
+    pub fn get_histograms(&self, capacity: usize) -> Vec<Option<RefHistogramSample>> {
+        self.histograms
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(capacity))
+    }
+
+    pub fn put_histograms(&self, mut b: Vec<Option<RefHistogramSample>>) {
+        b.fill(None);
+        b.clear();
+        self.histograms.lock().push(b);
+    }
+
+    pub fn get_float_histograms(&self, capacity: usize) -> Vec<Option<RefFloatHistogramSample>> {
+        self.float_histograms
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(capacity))
+    }
+
+    pub fn put_float_histograms(&self, mut b: Vec<Option<RefFloatHistogramSample>>) {
+        b.fill(None);
+        b.clear();
+        self.float_histograms.lock().push(b);
+    }
+
+    pub fn get_metadata(&self, capacity: usize) -> Vec<RefMetadata> {
+        self.metadata
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(capacity))
+    }
+
+    pub fn put_metadata(&self, mut b: Vec<RefMetadata>) {
+        b.clear();
+        self.metadata.lock().push(b);
     }
 }
 
