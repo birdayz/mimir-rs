@@ -39,8 +39,14 @@ impl InstanceRingReader for Ring {
     }
 }
 
-struct StaticPartitionRingReader {
+pub struct StaticPartitionRingReader {
     ring: Arc<PartitionRing>,
+}
+
+impl StaticPartitionRingReader {
+    pub fn new(ring: Arc<PartitionRing>) -> Self {
+        Self { ring }
+    }
 }
 
 impl PartitionRingReader for StaticPartitionRingReader {
@@ -166,6 +172,182 @@ impl PartitionInstanceRing {
             self.heartbeat_timeout,
         ))
     }
+}
+
+/// Holds one PartitionInstanceRing per watcher in a PartitionRingWatchers group.
+///
+/// Ported from github.com/grafana/dskit/ring/partition_instance_rings.go.
+pub struct PartitionInstanceRings {
+    rings: Vec<PartitionInstanceRing>,
+}
+
+impl PartitionInstanceRings {
+    pub fn new(
+        watchers: &super::watchers::PartitionRingWatchers,
+        instance_ring: Arc<dyn InstanceRingReader>,
+        heartbeat_timeout: Duration,
+    ) -> Self {
+        let rings = watchers
+            .all()
+            .iter()
+            .map(|w| {
+                PartitionInstanceRing::new(
+                    Arc::clone(w) as Arc<dyn PartitionRingReader>,
+                    Arc::clone(&instance_ring),
+                    heartbeat_timeout,
+                )
+            })
+            .collect();
+        Self { rings }
+    }
+
+    pub fn count(&self) -> usize {
+        self.rings.len()
+    }
+
+    pub fn get(&self, idx: usize) -> &PartitionInstanceRing {
+        &self.rings[idx]
+    }
+}
+
+/// Partition instance ring supporting multi-partition ownership.
+///
+/// Ported from github.com/grafana/dskit/ring/multi_partition_instance_ring.go.
+pub struct MultiPartitionInstanceRing {
+    partitions_ring_reader: Arc<dyn PartitionRingReader>,
+    instances_ring: Arc<dyn InstanceRingReader>,
+    heartbeat_timeout: Duration,
+}
+
+impl MultiPartitionInstanceRing {
+    pub fn new(
+        partitions_ring_reader: Arc<dyn PartitionRingReader>,
+        instances_ring: Arc<dyn InstanceRingReader>,
+        heartbeat_timeout: Duration,
+    ) -> Self {
+        Self {
+            partitions_ring_reader,
+            instances_ring,
+            heartbeat_timeout,
+        }
+    }
+
+    pub fn partition_ring(&self) -> Arc<PartitionRing> {
+        self.partitions_ring_reader.partition_ring()
+    }
+
+    pub fn get_replication_set_for_partition_and_operation(
+        &self,
+        partition_id: i32,
+        op: Operation,
+    ) -> Result<ReplicationSet, PartitionRingError> {
+        self.get_replication_set_for_partition_and_operation_at(partition_id, op, SystemTime::now())
+    }
+
+    pub fn get_replication_set_for_partition_and_operation_at(
+        &self,
+        partition_id: i32,
+        op: Operation,
+        now: SystemTime,
+    ) -> Result<ReplicationSet, PartitionRingError> {
+        let owner_ids = self.partition_ring().multi_partition_owner_ids(partition_id);
+        if owner_ids.is_empty() {
+            return Err(PartitionRingError::EmptyRing);
+        }
+
+        let mut instances = Vec::with_capacity(owner_ids.len());
+        let mut healthy_owner_ids = Vec::with_capacity(owner_ids.len());
+        for instance_id in owner_ids {
+            let Ok(instance) = self.instances_ring.get_instance(&instance_id) else {
+                continue;
+            };
+            if !instance.is_healthy(op, self.heartbeat_timeout, now) {
+                continue;
+            }
+            instances.push(instance);
+            healthy_owner_ids.push(instance_id);
+        }
+
+        if instances.is_empty() {
+            return Err(PartitionRingError::PartitionTooManyUnhealthyInstances(
+                partition_id,
+            ));
+        }
+
+        let mut zones_buf: Vec<String> = Vec::with_capacity(8);
+        for inst in &instances {
+            if !zones_buf.contains(&inst.zone) {
+                zones_buf.push(inst.zone.clone());
+            }
+        }
+        let unique_zones = zones_buf.len();
+        let picked =
+            highest_preferably_non_read_only_from_each_zone(&instances, &healthy_owner_ids, &zones_buf);
+
+        Ok(ReplicationSet {
+            instances: picked,
+            max_errors: 0,
+            max_unavailable_zones: unique_zones.saturating_sub(1),
+            zone_awareness_enabled: true,
+            partition_id,
+        })
+    }
+}
+
+fn highest_preferably_non_read_only_from_each_zone(
+    instances: &[InstanceDesc],
+    instance_ids: &[String],
+    instance_zones: &[String],
+) -> Vec<InstanceDesc> {
+    let mut out = Vec::with_capacity(instance_zones.len());
+    for zone in instance_zones {
+        let mut highest: Option<usize> = None;
+        for (i, instance) in instances.iter().enumerate() {
+            if &instance.zone != zone {
+                continue;
+            }
+            let Some(h) = highest else {
+                highest = Some(i);
+                continue;
+            };
+            if instances[h].read_only && !instance.read_only {
+                highest = Some(i);
+                continue;
+            }
+            if instance.read_only && !instances[h].read_only {
+                continue;
+            }
+            if index_from_instance_suffix(&instance_ids[i])
+                < index_from_instance_suffix(&instance_ids[h])
+            {
+                continue;
+            }
+            highest = Some(i);
+        }
+        if let Some(h) = highest {
+            out.push(instances[h].clone());
+        }
+    }
+    out
+}
+
+fn index_from_instance_suffix(instance: &str) -> usize {
+    let bytes = instance.as_bytes();
+    let mut digits_len = 0usize;
+    while digits_len < bytes.len() {
+        let b = bytes[bytes.len() - digits_len - 1];
+        if b.is_ascii_digit() {
+            digits_len += 1;
+        } else {
+            break;
+        }
+    }
+    if digits_len == 0 {
+        return usize::MAX;
+    }
+    instance[instance.len() - digits_len..]
+        .parse::<usize>()
+        .unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]

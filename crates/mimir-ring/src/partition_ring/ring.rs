@@ -26,10 +26,10 @@ pub struct PartitionRingOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CacheKey {
-    identifier: String,
-    shard_size: usize,
-    lookback_period: Duration,
+pub struct CacheKey {
+    pub identifier: String,
+    pub shard_size: usize,
+    pub lookback_period: Duration,
 }
 
 #[derive(Clone)]
@@ -39,14 +39,14 @@ struct CachedLookback {
     valid_before: i64,
 }
 
-struct LruNode<V> {
+pub struct LruNode<V> {
     key: CacheKey,
     val: V,
     prev: Option<usize>,
     next: Option<usize>,
 }
 
-struct BoundedLru<V> {
+pub struct BoundedLru<V> {
     cap: usize,
     index: HashMap<CacheKey, usize>,
     nodes: Vec<Option<LruNode<V>>>,
@@ -116,6 +116,10 @@ impl<V: Clone> BoundedLru<V> {
         self.nodes[idx].as_ref().map(|n| n.val.clone())
     }
 
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
     fn insert(&mut self, key: CacheKey, val: V) {
         if let Some(&idx) = self.index.get(&key) {
             if let Some(n) = self.nodes[idx].as_mut() {
@@ -159,13 +163,13 @@ impl<V: Clone> BoundedLru<V> {
     }
 }
 
-enum CacheStorage<V> {
+pub enum CacheStorage<V> {
     Unbounded(HashMap<CacheKey, V>),
     Lru(BoundedLru<V>),
 }
 
 impl<V: Clone> CacheStorage<V> {
-    fn new(size: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         if size > 0 {
             Self::Lru(BoundedLru::new(size))
         } else {
@@ -173,20 +177,39 @@ impl<V: Clone> CacheStorage<V> {
         }
     }
 
-    fn get(&mut self, key: &CacheKey) -> Option<V> {
+    pub fn new_map() -> Self {
+        Self::Unbounded(HashMap::new())
+    }
+
+    pub fn new_lru(size: usize) -> Self {
+        Self::Lru(BoundedLru::new(size))
+    }
+
+    pub fn get(&mut self, key: &CacheKey) -> Option<V> {
         match self {
             Self::Unbounded(m) => m.get(key).cloned(),
             Self::Lru(lru) => lru.get(key),
         }
     }
 
-    fn insert(&mut self, key: CacheKey, val: V) {
+    pub fn insert(&mut self, key: CacheKey, val: V) {
         match self {
             Self::Unbounded(m) => {
                 m.insert(key, val);
             }
             Self::Lru(lru) => lru.insert(key, val),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Unbounded(m) => m.len(),
+            Self::Lru(lru) => lru.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -317,6 +340,41 @@ impl PartitionRing {
 
     pub fn desc(&self) -> &PartitionRingDesc {
         &self.desc
+    }
+
+    pub fn options(&self) -> &PartitionRingOptions {
+        &self.opts
+    }
+
+    pub fn ring_tokens(&self) -> &[u32] {
+        &self.ring_tokens
+    }
+
+    pub fn partition_by_token(&self) -> &HashMap<u32, i32> {
+        &self.partition_by_token
+    }
+
+    pub fn cache_without_lookback_len(&self) -> usize {
+        self.shuffle_shard_cache.without_lookback.lock().len()
+    }
+
+    pub fn cache_with_lookback_len(&self) -> usize {
+        self.shuffle_shard_cache.with_lookback.lock().len()
+    }
+
+    pub fn cache_ptr_eq(&self, other: &PartitionRing) -> bool {
+        Arc::ptr_eq(&self.shuffle_shard_cache, &other.shuffle_shard_cache)
+    }
+
+    pub fn subring_indexes_eq(&self, other: &PartitionRing) -> bool {
+        self.ring_tokens == other.ring_tokens
+            && self.ring_partition_ids == other.ring_partition_ids
+            && self.ring_partition_active == other.ring_partition_active
+            && self.partition_by_token == other.partition_by_token
+            && self.owners_by_partition == other.owners_by_partition
+            && self.active_partitions_count == other.active_partitions_count
+            && self.non_pending_partitions_count == other.non_pending_partitions_count
+            && self.max_partition_id == other.max_partition_id
     }
 
     /// Reuses `prev`'s shuffle-shard cache and all-Active subring memo when the two rings
@@ -452,7 +510,7 @@ impl PartitionRing {
         Ok(sub)
     }
 
-    fn compute_shuffle_shard(
+    pub fn compute_shuffle_shard(
         &self,
         identifier: &str,
         mut size: usize,
@@ -746,7 +804,7 @@ impl PartitionRing {
 
 /// Reports whether `a` and `b` hold the same non-Pending partitions and the same owners of them
 /// (Go `sameExceptPending`).
-fn same_except_pending(a: &PartitionRingDesc, b: &PartitionRingDesc) -> bool {
+pub fn same_except_pending(a: &PartitionRingDesc, b: &PartitionRingDesc) -> bool {
     let mut count = 0isize;
     for (id, pa) in &a.partitions {
         if pa.is_pending() {
@@ -791,6 +849,12 @@ fn same_except_pending(a: &PartitionRingDesc, b: &PartitionRingDesc) -> bool {
     count == 0
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionKeys {
+    pub partition_id: i32,
+    pub indexes: Vec<usize>,
+}
+
 pub struct ActivePartitionBatchRing {
     ring: Arc<PartitionRing>,
 }
@@ -824,6 +888,66 @@ impl ActivePartitionBatchRing {
             zone_awareness_enabled: false,
             partition_id: pid,
         })
+    }
+
+    /// Groups input keys by the active partition owning each key.
+    ///
+    /// Ported from github.com/grafana/dskit/ring/partition_ring.go (ActivePartitionBatchRing.GetKeysByPartition).
+    pub fn get_keys_by_partition(
+        &self,
+        ctx: Option<&mimir_common::services::ServiceContext>,
+        keys: &[u32],
+    ) -> Result<Vec<PartitionKeys>, PartitionRingError> {
+        if self.ring.active_partitions_count() == 0 {
+            return Err(PartitionRingError::NoActivePartitionFound);
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(c) = ctx {
+            if c.is_canceled() {
+                return Err(PartitionRingError::Other("context canceled".to_string()));
+            }
+        }
+
+        let num_slots = (self.ring.max_partition_id().max(0) as usize) + 1;
+        let mut num_keys_by_partition = vec![0usize; num_slots];
+        let mut partition_id_by_key = Vec::with_capacity(keys.len());
+
+        for (i, &key) in keys.iter().enumerate() {
+            if i % 10_000 == 0 {
+                if let Some(c) = ctx {
+                    if c.is_canceled() {
+                        return Err(PartitionRingError::Other("context canceled".to_string()));
+                    }
+                }
+            }
+            let pid = self.ring.active_partition_for_key(key)?;
+            if pid < 0 || (pid as usize) >= num_slots {
+                return Err(PartitionRingError::InconsistentTokensInfo);
+            }
+            partition_id_by_key.push(pid);
+            num_keys_by_partition[pid as usize] += 1;
+        }
+
+        let mut keys_by_partition: Vec<Vec<usize>> = num_keys_by_partition
+            .iter()
+            .map(|&cap| Vec::with_capacity(cap))
+            .collect();
+        for (i, pid) in partition_id_by_key.into_iter().enumerate() {
+            keys_by_partition[pid as usize].push(i);
+        }
+
+        let mut result = Vec::new();
+        for (id, indexes) in keys_by_partition.into_iter().enumerate() {
+            if !indexes.is_empty() {
+                result.push(PartitionKeys {
+                    partition_id: id as i32,
+                    indexes,
+                });
+            }
+        }
+        Ok(result)
     }
 }
 
