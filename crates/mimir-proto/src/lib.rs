@@ -21,6 +21,8 @@ pub mod client;
 pub mod compat;
 pub mod cortexpb;
 pub mod go_strconv;
+pub mod grpcclient;
+pub mod grpcutil;
 pub mod grpcutilpb;
 pub use grpcutilpb::google_rpc;
 pub mod httpgrpcpb;

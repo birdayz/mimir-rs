@@ -10,12 +10,11 @@
 //! - net.SplitHostPort / net.JoinHostPort / net.(*Resolver).LookupSRV ordering
 //!   from the Go standard library (behaviour relied upon by dskit)
 //!
-//! The `miekgdns` resolver type (github.com/grafana/dskit/dns/miekgdns) is not
-//! ported: selecting it returns an explicit error. Mimir itself only uses
-//! `dns.GolangResolverType` (pkg/mimir/modules.go `initMemberlistKV`).
+//! - github.com/grafana/dskit/dns/miekgdns/resolver.go
 
 mod error;
 pub mod godns;
+pub mod miekgdns;
 pub(crate) mod net;
 mod provider;
 mod resolver;

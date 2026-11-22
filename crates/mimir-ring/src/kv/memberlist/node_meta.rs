@@ -10,13 +10,14 @@ pub const MAX_ZONE_NAME_LENGTH: usize = 16;
 const MIN_METADATA_SIZE_VERSION_1: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum NodeRole {
-    Member = 1,
-    Bridge = 2,
-}
+pub struct NodeRole(pub u8);
 
 impl NodeRole {
+    #[allow(non_upper_case_globals)]
+    pub const Member: Self = Self(1);
+    #[allow(non_upper_case_globals)]
+    pub const Bridge: Self = Self(2);
+
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "member" => Ok(Self::Member),
@@ -30,9 +31,10 @@ impl NodeRole {
 
 impl fmt::Display for NodeRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NodeRole::Member => f.write_str("member"),
-            NodeRole::Bridge => f.write_str("bridge"),
+        match self.0 {
+            1 => f.write_str("member"),
+            2 => f.write_str("bridge"),
+            other => write!(f, "unknown({other})"),
         }
     }
 }
@@ -49,7 +51,7 @@ pub fn encode_node_metadata(role: NodeRole, zone: &str) -> Result<Vec<u8>, Strin
     }
     let mut buf = Vec::with_capacity(3 + zone_bytes.len());
     buf.push(1u8);
-    buf.push(role as u8);
+    buf.push(role.0);
     buf.push(zone_bytes.len() as u8);
     buf.extend_from_slice(zone_bytes);
     Ok(buf)

@@ -5,7 +5,9 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use thiserror::Error;
 use ulid::Ulid;
@@ -30,7 +32,7 @@ use crate::chunkenc::st::StEncoder;
 use crate::chunkenc::xor::XorAppendState;
 use crate::chunkenc::xor2::Xor2AppendState;
 use crate::chunks_block::{BlockChunksError, BlockChunksWriter, ChunkMeta, DEFAULT_CHUNK_SEGMENT_SIZE};
-use crate::head::DEFAULT_SAMPLES_PER_CHUNK;
+use crate::head::{Head, HeadAppender, HeadError, HeadOptions, DEFAULT_SAMPLES_PER_CHUNK};
 use crate::index::{IndexError, IndexWriter, INDEX_FILENAME};
 use crate::labels::Labels;
 use crate::tombstones::{write_tombstones_file, Interval, MemTombstones, TombstoneError};
@@ -122,6 +124,10 @@ pub enum CompactError {
     Tombstone(#[from] TombstoneError),
     #[error("chunk error: {0}")]
     Chunk(#[from] ChunkError),
+    #[error("head error: {0}")]
+    Head(#[from] HeadError),
+    #[error("compaction cancelled")]
+    Cancelled,
 }
 
 /// Decoded sample value used during block compaction and sample-level querying.
@@ -2442,8 +2448,31 @@ fn write_prepared_block_with_metrics(
     segment_size: usize,
     metrics: Option<&CompactorMetrics>,
 ) -> Result<Option<BlockMeta>, CompactError> {
+    write_prepared_block_with_uid(
+        dest,
+        Ulid::new(),
+        mint,
+        maxt,
+        prepared,
+        compaction,
+        out_of_order,
+        segment_size,
+        metrics,
+    )
+}
 
-    let uid = Ulid::new();
+#[allow(clippy::too_many_arguments)]
+fn write_prepared_block_with_uid(
+    dest: &Path,
+    uid: Ulid,
+    mint: i64,
+    maxt: i64,
+    prepared: Vec<(Labels, Vec<ChunkMeta>)>,
+    compaction: BlockMetaCompaction,
+    out_of_order: bool,
+    segment_size: usize,
+    metrics: Option<&CompactorMetrics>,
+) -> Result<Option<BlockMeta>, CompactError> {
     let final_dir = dest.join(uid.to_string());
     let tmp_dir = dest.join(format!("{uid}{TMP_BLOCK_DIR_SUFFIX}"));
     if tmp_dir.exists() {
@@ -2780,10 +2809,421 @@ pub fn compact_blocks_with_float_encoding_and_segment_size_and_metrics(
     }
 }
 
-#[derive(Clone)]
-struct DirMeta {
-    dir: std::path::PathBuf,
-    meta: BlockMeta,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirMeta {
+    pub dir: std::path::PathBuf,
+    pub meta: BlockMeta,
+}
+
+/// Merges parent `BlockMeta`s into the compacted output `BlockMeta`, matching Go `CompactBlockMetas`.
+pub fn compact_block_metas(out_ulid: Ulid, metas: &[&BlockMeta]) -> BlockMeta {
+    let mut mint = i64::MAX;
+    let mut maxt = i64::MIN;
+    let mut max_level = 0i32;
+    let mut sources_set = std::collections::BTreeSet::new();
+    let mut parents = Vec::with_capacity(metas.len());
+    let mut all_ooo = !metas.is_empty();
+    let mut any_stale = false;
+    let mut any_selected = false;
+
+    for m in metas {
+        mint = mint.min(m.min_time);
+        maxt = maxt.max(m.max_time);
+        max_level = max_level.max(m.compaction.level);
+        for &s in &m.compaction.sources {
+            sources_set.insert(s);
+        }
+        if m.compaction.from_stale_series() {
+            any_stale = true;
+        }
+        if m.compaction.from_selected_series() {
+            any_selected = true;
+        }
+        if !m.compaction.from_out_of_order() {
+            all_ooo = false;
+        }
+        parents.push(BlockDesc {
+            ulid: m.ulid,
+            min_time: m.min_time,
+            max_time: m.max_time,
+        });
+    }
+    let mut comp = BlockMetaCompaction {
+        level: max_level + 1,
+        sources: sources_set.into_iter().collect(),
+        deletable: false,
+        parents,
+        failed: false,
+        hints: Vec::new(),
+    };
+    if any_stale {
+        comp.set_stale_series();
+    }
+    if any_selected {
+        comp.set_selected_series();
+    }
+    if all_ooo {
+        comp.set_out_of_order();
+    }
+    BlockMeta {
+        ulid: out_ulid,
+        min_time: mint,
+        max_time: maxt,
+        stats: BlockStats::default(),
+        compaction: comp,
+        version: META_VERSION_1,
+        out_of_order: false,
+        thanos: None,
+    }
+}
+
+/// Compacts `blocks` into `shard_count` sharded output blocks by `labels.stable_hash() % shard_count`.
+pub fn compact_blocks_with_splitting(
+    dest: &Path,
+    blocks: &[&Block],
+    shard_count: u64,
+) -> Result<Vec<Option<Ulid>>, CompactError> {
+    if shard_count == 0 {
+        return Err(CompactError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shard_count must be > 0",
+        )));
+    }
+    if blocks.is_empty() {
+        return Ok(vec![None; shard_count as usize]);
+    }
+    let meta_refs: Vec<&BlockMeta> = blocks.iter().map(|b| b.meta()).collect();
+    let merged = compact_block_metas(Ulid::new(), &meta_refs);
+    let mint = merged.min_time;
+    let maxt = merged.max_time;
+    if maxt <= mint {
+        for b in blocks {
+            let mut m = b.meta().clone();
+            m.compaction.deletable = true;
+            let _ = write_meta_file(b.dir(), &mut m);
+        }
+        return Ok(vec![None; shard_count as usize]);
+    }
+    let maxt_inclusive = maxt - 1;
+
+    type SeriesChunkList = Vec<(ChunkMeta, Arc<[Interval]>)>;
+    let mut series_map: std::collections::BTreeMap<Labels, SeriesChunkList> =
+        std::collections::BTreeMap::new();
+    for b in blocks {
+        let idx = b.index();
+        let chk_r = b.chunks();
+        let tomb_r = b.tombstones();
+        let all_ids = idx.postings("", &[""]).map_err(CompactError::Index)?;
+        for id in all_ids {
+            let (labels, mut chks) = idx.series(id)?;
+            let tombs: Arc<[Interval]> = tomb_r.get(id).into();
+            chks.retain(|c| !tombs.iter().any(|iv| iv.is_subrange(c.min_time, c.max_time)));
+            if chks.is_empty() {
+                continue;
+            }
+            for c in &mut chks {
+                c.chunk = Some(chk_r.chunk(c.ref_id)?);
+            }
+            let entry = series_map.entry(labels).or_default();
+            for c in chks {
+                entry.push((c, Arc::clone(&tombs)));
+            }
+        }
+    }
+
+    let mut shards: Vec<Vec<(Labels, Vec<ChunkMeta>)>> = vec![Vec::new(); shard_count as usize];
+    for (labels, chks) in series_map {
+        let trimmed = trim_and_merge_chunks_per_chunk(chks, mint, maxt_inclusive, Encoding::Xor)?;
+        if !trimmed.is_empty() {
+            let idx = (labels.stable_hash() % shard_count) as usize;
+            shards[idx].push((labels, trimmed));
+        }
+    }
+
+    let base_ulid = Ulid::new();
+    let base_ms = base_ulid.timestamp_ms();
+    let base_rand = base_ulid.random();
+    let mut out_ids = vec![None; shard_count as usize];
+    let mut any_written = false;
+    for (i, shard_series) in shards.into_iter().enumerate() {
+        if shard_series.is_empty() {
+            continue;
+        }
+        let uid = Ulid::from_parts(base_ms, base_rand.wrapping_add(i as u128));
+        if let Some(meta) = write_prepared_block_with_uid(
+            dest,
+            uid,
+            mint,
+            maxt,
+            shard_series,
+            merged.compaction.clone(),
+            false,
+            0,
+            None,
+        )? {
+            out_ids[i] = Some(meta.ulid);
+            any_written = true;
+        }
+    }
+    if !any_written {
+        for b in blocks {
+            let mut m = b.meta().clone();
+            m.compaction.deletable = true;
+            let _ = write_meta_file(b.dir(), &mut m);
+        }
+    }
+    Ok(out_ids)
+}
+
+/// Cancellable variant of [`compact_blocks`]; when `cancel` is set, returns
+/// [`CompactError::Cancelled`] without marking source blocks `compaction.failed = true`.
+pub fn compact_blocks_cancellable(
+    dest: &Path,
+    blocks: &[&Block],
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<BlockMeta>, CompactError> {
+    if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return Err(CompactError::Cancelled);
+    }
+    compact_blocks(dest, blocks)
+}
+
+/// Result of [`open_blocks_for_compaction`]: `(opened_blocks, newly_opened_to_close, result)`.
+pub type OpenedCompactionBlocks = (Vec<Arc<Block>>, Vec<Arc<Block>>, Result<(), BlockError>);
+
+/// Opens block directories for compaction, reusing already-open blocks by ULID.
+pub fn open_blocks_for_compaction(
+    dirs: &[PathBuf],
+    open: &[Arc<Block>],
+    concurrency: usize,
+) -> OpenedCompactionBlocks {
+    let mut blocks = Vec::with_capacity(dirs.len());
+    let mut to_close = Vec::new();
+    let mut to_open = Vec::new();
+
+    for d in dirs {
+        let meta = match read_meta_file(d) {
+            Ok(m) => m,
+            Err(e) => return (blocks, to_close, Err(e)),
+        };
+        if let Some(existing) = open.iter().find(|b| b.ulid() == meta.ulid) {
+            blocks.push(Arc::clone(existing));
+        } else {
+            to_open.push(d.clone());
+        }
+    }
+
+    let concurrency = concurrency.max(1);
+    if concurrency == 1 {
+        for d in to_open {
+            match Block::open(&d) {
+                Ok(b) => {
+                    let arc = Arc::new(b);
+                    blocks.push(Arc::clone(&arc));
+                    to_close.push(arc);
+                }
+                Err(e) => return (blocks, to_close, Err(e)),
+            }
+        }
+        return (blocks, to_close, Ok(()));
+    }
+
+    let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(to_open)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let results: Arc<Mutex<Vec<Result<Block, BlockError>>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let q = Arc::clone(&queue);
+        let s = Arc::clone(&stop);
+        let r = Arc::clone(&results);
+        handles.push(std::thread::spawn(move || loop {
+            if s.load(Ordering::Acquire) {
+                break;
+            }
+            let next = q.lock().unwrap().pop_front();
+            let Some(dir) = next else { break };
+            let res = Block::open(&dir);
+            if res.is_err() {
+                s.store(true, Ordering::Release);
+            }
+            r.lock().unwrap().push(res);
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let mut first_err = None;
+    for res in results.lock().unwrap().drain(..) {
+        match res {
+            Ok(b) => {
+                let arc = Arc::new(b);
+                blocks.push(Arc::clone(&arc));
+                to_close.push(arc);
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(e) => (blocks, to_close, Err(e)),
+        None => (blocks, to_close, Ok(())),
+    }
+}
+
+struct AsyncSeriesItem {
+    labels: Labels,
+    chunks: Vec<ChunkMeta>,
+}
+
+/// Background streaming block writer (`tsdb.asyncBlockWriter`).
+pub struct AsyncBlockWriter {
+    tx: Mutex<Option<mpsc::SyncSender<AsyncSeriesItem>>>,
+    handle: Mutex<Option<std::thread::JoinHandle<Result<BlockStats, String>>>>,
+    result: Mutex<Option<Result<BlockStats, String>>>,
+}
+
+impl AsyncBlockWriter {
+    pub fn new(mut chunkw: BlockChunksWriter, mut indexw: IndexWriter) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<AsyncSeriesItem>(64);
+        let handle = std::thread::spawn(move || -> Result<BlockStats, String> {
+            let mut stats = BlockStats::default();
+            let mut ref_id = 0u64;
+            while let Ok(item) = rx.recv() {
+                let mut chks = item.chunks;
+                chunkw
+                    .write_chunks(&mut chks)
+                    .map_err(|e| format!("write chunks: {e}"))?;
+                indexw
+                    .add_series(ref_id, &item.labels, &chks)
+                    .map_err(|e| format!("add series: {e}"))?;
+                stats.num_chunks += chks.len() as u64;
+                stats.num_series += 1;
+                for chk in &chks {
+                    if let Some(ref enc) = chk.chunk {
+                        let n = enc.num_samples() as u64;
+                        stats.num_samples += n;
+                        match enc.encoding() {
+                            Encoding::Xor | Encoding::Xor2 => stats.num_float_samples += n,
+                            Encoding::Histogram
+                            | Encoding::FloatHistogram
+                            | Encoding::HistogramSt
+                            | Encoding::FloatHistogramSt => stats.num_histogram_samples += n,
+                            Encoding::None => {}
+                        }
+                    }
+                }
+                ref_id += 1;
+            }
+            chunkw.close().map_err(|e| format!("closing chunk writer: {e}"))?;
+            indexw.close().map_err(|e| format!("closing index writer: {e}"))?;
+            Ok(stats)
+        });
+        Self {
+            tx: Mutex::new(Some(tx)),
+            handle: Mutex::new(Some(handle)),
+            result: Mutex::new(None),
+        }
+    }
+
+    pub fn add_series(&self, labels: Labels, chunks: Vec<ChunkMeta>) -> Result<(), CompactError> {
+        let sender = self.tx.lock().unwrap().as_ref().cloned();
+        if let Some(tx) = sender {
+            let _ = tx.send(AsyncSeriesItem { labels, chunks });
+        }
+        Ok(())
+    }
+
+    /// Idempotently closes the input channel.
+    pub fn close_async(&self) {
+        self.tx.lock().unwrap().take();
+    }
+
+    /// Waits for background completion and idempotently returns the cached result.
+    pub fn wait_finished(&self) -> Result<BlockStats, CompactError> {
+        self.close_async();
+        let mut res_guard = self.result.lock().unwrap();
+        if res_guard.is_none() {
+            if let Some(h) = self.handle.lock().unwrap().take() {
+                let r = h
+                    .join()
+                    .unwrap_or_else(|_| Err("async block writer thread panicked".to_string()));
+                *res_guard = Some(r);
+            }
+        }
+        match res_guard.as_ref() {
+            Some(Ok(stats)) => Ok(stats.clone()),
+            Some(Err(msg)) => Err(CompactError::Io(io::Error::other(msg.clone()))),
+            None => Ok(BlockStats::default()),
+        }
+    }
+}
+
+/// Standalone block writer (`tsdb.BlockWriter`).
+pub struct BlockWriter {
+    dest_dir: PathBuf,
+    chunk_dir: PathBuf,
+    head: Head,
+}
+
+impl BlockWriter {
+    pub fn new(dir: impl AsRef<Path>, block_size_ms: i64) -> Result<Self, CompactError> {
+        let dest_dir = dir.as_ref().to_path_buf();
+        let chunk_dir = std::env::temp_dir().join(format!("mimir-bw-{}", Ulid::new()));
+        fs::create_dir_all(&chunk_dir)?;
+        let opts = HeadOptions {
+            chunk_range_ms: block_size_ms,
+            ..HeadOptions::default()
+        };
+        let head = Head::open(&chunk_dir, opts, i64::MIN)?;
+        Ok(Self {
+            dest_dir,
+            chunk_dir,
+            head,
+        })
+    }
+
+    pub fn appender(&self) -> HeadAppender<'_> {
+        self.head.appender()
+    }
+
+    pub fn flush(&self) -> Result<Option<Ulid>, CompactError> {
+        if self.head.num_series() == 0 {
+            return Ok(None);
+        }
+        let mint = self.head.min_time();
+        let maxt_incl = self.head.max_time();
+        if maxt_incl < mint {
+            return Ok(None);
+        }
+        let maxt = maxt_incl.saturating_add(1);
+        let candidates = self.head.collect_compaction_candidates(mint, maxt_incl)?;
+        let meta_opt = write_head_block_streaming_with_options(
+            &self.dest_dir,
+            mint,
+            maxt,
+            maxt_incl,
+            candidates,
+            BlockMetaCompaction::default(),
+            false,
+            0,
+            None,
+            |ref_id, chks, tombs| {
+                self.head
+                    .load_series_in_order_chunks_into(ref_id, mint, maxt_incl, chks, tombs)
+                    .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
+            },
+        )?;
+        Ok(meta_opt.map(|m| m.ulid))
+    }
+
+    pub fn close(self) -> Result<(), CompactError> {
+        let res = self.head.close();
+        let _ = fs::remove_dir_all(&self.chunk_dir);
+        res.map_err(CompactError::Head)
+    }
 }
 
 /// Plans the next on-disk block compaction in `dir` matching Go `LeveledCompactor.Plan`.
@@ -2791,6 +3231,17 @@ pub fn plan_block_compactions(
     dir: &Path,
     ranges_ms: &[i64],
     enable_overlapping: bool,
+) -> Result<Option<Vec<std::path::PathBuf>>, CompactError> {
+    plan_block_compactions_with_filter(dir, ranges_ms, enable_overlapping, None)
+}
+
+/// Like [`plan_block_compactions`], stopping block collection as soon as `exclude_filter`
+/// returns `true` for a block (matching Go `LeveledCompactorOptions.BlockExcludeFilter`).
+pub fn plan_block_compactions_with_filter(
+    dir: &Path,
+    ranges_ms: &[i64],
+    enable_overlapping: bool,
+    exclude_filter: Option<&mut dyn FnMut(&BlockMeta) -> bool>,
 ) -> Result<Option<Vec<std::path::PathBuf>>, CompactError> {
     if ranges_ms.is_empty() {
         return Ok(None);
@@ -2800,14 +3251,20 @@ pub fn plan_block_compactions(
         return Ok(None);
     }
     let mut dms = Vec::with_capacity(dirs.len());
+    let mut filter = exclude_filter;
     for (_, path) in dirs {
         let meta = read_meta_file(&path)?;
+        if let Some(ref mut f) = filter {
+            if f(&meta) {
+                return Ok(None);
+            }
+        }
         dms.push(DirMeta { dir: path, meta });
     }
-    plan_from_metas(dms, ranges_ms, enable_overlapping)
+    plan_dir_metas(dms, ranges_ms, enable_overlapping)
 }
 
-fn plan_from_metas(
+pub fn plan_dir_metas(
     dms: Vec<DirMeta>,
     ranges_ms: &[i64],
     enable_overlapping: bool,
@@ -2937,7 +3394,7 @@ fn select_dirs<'a>(ds: &'a [DirMeta], ranges_ms: &[i64]) -> Vec<&'a DirMeta> {
     Vec::new()
 }
 
-fn split_by_range(ds: &[DirMeta], tr: i64) -> Vec<Vec<&DirMeta>> {
+pub fn split_by_range(ds: &[DirMeta], tr: i64) -> Vec<Vec<&DirMeta>> {
     if tr <= 0 {
         return Vec::new();
     }

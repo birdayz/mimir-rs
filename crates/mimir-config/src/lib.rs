@@ -13,6 +13,7 @@
 pub mod duration;
 pub mod env;
 pub mod error;
+pub mod flagext;
 pub mod flags;
 pub mod help;
 pub mod ingester;
@@ -35,6 +36,12 @@ pub use duration::{
 };
 pub use env::{expand_environment_variables, expand_environment_variables_with};
 pub use error::{CliAction, ConfigError};
+pub use flagext::{
+    flag_to_env_var, parse_flags_and_arguments_with_env, parse_flags_without_arguments_with_env,
+    track_registered_flags, DayValue, FlagTime, LimitsMapValidator, RegisteredFlags, URLValue,
+    ValidatedLimitsMap,
+};
+pub use secret::Secret;
 pub use flags::{
     format_modules, format_version, go_version_str, is_targetable_module, parse_config_file_parameter, FlagSet,
     MainFlags, USER_VISIBLE_MODULES,
@@ -64,12 +71,16 @@ pub use mimir::{
     InstrumentRefLeaksConfig, LoadedConfig, MimirConfig,
 };
 pub use runtime_config::{
-    is_url, merge_limits, merge_limits_in_place, parse_runtime_config_yaml,
+    assign_config_source_ids, is_url, merge_limits, merge_limits_in_place,
+    parse_config_source_entry, parse_runtime_config_yaml,
     parse_runtime_config_yaml_with_defaults, parse_tenant_id_with_metadata,
-    runtime_config_source_ids, DistributorInstanceLimits, MultiRuntimeConfig, Overrides,
-    RuntimeConfigHttpObserver, RuntimeConfigLoadEvent, RuntimeConfigManager,
-    RuntimeConfigManagerOptions, RuntimeConfigObserver, RuntimeConfigSourceStatus,
-    RuntimeConfigValues,
+    runtime_config_source_ids, sanitize_url_for_metrics, sanitize_url_for_metrics_checked,
+    DistributorInstanceLimits, GenericRuntimeConfigManager, GenericRuntimeConfigOptions,
+    HttpProvider, HttpProviderError, MultiRuntimeConfig, Overrides, ParsedConfigSource,
+    RuntimeConfigHttpObserver, RuntimeConfigLoadEvent, RuntimeConfigLoader,
+    RuntimeConfigManager, RuntimeConfigManagerOptions, RuntimeConfigMapLoader,
+    RuntimeConfigObserver, RuntimeConfigPreprocessor, RuntimeConfigSourceStatus,
+    RuntimeConfigValues, SourceParameter,
 };
 pub use server::{
     ActivityTrackerConfig, ClusterValidationProtocolConfig, ClusterValidationProtocolConfigForHTTP,

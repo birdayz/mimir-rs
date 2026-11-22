@@ -643,7 +643,7 @@ async fn golang_provider_resolves_localhost_and_rejects_missing_port() {
 }
 
 #[test]
-fn miekgdns_resolver_type_is_explicitly_unsupported() {
+fn miekgdns_resolver_type_is_supported() {
     let rt: ResolverType = "miekgdns".parse().unwrap();
-    assert!(Provider::new(&rt, 0, None, "", HashMap::new()).is_err());
+    assert!(Provider::new(&rt, 2, None, "", HashMap::new()).is_ok());
 }

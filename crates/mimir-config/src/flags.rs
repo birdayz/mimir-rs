@@ -139,6 +139,28 @@ impl<T> FlagSet<T> {
         );
     }
 
+    pub fn secret_var(
+        &mut self,
+        name: &str,
+        default_val: &crate::secret::Secret,
+        usage: &str,
+        get: impl Fn(&T) -> &crate::secret::Secret + 'static,
+        get_mut: impl Fn(&mut T) -> &mut crate::secret::Secret + 'static,
+    ) {
+        self.register_raw(
+            name,
+            false,
+            "value",
+            default_val.to_string(),
+            usage,
+            move |t, s| {
+                get_mut(t).set(s);
+                Ok(())
+            },
+            move |t| get(t).to_string(),
+        );
+    }
+
     pub fn string_var(
         &mut self,
         name: &str,
@@ -705,6 +727,51 @@ impl<T> FlagSet<T> {
     /// Names of all registered flags.
     pub fn flag_names(&self) -> impl Iterator<Item = &str> {
         self.flags.keys().map(String::as_str)
+    }
+
+    /// Sets flag values from process environment variables for any flags not explicitly set on CLI
+    /// (`dskit/flagext.SetFlagsFromEnv`).
+    pub fn set_flags_from_env(
+        &mut self,
+        target: &mut T,
+        prefix: &str,
+    ) -> Result<(), ConfigError> {
+        self.set_flags_from_env_with_lookup(target, prefix, |k| std::env::var(k).ok())
+    }
+
+    /// Sets flag values from environment variables using `lookup` (`dskit/flagext.SetFlagsFromEnvWithLookup`).
+    pub fn set_flags_from_env_with_lookup<F>(
+        &mut self,
+        target: &mut T,
+        prefix: &str,
+        mut lookup: F,
+    ) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let mut errs = Vec::new();
+        for (name, entry) in &mut self.flags {
+            if entry.was_set {
+                continue;
+            }
+            let env_var = crate::flagext::flag_to_env_var(prefix, name);
+            let Some(val) = lookup(&env_var) else {
+                continue;
+            };
+            if let Err(e) = (entry.setter)(target, &val) {
+                errs.push(format!(
+                    "setting flag {name:?} from environment variable {env_var}: {}",
+                    flag_set_error_text(&e)
+                ));
+            } else {
+                entry.was_set = true;
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigError::Flag(errs.join("\n")))
+        }
     }
 }
 

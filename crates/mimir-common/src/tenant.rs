@@ -359,6 +359,10 @@ impl Metadata {
     pub fn with_tenant(&self, tenant_id: &str) -> String {
         format!("{tenant_id}{}", self.source)
     }
+
+    pub fn divide(&self) -> impl Iterator<Item = Metadata> + '_ {
+        self.iter().map(|(k, v)| Metadata::default().with(k, v))
+    }
 }
 
 fn write_metadata_kv(into: &mut String, key: &str, val: &str) {

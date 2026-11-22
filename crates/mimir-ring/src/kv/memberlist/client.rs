@@ -28,7 +28,7 @@ use mimir_config::server::MemberlistConfig;
 use mimir_proto::memberlistpb::KeyValuePair;
 use mimir_proto::prost::Message as _;
 use parking_lot::{Mutex, RwLock};
-use prometheus::Registry;
+use prometheus::{core::Collector, Registry};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -88,12 +88,24 @@ const EMPTY_SNAPPY_DATA: &[u8] = &[0x00];
 type MergeValueResult = (Option<Box<dyn Mergeable>>, usize, bool, Option<SystemTime>);
 
 /// dskit `ringBroadcast`.
-struct RingBroadcast {
-    key: String,
-    content: Vec<String>,
-    version: usize,
-    msg: Vec<u8>,
-    finished: Box<dyn Fn() + Send + Sync>,
+pub struct RingBroadcast {
+    pub key: String,
+    pub content: Vec<String>,
+    pub version: usize,
+    pub msg: Vec<u8>,
+    pub(crate) finished: Box<dyn Fn() + Send + Sync>,
+}
+
+impl RingBroadcast {
+    pub fn new(key: String, content: Vec<String>, version: usize, msg: Vec<u8>) -> Self {
+        Self {
+            key,
+            content,
+            version,
+            msg,
+            finished: Box::new(|| {}),
+        }
+    }
 }
 
 impl Broadcast for RingBroadcast {
@@ -303,6 +315,10 @@ pub struct KvOptions {
     pub discover_members_backoff: BackoffConfig,
     /// Optional memberlist symmetric stream decryptor (when `MessageType::Encrypt` is used).
     pub stream_decryptor: Option<StreamDecryptFn>,
+    /// Optional override for `maxCasRetries` (default 10).
+    pub max_cas_retries: Option<usize>,
+    /// Optional hook run at the start of `join_members_on_startup` (tests only).
+    pub before_join_members_on_startup_hook: Option<Arc<dyn Fn(ServiceContext) -> BoxFuture<'static, ()> + Send + Sync>>,
 }
 
 impl Default for KvOptions {
@@ -316,6 +332,8 @@ impl Default for KvOptions {
                 max_retries: 10,
             },
             stream_decryptor: None,
+            max_cas_retries: None,
+            before_join_members_on_startup_hook: None,
         }
     }
 }
@@ -372,6 +390,8 @@ pub struct MemberlistKv {
     metrics: KvMetrics,
     go_metrics: Arc<GoMetrics>,
     stream_decryptor: Option<StreamDecryptFn>,
+    max_cas_retries: usize,
+    before_join_hook: Option<Arc<dyn Fn(ServiceContext) -> BoxFuture<'static, ()> + Send + Sync>>,
     propagation_tracker: Mutex<Option<Arc<super::propagation_tracker::PropagationDelayTracker>>>,
 }
 
@@ -467,6 +487,8 @@ impl MemberlistKv {
 
         let go_metrics = global_go_metrics();
         let stream_decryptor = opts.stream_decryptor;
+        let max_cas_retries = opts.max_cas_retries.unwrap_or(MAX_CAS_RETRIES);
+        let before_join_hook = opts.before_join_members_on_startup_hook;
         let (leave_tx, leave_rx) = mpsc::channel(1);
         let retransmit_mult = timing.retransmit_mult;
         let awareness_max = timing.awareness_max_multiplier;
@@ -534,6 +556,8 @@ impl MemberlistKv {
                 metrics: KvMetrics::new(metrics_namespace),
                 go_metrics: Arc::clone(&go_metrics),
                 stream_decryptor,
+                max_cas_retries,
+                before_join_hook,
                 propagation_tracker: Mutex::new(None),
                 cfg,
             }
@@ -1547,6 +1571,9 @@ impl MemberlistKv {
 
     /// dskit `joinMembersOnStartup`.
     async fn join_members_on_startup(&self, ctx: &ServiceContext) -> bool {
+        if let Some(hook) = &self.before_join_hook {
+            hook(ctx.clone()).await;
+        }
         let members = self.cfg.join_members.0.clone();
         if members.is_empty() {
             return true;
@@ -1727,6 +1754,135 @@ impl MemberlistKv {
         &self.node_name
     }
 
+    pub fn configured_compression_algorithm(&self) -> &str {
+        &self.cfg.compression_algorithm
+    }
+
+    pub fn wire_compression_type(&self) -> CompressionType {
+        self.compression_algo
+    }
+
+    pub fn set_delegate_ready(&self, ready: bool) {
+        self.delegate_ready.store(ready, Ordering::Release);
+    }
+
+    pub fn num_key_workers(&self) -> usize {
+        self.workers.lock().len()
+    }
+
+    pub fn local_state_cache_len(&self) -> usize {
+        self.local_state_cache.lock().len()
+    }
+
+    pub fn local_state_cache_contains(&self, key: &str) -> bool {
+        self.local_state_cache.lock().contains_key(key)
+    }
+
+    pub fn local_state_cache_counts(&self, key: &str) -> (f64, f64) {
+        (
+            self.metrics.local_state_cache_hits.with_label_values(&[key]).get(),
+            self.metrics.local_state_cache_misses.with_label_values(&[key]).get(),
+        )
+    }
+
+    pub fn local_state_cache_metric_counts(&self) -> (usize, usize) {
+        let hits: usize = self.metrics.local_state_cache_hits.collect().iter().map(|mf| mf.get_metric().len()).sum();
+        let misses: usize = self.metrics.local_state_cache_misses.collect().iter().map(|mf| mf.get_metric().len()).sum();
+        (hits, misses)
+    }
+
+    pub fn store_insert_for_test(
+        &self,
+        key: &str,
+        value: Box<dyn Mergeable>,
+        version: usize,
+        codec_id: &str,
+        deleted: bool,
+        update_time: Option<SystemTime>,
+    ) {
+        self.store.lock().insert(
+            key.to_string(),
+            ValueDesc {
+                value,
+                version,
+                codec_id: codec_id.to_string(),
+                deleted,
+                update_time,
+            },
+        );
+    }
+
+    pub fn store_age_entry_for_test(&self, key: &str, update_time: SystemTime) {
+        if let Some(entry) = self.store.lock().get_mut(key) {
+            entry.update_time = Some(update_time);
+        }
+    }
+
+    pub fn merge_value_for_key_for_test(
+        &self,
+        key: &str,
+        incoming: &mut dyn Mergeable,
+        cas_version: usize,
+        codec_id: &str,
+        deleted: bool,
+        update_time: Option<SystemTime>,
+    ) -> Result<usize, KvError> {
+        let (_, version, _, _) = self.merge_value_for_key(
+            key,
+            incoming,
+            cas_version,
+            codec_id,
+            deleted,
+            update_time,
+        )?;
+        Ok(version)
+    }
+
+    pub fn enqueue_key_update_for_test(
+        &self,
+        key: &str,
+        value: Bytes,
+        codec: Arc<dyn Codec>,
+        deleted: bool,
+    ) -> bool {
+        self.enqueue_key_update(
+            key,
+            ValueUpdate {
+                value,
+                codec,
+                message_size: 0,
+                deleted,
+                update_time: Some(SystemTime::now()),
+            },
+        )
+    }
+
+    pub fn add_test_key_watcher(&self, key: &str) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.watchers
+            .lock()
+            .entry(key.to_string())
+            .or_default()
+            .push(WatcherEntry {
+                notify: Arc::clone(&notify),
+            });
+        notify
+    }
+
+    pub fn remove_test_key_watcher(&self, key: &str, notify: &Arc<Notify>) {
+        let mut w = self.watchers.lock();
+        if let Some(list) = w.get_mut(key) {
+            list.retain(|e| !Arc::ptr_eq(&e.notify, notify));
+            if list.is_empty() {
+                w.remove(key);
+            }
+        }
+    }
+
+    pub fn shutdown_workers_for_test(&self) {
+        self.shutdown_ctx.cancel();
+    }
+
     /// The dskit `KVConfig` this KV was created with.
     pub fn config(&self) -> &MemberlistConfig {
         &self.cfg
@@ -1890,7 +2046,7 @@ impl MemberlistKv {
             })
         });
 
-        for _ in 0..MAX_CAS_RETRIES {
+        for _ in 0..self.max_cas_retries {
             self.metrics.cas_attempts.inc();
             if last_was_no_change {
                 tokio::time::sleep(NO_CHANGE_DETECTED_RETRY_SLEEP).await;
@@ -2045,10 +2201,14 @@ impl MemberlistKv {
                     if !had_curr {
                         return Ok((None, 0, curr_deleted, curr_update));
                     }
-                    let changed_curr = store
-                        .get(key)
-                        .is_none_or(|c| !c.value.eq_mergeable(result.as_ref()));
-                    if changed_curr {
+                    let changed_live = store.get(key).is_none_or(|c| {
+                        let mut c_live = c.value.clone_mergeable();
+                        c_live.remove_tombstones(None);
+                        let mut r_live = result.clone_mergeable();
+                        r_live.remove_tombstones(None);
+                        !c_live.eq_mergeable(r_live.as_ref())
+                    });
+                    if changed_live {
                         let new_version = curr_version + 1;
                         store.insert(
                             key.to_string(),
@@ -2116,7 +2276,7 @@ impl MemberlistKv {
 
     /// dskit `broadcastNewValue`.
     #[allow(clippy::too_many_arguments)]
-    fn broadcast_new_value(
+    pub fn broadcast_new_value(
         &self,
         key: &str,
         change: &dyn Mergeable,
@@ -2174,7 +2334,7 @@ impl MemberlistKv {
     }
 
     /// dskit `notifyWatchers`.
-    pub(crate) fn notify_watchers(&self, key: &str) {
+    pub fn notify_watchers(&self, key: &str) {
         let interval = self.cfg.notify_interval.as_std().unwrap_or(Duration::ZERO);
         if interval.is_zero() {
             self.notify_watchers_sync(key);
@@ -2184,7 +2344,7 @@ impl MemberlistKv {
     }
 
     /// dskit `sendKeyNotifications`.
-    fn send_key_notifications(&self) {
+    pub fn send_key_notifications(&self) {
         let notifs = {
             let mut n = self.key_notifications.lock();
             if n.is_empty() {
@@ -2222,7 +2382,7 @@ impl MemberlistKv {
     }
 
     /// dskit `cleanupObsoleteEntries`.
-    fn cleanup_obsolete_entries(&self) {
+    pub fn cleanup_obsolete_entries(&self) {
         let timeout = self.cfg.obsolete_entries_timeout.as_std().unwrap_or(Duration::ZERO);
         let now = SystemTime::now();
         let mut removed = Vec::new();
@@ -2532,7 +2692,7 @@ impl MemberlistKv {
     }
 
     /// dskit `GetBroadcasts`: locally generated updates first, then gossiped ones.
-    pub(crate) fn delegate_get_broadcasts(&self, overhead: usize, limit: usize) -> Vec<Vec<u8>> {
+    pub fn delegate_get_broadcasts(&self, overhead: usize, limit: usize) -> Vec<Vec<u8>> {
         if !self.delegate_ready.load(Ordering::Acquire) {
             return Vec::new();
         }

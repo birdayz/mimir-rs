@@ -5,10 +5,10 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::any::Any;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar, Mutex};
@@ -18,13 +18,13 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::chunks_block::{BlockChunksError, BlockChunksReader};
-use crate::index::{IndexError, IndexReader, INDEX_FILENAME};
+use crate::index::{IndexError, IndexReader, INDEX_FILENAME, INDEX_FORMAT_V2};
 use crate::matcher::LabelMatcher;
 use crate::postings::{postings_for_matchers, PostingsError};
 use crate::postings_cache::{
     next_postings_cache_source_id, PostingsForMatchersCache, PostingsForMatchersCacheConfig,
 };
-use crate::tombstones::{read_tombstones_file, MemTombstones, TombstoneError, TOMBSTONES_FILENAME};
+use crate::tombstones::{read_tombstones_file, write_tombstones_file, Interval, MemTombstones, TombstoneError, TOMBSTONES_FILENAME};
 
 pub const META_FILENAME: &str = "meta.json";
 pub const META_VERSION_1: i32 = 1;
@@ -43,6 +43,8 @@ pub enum BlockError {
     UnsupportedMetaVersion(i32),
     #[error("index error: {0}")]
     Index(#[from] IndexError),
+    #[error("postings error: {0}")]
+    Postings(#[from] PostingsError),
     #[error("chunks error: {0}")]
     Chunks(#[from] BlockChunksError),
     #[error("tombstones error: {0}")]
@@ -409,6 +411,53 @@ impl Drop for BlockReadGuard {
     }
 }
 
+/// Repairs Prometheus 2.1 blocks whose `meta.json` has `version == 2` and whose `index`
+/// file header mistakenly carries version `1` instead of `2`.
+///
+/// Ported from github.com/prometheus/prometheus/tsdb/repair.go (`repairBadIndexVersion`).
+pub fn repair_bad_index_version(dir: &Path) -> Result<(), BlockError> {
+    let dirs = list_block_dirs(dir)?;
+    struct TmpGuard(Vec<PathBuf>);
+    impl Drop for TmpGuard {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+    let mut tmp_guard = TmpGuard(Vec::new());
+    for (_, d) in dirs {
+        let meta_path = d.join(META_FILENAME);
+        let Ok(bytes) = fs::read(&meta_path) else {
+            continue;
+        };
+        let Ok(mut meta) = serde_json::from_slice::<BlockMeta>(&bytes) else {
+            continue;
+        };
+        if meta.version != META_VERSION_1 && meta.version != 2 {
+            continue;
+        }
+        if meta.version == META_VERSION_1 {
+            continue;
+        }
+        let repl_path = d.join("index.repaired");
+        tmp_guard.0.push(repl_path.clone());
+        let idx_path = d.join(INDEX_FILENAME);
+        {
+            let mut broken = File::open(&idx_path)?;
+            let mut repl = File::create(&repl_path)?;
+            io::copy(&mut broken, &mut repl)?;
+            repl.seek(SeekFrom::Start(4))?;
+            repl.write_all(&[INDEX_FORMAT_V2])?;
+            repl.sync_all()?;
+        }
+        fs::rename(&repl_path, &idx_path)?;
+        meta.version = META_VERSION_1;
+        write_meta_file(&d, &mut meta)?;
+    }
+    Ok(())
+}
+
 /// Opened immutable on-disk Prometheus ULID block (`tsdb.Block`).
 #[derive(Debug)]
 pub struct Block {
@@ -417,7 +466,8 @@ pub struct Block {
     index: IndexReader,
     chunks: BlockChunksReader,
     tombstones: MemTombstones,
-    total_size: u64,
+    total_size: AtomicU64,
+    delete_mtx: Mutex<()>,
     postings_cache: Arc<PostingsForMatchersCache>,
     postings_cache_source_id: u64,
     compaction_failed: AtomicBool,
@@ -472,7 +522,8 @@ impl Block {
             index,
             chunks,
             tombstones,
-            total_size,
+            total_size: AtomicU64::new(total_size),
+            delete_mtx: Mutex::new(()),
             postings_cache,
             postings_cache_source_id: next_postings_cache_source_id(),
             compaction_failed,
@@ -607,7 +658,42 @@ impl Block {
 
     #[inline]
     pub fn size(&self) -> u64 {
-        self.total_size
+        self.total_size.load(Ordering::Acquire)
+    }
+
+    /// Persists tombstones for series matching `matchers` with chunks overlapping `[mint, maxt]`
+    /// (`Block.Delete` in `block.go:648-713`).
+    pub fn delete(
+        &self,
+        mint: i64,
+        maxt: i64,
+        matchers: &[LabelMatcher],
+    ) -> Result<(), BlockError> {
+        let _guard = self.delete_mtx.lock();
+        let refs = postings_for_matchers(&self.index, matchers)?;
+        for r in refs {
+            let (_, chks) = self.index.series(r)?;
+            if chks.is_empty() {
+                continue;
+            }
+            if chks.iter().any(|c| c.overlaps_closed_interval(mint, maxt)) {
+                let first_min = chks[0].min_time;
+                let last_max = chks[chks.len() - 1].max_time;
+                let tmin = mint.max(first_min);
+                let tmax = maxt.min(last_max);
+                self.tombstones.add_interval(r, Interval { mint: tmin, maxt: tmax });
+            }
+        }
+        let tomb_n = write_tombstones_file(&self.dir, &self.tombstones)?;
+        let mut m = self.meta.clone();
+        m.stats.num_tombstones = self.tombstones.total();
+        let meta_n = write_meta_file(&self.dir, &mut m)?;
+        let new_size = (self.index.size() as u64)
+            + (self.chunks.total_size() as u64)
+            + (tomb_n as u64)
+            + (meta_n as u64);
+        self.total_size.store(new_size, Ordering::Release);
+        Ok(())
     }
 
     /// Go `Block.GetSymbolTableSize` (`index.Reader.SymbolTableSize`).
