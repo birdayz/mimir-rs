@@ -45,16 +45,30 @@ fn labels_hash_rejects_len_1_shl_24_instead_of_24bit_wrap_ub() {
 }
 
 #[test]
-fn traceparent_accepts_all_8bit_lowercase_hex_flags_per_w3c() {
+fn traceparent_matches_go_otel_v0_and_future_version_flags() {
     let tid = "4bf92f3577b34da6a3ce929d0e0e4736";
     let sid = "00f067aa0ba902b7";
-    for flag in 0u8..=u8::MAX {
+    // Go go.opentelemetry.io/otel/propagation/trace_context.go:108-114:
+    // version 00 accepts flags 00..=03 and rejects reserved bits (> 0x03).
+    for flag in 0u8..=3u8 {
         let hdr = format!("00-{tid}-{sid}-{flag:02x}");
         let ctx = parse_traceparent(&hdr)
-            .unwrap_or_else(|| panic!("W3C traceparent must accept flags {flag:02x}"));
+            .unwrap_or_else(|| panic!("v00 traceparent must accept flags {flag:02x}"));
         assert_eq!(ctx.is_sampled(), (flag & 0x01) != 0);
         assert_eq!(ctx.trace_flags, flag);
         assert_eq!(ctx.to_traceparent(), hdr);
+    }
+    for flag in 4u8..=u8::MAX {
+        let hdr = format!("00-{tid}-{sid}-{flag:02x}");
+        assert!(parse_traceparent(&hdr).is_none(), "v00 must reject flags {flag:02x}");
+    }
+    // Future version 01 accepts all lowercase hex flags 00..=ff and masks to sampled|random (0x03).
+    for flag in 0u8..=u8::MAX {
+        let hdr = format!("01-{tid}-{sid}-{flag:02x}");
+        let ctx = parse_traceparent(&hdr)
+            .unwrap_or_else(|| panic!("v01 traceparent must accept flags {flag:02x}"));
+        assert_eq!(ctx.is_sampled(), (flag & 0x01) != 0);
+        assert_eq!(ctx.trace_flags, flag & 0x03);
     }
     assert!(parse_traceparent(&format!("00-{tid}-{sid}-FF")).is_none());
     assert!(parse_traceparent(&format!("00-{tid}-{sid}-0")).is_none());

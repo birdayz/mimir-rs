@@ -719,7 +719,14 @@ pub fn parse_traceparent(header: &str) -> Option<TraceContext> {
     if parts[3].len() != 2 || !parts[3].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
         return None;
     }
-    let trace_flags = u8::from_str_radix(parts[3], 16).ok()?;
+    let raw_flags = u8::from_str_radix(parts[3], 16).ok()?;
+    // Exact Go go.opentelemetry.io/otel/propagation/trace_context.go:108-114 parity:
+    // version 00 rejects reserved flag bits (> 0x03); future versions (01..=fe) mask to
+    // FlagsSampled (0x01) | FlagsRandom (0x02).
+    if version == "00" && raw_flags > 0x03 {
+        return None;
+    }
+    let trace_flags = raw_flags & 0x03;
     let sc = TraceContext {
         trace_id,
         span_id,

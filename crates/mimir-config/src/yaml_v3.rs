@@ -1763,13 +1763,52 @@ fn collect_merged_pairs(
     Ok(explicit_keys)
 }
 
-fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<serde_yaml::Value, String> {
+#[derive(Default)]
+struct DocAliasBudget {
+    decode_count: usize,
+    alias_count: usize,
+    alias_depth: usize,
+    active_aliases: HashSet<usize>,
+}
+
+fn doc_node_to_yaml(
+    doc: &Document,
+    t: &Types,
+    n: usize,
+    ty: usize,
+    budget: &mut DocAliasBudget,
+) -> Result<serde_yaml::Value, String> {
     use serde_yaml::{Mapping, Value};
-    let n = doc_deref(doc, n);
+    budget.decode_count = budget.decode_count.saturating_add(1);
+    if budget.alias_depth > 0 {
+        budget.alias_count = budget.alias_count.saturating_add(1);
+    }
+    if budget.alias_count > 100
+        && budget.decode_count > 1000
+        && (budget.alias_count as f64) / (budget.decode_count as f64)
+            > allowed_alias_ratio(budget.decode_count)
+    {
+        return Err("yaml: document contains excessive aliasing".to_string());
+    }
+
     let node = doc.node(n);
+    if node.kind == Kind::Alias {
+        if !budget.active_aliases.insert(n) {
+            return Err(format!("yaml: anchor '{}' value contains itself", node.value));
+        }
+        budget.alias_depth += 1;
+        let res = match node.alias {
+            Some(target) => doc_node_to_yaml(doc, t, target, ty, budget),
+            None => Ok(Value::Null),
+        };
+        budget.alias_depth -= 1;
+        budget.active_aliases.remove(&n);
+        return res;
+    }
+
     if node.kind == Kind::Document {
         return match node.content.first() {
-            Some(&c) => doc_node_to_yaml(doc, t, c, ty),
+            Some(&c) => doc_node_to_yaml(doc, t, c, ty, budget),
             None => Ok(Value::Null),
         };
     }
@@ -1787,7 +1826,7 @@ fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<se
             };
             let mut seq = Vec::with_capacity(node.content.len());
             for &c in &node.content {
-                seq.push(doc_node_to_yaml(doc, t, c, elem_ty)?);
+                seq.push(doc_node_to_yaml(doc, t, c, elem_ty, budget)?);
             }
             Ok(Value::Sequence(seq))
         }
@@ -1797,39 +1836,39 @@ fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<se
             let mut out = Mapping::with_capacity(pairs.len());
             if info.name == "activeseriesmodel.CustomTrackersConfig" {
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
-                    let vv = doc_node_to_yaml(doc, t, v, t.string)?;
+                    let kv = doc_node_to_yaml(doc, t, k, t.string, budget)?;
+                    let vv = doc_node_to_yaml(doc, t, v, t.string, budget)?;
                     out.insert(kv, vv);
                 }
             } else if let Some(elem_ty) = limits_map_elem_ty(t, &info.name) {
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
-                    let vv = doc_node_to_yaml(doc, t, v, elem_ty)?;
+                    let kv = doc_node_to_yaml(doc, t, k, t.string, budget)?;
+                    let vv = doc_node_to_yaml(doc, t, v, elem_ty, budget)?;
                     out.insert(kv, vv);
                 }
             } else if info.kind == "struct" {
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
+                    let kv = doc_node_to_yaml(doc, t, k, t.string, budget)?;
                     let field_ty = kv
                         .as_str()
                         .and_then(|key| info.fields.iter().find(|f| f.key == key).map(|f| f.ty))
                         .or(info.inline_map)
                         .unwrap_or(t.iface);
-                    let vv = doc_node_to_yaml(doc, t, v, field_ty)?;
+                    let vv = doc_node_to_yaml(doc, t, v, field_ty, budget)?;
                     out.insert(kv, vv);
                 }
             } else if info.kind == "map" {
                 let key_ty = info.key.unwrap_or(t.string);
                 let elem_ty = info.elem.unwrap_or(t.iface);
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, key_ty)?;
-                    let vv = doc_node_to_yaml(doc, t, v, elem_ty)?;
+                    let kv = doc_node_to_yaml(doc, t, k, key_ty, budget)?;
+                    let vv = doc_node_to_yaml(doc, t, v, elem_ty, budget)?;
                     out.insert(kv, vv);
                 }
             } else {
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, t.iface)?;
-                    let vv = doc_node_to_yaml(doc, t, v, t.iface)?;
+                    let kv = doc_node_to_yaml(doc, t, k, t.iface, budget)?;
+                    let vv = doc_node_to_yaml(doc, t, v, t.iface, budget)?;
                     out.insert(kv, vv);
                 }
             }
@@ -1843,7 +1882,8 @@ fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<se
 /// `yaml.v3` scalar coercions applied according to the Go type graph.
 pub fn doc_to_serde_value(doc: &Document) -> Result<serde_yaml::Value, String> {
     let t = types()?;
-    doc_node_to_yaml(doc, t, doc.root, t.root)
+    let mut budget = DocAliasBudget::default();
+    doc_node_to_yaml(doc, t, doc.root, t.root, &mut budget)
 }
 
 fn normalize_serde_scalar(t: &Types, val: &mut serde_yaml::Value, ty: usize) {

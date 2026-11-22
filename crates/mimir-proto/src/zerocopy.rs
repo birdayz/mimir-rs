@@ -1069,7 +1069,6 @@ pub fn decode_write_request_with_limit<'a, 's>(
     let mut skip_label_validation = false;
     let mut skip_label_count_validation = false;
     let mut seen_first_symbol = false;
-    let mut prescanned_all_symbols = false;
     let mut all_symbols_utf8 = true;
     let mut budget = ExpansionBudget::new(max_expanded_label_bytes);
 
@@ -1131,25 +1130,23 @@ pub fn decode_write_request_with_limit<'a, 's>(
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                if !prescanned_all_symbols {
-                    if !seen_first_symbol && !sub.is_empty() {
-                        return Err(DecodeError::InvalidFirstSymbol);
-                    }
-                    seen_first_symbol = true;
-                    let valid_utf8 = is_valid_utf8_fast(&input[sub.clone()]);
-                    if !valid_utf8 {
-                        all_symbols_utf8 = false;
-                    }
-                    scratch.rw2_symbols.push(if sub.is_empty() {
-                        SliceRef::Empty
-                    } else {
-                        SliceRef::Input {
-                            start: sub.start as u32,
-                            len: sub.len() as u32,
-                        }
-                    });
-                    scratch.rw2_symbols_utf8.push(valid_utf8);
+                if !seen_first_symbol && !sub.is_empty() {
+                    return Err(DecodeError::InvalidFirstSymbol);
                 }
+                seen_first_symbol = true;
+                let valid_utf8 = is_valid_utf8_fast(&input[sub.clone()]);
+                if !valid_utf8 {
+                    all_symbols_utf8 = false;
+                }
+                scratch.rw2_symbols.push(if sub.is_empty() {
+                    SliceRef::Empty
+                } else {
+                    SliceRef::Input {
+                        start: sub.start as u32,
+                        len: sub.len() as u32,
+                    }
+                });
+                scratch.rw2_symbols_utf8.push(valid_utf8);
             }
             5 => {
                 if !is_rw2 {
@@ -1162,80 +1159,15 @@ pub fn decode_write_request_with_limit<'a, 's>(
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                if !seen_first_symbol && !prescanned_all_symbols {
-                    prescanned_all_symbols = true;
-                    prescan_rw2_symbols_after(
-                        input,
-                        pos,
-                        len,
-                        &mut seen_first_symbol,
-                        &mut all_symbols_utf8,
-                        scratch,
-                    )?;
-                }
-                let snap_labels = scratch.labels.len();
-                let snap_samples = scratch.samples.len();
-                let snap_exemplars = scratch.exemplars.len();
-                let snap_exemplar_labels = scratch.exemplar_labels.len();
-                let snap_histograms = scratch.histograms.len();
-                let snap_neg_spans = scratch.neg_spans.len();
-                let snap_pos_spans = scratch.pos_spans.len();
-                let snap_neg_deltas = scratch.neg_deltas.len();
-                let snap_pos_deltas = scratch.pos_deltas.len();
-                let snap_neg_counts = scratch.neg_counts.len();
-                let snap_pos_counts = scratch.pos_counts.len();
-                let snap_custom_values = scratch.custom_values.len();
-                let snap_budget = budget.used;
-                let ts_meta = match decode_timeseries_rw2(
+                let ts_meta = decode_timeseries_rw2(
                     input,
-                    sub.clone(),
+                    sub,
                     rw2_offset,
                     common_symbols,
                     &opts,
                     scratch,
                     &mut budget,
-                ) {
-                    Ok(m) => m,
-                    Err(
-                        DecodeError::InvalidLabelRef { .. }
-                        | DecodeError::InvalidExemplarLabelRef { .. }
-                        | DecodeError::InvalidHelpRef { .. }
-                        | DecodeError::InvalidUnitRef { .. },
-                    ) if !prescanned_all_symbols => {
-                        scratch.labels.truncate(snap_labels);
-                        scratch.samples.truncate(snap_samples);
-                        scratch.exemplars.truncate(snap_exemplars);
-                        scratch.exemplar_labels.truncate(snap_exemplar_labels);
-                        scratch.histograms.truncate(snap_histograms);
-                        scratch.neg_spans.truncate(snap_neg_spans);
-                        scratch.pos_spans.truncate(snap_pos_spans);
-                        scratch.neg_deltas.truncate(snap_neg_deltas);
-                        scratch.pos_deltas.truncate(snap_pos_deltas);
-                        scratch.neg_counts.truncate(snap_neg_counts);
-                        scratch.pos_counts.truncate(snap_pos_counts);
-                        scratch.custom_values.truncate(snap_custom_values);
-                        budget.used = snap_budget;
-                        prescanned_all_symbols = true;
-                        prescan_rw2_symbols_after(
-                            input,
-                            pos,
-                            len,
-                            &mut seen_first_symbol,
-                            &mut all_symbols_utf8,
-                            scratch,
-                        )?;
-                        decode_timeseries_rw2(
-                            input,
-                            sub,
-                            rw2_offset,
-                            common_symbols,
-                            &opts,
-                            scratch,
-                            &mut budget,
-                        )?
-                    }
-                    Err(e) => return Err(e),
-                };
+                )?;
                 scratch.timeseries.push(ts_meta);
             }
             1000 => {
@@ -1335,79 +1267,6 @@ fn append_raw_classic_labels(
             append_stringlabel_pair_proto(label_bytes_arena, name, value)?;
         } else {
             skip_field_bounded(input, &mut pos, end, wire_type)?;
-        }
-    }
-    Ok(())
-}
-
-fn prescan_rw2_symbols_after(
-    input: &[u8],
-    mut scan_pos: usize,
-    len: usize,
-    seen_first_symbol: &mut bool,
-    all_symbols_utf8: &mut bool,
-    scratch: &mut WriteRequestScratch,
-) -> Result<(), DecodeError> {
-    while scan_pos < len {
-        let (sf, sw) = read_key_bounded(input, &mut scan_pos, len)?;
-        if sf == 4 {
-            if sw != 2 {
-                return Err(DecodeError::InvalidWireType {
-                    field: 4,
-                    wire_type: sw,
-                });
-            }
-            let sub = read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
-            if !*seen_first_symbol && !sub.is_empty() {
-                return Err(DecodeError::InvalidFirstSymbol);
-            }
-            *seen_first_symbol = true;
-            let valid_utf8 = is_valid_utf8_fast(&input[sub.clone()]);
-            if !valid_utf8 {
-                *all_symbols_utf8 = false;
-            }
-            scratch.rw2_symbols.push(if sub.is_empty() {
-                SliceRef::Empty
-            } else {
-                SliceRef::Input {
-                    start: sub.start as u32,
-                    len: sub.len() as u32,
-                }
-            });
-            scratch.rw2_symbols_utf8.push(valid_utf8);
-        } else {
-            skip_field_bounded(input, &mut scan_pos, len, sw)?;
-        }
-    }
-    Ok(())
-}
-
-fn prescan_rw2_stream_symbols_after<'a>(
-    input: &'a [u8],
-    mut scan_pos: usize,
-    len: usize,
-    seen_first_symbol: &mut bool,
-    resolved: &mut Vec<Option<(&'a [u8], bool)>>,
-) -> Result<(), DecodeError> {
-    while scan_pos < len {
-        let (sf, sw) = read_key_bounded(input, &mut scan_pos, len)?;
-        if sf == 4 {
-            if sw != 2 {
-                return Err(DecodeError::InvalidWireType {
-                    field: 4,
-                    wire_type: sw,
-                });
-            }
-            let sub = read_length_delimited_range_bounded(input, &mut scan_pos, len)?;
-            let sym_bytes = &input[sub];
-            if !*seen_first_symbol && !sym_bytes.is_empty() {
-                return Err(DecodeError::InvalidFirstSymbol);
-            }
-            *seen_first_symbol = true;
-            let valid_utf8 = is_valid_utf8_fast(sym_bytes);
-            resolved.push(Some((sym_bytes, valid_utf8)));
-        } else {
-            skip_field_bounded(input, &mut scan_pos, len, sw)?;
         }
     }
     Ok(())
@@ -1947,7 +1806,6 @@ resolved_scratch.lossy_utf8_arena.clear();
         }
 
         let mut seen_first_symbol = false;
-        let mut prescanned_all_symbols = false;
         let mut emitted_any_series = false;
 
         let mut pos = 0usize;
@@ -2007,16 +1865,14 @@ resolved_scratch.lossy_utf8_arena.clear();
                             break;
                         }
                     };
-                    if !prescanned_all_symbols {
-                        let sym_bytes = &input[sub];
-                        if !seen_first_symbol && !sym_bytes.is_empty() {
-                            loop_res = Err(DecodeError::InvalidFirstSymbol);
-                            break;
-                        }
-                        seen_first_symbol = true;
-                        let valid_utf8 = is_valid_utf8_fast(sym_bytes);
-                        resolved.push(Some((sym_bytes, valid_utf8)));
+                    let sym_bytes = &input[sub];
+                    if !seen_first_symbol && !sym_bytes.is_empty() {
+                        loop_res = Err(DecodeError::InvalidFirstSymbol);
+                        break;
                     }
+                    seen_first_symbol = true;
+                    let valid_utf8 = is_valid_utf8_fast(sym_bytes);
+                    resolved.push(Some((sym_bytes, valid_utf8)));
                 }
                 5 => {
                     if wire_type != 2 {
@@ -2033,35 +1889,9 @@ resolved_scratch.lossy_utf8_arena.clear();
                             break;
                         }
                     };
-                    if !seen_first_symbol && !prescanned_all_symbols {
-                        prescanned_all_symbols = true;
-                        if let Err(e) = prescan_rw2_stream_symbols_after(
-                            input,
-                            pos,
-                            len,
-                            &mut seen_first_symbol,
-                            resolved,
-                        ) {
-                            loop_res = Err(e);
-                            break;
-                        }
-                    }
-                    let snap_label_bytes = label_bytes_arena.len();
-                    let snap_samples = samples_arena.len();
-                    let snap_exemplars = scratch.exemplars.len();
-                    let snap_exemplar_labels = scratch.exemplar_labels.len();
-                    let snap_histograms = scratch.histograms.len();
-                    let snap_neg_spans = scratch.neg_spans.len();
-                    let snap_pos_spans = scratch.pos_spans.len();
-                    let snap_neg_deltas = scratch.neg_deltas.len();
-                    let snap_pos_deltas = scratch.pos_deltas.len();
-                    let snap_neg_counts = scratch.neg_counts.len();
-                    let snap_pos_counts = scratch.pos_counts.len();
-                    let snap_custom_values = scratch.custom_values.len();
-                    let snap_budget = budget.used;
-                    let res_series = decode_timeseries_rw2_stream(
+                    let series = match decode_timeseries_rw2_stream(
                         input,
-                        sub.clone(),
+                        sub,
                         rw2_offset,
                         common_symbols,
                         resolved,
@@ -2076,64 +1906,8 @@ resolved_scratch.lossy_utf8_arena.clear();
                         source,
                         skip_label_validation,
                         skip_label_count_validation,
-                    );
-                    let series = match res_series {
+                    ) {
                         Ok(s) => s,
-                        Err(
-                            DecodeError::InvalidLabelRef { .. }
-                            | DecodeError::InvalidExemplarLabelRef { .. }
-                            | DecodeError::InvalidHelpRef { .. }
-                            | DecodeError::InvalidUnitRef { .. },
-                        ) if !prescanned_all_symbols => {
-                            label_bytes_arena.truncate(snap_label_bytes);
-                            samples_arena.truncate(snap_samples);
-                            scratch.exemplars.truncate(snap_exemplars);
-                            scratch.exemplar_labels.truncate(snap_exemplar_labels);
-                            scratch.histograms.truncate(snap_histograms);
-                            scratch.neg_spans.truncate(snap_neg_spans);
-                            scratch.pos_spans.truncate(snap_pos_spans);
-                            scratch.neg_deltas.truncate(snap_neg_deltas);
-                            scratch.pos_deltas.truncate(snap_pos_deltas);
-                            scratch.neg_counts.truncate(snap_neg_counts);
-                            scratch.pos_counts.truncate(snap_pos_counts);
-                            scratch.custom_values.truncate(snap_custom_values);
-                            budget.used = snap_budget;
-                            prescanned_all_symbols = true;
-                            if let Err(e) = prescan_rw2_stream_symbols_after(
-                                input,
-                                pos,
-                                len,
-                                &mut seen_first_symbol,
-                                resolved,
-                            ) {
-                                loop_res = Err(e);
-                                break;
-                            }
-                            match decode_timeseries_rw2_stream(
-                                input,
-                                sub,
-                                rw2_offset,
-                                common_symbols,
-                                resolved,
-                                lossy_utf8_arena,
-                                lossy_map,
-                                pending_meta,
-                                &opts,
-                                scratch,
-                                label_bytes_arena,
-                                &mut budget,
-                                samples_arena,
-                                source,
-                                skip_label_validation,
-                                skip_label_count_validation,
-                            ) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    loop_res = Err(e);
-                                    break;
-                                }
-                            }
-                        }
                         Err(e) => {
                             loop_res = Err(e);
                             break;
@@ -2278,8 +2052,7 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
         match field_num {
             1 => {
                 if wire_type == 0 {
-                    let r = read_varint_bounded(input, &mut pos, end)? as u32;
-                    scratch.rw2_label_refs.push(r);
+                    return Err(DecodeError::OddNumberOfLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
                     let mut p = packed.start;
@@ -2640,8 +2413,7 @@ fn decode_exemplar_rw2_resolved<'a>(
         match field_num {
             1 => {
                 if wire_type == 0 {
-                    let r = read_varint_bounded(input, &mut pos, end)? as u32;
-                    scratch.rw2_exemplar_label_refs.push(r);
+                    return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
                     let mut p = packed.start;
@@ -2966,8 +2738,7 @@ fn decode_timeseries_rw2(
         match field_num {
             1 => {
                 if wire_type == 0 {
-                    let r = read_varint_bounded(input, &mut pos, end)? as u32;
-                    scratch.rw2_label_refs.push(r);
+                    return Err(DecodeError::OddNumberOfLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
                     let mut p = packed.start;
@@ -3294,8 +3065,7 @@ fn decode_exemplar_rw2(
         match field_num {
             1 => {
                 if wire_type == 0 {
-                    let r = read_varint_bounded(input, &mut pos, end)? as u32;
-                    scratch.rw2_exemplar_label_refs.push(r);
+                    return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
                     let mut p = packed.start;
@@ -5091,7 +4861,8 @@ mod tests {
             assert_eq!(owned.timeseries[0].histograms, rw1.timeseries[0].histograms);
         }
 
-        // Test out-of-order RW2 fields: field 5 encoded BEFORE field 4 must decode cleanly.
+        // Test out-of-order RW2 fields: field 5 encoded BEFORE field 4 MUST fail with InvalidLabelRef
+        // (matching Go mimir.pb.go single-pass unmarshaling).
         let rw2 = from_write_request_to_rw2(&rw1, 0, None).unwrap();
         let part_ts = cortexpb::WriteRequest {
             timeseries_rw2: rw2.timeseries_rw2.clone(),
@@ -5106,27 +4877,27 @@ mod tests {
         let mut out_of_order = Vec::new();
         out_of_order.extend_from_slice(&part_ts);
         out_of_order.extend_from_slice(&part_syms);
-        let dec_ooo = decode_write_request(&out_of_order, DecodeOptions::rw2(), &mut scratch)
-            .expect("out-of-order RW2 fields must decode cleanly");
-        assert_eq!(dec_ooo.timeseries_len(), 1);
-        assert_eq!(dec_ooo.timeseries_at(0).samples().len(), 4);
+        assert!(matches!(
+            decode_write_request(&out_of_order, DecodeOptions::rw2(), &mut scratch),
+            Err(DecodeError::InvalidLabelRef { .. })
+        ));
         let mut resolved_ooo = Rw2ResolvedScratch::new();
         let mut label_bytes_ooo = Vec::new();
         let mut samples_ooo = Vec::new();
         let mut meta_ooo = Vec::new();
-        let mut streamed_ooo = 0usize;
-        decode_rw2_stream(
-            &out_of_order,
-            DecodeOptions::rw2(),
-            &mut scratch,
-            &mut resolved_ooo,
-            &mut label_bytes_ooo,
-            &mut samples_ooo,
-            &mut meta_ooo,
-            |_| streamed_ooo += 1,
-        )
-        .expect("out-of-order RW2 stream must decode cleanly");
-        assert_eq!(streamed_ooo, 1);
+        assert!(matches!(
+            decode_rw2_stream(
+                &out_of_order,
+                DecodeOptions::rw2(),
+                &mut scratch,
+                &mut resolved_ooo,
+                &mut label_bytes_ooo,
+                &mut samples_ooo,
+                &mut meta_ooo,
+                |_| {},
+            ),
+            Err(DecodeError::InvalidLabelRef { .. })
+        ));
     }
 
     #[test]
@@ -5212,30 +4983,32 @@ mod tests {
         assert!(streamed_labels[0].windows(2).any(|w| w == b"m1"));
         assert!(streamed_labels[1].windows(2).any(|w| w == b"m2"));
 
-        // 2. Kafka v2: field 5 before field 4 referencing local symbol >= 64 resolves cleanly,
-        //    while referencing an out-of-bounds symbol still fails with InvalidLabelRef.
+        // 2. Kafka v2: field 5 before field 4 referencing local symbol >= 64 fails with InvalidLabelRef
+        //    (matching Go mimir.pb.go single-pass unmarshaling).
         let mut kv2_local_before_sym = Vec::new();
         push_ts(&mut kv2_local_before_sym, &[1, 65], 1.0, 100, 0, 0);
         push_sym(&mut kv2_local_before_sym, "");
         push_sym(&mut kv2_local_before_sym, "custom_metric");
-        let dec_kv2 = decode_write_request(&kv2_local_before_sym, DecodeOptions::kafka_v2(), &mut scratch)
-            .expect("kafka v2 field 5 before field 4 must resolve local symbol 65");
-        assert_eq!(dec_kv2.to_owned_write_request().timeseries[0].labels[0].value.as_ref(), b"custom_metric");
+        assert_eq!(
+            decode_write_request(&kv2_local_before_sym, DecodeOptions::kafka_v2(), &mut scratch).err(),
+            Some(DecodeError::InvalidLabelRef { index: 65, offset: 64 })
+        );
         {
             let mut m = Vec::new();
-            let mut got_labels = Vec::new();
-            decode_rw2_stream(
-                &kv2_local_before_sym,
-                DecodeOptions::kafka_v2(),
-                &mut scratch,
-                &mut resolved,
-                &mut label_bytes,
-                &mut samples,
-                &mut m,
-                |s| got_labels.push(s.encoded_labels.to_vec()),
-            )
-            .expect("kafka v2 stream field 5 before field 4 must resolve local symbol 65");
-            assert!(got_labels[0].windows(13).any(|w| w == b"custom_metric"));
+            assert_eq!(
+                decode_rw2_stream(
+                    &kv2_local_before_sym,
+                    DecodeOptions::kafka_v2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut label_bytes,
+                    &mut samples,
+                    &mut m,
+                    |_| {},
+                )
+                .err(),
+                Some(DecodeError::InvalidLabelRef { index: 65, offset: 64 })
+            );
         }
         let mut kv2_missing_sym = Vec::new();
         push_ts(&mut kv2_missing_sym, &[1, 99], 1.0, 100, 0, 0);
@@ -5300,15 +5073,8 @@ mod tests {
         let mut label_bytes = Vec::new();
         let mut samples = Vec::new();
 
-        // (a) Unpacked wire_type=0: truncated EOF (tag 0x08 only) -> UnexpectedEof; odd single varint [0x08, 0x01] -> OddNumberOfLabelRefs
-        let ts_wire_wt0_eof = vec![0x08];
-        let mut wr_wt0_eof = vec![0x2a, ts_wire_wt0_eof.len() as u8];
-        wr_wt0_eof.extend_from_slice(&ts_wire_wt0_eof);
-        assert_eq!(
-            decode_write_request(&wr_wt0_eof, DecodeOptions::rw2(), &mut scratch).err(),
-            Some(DecodeError::UnexpectedEof)
-        );
-        let ts_wire_wt0 = vec![0x08, 0x01];
+        // (a) Unpacked wire_type=0 with truncated EOF (tag 0x08 only) -> OddNumberOfLabelRefs (Go mimir.pb.go parity)
+        let ts_wire_wt0 = vec![0x08];
         let mut wr_wt0 = vec![0x2a, ts_wire_wt0.len() as u8];
         wr_wt0.extend_from_slice(&ts_wire_wt0);
         assert_eq!(
@@ -5333,17 +5099,8 @@ mod tests {
             );
         }
 
-        // (b) Exemplar unpacked wire_type=0: truncated EOF -> UnexpectedEof; odd single varint [0x08, 0x01] -> OddNumberOfExemplarLabelRefs
-        let ex_wire_wt0_eof = vec![0x08];
-        let mut ts_ex_wt0_eof = vec![0x22, ex_wire_wt0_eof.len() as u8];
-        ts_ex_wt0_eof.extend_from_slice(&ex_wire_wt0_eof);
-        let mut wr_ex_wt0_eof = vec![0x2a, ts_ex_wt0_eof.len() as u8];
-        wr_ex_wt0_eof.extend_from_slice(&ts_ex_wt0_eof);
-        assert_eq!(
-            decode_write_request(&wr_ex_wt0_eof, DecodeOptions::rw2(), &mut scratch).err(),
-            Some(DecodeError::UnexpectedEof)
-        );
-        let ex_wire_wt0 = vec![0x08, 0x01];
+        // (b) Exemplar unpacked wire_type=0 with truncated EOF (tag 0x08 only) -> OddNumberOfExemplarLabelRefs (Go mimir.pb.go parity)
+        let ex_wire_wt0 = vec![0x08];
         let mut ts_ex_wt0 = vec![0x22, ex_wire_wt0.len() as u8];
         ts_ex_wt0.extend_from_slice(&ex_wire_wt0);
         let mut wr_ex_wt0 = vec![0x2a, ts_ex_wt0.len() as u8];

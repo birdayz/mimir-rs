@@ -255,20 +255,21 @@ fn w34_rw2_unpacked_and_split_packed_label_refs_and_odd_checks() {
     push_bytes_field(&mut wire, 4, b"span"); // 7
     push_bytes_field(&mut wire, 4, b"s456"); // 8
 
-    // Series 1: pure unpacked wire_type=0 labels_refs + pure unpacked exemplar labels_refs.
-    let mut ts1 = Vec::new();
+    // Unpacked wire_type=0 labels_refs MUST be rejected with OddNumberOfLabelRefs (Go mimir.pb.go parity).
+    let mut unpacked_wire = wire.clone();
+    let mut ts_unpacked = Vec::new();
     for r in [1u64, 2, 3, 4] {
-        push_varint_field(&mut ts1, 1, r);
+        push_varint_field(&mut ts_unpacked, 1, r);
     }
-    push_bytes_field(&mut ts1, 2, &encode_sample(1.0, 100));
-    let mut ex1 = Vec::new();
-    for r in [5u64, 6] {
-        push_varint_field(&mut ex1, 1, r);
-    }
-    push_bytes_field(&mut ts1, 4, &ex1);
-    push_bytes_field(&mut wire, 5, &ts1);
+    push_bytes_field(&mut ts_unpacked, 2, &encode_sample(1.0, 100));
+    push_bytes_field(&mut unpacked_wire, 5, &ts_unpacked);
+    let mut scratch = WriteRequestScratch::new();
+    assert_eq!(
+        decode_write_request(&unpacked_wire, DecodeOptions::rw2(), &mut scratch).err(),
+        Some(DecodeError::OddNumberOfLabelRefs)
+    );
 
-    // Series 2: odd-length split packed chunks [1, 2, 3] + [4] and exemplar [5] + [6, 7, 8].
+    // Split packed chunks [1, 2, 3] + [4] and exemplar [5] + [6, 7, 8] decode cleanly.
     let mut ts2 = Vec::new();
     let mut p1 = Vec::new();
     for r in [1u64, 2, 3] {
@@ -292,16 +293,13 @@ fn w34_rw2_unpacked_and_split_packed_label_refs_and_odd_checks() {
     push_bytes_field(&mut ts2, 4, &ex2);
     push_bytes_field(&mut wire, 5, &ts2);
 
-    let mut scratch = WriteRequestScratch::new();
     let dec = decode_write_request(&wire, DecodeOptions::rw2(), &mut scratch)
-        .expect("unpacked and split packed RW2 label_refs must decode");
+        .expect("split packed RW2 label_refs must decode");
     let owned = dec.to_owned_write_request();
-    assert_eq!(owned.timeseries.len(), 2);
+    assert_eq!(owned.timeseries.len(), 1);
     assert_eq!(owned.timeseries[0].labels.len(), 2);
     assert_eq!(owned.timeseries[0].labels[1].value.as_ref(), b"api");
-    assert_eq!(owned.timeseries[0].exemplars[0].labels[0].value.as_ref(), b"t123");
-    assert_eq!(owned.timeseries[1].labels.len(), 2);
-    assert_eq!(owned.timeseries[1].exemplars[0].labels.len(), 2);
+    assert_eq!(owned.timeseries[0].exemplars[0].labels.len(), 2);
 
     let mut resolved = Rw2ResolvedScratch::new();
     let mut label_bytes = Vec::new();
@@ -325,7 +323,7 @@ fn w34_rw2_unpacked_and_split_packed_label_refs_and_odd_checks() {
         )
         .expect("streaming unpacked and split packed RW2 label_refs must decode");
     }
-    assert_eq!(streamed, 2);
+    assert_eq!(streamed, 1);
 
     // Odd total across split packed + unpacked -> OddNumberOfLabelRefs AFTER loop.
     let mut odd_wire = Vec::new();
@@ -373,11 +371,11 @@ fn w34_rw2_metadata_before_label_refs_and_symbols_after_timeseries() {
     push_bytes_field(&mut ts, 1, &packed); // labels_refs LAST!
 
     let mut kv2_wire = Vec::new();
-    push_bytes_field(&mut kv2_wire, 5, &ts);
     push_bytes_field(&mut kv2_wire, 4, b""); // 64
     push_bytes_field(&mut kv2_wire, 4, b"http_requests_total"); // 65
     push_bytes_field(&mut kv2_wire, 4, b"total requests"); // 66
     push_bytes_field(&mut kv2_wire, 4, b"requests"); // 67
+    push_bytes_field(&mut kv2_wire, 5, &ts);
 
     let mut scratch = WriteRequestScratch::new();
     let dec = decode_write_request(&kv2_wire, DecodeOptions::kafka_v2(), &mut scratch)
@@ -422,11 +420,11 @@ fn w34_rw2_metadata_before_label_refs_and_symbols_after_timeseries() {
     push_bytes_field(&mut ts_hist, 1, &p_hist);
 
     let mut rw2_wire = Vec::new();
-    push_bytes_field(&mut rw2_wire, 5, &ts_hist);
     push_bytes_field(&mut rw2_wire, 4, b""); // 0
     push_bytes_field(&mut rw2_wire, 4, b"__name__"); // 1
     push_bytes_field(&mut rw2_wire, 4, b"lat_bucket"); // 2
     push_bytes_field(&mut rw2_wire, 4, b"latency"); // 3
+    push_bytes_field(&mut rw2_wire, 5, &ts_hist);
 
     label_bytes.clear();
     samples.clear();
