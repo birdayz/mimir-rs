@@ -13,7 +13,7 @@
 //! - github.com/grafana/mimir/pkg/storage/ingest/DESIGN.md
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -985,6 +985,7 @@ pub struct KafkaClient {
     /// kprom client hooks (`kgo.WithHooks(metrics)`), set once by the client's owner.
     kprom: OnceLock<Arc<KpromMetrics>>,
     extended_metrics: Option<KafkaClientExtendedMetrics>,
+    closed: AtomicBool,
 }
 
 impl KafkaClient {
@@ -1023,6 +1024,7 @@ impl KafkaClient {
             any_broker: parking_lot::Mutex::new(AnyBrokerRotation::default()),
             kprom: OnceLock::new(),
             extended_metrics: None,
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -1070,10 +1072,21 @@ impl KafkaClient {
 
     /// Closes all pooled broker connections and aborts their background reader/writer tasks.
     pub async fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         let mut map = self.conns_by_addr.lock().await;
         for (_, conn) in map.drain() {
             conn.mark_dead();
         }
+    }
+
+    /// Returns `true` once [`Self::close`] has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_conn_count(&self) -> usize {
+        self.conns_by_addr.lock().await.len()
     }
 
     /// `kgo.NodeName` of the broker a connection to `addr` belongs to.
