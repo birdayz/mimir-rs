@@ -1037,7 +1037,7 @@ impl HeadChunksReader {
         Ok(())
     }
 
-    /// Drops any mapped or active segments with sequence strictly greater than `max_keep_seq`
+    /// Drops any mapped or active segments with sequence `>= min_drop_seq`
     /// (must be called before unlinking rolled-back segments on disk).
     pub(crate) fn drop_segments_from(&mut self, min_drop_seq: usize) {
         let to_drop: Vec<usize> = self

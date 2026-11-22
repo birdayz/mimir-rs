@@ -795,6 +795,7 @@ fn load_types() -> Result<Types, String> {
 struct Fail(String);
 
 const MAX_ALIAS_DEPTH: usize = 64;
+const MAX_CALL_DEPTH: usize = 128;
 const ALIAS_RATIO_RANGE_LOW: usize = 400_000;
 const ALIAS_RATIO_RANGE_HIGH: usize = 4_000_000;
 const ALIAS_RATIO_RANGE: f64 = (ALIAS_RATIO_RANGE_HIGH - ALIAS_RATIO_RANGE_LOW) as f64;
@@ -820,6 +821,7 @@ struct Decoder<'a> {
     decode_count: usize,
     alias_count: usize,
     alias_depth: usize,
+    call_depth: usize,
 }
 
 /// `TypeError.Error()`.
@@ -840,7 +842,17 @@ impl<'a> Decoder<'a> {
             decode_count: 0,
             alias_count: 0,
             alias_depth: 0,
+            call_depth: 0,
         }
+    }
+
+    fn new_sub(&self, known_fields: bool) -> Self {
+        let mut sub = Decoder::new(self.doc, self.types, known_fields);
+        sub.decode_count = self.decode_count;
+        sub.alias_count = self.alias_count;
+        sub.alias_depth = self.alias_depth;
+        sub.call_depth = self.call_depth;
+        sub
     }
 
     fn count_and_check_aliases(&mut self) -> Result<(), Fail> {
@@ -861,10 +873,7 @@ impl<'a> Decoder<'a> {
     /// `node.DecodeWithOptions(out, opts)` / `node.Decode(out)` from inside an unmarshaler:
     /// a fresh decoder whose `TypeError` is merged into ours by `callUnmarshaler`.
     fn sub_decode(&mut self, n: usize, ty: usize, known_fields: bool) -> Result<bool, Fail> {
-        let mut sub = Decoder::new(self.doc, self.types, known_fields);
-        sub.decode_count = self.decode_count;
-        sub.alias_count = self.alias_count;
-        sub.alias_depth = self.alias_depth;
+        let mut sub = self.new_sub(known_fields);
         let res = sub.unmarshal(n, ty);
         self.decode_count = sub.decode_count;
         self.alias_count = sub.alias_count;
@@ -897,6 +906,16 @@ impl<'a> Decoder<'a> {
     }
 
     fn unmarshal(&mut self, n: usize, ty: usize) -> Result<bool, Fail> {
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(Fail("yaml: document exceeds maximum nesting depth".to_string()));
+        }
+        self.call_depth += 1;
+        let res = self.unmarshal_inner(n, ty);
+        self.call_depth -= 1;
+        res
+    }
+
+    fn unmarshal_inner(&mut self, n: usize, ty: usize) -> Result<bool, Fail> {
         self.count_and_check_aliases()?;
         let node = self.doc.node(n);
         match node.kind {
@@ -965,8 +984,11 @@ impl<'a> Decoder<'a> {
             } else {
                 (self.types.storage_backend, "blocks_storage")
             };
-            let mut sub = Decoder::new(self.doc, self.types, true);
-            sub.unmarshal(n, loc_ty)?;
+            let mut sub = self.new_sub(true);
+            let res = sub.unmarshal(n, loc_ty);
+            self.decode_count = sub.decode_count;
+            self.alias_count = sub.alias_count;
+            res?;
             if !sub.terrors.is_empty() {
                 return Err(Fail(format!("key {loc:?}: {}", type_error(&sub.terrors))));
             }
@@ -976,8 +998,11 @@ impl<'a> Decoder<'a> {
             // `type plain T; DecodeWithOptions((*plain)(x), KnownFields: true)` / unmarshal((*plain)(x)).
             let known = kind == "obsolete" && self.known_fields || kind == "node";
             if kind == "node" {
-                let mut sub = Decoder::new(self.doc, self.types, known);
-                let good = sub.mapping_or_other_named(n, ty, &delegate)?;
+                let mut sub = self.new_sub(known);
+                let res = sub.mapping_or_other_named(n, ty, &delegate);
+                self.decode_count = sub.decode_count;
+                self.alias_count = sub.alias_count;
+                let good = res?;
                 self.terrors.append(&mut sub.terrors);
                 return Ok(good);
             }
@@ -1040,8 +1065,11 @@ impl<'a> Decoder<'a> {
                     .position(|t| t.name == elem)
                     .unwrap_or(self.types.string);
                 let map_name = format!("map[string]{elem}");
-                let mut sub = Decoder::new(self.doc, self.types, false);
-                let good = sub.mapping_typed(n, &map_name, self.types.string, elem_ty)?;
+                let mut sub = self.new_sub(false);
+                let res = sub.mapping_typed(n, &map_name, self.types.string, elem_ty);
+                self.decode_count = sub.decode_count;
+                self.alias_count = sub.alias_count;
+                let good = res?;
                 self.terrors.append(&mut sub.terrors);
                 Ok(good)
             }
@@ -1743,6 +1771,21 @@ fn collect_merged_pairs(
     visited: &mut HashSet<usize>,
     budget: &mut DocAliasBudget,
 ) -> Result<Vec<(usize, usize)>, String> {
+    if budget.call_depth >= MAX_CALL_DEPTH {
+        return Err("yaml: document exceeds maximum nesting depth".to_string());
+    }
+    budget.call_depth += 1;
+    let res = collect_merged_pairs_inner(doc, n, visited, budget);
+    budget.call_depth -= 1;
+    res
+}
+
+fn collect_merged_pairs_inner(
+    doc: &Document,
+    n: usize,
+    visited: &mut HashSet<usize>,
+    budget: &mut DocAliasBudget,
+) -> Result<Vec<(usize, usize)>, String> {
     budget.tick()?;
     let n = doc_deref(doc, n);
     if !visited.insert(n) {
@@ -1821,7 +1864,7 @@ fn doc_node_to_yaml(
     ty: usize,
     budget: &mut DocAliasBudget,
 ) -> Result<serde_yaml::Value, String> {
-    if budget.call_depth >= 128 {
+    if budget.call_depth >= MAX_CALL_DEPTH {
         return Err("yaml: document exceeds maximum nesting depth".to_string());
     }
     budget.call_depth += 1;
