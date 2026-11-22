@@ -442,6 +442,7 @@ struct CachedReloadingClientCaVerifier {
     mode: String,
     provider: Arc<rustls::crypto::CryptoProvider>,
     initial_hint_subjects: Vec<DistinguishedName>,
+    rotated: std::sync::atomic::AtomicBool,
     last_check_ms: std::sync::atomic::AtomicU64,
     reload_lock: parking_lot::Mutex<()>,
     state: parking_lot::RwLock<(Vec<u8>, Arc<dyn ClientCertVerifier>)>,
@@ -478,6 +479,7 @@ impl CachedReloadingClientCaVerifier {
             mode,
             provider,
             initial_hint_subjects,
+            rotated: std::sync::atomic::AtomicBool::new(false),
             last_check_ms: std::sync::atomic::AtomicU64::new(monotonic_ms()),
             reload_lock: parking_lot::Mutex::new(()),
             state: parking_lot::RwLock::new((pem, verifier)),
@@ -509,8 +511,14 @@ impl CachedReloadingClientCaVerifier {
                                 pinned_ders.push(der);
                             }
                         }
-                        if let Ok(v) = build_client_cert_verifier(&self.mode, Some((roots, pinned_ders)), &self.provider) {
+                        if roots.is_empty() {
+                            tracing::warn!(
+                                path = %self.path,
+                                "reloaded client_ca_file parsed to 0 certificates; retaining last good verifier"
+                            );
+                        } else if let Ok(v) = build_client_cert_verifier(&self.mode, Some((roots, pinned_ders)), &self.provider) {
                             *self.state.write() = (pem, v);
+                            self.rotated.store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
                 }
@@ -537,7 +545,11 @@ impl ClientCertVerifier for CachedReloadingClientCaVerifier {
         self.current().client_auth_mandatory()
     }
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &self.initial_hint_subjects
+        if self.rotated.load(std::sync::atomic::Ordering::Acquire) {
+            &[]
+        } else {
+            &self.initial_hint_subjects
+        }
     }
     fn verify_client_cert(
         &self,

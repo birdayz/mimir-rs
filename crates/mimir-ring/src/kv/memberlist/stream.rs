@@ -63,13 +63,10 @@ async fn decrypt_remote_state<R: AsyncRead + Unpin + Send>(
             "memberlist: Remote node state size approaches limit"
         );
     }
-    let mut cipher_bytes = vec![0u8; more_bytes as usize];
-    if !cipher_bytes.is_empty() {
-        reader
-            .read_exact(&mut cipher_bytes)
-            .await
-            .map_err(|e| format!("read encrypted state payload: {e}"))?;
-    }
+    let mut cipher_bytes = Vec::new();
+    read_exact_bounded_append(reader, &mut cipher_bytes, more_bytes as usize)
+        .await
+        .map_err(|e| format!("read encrypted state payload: {e}"))?;
     let mut aad = Vec::with_capacity(5 + stream_label.len());
     aad.push(MessageType::Encrypt as u8);
     aad.extend_from_slice(&len_buf);
@@ -310,13 +307,10 @@ pub(super) async fn read_push_pull_from_stream<R: AsyncRead + Unpin + Send>(
             hdr.user_state_len
         ));
     }
-    let mut user_buf = vec![0u8; hdr.user_state_len];
-    if hdr.user_state_len > 0 {
-        reader
-            .read_exact(&mut user_buf)
-            .await
-            .map_err(|e| format!("read user state: {e}"))?;
-    }
+    let mut user_buf = Vec::new();
+    read_exact_bounded_append(reader, &mut user_buf, hdr.user_state_len)
+        .await
+        .map_err(|e| format!("read user state: {e}"))?;
     Ok((hdr.join, nodes, user_buf))
 }
 
@@ -328,13 +322,10 @@ pub(super) async fn read_user_msg_from_stream<R: AsyncRead + Unpin + Send>(
     if len > MAX_PUSH_STATE_BYTES {
         return Err(format!("user msg len {len} exceeds limit"));
     }
-    let mut out = vec![0u8; len];
-    if len > 0 {
-        reader
-            .read_exact(&mut out)
-            .await
-            .map_err(|e| format!("read user msg payload: {e}"))?;
-    }
+    let mut out = Vec::new();
+    read_exact_bounded_append(reader, &mut out, len)
+        .await
+        .map_err(|e| format!("read user msg payload: {e}"))?;
     Ok(out)
 }
 
@@ -538,49 +529,174 @@ fn read_sync_string(b: &[u8], pos: &mut usize) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
-fn skip_sync_val(b: &[u8], pos: &mut usize) -> Result<(), String> {
+fn advance_checked(b: &[u8], pos: &mut usize, n: usize) -> Result<(), String> {
+    let next = pos.checked_add(n).ok_or_else(|| "eof".to_string())?;
+    if next > b.len() {
+        return Err("eof".to_string());
+    }
+    *pos = next;
+    Ok(())
+}
+
+fn read_be_u16_at(b: &[u8], pos: &mut usize) -> Result<usize, String> {
+    let end = pos.checked_add(2).ok_or_else(|| "eof".to_string())?;
+    let s = b.get(*pos..end).ok_or_else(|| "eof".to_string())?;
+    *pos = end;
+    Ok(u16::from_be_bytes([s[0], s[1]]) as usize)
+}
+
+fn read_be_u32_at(b: &[u8], pos: &mut usize) -> Result<usize, String> {
+    let end = pos.checked_add(4).ok_or_else(|| "eof".to_string())?;
+    let s = b.get(*pos..end).ok_or_else(|| "eof".to_string())?;
+    *pos = end;
+    Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
+}
+
+pub(super) fn skip_sync_val(b: &[u8], pos: &mut usize) -> Result<(), String> {
+    skip_sync_val_depth(b, pos, 0)
+}
+
+fn skip_sync_val_depth(b: &[u8], pos: &mut usize, depth: usize) -> Result<(), String> {
+    if depth >= MAX_MP_DEPTH {
+        return Err(format!("msgpack skip depth exceeds max {MAX_MP_DEPTH}"));
+    }
     let start = *pos;
     let bd = *b.get(start).ok_or("eof")?;
     *pos += 1;
     match bd {
         0x00..=0x7f | 0xc0..=0xc3 | 0xe0..=0xff => Ok(()),
-        0xcc | 0xd0 => {
-            *pos += 1;
-            Ok(())
-        }
-        0xcd | 0xd1 => {
-            *pos += 2;
-            Ok(())
-        }
-        0xce | 0xd2 | 0xca => {
-            *pos += 4;
-            Ok(())
-        }
-        0xcf | 0xd3 | 0xcb => {
-            *pos += 8;
-            Ok(())
-        }
-        0xa0..=0xbf => {
-            *pos += (bd & 0x1f) as usize;
-            Ok(())
-        }
+        0xcc | 0xd0 => advance_checked(b, pos, 1),
+        0xcd | 0xd1 => advance_checked(b, pos, 2),
+        0xce | 0xd2 | 0xca => advance_checked(b, pos, 4),
+        0xcf | 0xd3 | 0xcb => advance_checked(b, pos, 8),
+        0xa0..=0xbf => advance_checked(b, pos, (bd & 0x1f) as usize),
         0xd9 | 0xc4 => {
             let n = *b.get(*pos).ok_or("eof")? as usize;
-            *pos += 1 + n;
-            Ok(())
+            *pos += 1;
+            advance_checked(b, pos, n)
         }
         0xda | 0xc5 => {
-            let s = b.get(*pos..*pos + 2).ok_or("eof")?;
-            *pos += 2 + u16::from_be_bytes([s[0], s[1]]) as usize;
-            Ok(())
+            let n = read_be_u16_at(b, pos)?;
+            advance_checked(b, pos, n)
         }
         0xdb | 0xc6 => {
-            let s = b.get(*pos..*pos + 4).ok_or("eof")?;
-            *pos += 4 + u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize;
+            let n = read_be_u32_at(b, pos)?;
+            advance_checked(b, pos, n)
+        }
+        0xd4 => advance_checked(b, pos, 2),
+        0xd5 => advance_checked(b, pos, 3),
+        0xd6 => advance_checked(b, pos, 5),
+        0xd7 => advance_checked(b, pos, 9),
+        0xd8 => advance_checked(b, pos, 17),
+        0xc7 => {
+            let n = *b.get(*pos).ok_or("eof")? as usize;
+            *pos += 1;
+            let total = n.checked_add(1).ok_or_else(|| "eof".to_string())?;
+            advance_checked(b, pos, total)
+        }
+        0xc8 => {
+            let n = read_be_u16_at(b, pos)?;
+            let total = n.checked_add(1).ok_or_else(|| "eof".to_string())?;
+            advance_checked(b, pos, total)
+        }
+        0xc9 => {
+            let n = read_be_u32_at(b, pos)?;
+            let total = n.checked_add(1).ok_or_else(|| "eof".to_string())?;
+            advance_checked(b, pos, total)
+        }
+        0x90..=0x9f => {
+            let count = (bd & 0x0f) as usize;
+            for _ in 0..count {
+                skip_sync_val_depth(b, pos, depth + 1)?;
+            }
             Ok(())
         }
-        _ => Err("unsupported skip".to_string()),
+        0xdc => {
+            let count = read_be_u16_at(b, pos)?;
+            if count > b.len().saturating_sub(*pos) {
+                return Err("eof".to_string());
+            }
+            for _ in 0..count {
+                skip_sync_val_depth(b, pos, depth + 1)?;
+            }
+            Ok(())
+        }
+        0xdd => {
+            let count = read_be_u32_at(b, pos)?;
+            if count > b.len().saturating_sub(*pos) {
+                return Err("eof".to_string());
+            }
+            for _ in 0..count {
+                skip_sync_val_depth(b, pos, depth + 1)?;
+            }
+            Ok(())
+        }
+        0x80..=0x8f => {
+            let count = (bd & 0x0f) as usize;
+            for _ in 0..count {
+                skip_sync_val_depth(b, pos, depth + 1)?;
+                skip_sync_val_depth(b, pos, depth + 1)?;
+            }
+            Ok(())
+        }
+        0xde => {
+            let count = read_be_u16_at(b, pos)?;
+            if count.saturating_mul(2) > b.len().saturating_sub(*pos) {
+                return Err("eof".to_string());
+            }
+            for _ in 0..count {
+                skip_sync_val_depth(b, pos, depth + 1)?;
+                skip_sync_val_depth(b, pos, depth + 1)?;
+            }
+            Ok(())
+        }
+        0xdf => {
+            let count = read_be_u32_at(b, pos)?;
+            if count.saturating_mul(2) > b.len().saturating_sub(*pos) {
+                return Err("eof".to_string());
+            }
+            for _ in 0..count {
+                skip_sync_val_depth(b, pos, depth + 1)?;
+                skip_sync_val_depth(b, pos, depth + 1)?;
+            }
+            Ok(())
+        }
     }
+}
+
+#[doc(hidden)]
+pub async fn decrypt_remote_state_for_test<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+    stream_label: &str,
+) -> Result<Vec<u8>, String> {
+    let noop: StreamDecryptFn = Arc::new(|cipher, _aad| Ok(cipher.to_vec()));
+    decrypt_remote_state(reader, stream_label, None, &noop).await
+}
+
+#[doc(hidden)]
+pub async fn read_push_pull_from_stream_for_test<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+) -> Result<(bool, Vec<PushNodeState>, Vec<u8>), String> {
+    read_push_pull_from_stream(reader).await
+}
+
+#[doc(hidden)]
+pub async fn read_user_msg_from_stream_for_test<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+) -> Result<Vec<u8>, String> {
+    read_user_msg_from_stream(reader).await
+}
+
+#[doc(hidden)]
+pub async fn read_msgpack_map_bytes_for_test<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+) -> Result<Vec<u8>, String> {
+    read_msgpack_map_bytes(reader).await
+}
+
+#[doc(hidden)]
+pub fn skip_sync_val_for_test(b: &[u8], pos: &mut usize) -> Result<(), String> {
+    skip_sync_val(b, pos)
 }
 
 /// Reads a single complete self-delimiting MessagePack item from an async reader into a byte buffer.
@@ -778,6 +894,41 @@ fn read_mp_item_limited<'a, R: AsyncRead + Unpin + Send>(
     })
 }
 
+const STREAM_READ_CHUNK_BYTES: usize = 64 * 1024;
+
+async fn read_exact_bounded_append<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    len: usize,
+) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let orig_len = out.len();
+    let target_len = orig_len
+        .checked_add(len)
+        .ok_or_else(|| mp_invalid("stream payload length overflow"))?;
+    out.reserve(len.min(STREAM_READ_CHUNK_BYTES));
+    let mut remaining = len;
+    while remaining > 0 {
+        let step = remaining.min(STREAM_READ_CHUNK_BYTES);
+        let start = out.len();
+        out.resize(start + step, 0);
+        if let Err(err) = reader.read_exact(&mut out[start..]).await {
+            out.truncate(start);
+            return Err(err);
+        }
+        remaining -= step;
+    }
+    if out.len() != target_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short read on bounded stream payload",
+        ));
+    }
+    Ok(())
+}
+
 async fn read_append<R: AsyncRead + Unpin + Send>(
     reader: &mut R,
     out: &mut Vec<u8>,
@@ -785,10 +936,7 @@ async fn read_append<R: AsyncRead + Unpin + Send>(
     max_bytes: usize,
 ) -> io::Result<()> {
     ensure_capacity_within_limit(out, len, max_bytes)?;
-    let start = out.len();
-    out.resize(start + len, 0);
-    reader.read_exact(&mut out[start..]).await?;
-    Ok(())
+    read_exact_bounded_append(reader, out, len).await
 }
 
 #[cfg(test)]

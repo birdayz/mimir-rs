@@ -421,7 +421,7 @@ impl Default for ReporterConfig {
 pub struct Reporter {
     cfg: ReporterConfig,
     bucket: BucketClient,
-    client: reqwest::Client,
+    client: Result<reqwest::Client, String>,
     requests_total: Counter,
     requests_failed_total: Counter,
     requests_latency: Histogram,
@@ -460,7 +460,7 @@ impl Reporter {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
-                .expect("reqwest client"),
+                .map_err(|e| format!("build usage-stats HTTP client: {e}")),
             requests_total,
             requests_failed_total,
             requests_latency,
@@ -481,8 +481,8 @@ impl Reporter {
 
     async fn do_send(&self, report: &Report) -> Result<(), String> {
         let data = serde_json::to_vec(report).map_err(|e| format!("marshal the report: {e}"))?;
-        let resp = self
-            .client
+        let client = self.client.as_ref().map_err(Clone::clone)?;
+        let resp = client
             .post(&self.cfg.server_url)
             .header("Content-Type", "application/json")
             .body(data)

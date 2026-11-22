@@ -921,11 +921,13 @@ impl MemberlistKv {
             let mut updates_node = false;
             if !table.map.contains_key(&a.node) {
                 if let Some(cidrs) = self.cidrs_allowed.as_deref() {
-                    if let Some(ip) = super::bytes_to_ip(&a.addr) {
-                        if let Err(err) = super::super::security::ip_allowed(Some(cidrs), ip) {
-                            warn!(node = %a.node, %err, "memberlist: Rejected node");
-                            return;
-                        }
+                    let Some(ip) = super::bytes_to_ip(&a.addr) else {
+                        warn!(node = %a.node, addr_len = a.addr.len(), "memberlist: Rejected node with invalid addr");
+                        return;
+                    };
+                    if let Err(err) = super::super::security::ip_allowed(Some(cidrs), ip) {
+                        warn!(node = %a.node, %err, "memberlist: Rejected node");
+                        return;
                     }
                 }
                 let state = NodeState {
@@ -948,11 +950,13 @@ impl MemberlistKv {
                 let state = table.map.get(&a.node).expect("present");
                 if state.addr != a.addr || state.port != a.port {
                     if let Some(cidrs) = self.cidrs_allowed.as_deref() {
-                        if let Some(ip) = super::bytes_to_ip(&a.addr) {
-                            if let Err(err) = super::super::security::ip_allowed(Some(cidrs), ip) {
-                                warn!(node = %a.node, %err, "memberlist: Rejected IP update");
-                                return;
-                            }
+                        let Some(ip) = super::bytes_to_ip(&a.addr) else {
+                            warn!(node = %a.node, addr_len = a.addr.len(), "memberlist: Rejected IP update with invalid addr");
+                            return;
+                        };
+                        if let Err(err) = super::super::security::ip_allowed(Some(cidrs), ip) {
+                            warn!(node = %a.node, %err, "memberlist: Rejected IP update");
+                            return;
                         }
                     }
                     let reclaim = self.timing.dead_node_reclaim_time;

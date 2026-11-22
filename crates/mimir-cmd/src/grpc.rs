@@ -964,6 +964,54 @@ enum BoundedDecompressAlgo {
 /// bounding `gzip`/`zstd`/`snappy`/`s2` decompression to `max_recv`, and enforcing
 /// non-client-streaming gRPC cardinality (0 frames or 2+ frames -> `Code::Internal`) before
 /// emitting frame 1 so inner handlers never execute on frame 1 when frame 2 is present.
+fn zstd_window_log_max(max_recv: usize) -> u32 {
+    // Standard streaming zstd encoders at default level 3 emit windowLog=21 (2 MiB) when
+    // uncompressed size is unknown; cap to [21, 23] (2 MiB..8 MiB) so normal frames work
+    // while preventing multi-hundred-MiB / GiB window-allocation bombs.
+    if max_recv == 0 {
+        return 21;
+    }
+    let bits = usize::BITS - (max_recv - 1).leading_zeros();
+    bits.clamp(21, 23)
+}
+
+#[doc(hidden)]
+#[allow(clippy::result_large_err)]
+pub async fn drive_bounded_grpc_decompress_for_test(
+    chunks: Vec<Bytes>,
+    algo: &str,
+    max_recv: usize,
+) -> Result<Vec<u8>, Status> {
+    use http_body_util::BodyExt as _;
+
+    struct VecBody(std::collections::VecDeque<Bytes>);
+    impl hyper::body::Body for VecBody {
+        type Data = Bytes;
+        type Error = Status;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            match self.0.pop_front() {
+                Some(b) => Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    let algo = match algo {
+        "gzip" => BoundedDecompressAlgo::Gzip,
+        "zstd" => BoundedDecompressAlgo::Zstd,
+        "snappy" => BoundedDecompressAlgo::Snappy,
+        "s2" => BoundedDecompressAlgo::S2,
+        _ => BoundedDecompressAlgo::Identity,
+    };
+    let inner = tonic::body::BoxBody::new(VecBody(chunks.into()));
+    let body = BoundedGrpcDecompressBody::new(inner, algo, max_recv);
+    let collected = body.collect().await?;
+    Ok(collected.to_bytes().to_vec())
+}
+
 struct BoundedGrpcDecompressBody {
     inner: tonic::body::BoxBody,
     algo: BoundedDecompressAlgo,
@@ -1085,7 +1133,11 @@ impl BoundedGrpcDecompressBody {
                             })?;
                         }
                         BoundedDecompressAlgo::Zstd => {
-                            let dec = zstd::stream::read::Decoder::new(compressed).map_err(|e| {
+                            let window_log = zstd_window_log_max(self.max_recv);
+                            let mut dec = zstd::stream::read::Decoder::new(compressed).map_err(|e| {
+                                Status::internal(format!("zstd decompression failed: {e}"))
+                            })?;
+                            dec.window_log_max(window_log).map_err(|e| {
                                 Status::internal(format!("zstd decompression failed: {e}"))
                             })?;
                             dec.take(limit).read_to_end(&mut decompressed).map_err(|e| {
@@ -1185,6 +1237,13 @@ impl hyper::body::Body for BoundedGrpcDecompressBody {
                     if frame.is_data() {
                         if let Ok(data) = frame.into_data() {
                             if !data.is_empty() {
+                                if self.frames_seen >= 1 {
+                                    self.buffered_frame1 = None;
+                                    self.done = true;
+                                    return Poll::Ready(Some(Err(Status::internal(
+                                        "cardinality violation: received multiple request messages for non-client-streaming RPC",
+                                    ))));
+                                }
                                 if self.frames_seen == 0
                                     && matches!(self.algo, BoundedDecompressAlgo::Identity)
                                     && self.in_buf.is_empty()
