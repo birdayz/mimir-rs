@@ -3,10 +3,12 @@
 //! Ported from github.com/prometheus/prometheus/tsdb/index/postings.go
 //! and github.com/prometheus/prometheus/tsdb/querier.go.
 
-use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::any::Any;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
+use bytes::Bytes;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
@@ -22,6 +24,25 @@ pub const ALL_POSTINGS_KEY: (SymbolId, SymbolId) = (SymbolId::EMPTY, SymbolId::E
 /// Minimum label value byte length required before counting towards per-label-name byte accounting.
 pub const LABEL_VALUE_BYTES_MIN_LENGTH: usize = 128;
 
+/// Interval (in iterations) for checking context cancellation in tight loops.
+pub const CHECK_CONTEXT_EVERY_N_ITERATIONS: usize = 128;
+
+/// Context cancellation check hook matching Go `context.Context.Err()`.
+pub trait ContextCheck {
+    fn err(&self) -> Option<String>;
+}
+
+/// No-op context that is never canceled.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopContext;
+
+impl ContextCheck for NoopContext {
+    #[inline]
+    fn err(&self) -> Option<String> {
+        None
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PostingsError {
     #[error("unexpected all-postings matcher among other matchers")]
@@ -30,6 +51,22 @@ pub enum PostingsError {
     Matcher(#[from] crate::matcher::MatcherError),
     #[error("index read error: {0}")]
     Index(String),
+    #[error("context canceled: {0}")]
+    ContextCanceled(String),
+    #[error("{0}")]
+    Custom(String),
+}
+
+impl PostingsError {
+    pub fn clone_for_iter(&self) -> Self {
+        match self {
+            Self::UnexpectedAllPostings => Self::UnexpectedAllPostings,
+            Self::Matcher(e) => Self::Custom(e.to_string()),
+            Self::Index(s) => Self::Index(s.clone()),
+            Self::ContextCanceled(s) => Self::ContextCanceled(s.clone()),
+            Self::Custom(s) => Self::Custom(s.clone()),
+        }
+    }
 }
 
 /// Trait implemented by both [`MemPostingsView`] (Head) and [`crate::index::IndexReader`] (Block)
@@ -1359,6 +1396,341 @@ impl MemPostings {
             .collect();
         resolved.sort_unstable();
         resolved
+    }
+
+    /// Inserts `series_ref` directly for a single `(name_id, value_id)` pair (used for testing `addFor`).
+    pub fn add_for_pair(&self, series_ref: u64, name_id: SymbolId, value_id: SymbolId) {
+        let _gate = self.add_gate.read();
+        let ordered = self.ordered.load(AtomicOrdering::Acquire);
+        if (name_id, value_id) == ALL_POSTINGS_KEY {
+            self.all_postings.write().push(series_ref, ordered);
+            return;
+        }
+        self.stripes[Self::stripe_idx(name_id)]
+            .write()
+            .add_for(series_ref, name_id, value_id, ordered);
+    }
+
+    /// Returns whether all postings lists in this `MemPostings` are sorted (for testing `ensure_order`).
+    pub fn is_all_sorted(&self) -> bool {
+        {
+            let all = self.all_postings.read();
+            if !all.small.is_sorted() || !all.overflow.is_sorted() {
+                return false;
+            }
+        }
+        for s_rw in &self.stripes {
+            let stripe = s_rw.read();
+            for vm in stripe.m.values() {
+                for list in vm.values() {
+                    if !list.is_sorted() {
+                        return false;
+                    }
+                }
+            }
+            for ov in stripe.overflow.values() {
+                if !ov.is_sorted() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Returns the number of series references in the postings list for `name=value`.
+    /// Ported from `MemPostings.PostingsLength` in `tsdb/index/postings_mimir.go`.
+    pub fn postings_length(&self, name: &str, value: &str, symbols: &SymbolTable) -> usize {
+        if name.is_empty() && value.is_empty() {
+            return self.all_postings.read().len();
+        }
+        let Some(name_id) = symbols.get(name) else {
+            return 0;
+        };
+        let Some(value_id) = symbols.get(value) else {
+            return 0;
+        };
+        self.postings_len(name_id, value_id)
+    }
+
+    /// Appends `count` series references from random positions in the postings list for `name=value`
+    /// into `buffer`, matching `MemPostings.AppendRandomPostingsRefs`.
+    pub fn append_random_postings_refs(
+        &self,
+        name: &str,
+        value: &str,
+        count: usize,
+        symbols: &SymbolTable,
+        buffer: &mut Vec<u64>,
+    ) {
+        if count == 0 {
+            return;
+        }
+        if name.is_empty() && value.is_empty() {
+            let all = self.all_postings.read();
+            append_random_sample_from_slices(&all.small, &all.overflow, count, buffer);
+            return;
+        }
+        let Some(name_id) = symbols.get(name) else {
+            return;
+        };
+        let Some(value_id) = symbols.get(value) else {
+            return;
+        };
+        self.append_postings_sample(name_id, value_id, count, buffer);
+    }
+
+    /// Returns label values for `name` honoring optional `LabelHints`, matching `MemPostings.LabelValues`.
+    pub fn label_values_with_hints(
+        &self,
+        name: &str,
+        symbols: &SymbolTable,
+        hints: Option<&LabelHints>,
+    ) -> Vec<String> {
+        let values = self.label_values(name, symbols);
+        match hints {
+            Some(h) => h.apply_limit(&values),
+            None => values,
+        }
+    }
+
+    /// Calculates cardinality statistics from postings, matching `MemPostings.Stats`.
+    pub fn stats(
+        &self,
+        symbols: &SymbolTable,
+        label: &str,
+        limit: usize,
+        label_size_fn: impl Fn(&str, &str, u64) -> u64,
+    ) -> PostingsStats {
+        let mut metrics = PostingsStatMaxHeap::new(limit);
+        let mut labels_heap = PostingsStatMaxHeap::new(limit);
+        let mut label_value_length = PostingsStatMaxHeap::new(limit);
+        let mut label_value_pairs = PostingsStatMaxHeap::new(limit);
+        let mut num_label_pairs = 0usize;
+
+        for s_rw in &self.stripes {
+            let stripe = s_rw.read();
+            for (&name_id, vm) in &stripe.m {
+                if name_id == ALL_POSTINGS_KEY.0 {
+                    continue;
+                }
+                let n = symbols.resolve(name_id);
+                labels_heap.push(Stat {
+                    name: n.to_string(),
+                    count: vm.len() as u64,
+                });
+                num_label_pairs += vm.len();
+                let mut size = 0u64;
+                for (&val_id, small) in vm {
+                    let v = symbols.resolve(val_id);
+                    let ov_len = if stripe.overflow.is_empty() {
+                        0
+                    } else {
+                        stripe.overflow.get(&(name_id, val_id)).map_or(0, Vec::len)
+                    };
+                    let series_cnt = (small.len() + ov_len) as u64;
+                    if n == label {
+                        metrics.push(Stat {
+                            name: v.to_string(),
+                            count: series_cnt,
+                        });
+                    }
+                    label_value_pairs.push(Stat {
+                        name: format!("{n}={v}"),
+                        count: series_cnt,
+                    });
+                    size += label_size_fn(n, v, series_cnt);
+                }
+                label_value_length.push(Stat {
+                    name: n.to_string(),
+                    count: size,
+                });
+            }
+        }
+
+        PostingsStats {
+            cardinality_metrics_stats: metrics.get(),
+            cardinality_label_stats: labels_heap.get(),
+            label_value_stats: label_value_length.get(),
+            label_value_pairs_stats: label_value_pairs.get(),
+            num_label_pairs,
+        }
+    }
+
+    /// Returns a streaming postings iterator for `(name, values)`.
+    pub fn postings_iter(
+        &self,
+        name: &str,
+        values: &[&str],
+        symbols: &SymbolTable,
+    ) -> Box<dyn PostingsIter> {
+        if name.is_empty() && values.contains(&"") {
+            return Box::new(ListPostings::new(self.all_postings()));
+        }
+        let Some(name_id) = symbols.get(name) else {
+            return Box::new(EmptyPostingsIter);
+        };
+        let mut its: Vec<Box<dyn PostingsIter>> = Vec::with_capacity(values.len());
+        for &v in values {
+            if let Some(vid) = symbols.get(v) {
+                let list = self.postings_for_id(name_id, vid);
+                if !list.is_empty() {
+                    its.push(Box::new(ListPostings::new(list)));
+                }
+            }
+        }
+        merge_iters(its)
+    }
+
+    /// Returns a streaming postings iterator for all values of `name`.
+    pub fn postings_for_all_values_iter(
+        &self,
+        name: &str,
+        symbols: &SymbolTable,
+    ) -> Box<dyn PostingsIter> {
+        let Some(name_id) = symbols.get(name) else {
+            return Box::new(EmptyPostingsIter);
+        };
+        if name_id == ALL_POSTINGS_KEY.0 {
+            return Box::new(ListPostings::new(self.all_postings()));
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let Some(vm) = stripe.m.get(&name_id) else {
+            return Box::new(EmptyPostingsIter);
+        };
+        let mut its: Vec<Box<dyn PostingsIter>> = Vec::with_capacity(vm.len());
+        for &vid in vm.keys() {
+            let mut list: Vec<u64> = vm
+                .get(&vid)
+                .map(|v| v.iter().map(|&x| x as u64).collect())
+                .unwrap_or_default();
+            if !stripe.overflow.is_empty() {
+                if let Some(ov) = stripe.overflow.get(&(name_id, vid)) {
+                    list.extend_from_slice(ov);
+                }
+            }
+            if !list.is_empty() {
+                its.push(Box::new(ListPostings::new(list)));
+            }
+        }
+        merge_iters(its)
+    }
+
+    /// Returns a streaming postings iterator for values of `name` matching `pred`,
+    /// checking `ctx` every `CHECK_CONTEXT_EVERY_N_ITERATIONS` values.
+    pub fn postings_for_label_matching_iter_ctx(
+        &self,
+        ctx: &dyn ContextCheck,
+        name: &str,
+        symbols: &SymbolTable,
+        pred: &mut dyn FnMut(&str) -> bool,
+    ) -> Box<dyn PostingsIter> {
+        let Some(name_id) = symbols.get(name) else {
+            return Box::new(EmptyPostingsIter);
+        };
+        let value_ids: Vec<SymbolId> = {
+            let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+            match stripe.lvs.get(&name_id) {
+                Some(v) => v.clone(),
+                None => return Box::new(EmptyPostingsIter),
+            }
+        };
+        let mut matching_ids = Vec::new();
+        for (i, &vid) in value_ids.iter().enumerate() {
+            if i % CHECK_CONTEXT_EVERY_N_ITERATIONS == 0 && ctx.err().is_some() {
+                let err_msg = ctx.err().unwrap_or_default();
+                return Box::new(ErrPostingsIter::new(PostingsError::ContextCanceled(
+                    err_msg,
+                )));
+            }
+            if pred(symbols.resolve(vid)) {
+                matching_ids.push(vid);
+            }
+        }
+        if matching_ids.is_empty() {
+            return Box::new(EmptyPostingsIter);
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let Some(vm) = stripe.m.get(&name_id) else {
+            return Box::new(EmptyPostingsIter);
+        };
+        let mut its: Vec<Box<dyn PostingsIter>> = Vec::with_capacity(matching_ids.len());
+        for vid in matching_ids {
+            let mut list: Vec<u64> = vm
+                .get(&vid)
+                .map(|v| v.iter().map(|&x| x as u64).collect())
+                .unwrap_or_default();
+            if !stripe.overflow.is_empty() {
+                if let Some(ov) = stripe.overflow.get(&(name_id, vid)) {
+                    list.extend_from_slice(ov);
+                }
+            }
+            if !list.is_empty() {
+                its.push(Box::new(ListPostings::new(list)));
+            }
+        }
+        merge_iters(its)
+    }
+
+    /// Returns sorted label values for `name` present in series referred to by `postings`.
+    pub fn label_values_for(
+        &self,
+        symbols: &SymbolTable,
+        postings: &mut dyn PostingsIter,
+        name: &str,
+    ) -> Result<Vec<String>, PostingsError> {
+        self.label_values_for_inner(symbols, postings, name, true)
+    }
+
+    /// Returns sorted label values for `name` present in series other than those in `postings`.
+    pub fn label_values_excluding(
+        &self,
+        symbols: &SymbolTable,
+        postings: &mut dyn PostingsIter,
+        name: &str,
+    ) -> Result<Vec<String>, PostingsError> {
+        self.label_values_for_inner(symbols, postings, name, false)
+    }
+
+    fn label_values_for_inner(
+        &self,
+        symbols: &SymbolTable,
+        postings: &mut dyn PostingsIter,
+        name: &str,
+        include_matches: bool,
+    ) -> Result<Vec<String>, PostingsError> {
+        let Some(name_id) = symbols.get(name) else {
+            return Ok(Vec::new());
+        };
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let Some(vm) = stripe.m.get(&name_id) else {
+            return Ok(Vec::new());
+        };
+        if vm.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut vals: Vec<String> = Vec::with_capacity(vm.len());
+        let mut candidates: Vec<Box<dyn PostingsIter>> = Vec::with_capacity(vm.len());
+        for (&vid, small) in vm {
+            vals.push(symbols.resolve(vid).to_string());
+            let mut list: Vec<u64> = small.iter().map(|&x| x as u64).collect();
+            if !stripe.overflow.is_empty() {
+                if let Some(ov) = stripe.overflow.get(&(name_id, vid)) {
+                    list.extend_from_slice(ov);
+                }
+            }
+            candidates.push(Box::new(ListPostings::new(list)));
+        }
+        drop(stripe);
+
+        let mut indexes = if include_matches {
+            find_intersecting_postings(postings, &mut candidates)?
+        } else {
+            find_non_contained_postings(postings, &mut candidates)?
+        };
+        indexes.sort_unstable();
+        let mut out: Vec<String> = indexes.into_iter().map(|i| std::mem::take(&mut vals[i])).collect();
+        out.sort_unstable();
+        Ok(out)
     }
 
     /// Returns a view implementing [`PostingsSource`] paired with `symbols`.
@@ -2800,6 +3172,931 @@ fn inverse_postings_for_single_matcher<S: PostingsSource + ?Sized>(
         return source.postings_for_all_values(&m.name);
     }
     source.postings_for_label_matching(&m.name, &mut |v| !m.matches(v))
+}
+
+/// Label hints controlling limit and ordering of label value queries, matching `storage.LabelHints`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LabelHints {
+    pub limit: isize,
+    pub limit_smallest: bool,
+}
+
+impl LabelHints {
+    pub fn apply_limit(&self, values: &[String]) -> Vec<String> {
+        if self.limit <= 0 || values.len() <= (self.limit as usize) {
+            return values.to_vec();
+        }
+        let limit = self.limit as usize;
+        if self.limit_smallest {
+            let mut heap: BinaryHeap<&str> = BinaryHeap::with_capacity(limit);
+            for v in values {
+                let s = v.as_str();
+                if heap.len() < limit {
+                    heap.push(s);
+                } else if let Some(&top) = heap.peek() {
+                    if s < top {
+                        heap.pop();
+                        heap.push(s);
+                    }
+                }
+            }
+            let mut out: Vec<String> = heap.into_iter().map(str::to_string).collect();
+            out.sort_unstable();
+            out
+        } else {
+            values[..limit].to_vec()
+        }
+    }
+}
+
+/// Cardinality statistic entry, matching `index.Stat`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stat {
+    pub name: String,
+    pub count: u64,
+}
+
+/// Bounded top-N max-heap matching `index.maxHeap` in `tsdb/index/postingsstats.go`.
+#[derive(Debug, Default)]
+pub struct PostingsStatMaxHeap {
+    max_length: usize,
+    min_value: u64,
+    min_index: usize,
+    items: Vec<Stat>,
+}
+
+impl PostingsStatMaxHeap {
+    pub fn new(length: usize) -> Self {
+        let mut h = Self::default();
+        h.init(length);
+        h
+    }
+
+    pub fn init(&mut self, length: usize) {
+        self.max_length = length;
+        self.min_value = u64::MAX;
+        self.min_index = 0;
+        self.items = Vec::with_capacity(length);
+    }
+
+    pub fn push(&mut self, item: Stat) {
+        if self.max_length == 0 {
+            return;
+        }
+        if self.items.len() < self.max_length {
+            if item.count < self.min_value {
+                self.min_value = item.count;
+                self.min_index = self.items.len();
+            }
+            self.items.push(item);
+            return;
+        }
+        if item.count < self.min_value {
+            return;
+        }
+        self.items[self.min_index] = item;
+        self.min_value = self.items[self.min_index].count;
+        for (i, stat) in self.items.iter().enumerate() {
+            if stat.count < self.min_value {
+                self.min_value = stat.count;
+                self.min_index = i;
+            }
+        }
+    }
+
+    pub fn get(mut self) -> Vec<Stat> {
+        self.items.sort_by_key(|a| Reverse(a.count));
+        self.items
+    }
+}
+
+/// Cardinality statistics returned by [`MemPostings::stats`], matching `index.PostingsStats`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PostingsStats {
+    pub cardinality_metrics_stats: Vec<Stat>,
+    pub cardinality_label_stats: Vec<Stat>,
+    pub label_value_stats: Vec<Stat>,
+    pub label_value_pairs_stats: Vec<Stat>,
+    pub num_label_pairs: usize,
+}
+
+/// Streaming iterator over an ascending sequence of series IDs, matching `index.Postings`.
+pub trait PostingsIter {
+    fn next(&mut self) -> bool;
+    fn seek(&mut self, v: u64) -> bool;
+    fn at(&self) -> u64;
+    fn err(&self) -> Option<&PostingsError>;
+    fn is_empty_sentinel(&self) -> bool {
+        false
+    }
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<P: PostingsIter + ?Sized> PostingsIter for Box<P> {
+    fn next(&mut self) -> bool {
+        (**self).next()
+    }
+    fn seek(&mut self, v: u64) -> bool {
+        (**self).seek(v)
+    }
+    fn at(&self) -> u64 {
+        (**self).at()
+    }
+    fn err(&self) -> Option<&PostingsError> {
+        (**self).err()
+    }
+    fn is_empty_sentinel(&self) -> bool {
+        (**self).is_empty_sentinel()
+    }
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+}
+
+/// Empty postings sentinel matching `index.EmptyPostings()`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EmptyPostingsIter;
+
+impl PostingsIter for EmptyPostingsIter {
+    fn next(&mut self) -> bool {
+        false
+    }
+    fn seek(&mut self, _v: u64) -> bool {
+        false
+    }
+    fn at(&self) -> u64 {
+        0
+    }
+    fn err(&self) -> Option<&PostingsError> {
+        None
+    }
+    fn is_empty_sentinel(&self) -> bool {
+        true
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Error postings iterator matching `index.ErrPostings(err)`.
+#[derive(Debug)]
+pub struct ErrPostingsIter {
+    err: PostingsError,
+}
+
+impl ErrPostingsIter {
+    pub fn new(err: PostingsError) -> Self {
+        Self { err }
+    }
+}
+
+impl PostingsIter for ErrPostingsIter {
+    fn next(&mut self) -> bool {
+        false
+    }
+    fn seek(&mut self, _v: u64) -> bool {
+        false
+    }
+    fn at(&self) -> u64 {
+        0
+    }
+    fn err(&self) -> Option<&PostingsError> {
+        Some(&self.err)
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// List-backed postings iterator matching `index.listPostings`.
+#[derive(Clone, Debug, Default)]
+pub struct ListPostings {
+    list: Vec<u64>,
+    pos: usize,
+    cur: u64,
+    positioned: bool,
+}
+
+impl ListPostings {
+    pub fn new(list: Vec<u64>) -> Self {
+        Self {
+            list,
+            pos: 0,
+            cur: 0,
+            positioned: false,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.len().saturating_sub(self.pos)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pos >= self.list.len()
+    }
+}
+
+impl PostingsIter for ListPostings {
+    fn next(&mut self) -> bool {
+        if self.pos < self.list.len() {
+            self.cur = self.list[self.pos];
+            self.pos += 1;
+            self.positioned = true;
+            return true;
+        }
+        self.cur = 0;
+        false
+    }
+
+    fn seek(&mut self, x: u64) -> bool {
+        if self.positioned && self.cur >= x {
+            return true;
+        }
+        if self.pos >= self.list.len() {
+            return false;
+        }
+        if self.list[self.pos] >= x {
+            self.cur = self.list[self.pos];
+            self.pos += 1;
+            self.positioned = true;
+            return true;
+        }
+        let rel = self.list[self.pos..].partition_point(|&v| v < x);
+        let idx = self.pos + rel;
+        if idx >= self.list.len() {
+            self.pos = self.list.len();
+            return false;
+        }
+        self.cur = self.list[idx];
+        self.pos = idx + 1;
+        self.positioned = true;
+        true
+    }
+
+    fn at(&self) -> u64 {
+        self.cur
+    }
+
+    fn err(&self) -> Option<&PostingsError> {
+        None
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Big-endian uint32 postings iterator matching `index.bigEndianPostings`.
+#[derive(Clone, Debug)]
+pub struct BigEndianPostings {
+    list: Bytes,
+    pos: usize,
+    cur: u32,
+    positioned: bool,
+}
+
+impl BigEndianPostings {
+    pub fn from_bytes(list: Bytes) -> Self {
+        Self {
+            list,
+            pos: 0,
+            cur: 0,
+            positioned: false,
+        }
+    }
+
+    pub fn from_slice(slice: &[u8]) -> Self {
+        Self::from_bytes(Bytes::copy_from_slice(slice))
+    }
+}
+
+impl PostingsIter for BigEndianPostings {
+    fn next(&mut self) -> bool {
+        if self.list.len().saturating_sub(self.pos) >= 4 {
+            let b = &self.list[self.pos..self.pos + 4];
+            self.cur = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+            self.pos += 4;
+            self.positioned = true;
+            return true;
+        }
+        false
+    }
+
+    fn seek(&mut self, x: u64) -> bool {
+        if self.positioned && u64::from(self.cur) >= x {
+            return true;
+        }
+        if x > u64::from(u32::MAX) {
+            self.pos = self.list.len();
+            return false;
+        }
+        let x32 = x as u32;
+        let rem = &self.list[self.pos..];
+        let num = rem.len() / 4;
+        // Binary search between current position and end.
+        let mut lo = 0usize;
+        let mut hi = num;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let off = mid * 4;
+            let v = u32::from_be_bytes([rem[off], rem[off + 1], rem[off + 2], rem[off + 3]]);
+            if v < x32 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < num {
+            let j = self.pos + lo * 4;
+            self.cur = u32::from_be_bytes([
+                self.list[j],
+                self.list[j + 1],
+                self.list[j + 2],
+                self.list[j + 3],
+            ]);
+            self.pos = j + 4;
+            self.positioned = true;
+            return true;
+        }
+        self.pos = self.list.len();
+        false
+    }
+
+    fn at(&self) -> u64 {
+        u64::from(self.cur)
+    }
+
+    fn err(&self) -> Option<&PostingsError> {
+        None
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Intersection iterator matching `index.Intersect(...)`.
+pub struct IntersectPostings {
+    postings: Vec<Box<dyn PostingsIter>>,
+    current: u64,
+}
+
+pub fn intersect_iters(mut its: Vec<Box<dyn PostingsIter>>) -> Box<dyn PostingsIter> {
+    if its.is_empty() || its.iter().any(|p| p.is_empty_sentinel()) {
+        return Box::new(EmptyPostingsIter);
+    }
+    if its.len() == 1 {
+        return its.remove(0);
+    }
+    Box::new(IntersectPostings {
+        postings: its,
+        current: 0,
+    })
+}
+
+impl PostingsIter for IntersectPostings {
+    fn next(&mut self) -> bool {
+        if !self.postings[0].next() {
+            return false;
+        }
+        let mut target = self.postings[0].at();
+        let mut all_equal = true;
+        for p in &mut self.postings[1..] {
+            if !p.next() {
+                return false;
+            }
+            let at = p.at();
+            if at > target {
+                target = at;
+                all_equal = false;
+            } else if at < target {
+                all_equal = false;
+            }
+        }
+        if all_equal {
+            self.current = target;
+            return true;
+        }
+        self.seek(target)
+    }
+
+    fn seek(&mut self, mut target: u64) -> bool {
+        loop {
+            let mut all_equal = true;
+            for p in &mut self.postings {
+                if !p.seek(target) {
+                    return false;
+                }
+                if p.at() > target {
+                    target = p.at();
+                    all_equal = false;
+                }
+            }
+            if all_equal {
+                self.current = target;
+                return true;
+            }
+        }
+    }
+
+    fn at(&self) -> u64 {
+        self.current
+    }
+
+    fn err(&self) -> Option<&PostingsError> {
+        for p in &self.postings {
+            if let Some(e) = p.err() {
+                return Some(e);
+            }
+        }
+        None
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Union iterator matching `index.Merge(ctx, ...)`.
+pub struct MergedPostings {
+    p: Vec<Box<dyn PostingsIter>>,
+    heap: BinaryHeap<(Reverse<u64>, usize)>,
+    cur: u64,
+    has_cur: bool,
+    initialized: bool,
+}
+
+pub fn merge_iters(mut its: Vec<Box<dyn PostingsIter>>) -> Box<dyn PostingsIter> {
+    if its.is_empty() {
+        return Box::new(EmptyPostingsIter);
+    }
+    if its.len() == 1 {
+        return its.remove(0);
+    }
+    let cap = its.len();
+    Box::new(MergedPostings {
+        p: its,
+        heap: BinaryHeap::with_capacity(cap),
+        cur: 0,
+        has_cur: false,
+        initialized: false,
+    })
+}
+
+impl MergedPostings {
+    fn init(&mut self) {
+        self.initialized = true;
+        for (idx, it) in self.p.iter_mut().enumerate() {
+            if it.next() {
+                self.heap.push((Reverse(it.at()), idx));
+            }
+        }
+    }
+}
+
+impl PostingsIter for MergedPostings {
+    fn next(&mut self) -> bool {
+        if !self.initialized {
+            self.init();
+        }
+        while let Some((Reverse(val), idx)) = self.heap.pop() {
+            if self.p[idx].next() {
+                self.heap.push((Reverse(self.p[idx].at()), idx));
+            }
+            if !self.has_cur || val != self.cur {
+                self.cur = val;
+                self.has_cur = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn seek(&mut self, id: u64) -> bool {
+        if !self.initialized {
+            self.initialized = true;
+            for (idx, it) in self.p.iter_mut().enumerate() {
+                if it.seek(id) {
+                    self.heap.push((Reverse(it.at()), idx));
+                }
+            }
+            if let Some(&(Reverse(val), _)) = self.heap.peek() {
+                self.cur = val;
+                self.has_cur = true;
+                return true;
+            }
+            return false;
+        }
+        while let Some(&(Reverse(top), _)) = self.heap.peek() {
+            if top >= id {
+                break;
+            }
+            let (_, idx) = self.heap.pop().unwrap();
+            if self.p[idx].seek(id) {
+                self.heap.push((Reverse(self.p[idx].at()), idx));
+            }
+        }
+        if let Some(&(Reverse(val), _)) = self.heap.peek() {
+            self.cur = val;
+            self.has_cur = true;
+            return true;
+        }
+        false
+    }
+
+    fn at(&self) -> u64 {
+        self.cur
+    }
+
+    fn err(&self) -> Option<&PostingsError> {
+        for p in &self.p {
+            if let Some(e) = p.err() {
+                return Some(e);
+            }
+        }
+        None
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Difference iterator matching `index.Without(full, drop)` and `newRemovedPostings`.
+pub struct RemovedPostings {
+    full: Box<dyn PostingsIter>,
+    remove: Box<dyn PostingsIter>,
+    cur: u64,
+    positioned: bool,
+    initialized: bool,
+    fok: bool,
+    rok: bool,
+}
+
+impl RemovedPostings {
+    pub fn new(full: Box<dyn PostingsIter>, remove: Box<dyn PostingsIter>) -> Self {
+        Self {
+            full,
+            remove,
+            cur: 0,
+            positioned: false,
+            initialized: false,
+            fok: false,
+            rok: false,
+        }
+    }
+}
+
+pub fn without_iters(full: Box<dyn PostingsIter>, drop: Box<dyn PostingsIter>) -> Box<dyn PostingsIter> {
+    if full.is_empty_sentinel() {
+        return Box::new(EmptyPostingsIter);
+    }
+    if drop.is_empty_sentinel() {
+        return full;
+    }
+    Box::new(RemovedPostings::new(full, drop))
+}
+
+impl PostingsIter for RemovedPostings {
+    fn next(&mut self) -> bool {
+        if !self.initialized {
+            self.fok = self.full.next();
+            self.rok = self.remove.next();
+            self.initialized = true;
+        }
+        loop {
+            if !self.fok {
+                return false;
+            }
+            if !self.rok {
+                self.cur = self.full.at();
+                self.positioned = true;
+                self.fok = self.full.Next_compat();
+                return true;
+            }
+            let fcur = self.full.at();
+            let rcur = self.remove.at();
+            if fcur < rcur {
+                self.cur = fcur;
+                self.positioned = true;
+                self.fok = self.full.next();
+                return true;
+            } else if rcur < fcur {
+                self.rok = self.remove.seek(fcur);
+            } else {
+                self.fok = self.full.next();
+            }
+        }
+    }
+
+    fn seek(&mut self, id: u64) -> bool {
+        if self.positioned && self.cur >= id {
+            return true;
+        }
+        self.fok = self.full.seek(id);
+        self.rok = self.remove.seek(id);
+        self.initialized = true;
+        self.next()
+    }
+
+    fn at(&self) -> u64 {
+        self.cur
+    }
+
+    fn err(&self) -> Option<&PostingsError> {
+        if let Some(e) = self.full.err() {
+            return Some(e);
+        }
+        self.remove.err()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+trait PostingsIterExt {
+    #[allow(non_snake_case)]
+    fn Next_compat(&mut self) -> bool;
+}
+
+impl<T: PostingsIter + ?Sized> PostingsIterExt for T {
+    #[inline]
+    fn Next_compat(&mut self) -> bool {
+        self.next()
+    }
+}
+
+/// Expands a [`PostingsIter`] into a `Vec<u64>`, matching `index.ExpandPostings`.
+pub fn expand_postings(p: &mut dyn PostingsIter) -> Result<Vec<u64>, PostingsError> {
+    let mut res = Vec::new();
+    while p.next() {
+        res.push(p.at());
+    }
+    if let Some(e) = p.err() {
+        return Err(e.clone_for_iter());
+    }
+    Ok(res)
+}
+
+/// Cloner allowing multiple independent iterators over an underlying `PostingsIter`,
+/// matching `index.PostingsCloner` in `tsdb/index/postings_cloner.go`.
+#[derive(Debug)]
+pub struct PostingsCloner {
+    ids: Vec<u64>,
+    err: Option<PostingsError>,
+}
+
+impl PostingsCloner {
+    pub fn new(p: &mut dyn PostingsIter) -> Self {
+        match expand_postings(p) {
+            Ok(ids) => Self { ids, err: None },
+            Err(e) => Self {
+                ids: Vec::new(),
+                err: Some(e),
+            },
+        }
+    }
+
+    pub fn clone_iter(&self) -> Box<dyn PostingsIter> {
+        if let Some(ref e) = self.err {
+            return Box::new(ErrPostingsIter::new(e.clone_for_iter()));
+        }
+        Box::new(ListPostings::new(self.ids.clone()))
+    }
+
+    pub fn num_postings(&self) -> usize {
+        self.ids.len()
+    }
+}
+
+/// Heap element used by [`PostingsWithIndexHeap`], matching `index.postingsWithIndex`.
+pub struct PostingsWithIndex {
+    pub index: usize,
+    pub p: Box<dyn PostingsIter>,
+    pub popped: bool,
+}
+
+/// Min-heap over [`PostingsWithIndex`], matching `index.postingsWithIndexHeap`.
+pub struct PostingsWithIndexHeap(pub Vec<PostingsWithIndex>);
+
+impl PostingsWithIndexHeap {
+    pub fn init(&mut self) {
+        let n = self.0.len();
+        for i in (0..n / 2).rev() {
+            self.down(i, n);
+        }
+    }
+
+    #[inline]
+    pub fn empty(&self) -> bool {
+        self.0.is_empty() || self.0[0].popped
+    }
+
+    #[inline]
+    pub fn at(&self) -> u64 {
+        self.0[0].p.at()
+    }
+
+    pub fn pop_index(&mut self) -> usize {
+        let index = self.0[0].index;
+        self.0[0].popped = true;
+        self.fix(0);
+        index
+    }
+
+    pub fn pop_node(&mut self) -> Option<PostingsWithIndex> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let n = self.0.len() - 1;
+        self.0.swap(0, n);
+        self.down(0, n);
+        self.0.pop()
+    }
+
+    pub fn seek_head(&mut self, val: u64) -> Result<(), PostingsError> {
+        if self.0[0].p.seek(val) {
+            self.fix(0);
+            return Ok(());
+        }
+        if let Some(e) = self.0[0].p.err() {
+            return Err(PostingsError::Custom(format!(
+                "seek postings {}: {}",
+                self.0[0].index, e
+            )));
+        }
+        self.pop_index();
+        Ok(())
+    }
+
+    #[inline]
+    fn less(&self, i: usize, j: usize) -> bool {
+        if self.0[i].popped != self.0[j].popped {
+            return self.0[j].popped;
+        }
+        self.0[i].p.at() < self.0[j].p.at()
+    }
+
+    fn fix(&mut self, i: usize) {
+        if !self.down(i, self.0.len()) {
+            self.up(i);
+        }
+    }
+
+    fn up(&mut self, mut j: usize) {
+        while j > 0 {
+            let i = (j - 1) / 2;
+            if i == j || !self.less(j, i) {
+                break;
+            }
+            self.0.swap(i, j);
+            j = i;
+        }
+    }
+
+    fn down(&mut self, i0: usize, n: usize) -> bool {
+        let mut i = i0;
+        loop {
+            let j1 = 2 * i + 1;
+            if j1 >= n {
+                break;
+            }
+            let mut j = j1;
+            let j2 = j1 + 1;
+            if j2 < n && self.less(j2, j1) {
+                j = j2;
+            }
+            if !self.less(j, i) {
+                break;
+            }
+            self.0.swap(i, j);
+            i = j;
+        }
+        i > i0
+    }
+}
+
+/// Returns indices of `candidates` whose intersection with `p` is non-empty,
+/// matching `index.FindIntersectingPostings`.
+pub fn find_intersecting_postings(
+    p: &mut dyn PostingsIter,
+    candidates: &mut [Box<dyn PostingsIter>],
+) -> Result<Vec<usize>, PostingsError> {
+    let mut nodes = Vec::with_capacity(candidates.len());
+    for (idx, it) in candidates.iter_mut().enumerate() {
+        if it.next() {
+            let taken = std::mem::replace(it, Box::new(EmptyPostingsIter));
+            nodes.push(PostingsWithIndex {
+                index: idx,
+                p: taken,
+                popped: false,
+            });
+        } else if let Some(e) = it.err() {
+            return Err(e.clone_for_iter());
+        }
+    }
+    let mut h = PostingsWithIndexHeap(nodes);
+    if h.empty() {
+        return Ok(Vec::new());
+    }
+    h.init();
+
+    let mut indexes = Vec::new();
+    while !h.empty() {
+        if !p.seek(h.at()) {
+            if let Some(e) = p.err() {
+                return Err(e.clone_for_iter());
+            }
+            return Ok(indexes);
+        }
+        if p.at() == h.at() {
+            indexes.push(h.pop_index());
+        } else {
+            h.seek_head(p.at())?;
+        }
+    }
+    Ok(indexes)
+}
+
+/// Returns indices of `candidates` not fully contained in `p`,
+/// matching `index.findNonContainedPostings`.
+pub fn find_non_contained_postings(
+    p: &mut dyn PostingsIter,
+    candidates: &mut [Box<dyn PostingsIter>],
+) -> Result<Vec<usize>, PostingsError> {
+    let mut nodes = Vec::with_capacity(candidates.len());
+    for (idx, it) in candidates.iter_mut().enumerate() {
+        if it.next() {
+            let taken = std::mem::replace(it, Box::new(EmptyPostingsIter));
+            nodes.push(PostingsWithIndex {
+                index: idx,
+                p: taken,
+                popped: false,
+            });
+        } else if let Some(e) = it.err() {
+            return Err(e.clone_for_iter());
+        }
+    }
+    let mut h = PostingsWithIndexHeap(nodes);
+    if h.empty() {
+        return Ok(Vec::new());
+    }
+    h.init();
+
+    let mut indexes = Vec::new();
+    while !h.empty() {
+        if !p.seek(h.at()) {
+            if let Some(e) = p.err() {
+                return Err(e.clone_for_iter());
+            }
+            while !h.empty() {
+                indexes.push(h.pop_index());
+            }
+            break;
+        }
+        if p.at() != h.at() {
+            indexes.push(h.pop_index());
+        } else {
+            h.seek_head(h.at() + 1)?;
+        }
+    }
+    Ok(indexes)
+}
+
+/// Returns `true` if `p1` and `p2` have at least one series ID in common,
+/// matching `index.intersect` in `tsdb/index/labelvalues.go`.
+pub fn intersect_any(p1: &mut dyn PostingsIter, p2: &mut dyn PostingsIter) -> bool {
+    if !p1.next() || !p2.next() {
+        return false;
+    }
+    let mut cur = p1.at().max(p2.at());
+    while p1.seek(cur) {
+        if p1.at() > cur {
+            cur = p1.at();
+        }
+        if !p2.seek(cur) {
+            break;
+        }
+        if p2.at() > cur {
+            cur = p2.at();
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Returns `true` if every series ID in `subp` is present in `p`,
+/// matching `index.contains` in `tsdb/index/labelvalues.go`.
+pub fn contains_all(p: &mut dyn PostingsIter, subp: &mut dyn PostingsIter) -> bool {
+    while subp.next() {
+        let needle = subp.at();
+        if !p.seek(needle) || p.at() != needle {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

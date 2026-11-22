@@ -105,6 +105,16 @@ pub struct MemTombstones {
     has_tombstones: AtomicBool,
 }
 
+impl PartialEq for MemTombstones {
+    fn eq(&self, other: &Self) -> bool {
+        let g1 = self.groups.read();
+        let g2 = other.groups.read();
+        *g1 == *g2
+    }
+}
+
+impl Eq for MemTombstones {}
+
 impl MemTombstones {
     pub fn new() -> Self {
         Self::default()
