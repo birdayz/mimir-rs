@@ -77,6 +77,7 @@ pub trait InstanceDescExt {
     ) -> bool;
     fn is_ready(&self, now: SystemTime, heartbeat_timeout: Duration) -> Result<(), String>;
     fn get_registered_at(&self) -> Option<SystemTime>;
+    fn get_last_heartbeat_at(&self) -> Option<SystemTime>;
     fn get_read_only_state(&self) -> (bool, Option<SystemTime>);
 }
 
@@ -140,6 +141,16 @@ impl InstanceDescExt for InstanceDesc {
             None
         } else {
             Some(UNIX_EPOCH + Duration::from_secs(self.registered_timestamp as u64))
+        }
+    }
+
+    fn get_last_heartbeat_at(&self) -> Option<SystemTime> {
+        if self.timestamp == 0 {
+            None
+        } else if self.timestamp > 0 {
+            Some(UNIX_EPOCH + Duration::from_secs(self.timestamp as u64))
+        } else {
+            UNIX_EPOCH.checked_sub(Duration::from_secs(self.timestamp.unsigned_abs()))
         }
     }
 
@@ -502,13 +513,21 @@ pub(crate) fn get_tokens_info(desc: &Desc) -> HashMap<u32, InstanceInfo> {
     out
 }
 
-pub(crate) fn merge_tokens(instances: &[Vec<u32>]) -> Vec<u32> {
+pub fn merge_tokens(instances: &[Vec<u32>]) -> Vec<u32> {
     let total: usize = instances.iter().map(|v| v.len()).sum();
     let mut out = Vec::with_capacity(total);
     for v in instances {
         out.extend_from_slice(v);
     }
     out.sort_unstable();
+    out
+}
+
+pub fn merge_tokens_by_zone(zones: &HashMap<String, Vec<Vec<u32>>>) -> HashMap<String, Vec<u32>> {
+    let mut out = HashMap::with_capacity(zones.len());
+    for (zone, lists) in zones {
+        out.insert(zone.clone(), merge_tokens(lists));
+    }
     out
 }
 

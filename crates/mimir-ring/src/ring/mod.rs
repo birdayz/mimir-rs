@@ -5,9 +5,14 @@
 //! - github.com/grafana/dskit/ring/token_range.go
 //! - github.com/grafana/dskit/ring/util.go
 
+pub mod batch;
 pub mod http;
 pub mod model;
+pub mod replication_set;
+pub mod replication_set_tracker;
 pub mod replication_strategy;
+pub mod ticker;
+pub mod token_range;
 pub mod util;
 
 use std::borrow::Cow;
@@ -237,6 +242,38 @@ impl RingMetrics {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetOptions {
+    pub replication_factor: usize,
+}
+
+/// Read-only ring interface matching `dskit/ring.ReadRing`.
+pub trait ReadRing: Send + Sync {
+    fn get(&self, key: u32, op: Operation) -> Result<ReplicationSet, RingError>;
+    fn get_with_options(
+        &self,
+        key: u32,
+        op: Operation,
+        opts: GetOptions,
+    ) -> Result<ReplicationSet, RingError>;
+    fn get_all_healthy(&self, op: Operation) -> Result<ReplicationSet, RingError>;
+    fn get_replication_set_for_operation(&self, op: Operation) -> Result<ReplicationSet, RingError>;
+    fn get_subring_for_operation_states(&self, op: Operation) -> Arc<Ring>;
+    fn replication_factor(&self) -> usize;
+    fn instances_count(&self) -> usize;
+    fn instances_with_tokens_count(&self) -> usize;
+    fn get_instance_state(&self, instance_id: &str) -> Result<InstanceState, RingError>;
+    fn has_instance(&self, instance_id: &str) -> bool;
+    fn cleanup_shuffle_shard_cache(&self, identifier: &str);
+    fn get_token_ranges_for_instance(&self, instance_id: &str) -> Result<Vec<u32>, RingError>;
+    fn instances_in_zone_count(&self, zone: &str) -> usize;
+    fn instances_with_tokens_in_zone_count(&self, zone: &str) -> usize;
+    fn writable_instances_with_tokens_count(&self) -> usize;
+    fn writable_instances_with_tokens_in_zone_count(&self, zone: &str) -> usize;
+    fn zones_count(&self) -> usize;
+    fn zones(&self) -> Vec<String>;
+}
+
 /// Classic consistent hash ring (`dskit/ring.Ring`).
 pub struct Ring {
     name: String,
@@ -290,6 +327,17 @@ impl Ring {
         strategy: Arc<dyn ReplicationStrategy>,
         reg: Option<&dyn AsRegisterer>,
     ) -> Result<Arc<Self>, RingError> {
+        Self::with_optional_store_and_strategy(settings, name, key, Some(store), strategy, reg)
+    }
+
+    pub fn with_optional_store_and_strategy(
+        settings: RingSettings,
+        name: &str,
+        key: &str,
+        store: Option<Arc<dyn KvClient>>,
+        strategy: Arc<dyn ReplicationStrategy>,
+        reg: Option<&dyn AsRegisterer>,
+    ) -> Result<Arc<Self>, RingError> {
         let reg = reg.map(|r| r.as_registerer());
         if settings.replication_factor == 0 {
             return Err(RingError::InvalidReplicationFactor(0));
@@ -298,7 +346,7 @@ impl Ring {
             name: name.to_string(),
             key: key.to_string(),
             settings,
-            kv_client: Some(store),
+            kv_client: store,
             strategy,
             inner: RwLock::new(RingInner {
                 ring_desc: Desc::default(),
@@ -321,6 +369,41 @@ impl Ring {
             }),
             metrics: Some(RingMetrics::new(name, reg.as_ref())),
         }))
+    }
+
+    /// Creates an in-memory [`Ring`] for unit tests without enforcing `replication_factor > 0`
+    /// or initializing metrics, matching `newRingForTesting` in `dskit/ring/ring_test.go`.
+    pub fn new_for_testing(
+        settings: RingSettings,
+        strategy: Arc<dyn ReplicationStrategy>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            name: String::new(),
+            key: String::new(),
+            settings,
+            kv_client: None,
+            strategy,
+            inner: RwLock::new(RingInner {
+                ring_desc: Desc::default(),
+                ring_tokens: Vec::new(),
+                ring_tokens_by_zone: HashMap::new(),
+                oldest_registered_timestamp: 0,
+                read_only_instances: None,
+                oldest_read_only_updated_timestamp: None,
+                ring_instance_by_token: Arc::new(HashMap::new()),
+                last_topology_change: UNIX_EPOCH,
+                ring_zones: Vec::new(),
+                tracked_ring_zones: HashSet::new(),
+                instances_with_tokens_count: 0,
+                instances_count_per_zone: HashMap::new(),
+                instances_with_tokens_count_per_zone: HashMap::new(),
+                writable_instances_with_tokens_count: 0,
+                writable_instances_with_tokens_count_per_zone: HashMap::new(),
+                shuffled_subring_cache: HashMap::new(),
+                shuffled_subring_with_lookback_cache: HashMap::new(),
+            }),
+            metrics: None,
+        })
     }
 
     /// Creates an in-memory [`Ring`] directly from a [`Desc`] (useful for tests & static snapshots).
@@ -476,7 +559,7 @@ impl Ring {
         self.set_ring_state_from_desc(ring_desc, true, true, true);
     }
 
-    fn set_ring_state_from_desc(
+    pub fn set_ring_state_from_desc(
         &self,
         ring_desc: Desc,
         update_metrics: bool,
@@ -630,6 +713,15 @@ impl Ring {
         replication_factor: usize,
     ) -> Result<ReplicationSet, RingError> {
         self.get_at(key, op, replication_factor, SystemTime::now())
+    }
+
+    pub fn get_with_options(
+        &self,
+        key: u32,
+        op: Operation,
+        opts: GetOptions,
+    ) -> Result<ReplicationSet, RingError> {
+        self.get_at(key, op, opts.replication_factor, SystemTime::now())
     }
 
     pub fn get_at(
@@ -1311,6 +1403,10 @@ impl Ring {
         self.inner.read().ring_zones.clone()
     }
 
+    pub fn read_only_instance_count(&self) -> usize {
+        self.inner.read().read_only_instances.unwrap_or(0)
+    }
+
     pub fn get_token_ranges_for_instance(&self, instance_id: &str) -> Result<Vec<u32>, RingError> {
         let inner = self.inner.read();
         let instance = inner
@@ -1377,6 +1473,94 @@ impl Ring {
         ranges.sort_unstable();
         Ok(ranges)
     }
+}
+
+impl ReadRing for Ring {
+    fn get(&self, key: u32, op: Operation) -> Result<ReplicationSet, RingError> {
+        self.get(key, op)
+    }
+
+    fn get_with_options(
+        &self,
+        key: u32,
+        op: Operation,
+        opts: GetOptions,
+    ) -> Result<ReplicationSet, RingError> {
+        self.get_with_options(key, op, opts)
+    }
+
+    fn get_all_healthy(&self, op: Operation) -> Result<ReplicationSet, RingError> {
+        self.get_all_healthy(op)
+    }
+
+    fn get_replication_set_for_operation(&self, op: Operation) -> Result<ReplicationSet, RingError> {
+        self.get_replication_set_for_operation(op)
+    }
+
+    fn get_subring_for_operation_states(&self, op: Operation) -> Arc<Ring> {
+        self.get_subring_for_operation_states(op)
+    }
+
+    fn replication_factor(&self) -> usize {
+        self.replication_factor()
+    }
+
+    fn instances_count(&self) -> usize {
+        self.instances_count()
+    }
+
+    fn instances_with_tokens_count(&self) -> usize {
+        self.instances_with_tokens_count()
+    }
+
+    fn get_instance_state(&self, instance_id: &str) -> Result<InstanceState, RingError> {
+        self.get_instance_state(instance_id)
+    }
+
+    fn has_instance(&self, instance_id: &str) -> bool {
+        self.has_instance(instance_id)
+    }
+
+    fn cleanup_shuffle_shard_cache(&self, identifier: &str) {
+        self.cleanup_shuffle_shard_cache(identifier);
+    }
+
+    fn get_token_ranges_for_instance(&self, instance_id: &str) -> Result<Vec<u32>, RingError> {
+        self.get_token_ranges_for_instance(instance_id)
+    }
+
+    fn instances_in_zone_count(&self, zone: &str) -> usize {
+        self.instances_in_zone_count(zone)
+    }
+
+    fn instances_with_tokens_in_zone_count(&self, zone: &str) -> usize {
+        self.instances_with_tokens_in_zone_count(zone)
+    }
+
+    fn writable_instances_with_tokens_count(&self) -> usize {
+        self.writable_instances_with_tokens_count()
+    }
+
+    fn writable_instances_with_tokens_in_zone_count(&self, zone: &str) -> usize {
+        self.writable_instances_with_tokens_in_zone_count(zone)
+    }
+
+    fn zones_count(&self) -> usize {
+        self.zones_count()
+    }
+
+    fn zones(&self) -> Vec<String> {
+        self.zones()
+    }
+}
+
+/// Returns a sorted list of all tokens in each entry in `groups_by_name` (each assumed already sorted).
+pub fn merge_token_groups(groups_by_name: &HashMap<String, Vec<u32>>) -> Vec<u32> {
+    if groups_by_name.len() == 1 {
+        return groups_by_name.values().next().cloned().unwrap_or_default();
+    }
+    let groups: Vec<Vec<u32>> = groups_by_name.values().cloned().collect();
+    merge_tokens(&groups)
 }
 
 fn can_stop_looking(
