@@ -193,39 +193,84 @@ impl BlockChunksWriter {
             return Ok(());
         }
 
-        if self.cur_writer.is_none() {
+        let mut batch_size: usize = 0;
+        let mut batch_start: usize = 0;
+        let mut batches: Vec<std::ops::Range<usize>> = Vec::with_capacity(1);
+        batches.push(0..0);
+        let mut first_batch = true;
+
+        for (i, chk) in chunks.iter().enumerate() {
+            let encoded = chk.chunk.as_ref().ok_or_else(|| {
+                BlockChunksError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ChunkMeta.chunk must be populated before write_chunks",
+                ))
+            })?;
+            let data_len = encoded.as_bytes().len();
+            let chk_size =
+                MAX_CHUNK_LENGTH_FIELD_SIZE + CHUNK_ENCODING_SIZE + data_len + CRC_SIZE;
+            batch_size += chk_size;
+
+            let mut cut_new_batch = (i != 0) && (batch_size + SEGMENT_HEADER_SIZE > self.segment_size);
+
+            if first_batch && self.pos > SEGMENT_HEADER_SIZE {
+                cut_new_batch = batch_size + self.pos > self.segment_size;
+                if cut_new_batch {
+                    first_batch = false;
+                }
+            }
+
+            if cut_new_batch {
+                batch_start = i;
+                batches.push(i..i);
+                batch_size = chk_size;
+            }
+            if let Some(last) = batches.last_mut() {
+                *last = batch_start..(i + 1);
+            }
+        }
+
+        if self.pos == 0 {
             self.cut()?;
         }
 
         let mut len_buf = [0u8; 10];
-        for chk in chunks.iter_mut() {
-            let encoded = chk
-                .chunk
-                .as_ref()
-                .expect("ChunkMeta.chunk must be populated before write_chunks");
-            let data = encoded.as_bytes();
-            let max_chk_size = MAX_CHUNK_LENGTH_FIELD_SIZE + CHUNK_ENCODING_SIZE + data.len() + CRC_SIZE;
+        let last_batch_idx = batches.len() - 1;
+        for (bi, range) in batches.into_iter().enumerate() {
+            for chk in &mut chunks[range] {
+                let encoded = chk.chunk.as_ref().ok_or_else(|| {
+                    BlockChunksError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ChunkMeta.chunk must be populated before write_chunks",
+                    ))
+                })?;
+                let data = encoded.as_bytes();
 
-            if self.pos > SEGMENT_HEADER_SIZE && self.pos + max_chk_size > self.segment_size {
+                // BlockChunkRef uses 0-based segment index (`self.seq - 1`).
+                let seg_idx = (self.seq.saturating_sub(1)) as u32;
+                chk.ref_id = BlockChunkRef::new(seg_idx, self.pos as u32).as_u64();
+
+                let ulen = put_uvarint(&mut len_buf, data.len() as u64);
+                let enc_byte = [encoded.encoding().as_u8()];
+                let crc = crc32c::crc32c(&enc_byte);
+                let crc = crc32c::crc32c_append(crc, data);
+
+                let w = self.cur_writer.as_mut().ok_or_else(|| {
+                    BlockChunksError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "chunk writer is closed",
+                    ))
+                })?;
+                w.write_all(&len_buf[..ulen])?;
+                w.write_all(&enc_byte)?;
+                w.write_all(data)?;
+                w.write_all(&crc.to_be_bytes())?;
+
+                self.pos += ulen + CHUNK_ENCODING_SIZE + data.len() + CRC_SIZE;
+            }
+            if bi < last_batch_idx {
                 self.cut()?;
             }
-
-            // BlockChunkRef uses 0-based segment index (`self.seq - 1`).
-            let seg_idx = (self.seq - 1) as u32;
-            chk.ref_id = BlockChunkRef::new(seg_idx, self.pos as u32).as_u64();
-
-            let ulen = put_uvarint(&mut len_buf, data.len() as u64);
-            let enc_byte = [encoded.encoding().as_u8()];
-            let crc = crc32c::crc32c(&enc_byte);
-            let crc = crc32c::crc32c_append(crc, data);
-
-            let w = self.cur_writer.as_mut().unwrap();
-            w.write_all(&len_buf[..ulen])?;
-            w.write_all(&enc_byte)?;
-            w.write_all(data)?;
-            w.write_all(&crc.to_be_bytes())?;
-
-            self.pos += ulen + CHUNK_ENCODING_SIZE + data.len() + CRC_SIZE;
         }
         Ok(())
     }

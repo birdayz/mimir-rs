@@ -853,6 +853,109 @@ fn reencode_single_chunk_filtered(
     }))
 }
 
+pub(crate) fn slice_chunk_prefix(
+    enc: &EncodedChunk,
+    stop_after: usize,
+) -> Result<Option<(EncodedChunk, i64, i64)>, ChunkError> {
+    if stop_after == 0 {
+        return Ok(None);
+    }
+    let samples = decode_chunk_samples(enc)?;
+    if samples.is_empty() {
+        return Ok(None);
+    }
+    if stop_after >= samples.len() {
+        let mint = samples.first().map_or(i64::MIN, |s| s.t);
+        let maxt = samples.last().map_or(i64::MIN, |s| s.t);
+        return Ok(Some((enc.clone(), mint, maxt)));
+    }
+    let surviving = &samples[..stop_after];
+    let mint = surviving[0].t;
+    let maxt = surviving[surviving.len() - 1].t;
+    let new_enc = match enc.encoding() {
+        Encoding::Xor => {
+            let mut c = XorChunk::new();
+            {
+                let mut app = c.appender()?;
+                for s in surviving {
+                    if let SampleValue::Float(v) = s.value {
+                        app.append(s.st, s.t, v)?;
+                    }
+                }
+            }
+            c.compact();
+            EncodedChunk::Xor(c)
+        }
+        Encoding::Xor2 => {
+            let mut c = Xor2Chunk::new();
+            {
+                let mut app = c.appender()?;
+                for s in surviving {
+                    if let SampleValue::Float(v) = s.value {
+                        app.append(s.st, s.t, v)?;
+                    }
+                }
+            }
+            c.compact();
+            EncodedChunk::Xor2(c)
+        }
+        Encoding::Histogram => {
+            let mut c = HistogramChunk::new();
+            {
+                let mut app = c.appender()?;
+                for s in surviving {
+                    if let SampleValue::Histogram(ref h) = s.value {
+                        app.append_histogram(None, s.st, s.t, h, true)?;
+                    }
+                }
+            }
+            c.compact();
+            EncodedChunk::Histogram(c)
+        }
+        Encoding::HistogramSt => {
+            let mut c = HistogramStChunk::new();
+            {
+                let mut app = c.appender()?;
+                for s in surviving {
+                    if let SampleValue::Histogram(ref h) = s.value {
+                        app.append_histogram(None, s.st, s.t, h, true)?;
+                    }
+                }
+            }
+            c.compact();
+            EncodedChunk::HistogramSt(c)
+        }
+        Encoding::FloatHistogram => {
+            let mut c = FloatHistogramChunk::new();
+            {
+                let mut app = c.appender()?;
+                for s in surviving {
+                    if let SampleValue::FloatHistogram(ref fh) = s.value {
+                        app.append_float_histogram(None, s.st, s.t, fh, true)?;
+                    }
+                }
+            }
+            c.compact();
+            EncodedChunk::FloatHistogram(c)
+        }
+        Encoding::FloatHistogramSt => {
+            let mut c = FloatHistogramStChunk::new();
+            {
+                let mut app = c.appender()?;
+                for s in surviving {
+                    if let SampleValue::FloatHistogram(ref fh) = s.value {
+                        app.append_float_histogram(None, s.st, s.t, fh, true)?;
+                    }
+                }
+            }
+            c.compact();
+            EncodedChunk::FloatHistogramSt(c)
+        }
+        Encoding::None => return Ok(None),
+    };
+    Ok(Some((new_enc, mint, maxt)))
+}
+
 /// Re-encodes a sorted, deduplicated stream of samples from overlapping chunks into new chunks,
 /// matching Prometheus `populateChunksFromIterable` (`querier.go:1207-1330`):
 /// - Switches to ST-capable encoding (`Xor2`, `HistogramSt`, `FloatHistogramSt`) whenever `st != 0`.
@@ -2774,6 +2877,7 @@ pub fn compact_blocks_with_float_encoding_and_segment_size_and_metrics(
             // mark source blocks deletable when all output blocks are empty, logging and
             // continuing if any individual meta.json update fails.
             for b in blocks {
+                b.set_deletable();
                 let mut m = b.meta().clone();
                 m.compaction.deletable = true;
                 if let Err(err) = write_meta_file(b.dir(), &mut m) {
@@ -2807,6 +2911,103 @@ pub fn compact_blocks_with_float_encoding_and_segment_size_and_metrics(
             }
         }
     }
+}
+
+/// Ports Go `LeveledCompactor.Write(dest, b, mint, maxt, base)` for a single source `Block`.
+/// Trims samples to `[mint, maxt - 1]`, applies `b`'s tombstones, and preserves
+/// `from_out_of_order`, `from_stale_series`, and `from_selected_series` hints from `base`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_block_from_block_with_base(
+    dest: &Path,
+    block: &Block,
+    mint: i64,
+    maxt: i64,
+    base: Option<&BlockMeta>,
+    float_encoding: Encoding,
+    segment_size: usize,
+    metrics: Option<&CompactorMetrics>,
+) -> Result<Option<BlockMeta>, CompactError> {
+    if maxt <= mint {
+        return Ok(None);
+    }
+    let _pop_guard = metrics.map(|m| {
+        m.populating_blocks.set(1.0);
+        PopulatingBlockGuard(&m.populating_blocks)
+    });
+    let uid = Ulid::new();
+    let maxt_inclusive = maxt - 1;
+    let idx = block.index();
+    let chk_r = block.chunks();
+    let tomb_r = block.tombstones();
+    let all_ids = idx.postings("", &[""]).map_err(CompactError::Index)?;
+    let mut prepared: Vec<(Labels, Vec<ChunkMeta>)> = Vec::with_capacity(all_ids.len());
+    for id in all_ids {
+        let (labels, mut chks) = idx.series(id)?;
+        let tombs: std::sync::Arc<[Interval]> = tomb_r.get(id).into();
+        chks.retain(|c| {
+            c.overlaps_closed_interval(mint, maxt_inclusive)
+                && !tombs.iter().any(|iv| iv.is_subrange(c.min_time, c.max_time))
+        });
+        if chks.is_empty() {
+            continue;
+        }
+        for c in &mut chks {
+            c.chunk = Some(chk_r.chunk(c.ref_id)?);
+        }
+        let tagged: Vec<(ChunkMeta, std::sync::Arc<[Interval]>)> = chks
+            .into_iter()
+            .map(|c| (c, std::sync::Arc::clone(&tombs)))
+            .collect();
+        let trimmed = trim_and_merge_chunks_per_chunk(
+            tagged,
+            mint,
+            maxt_inclusive,
+            float_encoding,
+        )?;
+        if !trimmed.is_empty() {
+            prepared.push((labels, trimmed));
+        }
+    }
+    if prepared.is_empty() {
+        return Ok(None);
+    }
+    prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut comp = BlockMetaCompaction {
+        level: 1,
+        sources: vec![uid],
+        deletable: false,
+        parents: Vec::new(),
+        failed: false,
+        hints: Vec::new(),
+    };
+    if let Some(b) = base {
+        comp.parents.push(BlockDesc {
+            ulid: b.ulid,
+            min_time: b.min_time,
+            max_time: b.max_time,
+        });
+        if b.compaction.from_out_of_order() {
+            comp.set_out_of_order();
+        }
+        if b.compaction.from_stale_series() {
+            comp.set_stale_series();
+        }
+        if b.compaction.from_selected_series() {
+            comp.set_selected_series();
+        }
+    }
+    write_prepared_block_with_uid(
+        dest,
+        uid,
+        mint,
+        maxt,
+        prepared,
+        comp,
+        false,
+        segment_size,
+        metrics,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

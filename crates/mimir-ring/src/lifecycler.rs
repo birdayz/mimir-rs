@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mimir_common::services::{basic_service, ManagedBasicService, ServiceContext, ServiceError};
+use mimir_common::services::{basic_service, ManagedBasicService, Service, ServiceContext, ServiceError, State};
 use mimir_config::ingester::RingConfig;
 use mimir_proto::ringpb::{Desc, InstanceDesc, InstanceState};
 use parking_lot::{Mutex, RwLock};
@@ -215,6 +215,7 @@ pub struct BasicLifecycler {
     token_generator: Arc<dyn TokenGenerator>,
     is_running: AtomicBool,
     op_lock: AsyncMutex<()>,
+    service: RwLock<Option<std::sync::Weak<ManagedBasicService>>>,
 }
 
 impl BasicLifecycler {
@@ -247,6 +248,7 @@ impl BasicLifecycler {
             token_generator,
             is_running: AtomicBool::new(false),
             op_lock: AsyncMutex::new(()),
+            service: RwLock::new(None),
         })
     }
 
@@ -301,6 +303,15 @@ impl BasicLifecycler {
         &self.token_generator
     }
 
+    pub fn service_state(&self) -> State {
+        self.service
+            .read()
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|s| s.state())
+            .unwrap_or(State::New)
+    }
+
     pub fn should_keep_instance_in_the_ring_on_shutdown(&self) -> bool {
         self.keep_on_shutdown.load(Ordering::Acquire)
     }
@@ -320,7 +331,7 @@ impl BasicLifecycler {
         self.change_state_locked(&op, state).await
     }
 
-    pub(crate) async fn change_state_inner(
+    pub async fn change_state_inner(
         &self,
         state: InstanceState,
     ) -> Result<(), LifecyclerError> {
@@ -371,7 +382,7 @@ impl BasicLifecycler {
         let l_run = self.clone();
         let l_stop = self.clone();
 
-        basic_service(
+        let svc = basic_service(
             Some(Box::new(move |ctx| {
                 let l = l_start.clone();
                 Box::pin(async move {
@@ -468,7 +479,9 @@ impl BasicLifecycler {
                 })
             })),
         )
-        .with_name(format!("{} basic lifecycler", self.ring_name))
+        .with_name(format!("{} basic lifecycler", self.ring_name));
+        *self.service.write() = Some(Arc::downgrade(&svc));
+        svc
     }
 
     async fn register_instance(&self) -> Result<(), LifecyclerError> {
@@ -643,7 +656,7 @@ impl BasicLifecycler {
         Ok(())
     }
 
-    async fn update_instance<F>(&self, update: F) -> Result<(), LifecyclerError>
+    pub async fn update_instance<F>(&self, update: F) -> Result<(), LifecyclerError>
     where
         F: FnMut(&mut Desc, &mut InstanceDesc) -> bool + Send + 'static,
     {
@@ -930,6 +943,131 @@ impl BasicLifecyclerDelegate for InstanceRegisterDelegate {
     }
 }
 
+/// Persists generated ring tokens to disk and reloads them on restart if the instance is not yet
+/// registered with tokens in the ring.
+///
+/// Ported from `github.com/grafana/dskit/ring/basic_lifecycler_delegates.go` (`TokensPersistencyDelegate`).
+pub struct TokensPersistencyDelegate {
+    next: Arc<dyn BasicLifecyclerDelegate>,
+    tokens_path: PathBuf,
+    load_state: InstanceState,
+}
+
+impl TokensPersistencyDelegate {
+    pub fn new(
+        tokens_path: impl Into<PathBuf>,
+        load_state: InstanceState,
+        next: Arc<dyn BasicLifecyclerDelegate>,
+    ) -> Self {
+        Self {
+            next,
+            tokens_path: tokens_path.into(),
+            load_state,
+        }
+    }
+}
+
+impl BasicLifecyclerDelegate for TokensPersistencyDelegate {
+    fn on_ring_instance_register(
+        &self,
+        lifecycler: &BasicLifecycler,
+        ring_desc: &Desc,
+        instance_exists: bool,
+        instance_id: &str,
+        instance_desc: Option<&InstanceDesc>,
+    ) -> (InstanceState, Vec<u32>) {
+        if self.tokens_path.as_os_str().is_empty() {
+            info!("not loading tokens from file, tokens file path is empty");
+            return self.next.on_ring_instance_register(
+                lifecycler,
+                ring_desc,
+                instance_exists,
+                instance_id,
+                instance_desc,
+            );
+        }
+
+        if instance_exists && instance_desc.is_some_and(|d| !d.tokens.is_empty()) {
+            info!("not loading tokens from file, instance already in the ring");
+            return self.next.on_ring_instance_register(
+                lifecycler,
+                ring_desc,
+                instance_exists,
+                instance_id,
+                instance_desc,
+            );
+        }
+
+        let tokens_from_file = match load_tokens_from_file(&self.tokens_path) {
+            Ok(t) => t,
+            Err(err) => {
+                let is_not_found = matches!(
+                    err,
+                    crate::token_gen::TokenGenError::Io(ref ioe)
+                        if ioe.kind() == std::io::ErrorKind::NotFound
+                );
+                if !is_not_found {
+                    error!(%err, "error loading tokens from file");
+                }
+                return self.next.on_ring_instance_register(
+                    lifecycler,
+                    ring_desc,
+                    instance_exists,
+                    instance_id,
+                    instance_desc,
+                );
+            }
+        };
+
+        let synthetic = InstanceDesc {
+            id: lifecycler.instance_id().to_string(),
+            addr: lifecycler.instance_addr().to_string(),
+            timestamp: system_time_to_unix_secs(SystemTime::now()),
+            registered_timestamp: lifecycler
+                .get_registered_at()
+                .map(system_time_to_unix_secs)
+                .unwrap_or(0),
+            state: self.load_state as i32,
+            tokens: tokens_from_file,
+            zone: lifecycler.instance_zone().to_string(),
+            ..Default::default()
+        };
+        self.next.on_ring_instance_register(
+            lifecycler,
+            ring_desc,
+            true,
+            lifecycler.instance_id(),
+            Some(&synthetic),
+        )
+    }
+
+    fn on_ring_instance_tokens(&self, lifecycler: &BasicLifecycler, tokens: &[u32]) {
+        if !self.tokens_path.as_os_str().is_empty() {
+            if let Err(err) = store_tokens_to_file(tokens, &self.tokens_path) {
+                error!(path = %self.tokens_path.display(), %err, "error storing tokens to disk");
+            }
+        }
+        self.next.on_ring_instance_tokens(lifecycler, tokens);
+    }
+
+    fn on_ring_instance_stopping<'a>(
+        &'a self,
+        lifecycler: &'a BasicLifecycler,
+    ) -> BoxFuture<'a, ()> {
+        self.next.on_ring_instance_stopping(lifecycler)
+    }
+
+    fn on_ring_instance_heartbeat(
+        &self,
+        lifecycler: &BasicLifecycler,
+        ring_desc: &mut Desc,
+        instance_desc: &mut InstanceDesc,
+    ) {
+        self.next
+            .on_ring_instance_heartbeat(lifecycler, ring_desc, instance_desc);
+    }
+}
+
 // --- Classic Lifecycler ---
 
 #[derive(Clone)]
@@ -949,6 +1087,30 @@ pub struct LifecyclerConfig {
     pub port: u16,
     pub id: String,
     pub token_generator: Option<Arc<dyn TokenGenerator>>,
+    pub spread_minimizing_token_generator: bool,
+}
+
+impl Default for LifecyclerConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_period: Duration::from_secs(5),
+            heartbeat_timeout: Duration::from_secs(60),
+            observe_period: Duration::ZERO,
+            join_after: Duration::ZERO,
+            min_ready_duration: Duration::from_secs(15),
+            final_sleep: Duration::ZERO,
+            num_tokens: 128,
+            tokens_file_path: String::new(),
+            zone: String::new(),
+            unregister_on_shutdown: true,
+            readiness_check_ring_health: true,
+            addr: String::new(),
+            port: 0,
+            id: String::new(),
+            token_generator: None,
+            spread_minimizing_token_generator: false,
+        }
+    }
 }
 
 impl LifecyclerConfig {
@@ -964,21 +1126,21 @@ impl LifecyclerConfig {
         .map_err(|e| LifecyclerError::Other(e.to_string()))?;
         let port = get_instance_port(cfg.instance_port, i64::from(listen_port)) as u16;
 
-        let token_generator: Arc<dyn TokenGenerator> =
-            if cfg.token_generation_strategy == "spread-minimizing" {
-                let zones = cfg.spread_minimizing_zones.0.clone();
-                Arc::new(
-                    SpreadMinimizingTokenGenerator::new(
-                        &cfg.instance_id,
-                        &cfg.instance_availability_zone,
-                        &zones,
-                        cfg.spread_minimizing_join_ring_in_order,
-                    )
-                    .map_err(|e| LifecyclerError::InvalidConfig(e.to_string()))?,
+        let is_spread_minimizing = cfg.token_generation_strategy == "spread-minimizing";
+        let token_generator: Arc<dyn TokenGenerator> = if is_spread_minimizing {
+            let zones = cfg.spread_minimizing_zones.0.clone();
+            Arc::new(
+                SpreadMinimizingTokenGenerator::new(
+                    &cfg.instance_id,
+                    &cfg.instance_availability_zone,
+                    &zones,
+                    cfg.spread_minimizing_join_ring_in_order,
                 )
-            } else {
-                Arc::new(RandomTokenGenerator::new())
-            };
+                .map_err(|e| LifecyclerError::InvalidConfig(e.to_string()))?,
+            )
+        } else {
+            Arc::new(RandomTokenGenerator::new())
+        };
 
         Ok(Self {
             heartbeat_period: cfg.heartbeat_period.as_std().unwrap_or(Duration::ZERO),
@@ -996,11 +1158,23 @@ impl LifecyclerConfig {
             port,
             id: cfg.instance_id.clone(),
             token_generator: Some(token_generator),
+            spread_minimizing_token_generator: is_spread_minimizing,
         })
+    }
+
+    pub fn set_token_generator<T: TokenGenerator + 'static>(&mut self, generator: Arc<T>) {
+        self.spread_minimizing_token_generator =
+            std::any::TypeId::of::<T>() == std::any::TypeId::of::<SpreadMinimizingTokenGenerator>();
+        self.token_generator = Some(generator);
     }
 
     /// Ported from `github.com/grafana/dskit/ring/lifecycler.go` (`LifecyclerConfig.Validate`).
     pub fn validate(&self) -> Result<(), LifecyclerError> {
+        if self.spread_minimizing_token_generator && !self.tokens_file_path.is_empty() {
+            return Err(LifecyclerError::InvalidConfig(
+                "you can't configure the tokens file path when using the spread minimizing token strategy. Please set the tokens file path to an empty string".to_string(),
+            ));
+        }
         if self.heartbeat_period.is_zero() {
             return Err(LifecyclerError::InvalidConfig(
                 "heartbeat period must be greater than 0".to_string(),
@@ -1108,7 +1282,7 @@ pub struct Lifecycler {
     ready: Mutex<ReadyState>,
     counters: RwLock<LifecyclerCounters>,
     token_generator: Arc<dyn TokenGenerator>,
-    can_join_timeout: Duration,
+    can_join_timeout: RwLock<Duration>,
     metrics: LifecyclerMetrics,
     is_running: AtomicBool,
     op_lock: AsyncMutex<()>,
@@ -1199,7 +1373,7 @@ impl Lifecycler {
                 zones: Vec::new(),
             }),
             token_generator,
-            can_join_timeout: Duration::from_secs(5 * 60),
+            can_join_timeout: RwLock::new(Duration::from_secs(5 * 60)),
             metrics: LifecyclerMetrics::new(ring_name, reg.as_ref()),
             is_running: AtomicBool::new(false),
             op_lock: AsyncMutex::new(()),
@@ -1217,6 +1391,22 @@ impl Lifecycler {
 
     pub fn get_tokens(&self) -> Vec<u32> {
         self.state.read().tokens.clone()
+    }
+
+    pub fn get_registered_at(&self) -> Option<SystemTime> {
+        self.state.read().registered_at
+    }
+
+    pub fn token_generator(&self) -> &Arc<dyn TokenGenerator> {
+        &self.token_generator
+    }
+
+    pub fn set_can_join_timeout(&self, timeout: Duration) {
+        *self.can_join_timeout.write() = timeout;
+    }
+
+    pub fn can_join_timeout(&self) -> Duration {
+        *self.can_join_timeout.read()
     }
 
     pub fn get_read_only_state(&self) -> (bool, Option<SystemTime>) {
@@ -1284,7 +1474,7 @@ impl Lifecycler {
         self.clear_tokens_on_shutdown.load(Ordering::Acquire)
     }
 
-    fn set_tokens(&self, tokens: Vec<u32>) {
+    pub fn set_tokens(&self, tokens: Vec<u32>) {
         {
             let mut st = self.state.write();
             st.tokens = tokens.clone();
@@ -1663,41 +1853,50 @@ impl Lifecycler {
         Ok(())
     }
 
+    pub async fn wait_before_joining(&self, ctx: &ServiceContext) -> Result<(), LifecyclerError> {
+        if !self.token_generator.can_join_enabled() {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + self.can_join_timeout();
+        loop {
+            if ctx.is_canceled() {
+                return Err(LifecyclerError::NotRunning);
+            }
+            let get_res = tokio::select! {
+                biased;
+                _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+                _ = tokio::time::sleep_until(deadline) => break,
+                res = self.kv_store.get(&self.ring_key) => res,
+            };
+            if let Ok(Some(any)) = get_res {
+                if let Ok(desc) = any.downcast::<Desc>() {
+                    if self.token_generator.can_join(&desc.ingesters).is_ok() {
+                        break;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+        if ctx.is_canceled() {
+            return Err(LifecyclerError::NotRunning);
+        }
+        Ok(())
+    }
+
     async fn auto_join(
         &self,
         ctx: &ServiceContext,
         target_state: InstanceState,
     ) -> Result<(), LifecyclerError> {
-        if self.token_generator.can_join_enabled() {
-            let deadline = tokio::time::Instant::now() + self.can_join_timeout;
-            loop {
-                if ctx.is_canceled() {
-                    return Err(LifecyclerError::NotRunning);
-                }
-                let get_res = tokio::select! {
-                    biased;
-                    _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    res = self.kv_store.get(&self.ring_key) => res,
-                };
-                if let Ok(Some(any)) = get_res {
-                    if let Ok(desc) = any.downcast::<Desc>() {
-                        if self.token_generator.can_join(&desc.ingesters).is_ok() {
-                            break;
-                        }
-                    }
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::select! {
-                    biased;
-                    _ = ctx.canceled() => return Err(LifecyclerError::NotRunning),
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
-            }
-        }
+        self.wait_before_joining(ctx).await?;
 
         let _op = tokio::select! {
             biased;
@@ -3519,7 +3718,7 @@ mod tests {
         let mut lc3_cfg = LifecyclerConfig::from_ring_config(&cfg, 9095).unwrap();
         lc3_cfg.heartbeat_period = Duration::from_secs(60);
         lc3_cfg.token_generator = Some(Arc::new(CanJoinTokenGen));
-        let mut lc3 = Lifecycler::with_store(
+        let lc3 = Lifecycler::with_store(
             lc3_cfg,
             Arc::new(HangingCasKv {
                 hang_after_calls: 99,
@@ -3533,7 +3732,7 @@ mod tests {
             false,
             None,
         );
-        Arc::get_mut(&mut lc3).unwrap().can_join_timeout = Duration::from_millis(60);
+        lc3.set_can_join_timeout(Duration::from_millis(60));
         lc3.is_running.store(true, Ordering::Release);
         let ctx3 = ServiceContext::background();
         let aj_res = tokio::time::timeout(

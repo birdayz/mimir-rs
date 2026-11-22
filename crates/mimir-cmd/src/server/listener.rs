@@ -19,7 +19,6 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use prometheus::Gauge;
 use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -295,183 +294,51 @@ pub async fn finish_accept(
     };
     if opts.proxy_protocol {
         let timeout = if opts.proxy_header_timeout.is_zero() {
-            Duration::from_secs(10)
+            super::proxyproto::default_read_header_timeout()
         } else {
             opts.proxy_header_timeout
         };
-        match tokio::time::timeout(timeout, read_proxy_header(&mut accepted.stream)).await {
-            Ok(Ok((prefix, src))) => {
-                accepted.prefix = prefix;
-                if let Some(src) = src {
-                    accepted.remote_addr = src;
+        let mut reader = super::proxyproto::ProxyAsyncBufReader::new(accepted.stream);
+        let res = super::proxyproto::read_header_timeout_async(&mut reader, timeout).await;
+        let (stream, buffered) = reader.into_inner_and_buffered();
+        accepted.stream = stream;
+        accepted.prefix = buffered;
+        match res {
+            Ok(hdr) => {
+                if !hdr.command.is_local() {
+                    if let Some(src) = hdr.source_addr.and_then(|a| a.as_socket_addr()) {
+                        accepted.remote_addr = src;
+                    }
                 }
             }
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "proxyproto: timeout reading PROXY protocol header",
-                ))
+            Err(super::proxyproto::ProxyError::NoProxyProtocol) => {
+                // dskit configures go-proxyproto with Policy::USE: connections without a
+                // PROXY header (or header-detection timeout) are accepted as-is.
             }
+            Err(e) => return Err(io::Error::from(e)),
         }
     }
     Ok(accepted)
 }
 
-const V2_SIG: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
-const V1_SIG: &[u8; 6] = b"PROXY ";
-
-/// Reads an optional PROXY v1/v2 header. Returns bytes read that are not part of a header
-/// (to be replayed) and the source address announced by the header, if any.
+#[cfg(test)]
 async fn read_proxy_header(stream: &mut TcpStream) -> io::Result<(Vec<u8>, Option<SocketAddr>)> {
-    let mut buf: Vec<u8> = Vec::with_capacity(256);
-    // Read just enough to decide whether a header is present.
-    loop {
-        let is_v1_prefix = V1_SIG.starts_with(&buf[..buf.len().min(V1_SIG.len())]);
-        let is_v2_prefix = V2_SIG.starts_with(&buf[..buf.len().min(V2_SIG.len())]);
-        if !is_v1_prefix && !is_v2_prefix {
-            return Ok((buf, None));
+    let mut reader = super::proxyproto::ProxyAsyncBufReader::new(stream);
+    let res = super::proxyproto::read_async(&mut reader).await;
+    let (_, buffered) = reader.into_inner_and_buffered();
+    match res {
+        Ok(hdr) => {
+            let src = if hdr.command.is_local() {
+                None
+            } else {
+                hdr.source_addr.and_then(|a| a.as_socket_addr())
+            };
+            Ok((buffered, src))
         }
-        if buf.len() >= V1_SIG.len() && buf.starts_with(V1_SIG) {
-            return read_v1(stream, buf).await;
-        }
-        if buf.len() >= V2_SIG.len() && buf.starts_with(V2_SIG) {
-            return read_v2(stream, buf).await;
-        }
-        let mut b = [0u8; 1];
-        let n = stream.read(&mut b).await?;
-        if n == 0 {
-            return Ok((buf, None));
-        }
-        buf.push(b[0]);
+        Err(super::proxyproto::ProxyError::NoProxyProtocol) => Ok((buffered, None)),
+        Err(e) => Err(io::Error::from(e)),
     }
 }
-
-fn proxy_err(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("proxyproto: {msg}"))
-}
-
-fn parse_v1_port(port_str: &str) -> io::Result<u16> {
-    // Matches pires/go-proxyproto parseV1PortNumber (v1.go:270-282): digits only,
-    // no leading zero when len > 1, and 0..=65535.
-    if port_str.is_empty()
-        || !port_str.bytes().all(|b| b.is_ascii_digit())
-        || (port_str.len() > 1 && port_str.starts_with('0'))
-    {
-        return Err(proxy_err("invalid port number"));
-    }
-    port_str
-        .parse::<u16>()
-        .map_err(|_| proxy_err("invalid port number"))
-}
-
-async fn read_v1(stream: &mut TcpStream, mut buf: Vec<u8>) -> io::Result<(Vec<u8>, Option<SocketAddr>)> {
-    // The v1 header is at most 107 bytes including CRLF.
-    while !buf.ends_with(b"\r\n") {
-        if buf.len() >= 107 {
-            return Err(proxy_err("version 1 header too long"));
-        }
-        let mut b = [0u8; 1];
-        if stream.read(&mut b).await? == 0 {
-            return Err(proxy_err("unexpected EOF in version 1 header"));
-        }
-        buf.push(b[0]);
-    }
-    let line = std::str::from_utf8(&buf[..buf.len() - 2]).map_err(|_| proxy_err("invalid header"))?;
-    let parts: Vec<&str> = line.split(' ').collect();
-    match parts.get(1).copied() {
-        Some("UNKNOWN") => Ok((Vec::new(), None)),
-        Some("TCP4") if parts.len() == 6 => {
-            let src_ip: std::net::Ipv4Addr = parts[2]
-                .parse()
-                .map_err(|_| proxy_err("invalid source address"))?;
-            let _dst_ip: std::net::Ipv4Addr = parts[3]
-                .parse()
-                .map_err(|_| proxy_err("invalid destination address"))?;
-            let src_port = parse_v1_port(parts[4])?;
-            let _dst_port = parse_v1_port(parts[5])?;
-            Ok((Vec::new(), Some(SocketAddr::new(IpAddr::V4(src_ip), src_port))))
-        }
-        Some("TCP6") if parts.len() == 6 => {
-            let src_ip: std::net::Ipv6Addr = parts[2]
-                .parse()
-                .map_err(|_| proxy_err("invalid source address"))?;
-            let _dst_ip: std::net::Ipv6Addr = parts[3]
-                .parse()
-                .map_err(|_| proxy_err("invalid destination address"))?;
-            let src_port = parse_v1_port(parts[4])?;
-            let _dst_port = parse_v1_port(parts[5])?;
-            Ok((Vec::new(), Some(SocketAddr::new(IpAddr::V6(src_ip), src_port))))
-        }
-        _ => Err(proxy_err("invalid version 1 header")),
-    }
-}
-
-async fn read_v2(stream: &mut TcpStream, mut buf: Vec<u8>) -> io::Result<(Vec<u8>, Option<SocketAddr>)> {
-    const MAX_V2_HEADER_SIZE: usize = 4096;
-    while buf.len() < 16 {
-        let mut b = [0u8; 1];
-        if stream.read(&mut b).await? == 0 {
-            return Err(proxy_err("unexpected EOF in version 2 header"));
-        }
-        buf.push(b[0]);
-    }
-    let ver_cmd = buf[12];
-    // Matches pires/go-proxyproto v2.go:98: only LOCAL (0x20) and PROXY (0x21) are valid.
-    if ver_cmd != 0x20 && ver_cmd != 0x21 {
-        return Err(proxy_err("unsupported version 2 command"));
-    }
-    let fam = buf[13];
-    // Matches pires/go-proxyproto addr_proto.go:24: only defined v2 family/protocol bytes.
-    let min_len = match fam {
-        0x00 => 0usize,        // UNSPEC
-        0x11 | 0x12 => 12,     // TCPv4 | UDPv4
-        0x21 | 0x22 => 36,     // TCPv6 | UDPv6
-        0x31 | 0x32 => 216,    // UnixStream | UnixDatagram
-        _ => return Err(proxy_err("unsupported version 2 address family and protocol")),
-    };
-    if fam == 0x00 && ver_cmd != 0x20 {
-        return Err(proxy_err("version 2 PROXY command cannot use UNSPEC family"));
-    }
-    let len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
-    if len > MAX_V2_HEADER_SIZE {
-        return Err(proxy_err("version 2 header length exceeds maximum"));
-    }
-    if len < min_len {
-        if ver_cmd == 0x20 {
-            if len > 0 {
-                let mut discard = vec![0u8; len];
-                stream.read_exact(&mut discard).await?;
-            }
-            return Ok((Vec::new(), None));
-        }
-        return Err(proxy_err("invalid version 2 payload length"));
-    }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
-    // LOCAL command: keep the real connection address.
-    if ver_cmd == 0x20 {
-        return Ok((Vec::new(), None));
-    }
-    let src = match fam {
-        0x11 | 0x12 => Some(SocketAddr::new(
-            IpAddr::from([payload[0], payload[1], payload[2], payload[3]]),
-            u16::from_be_bytes([payload[8], payload[9]]),
-        )),
-        0x21 | 0x22 => {
-            let mut a = [0u8; 16];
-            a.copy_from_slice(&payload[..16]);
-            Some(SocketAddr::new(
-                IpAddr::from(a),
-                u16::from_be_bytes([payload[32], payload[33]]),
-            ))
-        }
-        0x31 | 0x32 => None,
-        _ => unreachable!(),
-    };
-    Ok((Vec::new(), src))
-}
-
 /// A stream that first replays `prefix` (bytes consumed while probing for a PROXY header).
 pub struct PrefixedIo<T> {
     prefix: Vec<u8>,
@@ -546,6 +413,7 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedIo<T> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    const V2_SIG: &[u8; 12] = crate::server::proxyproto::SIGV2;
 
     #[test]
     fn empty_address_listens_dual_stack() {
@@ -589,11 +457,11 @@ mod tests {
         });
         let (mut a, _) = l.accept().await.unwrap();
         let (prefix, src) = read_proxy_header(&mut a).await.unwrap();
-        assert!(prefix.is_empty());
+        assert_eq!(prefix, b"GET");
         assert_eq!(src.unwrap(), "10.1.2.3:5555".parse().unwrap());
         let (mut b, _) = l.accept().await.unwrap();
         let (prefix, src) = read_proxy_header(&mut b).await.unwrap();
-        assert_eq!(prefix, b"G");
+        assert_eq!(prefix, b"GET / HTTP/1.1\r\n");
         assert!(src.is_none());
         let _ = client.await;
     }

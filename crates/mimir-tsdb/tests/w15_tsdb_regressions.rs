@@ -84,7 +84,9 @@ fn sq_01_tsdb_label_discovery_bypasses_postings_cache_and_eligibility_applies() 
             .unwrap();
         app.commit().unwrap();
     }
-    assert_eq!(cq.select(true, &m).unwrap().len(), 3);
+    drop(cq);
+    let cq2 = db.chunk_querier(i64::MIN, i64::MAX);
+    assert_eq!(cq2.select(true, &m).unwrap().len(), 3);
     assert_eq!(
         metric_val(
             "head_postings_for_matchers_cache_skips_total",

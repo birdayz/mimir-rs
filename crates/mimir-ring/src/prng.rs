@@ -252,6 +252,35 @@ impl GoRand {
     pub fn uint32(&mut self) -> u32 {
         (self.int63() >> 31) as u32
     }
+
+    pub fn int31(&mut self) -> i32 {
+        (self.int63() >> 32) as i32
+    }
+
+    pub fn int31n(&mut self, n: i32) -> i32 {
+        if n <= 0 {
+            return 0;
+        }
+        if n & (n - 1) == 0 {
+            return self.int31() & (n - 1);
+        }
+        let max = ((1u32 << 31) - 1 - ((1u32 << 31) % (n as u32))) as i32;
+        let mut v = self.int31();
+        while v > max {
+            v = self.int31();
+        }
+        v % n
+    }
+
+    pub fn intn(&mut self, n: usize) -> usize {
+        if n <= 1 {
+            return 0;
+        }
+        if n <= i32::MAX as usize {
+            return self.int31n(n as i32) as usize;
+        }
+        (self.int63() % (n as i64)) as usize
+    }
 }
 
 /// Exact port of `github.com/grafana/dskit/ring/shard.ShuffleShardSeed`.

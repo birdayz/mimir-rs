@@ -18,13 +18,15 @@ use crate::chunkenc::{ChunkError, EncodedChunk, Encoding};
 use crate::chunks_block::{BlockChunksError, ChunkMeta};
 use crate::compact::{
     compact_chunk_series_merge, decode_chunk_samples, merge_chunks_with_tombstones,
-    merge_chunks_with_tombstones_and_float_encoding, merge_head_chunks_with_tombstones,
+    merge_chunks_with_tombstones_and_float_encoding,
+    merge_head_chunks_with_tombstones_and_float_encoding,
     reencode_chunk_without_tombstones, DecodedSample,
 };
 use crate::head::{
     Head, HeadChunkSnapshot, HeadError, HeadReadGuard, HeadReadIsolation, SeriesEntry,
 };
 use crate::head_chunks::ChunkDiskMapperRef;
+use crate::isolation::{IsolationState, IsolationStateInfo};
 use crate::index::IndexError;
 use crate::labels::{decode_stringlabel_size, Labels};
 use crate::matcher::LabelMatcher;
@@ -315,6 +317,7 @@ pub struct PreparedChunkSelect {
     pub unordered: bool,
     head_overlaps_ooo: bool,
     head_isolation: Option<HeadReadIsolation>,
+    tx_iso: Option<IsolationStateInfo>,
     _block_guards: Vec<BlockReadGuard>,
     _head_guard: Option<HeadReadGuard>,
 }
@@ -376,6 +379,7 @@ pub struct TsdbQuerier<'a> {
     mint: i64,
     maxt: i64,
     concurrent: bool,
+    tx_iso: Option<Arc<IsolationState>>,
     select_stats: Option<BlockSelectStatsSink>,
     select_stats_filter: Option<SeriesStatsFilter>,
 }
@@ -388,6 +392,9 @@ impl<'a> TsdbQuerier<'a> {
                 && mint <= h.max_ooo_time();
             h.min_time() <= maxt || ooo
         });
+        let tx_iso = head
+            .filter(|h| !h.isolation().is_disabled())
+            .map(|h| Arc::new(h.isolation().state(mint, maxt)));
         let blocks = blocks
             .into_iter()
             .filter(|b| b.overlaps_closed_interval(mint, maxt))
@@ -401,6 +408,7 @@ impl<'a> TsdbQuerier<'a> {
             mint,
             maxt,
             concurrent: false,
+            tx_iso,
             select_stats: None,
             select_stats_filter: None,
         }
@@ -412,6 +420,9 @@ impl<'a> TsdbQuerier<'a> {
         mint: i64,
         maxt: i64,
     ) -> Self {
+        let tx_iso = head
+            .filter(|h| !h.isolation().is_disabled())
+            .map(|h| Arc::new(h.isolation().state(mint, maxt)));
         Self {
             head,
             blocks: Vec::new(),
@@ -421,6 +432,7 @@ impl<'a> TsdbQuerier<'a> {
             mint,
             maxt,
             concurrent: false,
+            tx_iso,
             select_stats: None,
             select_stats_filter: None,
         }
@@ -433,6 +445,9 @@ impl<'a> TsdbQuerier<'a> {
         mint: i64,
         maxt: i64,
     ) -> Self {
+        let tx_iso = head
+            .filter(|h| !h.isolation().is_disabled())
+            .map(|h| Arc::new(h.isolation().state(mint, maxt)));
         Self {
             head,
             blocks: Vec::new(),
@@ -442,9 +457,15 @@ impl<'a> TsdbQuerier<'a> {
             mint,
             maxt,
             concurrent: false,
+            tx_iso,
             select_stats: None,
             select_stats_filter: None,
         }
+    }
+
+    pub fn with_closed(mut self, closed: &'a AtomicBool) -> Self {
+        self.closed = Some(closed);
+        self
     }
 
     pub fn with_last_garbage_collected_mmap_ref(
@@ -689,6 +710,7 @@ impl<'a> TsdbQuerier<'a> {
             _block_guards: block_guards,
             _head_guard: head_guard,
             head_isolation,
+            tx_iso: self.tx_iso.as_ref().map(|s| s.info().clone()),
             mint: self.mint,
             maxt: self.maxt,
             unordered,
@@ -831,6 +853,7 @@ impl<'a> TsdbQuerier<'a> {
         }
         let head = prepared._head_guard.as_ref().and(self.head);
         let head_iso = prepared.head_isolation.as_ref();
+        let tx_iso = prepared.tx_iso.as_ref();
         let float_enc = self.head.map_or(Encoding::Xor, Head::float_chunk_encoding);
         let mint = prepared.mint;
         let maxt = prepared.maxt;
@@ -850,14 +873,20 @@ impl<'a> TsdbQuerier<'a> {
             };
             let mut out = Vec::with_capacity(refs.len());
             for &r in refs.iter() {
-                let res = match head_iso {
-                    Some(iso) => head.series_chunks_with_isolation(r, mint, maxt, iso)?,
-                    None => head.series_chunks(r, mint, maxt)?,
-                };
+                let res = head.series_chunks_with_tx_isolation(r, mint, maxt, head_iso, tx_iso)?;
                 if let Some((labels, chks, tombs)) = res {
                     // Go `HeadAndOOOChunkReader` / `populateChunksFromIterable` (`querier.go:1271`)
-                    // uses `Xor` for intra-head merges when `st == 0`.
-                    let final_chunks = merge_head_chunks_with_tombstones(chks, &tombs)?;
+                    // uses `Xor` when `st == 0`, and preserves `Xor2` when ST storage is enabled.
+                    let head_float_enc = if head.options().enable_st_storage {
+                        head.float_chunk_encoding()
+                    } else {
+                        Encoding::Xor
+                    };
+                    let final_chunks = merge_head_chunks_with_tombstones_and_float_encoding(
+                        chks,
+                        &tombs,
+                        head_float_enc,
+                    )?;
                     if !final_chunks.is_empty() {
                         out.push(QueryChunkSeries {
                             labels,
@@ -913,10 +942,7 @@ impl<'a> TsdbQuerier<'a> {
                 block_min_time: 0,
             };
             for &r in refs.iter() {
-                let res = match head_iso {
-                    Some(iso) => head.series_chunks_with_isolation(r, mint, maxt, iso)?,
-                    None => head.series_chunks(r, mint, maxt)?,
-                };
+                let res = head.series_chunks_with_tx_isolation(r, mint, maxt, head_iso, tx_iso)?;
                 if let Some((labels, chks, tombs)) = res {
                     if !chks.is_empty() && self.counts_for_stats(&labels) {
                         stats.series += 1;
@@ -977,8 +1003,17 @@ impl<'a> TsdbQuerier<'a> {
         }
         self.record_select_stats(head_stats, &block_stats, &empty_block_min_times);
 
+        let head_float_enc = if head.is_some_and(|h| h.options().enable_st_storage) {
+            float_enc
+        } else {
+            Encoding::Xor
+        };
         let merge_head = |items: Vec<(ChunkMeta, Vec<Interval>)>| -> Result<Vec<ChunkMeta>, QuerierError> {
-            Ok(merge_chunks_with_tombstones(items, false)?)
+            Ok(merge_chunks_with_tombstones_and_float_encoding(
+                items,
+                false,
+                head_float_enc,
+            )?)
         };
         let merge_cross_source = |items: Vec<(ChunkMeta, Vec<Interval>)>,
                                   allow_non_overlapping_raw: bool|
@@ -1055,6 +1090,7 @@ impl<'a> TsdbQuerier<'a> {
 
         let head = prepared._head_guard.as_ref().and(self.head);
         let head_iso = prepared.head_isolation.as_ref();
+        let tx_iso = prepared.tx_iso.as_ref();
         let float_enc = self.head.map_or(Encoding::Xor, Head::float_chunk_encoding);
         let mint = prepared.mint;
         let maxt = prepared.maxt;
@@ -1083,21 +1119,14 @@ impl<'a> TsdbQuerier<'a> {
                 (Some(h), Some(refs)) => {
                     let mut v = Vec::with_capacity(refs.len());
                     for &r in refs.iter() {
-                        let res = match head_iso {
-                            Some(iso) => h.series_lazy_chunk_count_with_snapshot_and_isolation(
-                                r,
-                                mint,
-                                maxt,
-                                series_filter,
-                                iso,
-                            )?,
-                            None => h.series_lazy_chunk_count_with_snapshot(
-                                r,
-                                mint,
-                                maxt,
-                                series_filter,
-                            )?,
-                        };
+                        let res = h.series_lazy_chunk_count_with_snapshot_and_tx_isolation(
+                            r,
+                            mint,
+                            maxt,
+                            series_filter,
+                            head_iso,
+                            tx_iso,
+                        )?;
                         if let Some((entry, chunk_count, head_snapshot)) = res {
                             if chunk_count > 0 {
                                 v.push(LazySeriesEntry {
@@ -1145,24 +1174,19 @@ impl<'a> TsdbQuerier<'a> {
                         continue;
                     };
                     let chks = match entry.head_snapshot {
-                        Some(snap) => h.series_final_chunks_from_snapshot(
+                        Some(snap) => h.series_final_chunks_from_snapshot_with_tx_isolation(
                             entry.head_entry.as_deref(),
                             r,
                             snap,
+                            tx_iso,
                         )?,
                         None => match entry.head_entry {
-                            Some(ref head_entry) => match head_iso {
-                                Some(iso) => h.series_final_chunks_for_entry_with_isolation(
-                                    head_entry, mint, maxt, iso,
-                                )?,
-                                None => h.series_final_chunks_for_entry(head_entry, mint, maxt)?,
-                            },
-                            None => match head_iso {
-                                Some(iso) => {
-                                    h.series_final_chunks_only_with_isolation(r, mint, maxt, iso)?
-                                }
-                                None => h.series_final_chunks_only(r, mint, maxt)?,
-                            },
+                            Some(ref head_entry) => h.series_final_chunks_for_entry_with_tx_isolation(
+                                head_entry, mint, maxt, head_iso, tx_iso,
+                            )?,
+                            None => h.series_final_chunks_only_with_tx_isolation(
+                                r, mint, maxt, head_iso, tx_iso,
+                            )?,
                         },
                     };
                     if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
@@ -1213,21 +1237,14 @@ impl<'a> TsdbQuerier<'a> {
                 block_min_time: 0,
             };
             for &r in refs.iter() {
-                let res = match head_iso {
-                    Some(iso) => h.series_chunk_metas_no_bytes_with_snapshot_and_isolation(
-                        r,
-                        mint,
-                        maxt,
-                        series_filter,
-                        iso,
-                    )?,
-                    None => h.series_chunk_metas_no_bytes_with_snapshot(
-                        r,
-                        mint,
-                        maxt,
-                        series_filter,
-                    )?,
-                };
+                let res = h.series_chunk_metas_no_bytes_with_snapshot_and_tx_isolation(
+                    r,
+                    mint,
+                    maxt,
+                    series_filter,
+                    head_iso,
+                    tx_iso,
+                )?;
                 if let Some((labels, ivs, head_snapshot)) = res {
                     if !ivs.is_empty() {
                         stats.series += 1;
@@ -1320,13 +1337,12 @@ impl<'a> TsdbQuerier<'a> {
                 if tag == 0 {
                     if let Some(h) = head {
                         let chks = match head_snap.take() {
-                            Some(snap) => h.series_final_chunks_from_snapshot(None, r, snap)?,
-                            None => match head_iso {
-                                Some(iso) => {
-                                    h.series_final_chunks_only_with_isolation(r, mint, maxt, iso)?
-                                }
-                                None => h.series_final_chunks_only(r, mint, maxt)?,
-                            },
+                            Some(snap) => h.series_final_chunks_from_snapshot_with_tx_isolation(
+                                None, r, snap, tx_iso,
+                            )?,
+                            None => h.series_final_chunks_only_with_tx_isolation(
+                                r, mint, maxt, head_iso, tx_iso,
+                            )?,
                         };
                         for c in chks {
                             head_items.push((c, Vec::new()));
@@ -1803,6 +1819,11 @@ impl<'a> TsdbChunkQuerier<'a> {
             inner: TsdbQuerier::with_blocks_lock_and_closed(head, blocks_lock, closed, mint, maxt),
             unordered: true,
         }
+    }
+
+    pub fn with_closed(mut self, closed: &'a AtomicBool) -> Self {
+        self.inner = self.inner.with_closed(closed);
+        self
     }
 
     pub fn with_last_garbage_collected_mmap_ref(

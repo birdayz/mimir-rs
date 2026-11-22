@@ -19,7 +19,7 @@ use mimir_storage::bucket::{tenant_deletion_mark_exists, BucketClient};
 use mimir_storage::ingest::{OffsetCatalogue, OffsetCatalogueMetrics};
 use mimir_storage::shipper::{read_shipped_blocks, Shipper, ShipperError, ShipperMetrics, SourceType};
 use mimir_tsdb::chunkenc::Encoding;
-use mimir_tsdb::db::{BlocksReloadedFn, BlocksToDeleteFn, Tsdb, TsdbError, TsdbOptions};
+use mimir_tsdb::db::{BlocksReloadedFn, BlocksToDeleteFn, Tsdb, TsdbError, TsdbExtraOptions, TsdbOptions};
 use mimir_tsdb::head::{HeadError, HeadOptions, SeriesLifecycleCallback};
 use mimir_tsdb::labels::Labels;
 use mimir_tsdb::metadata::MetadataLimits;
@@ -662,7 +662,18 @@ impl UserTsdb {
             }
         }
 
-        let db = Arc::new(Tsdb::open(&udir, tsdb_opts)?);
+        // Upstream Go Mimir ingester explicitly configures:
+        //   IsolationDisabled: true (ingester_tsdb.go:217)
+        //   EnableOverlappingCompaction: false (ingester_tsdb.go:219: only upload lvl 1 blocks)
+        let db = Arc::new(Tsdb::open_with_extra(
+            &udir,
+            tsdb_opts,
+            TsdbExtraOptions {
+                isolation_disabled: true,
+                ..Default::default()
+            },
+        )?);
+        db.set_enable_overlapping_compaction(false);
         // Go `createTSDB` only forwards `MinBlockDuration: blockRanges[0]` and
         // `MaxBlockDuration: blockRanges[len-1]`; Prometheus `tsdb.validateOpts` + `open` then
         // derive the compactor ranges as `ExponentialBlockRanges(min, 10, 3)` truncated at the
