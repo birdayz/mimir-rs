@@ -426,6 +426,59 @@ pub(crate) fn apply_get_options(
     rb
 }
 
+/// Ported from `thanos-io/objstore/exthttp/parse.go` and `clientutil/parse.go`:
+/// returns the content length parsed from the `Content-Length` HTTP header.
+pub fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Result<i64, String> {
+    let val = headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .ok_or_else(|| "Content-Length header not found".to_string())?;
+    let s = val
+        .to_str()
+        .map_err(|e| format!("convert Content-Length: {e}"))?;
+    if s.is_empty() {
+        return Err("Content-Length header has no values".to_string());
+    }
+    s.parse::<i64>()
+        .map_err(|e| format!("convert Content-Length: strconv.ParseInt: parsing {s:?}: {e}"))
+}
+
+/// Ported from `thanos-io/objstore/exthttp/parse.go` and `clientutil/parse.go`:
+/// returns the timestamp parsed from the `Last-Modified` HTTP header.
+/// If `format` is empty, RFC3339 is used as the default format.
+pub fn parse_last_modified(
+    headers: &reqwest::header::HeaderMap,
+    format: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
+    let val = headers
+        .get(reqwest::header::LAST_MODIFIED)
+        .ok_or_else(|| "Last-Modified header not found".to_string())?;
+    let s = val
+        .to_str()
+        .map_err(|e| format!("parse Last-Modified: {e}"))?;
+    if s.is_empty() {
+        return Err("Last-Modified header has no values".to_string());
+    }
+    let fmt = if format.is_empty() {
+        "2006-01-02T15:04:05Z07:00"
+    } else {
+        format
+    };
+    match fmt {
+        "2006-01-02T15:04:05Z07:00" | "rfc3339" | "RFC3339" => {
+            chrono::DateTime::parse_from_rfc3339(s).map_err(|e| {
+                format!("parse Last-Modified: parsing time {s:?} as \"2006-01-02T15:04:05Z07:00\": {e}")
+            })
+        }
+        "Mon, 02 Jan 2006 15:04:05 MST" | "rfc1123" | "RFC1123" => {
+            chrono::DateTime::parse_from_rfc2822(s).map_err(|e| {
+                format!("parse Last-Modified: parsing time {s:?} as \"Mon, 02 Jan 2006 15:04:05 MST\": {e}")
+            })
+        }
+        other => chrono::DateTime::parse_from_str(s, other)
+            .map_err(|e| format!("parse Last-Modified: parsing time {s:?} as {other:?}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

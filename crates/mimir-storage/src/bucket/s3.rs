@@ -236,6 +236,11 @@ impl S3BucketError {
     pub fn is_access_denied(&self) -> bool {
         self.inner.code() == "AccessDenied"
     }
+    /// thanos `IsConditionNotMetErr`.
+    pub fn is_condition_not_met(&self) -> bool {
+        matches!(self.inner.code(), "PreconditionFailed" | "ConditionalRequestConflict")
+            || matches!(&self.inner, S3Error::Response(r) if r.status_code == 412)
+    }
     /// The S3 error code (empty for transport errors).
     pub fn code(&self) -> &str {
         self.inner.code()
@@ -420,10 +425,18 @@ fn query_unescape(s: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|e| e.to_string())
 }
 
+/// Entry returned by [`S3Bucket::iter_with_attributes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3IterEntry {
+    pub name: String,
+    pub last_modified: Option<DateTime<Utc>>,
+}
+
 /// One page of a ListObjects(V2) response.
 #[derive(Default, Debug)]
 struct ListPage {
     keys: Vec<String>,
+    key_last_modified: Vec<Option<DateTime<Utc>>>,
     prefixes: Vec<String>,
     is_truncated: bool,
     next_continuation_token: String,
@@ -438,10 +451,15 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, S3Error> {
     let mut path: Vec<String> = Vec::new();
     let mut page = ListPage::default();
     let mut text = String::new();
+    let mut cur_lm: Option<DateTime<Utc>> = None;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                path.push(String::from_utf8_lossy(e.local_name().as_ref()).into_owned());
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if path.len() == 1 && name == "Contents" {
+                    cur_lm = None;
+                }
+                path.push(name);
                 text.clear();
             }
             Ok(Event::Text(t)) => {
@@ -451,6 +469,16 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, S3Error> {
                 let p: Vec<&str> = path.iter().map(String::as_str).collect();
                 match p.as_slice() {
                     [_, "Contents", "Key"] => page.keys.push(text.clone()),
+                    [_, "Contents", "LastModified"] => {
+                        cur_lm = DateTime::parse_from_rfc3339(text.trim())
+                            .ok()
+                            .map(|d| d.with_timezone(&Utc));
+                    }
+                    [_, "Contents"] => {
+                        if page.key_last_modified.len() < page.keys.len() {
+                            page.key_last_modified.push(cur_lm);
+                        }
+                    }
                     [_, "CommonPrefixes", "Prefix"] => page.prefixes.push(text.clone()),
                     [_, "IsTruncated"] => page.is_truncated = text.trim() == "true",
                     [_, "NextContinuationToken"] => page.next_continuation_token = text.clone(),
@@ -619,6 +647,29 @@ impl S3Bucket {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn storage_class(&self) -> &str {
+        &self.storage_class
+    }
+
+    pub fn part_size(&self) -> u64 {
+        self.part_size
+    }
+
+    pub fn list_objects_v1(&self) -> bool {
+        self.list_objects_v1
+    }
+
+    pub fn default_sse(&self) -> Option<&ServerSideEncryption> {
+        self.default_sse.as_ref()
+    }
+
+    pub fn effective_sse<'a>(
+        &'a self,
+        override_sse: Option<&'a ServerSideEncryption>,
+    ) -> Option<&'a ServerSideEncryption> {
+        override_sse.or(self.default_sse.as_ref())
     }
 
     fn bucket_check(&self) -> Result<(), S3Error> {
@@ -1039,6 +1090,15 @@ impl S3Bucket {
     /// `list_objects_version: v1` or a snowball location). Entries are returned in listing
     /// order (per page: objects, then common prefixes).
     pub async fn iter(&self, dir: &str, recursive: bool) -> Result<Vec<String>, S3BucketError> {
+        let entries = self.iter_with_attributes(dir, recursive).await?;
+        Ok(entries.into_iter().map(|e| e.name).collect())
+    }
+
+    pub async fn iter_with_attributes(
+        &self,
+        dir: &str,
+        recursive: bool,
+    ) -> Result<Vec<S3IterEntry>, S3BucketError> {
         let dir = if dir.is_empty() {
             String::new()
         } else {
@@ -1102,11 +1162,24 @@ impl S3Bucket {
             } else {
                 None
             };
-            for key in page.keys.into_iter().chain(page.prefixes) {
+            for (idx, key) in page.keys.into_iter().enumerate() {
                 if key.is_empty() || key == dir {
                     continue;
                 }
-                out.push(key);
+                let last_modified = page.key_last_modified.get(idx).copied().flatten();
+                out.push(S3IterEntry {
+                    name: key,
+                    last_modified,
+                });
+            }
+            for prefix in page.prefixes {
+                if prefix.is_empty() || prefix == dir {
+                    continue;
+                }
+                out.push(S3IterEntry {
+                    name: prefix,
+                    last_modified: None,
+                });
             }
             if use_v1 {
                 if !page.next_marker.is_empty() {
