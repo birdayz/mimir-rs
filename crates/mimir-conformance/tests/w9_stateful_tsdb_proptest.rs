@@ -666,11 +666,8 @@ async fn collect_full_read_snapshot(
     filter_metric: &str,
 ) -> FullReadSnapshot {
     let any_name = vec![matcher(ingesterpb::MatchType::RegexMatch, "__name__", ".+")];
-    // On `t-std`, enforce exact wire encoding byte parity (`4..=6`). On `t-st` (`xor2` /
-    // `histogram_st`), normalize compatible ST-free chunk family encodings (`4|7`, `5|8`, `6|9`)
-    // in the multi-seed runner while `repro_bug2_ooo_compaction_xor2_overlap_encoding_divergence`
-    // isolates the exact `EncXOR(4)` vs `EncXOR2(7)` OOO compaction divergence.
-    let strict_chunk_enc = tenant != "t-st";
+    // Enforce exact wire encoding byte parity (`4..=9`) on both `t-std` and `t-st`.
+    let strict_chunk_enc = true;
 
     let query_full = query_stream_canonical(
         ing,

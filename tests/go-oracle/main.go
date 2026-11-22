@@ -105,6 +105,12 @@ func main() {
 		out, err = cmdVerifyIndexFile(input)
 	case "serialize-ingest-records":
 		out, err = cmdSerializeIngestRecords(input)
+	case "write-st-tsdb-fixture":
+		out, err = cmdWriteSTTSDBFixture(input)
+	case "read-st-tsdb":
+		out, err = cmdReadSTTSDB(input)
+	case "format-propagation-tracker":
+		out, err = cmdFormatPropagationTracker(input)
 	default:
 		fatalf("unknown subcommand %q", cmd)
 	}
@@ -209,6 +215,7 @@ type SpanJSON struct {
 }
 
 type HistogramJSON struct {
+	ST              int64      `json:"st,omitempty"`
 	TimestampMs     int64      `json:"timestamp_ms"`
 	Schema          int32      `json:"schema"`
 	ZeroThreshold   float64    `json:"zero_threshold"`
@@ -730,7 +737,7 @@ func cmdEncodeChunk(input []byte) (*chunkOut, error) {
 	case chunkenc.EncHistogram, chunkenc.EncHistogramST:
 		var prev chunkenc.Appender
 		for _, h := range in.Histograms {
-			newC, _, nextApp, err := app.AppendHistogram(prev, 0, h.TimestampMs, toPromHistogram(h), true)
+			newC, _, nextApp, err := app.AppendHistogram(prev, h.ST, h.TimestampMs, toPromHistogram(h), true)
 			if err != nil {
 				return nil, err
 			}
@@ -743,7 +750,7 @@ func cmdEncodeChunk(input []byte) (*chunkOut, error) {
 	case chunkenc.EncFloatHistogram, chunkenc.EncFloatHistogramST:
 		var prev chunkenc.Appender
 		for _, h := range in.Histograms {
-			newC, _, nextApp, err := app.AppendFloatHistogram(prev, 0, h.TimestampMs, toPromFloatHistogram(h), true)
+			newC, _, nextApp, err := app.AppendFloatHistogram(prev, h.ST, h.TimestampMs, toPromFloatHistogram(h), true)
 			if err != nil {
 				return nil, err
 			}
@@ -794,10 +801,14 @@ func cmdDecodeChunk(input []byte) (*chunkOut, error) {
 			out.Samples = append(out.Samples, ChunkSampleJSON{ST: it.AtST(), T: t, V: v})
 		case chunkenc.ValHistogram:
 			t, h := it.AtHistogram(nil)
-			out.Histograms = append(out.Histograms, fromPromHistogram(t, h))
+			hj := fromPromHistogram(t, h)
+			hj.ST = it.AtST()
+			out.Histograms = append(out.Histograms, hj)
 		case chunkenc.ValFloatHistogram:
 			t, fh := it.AtFloatHistogram(nil)
-			out.Histograms = append(out.Histograms, fromPromFloatHistogram(t, fh))
+			fhj := fromPromFloatHistogram(t, fh)
+			fhj.ST = it.AtST()
+			out.Histograms = append(out.Histograms, fhj)
 		}
 	}
 	if err := it.Err(); err != nil {
@@ -1016,10 +1027,14 @@ func cmdVerifyTSDBDir(input []byte) (*verifyTSDBDirOut, error) {
 				entry.Samples = append(entry.Samples, ChunkSampleJSON{ST: it.AtST(), T: t, V: v})
 			case chunkenc.ValHistogram:
 				t, h := it.AtHistogram(nil)
-				entry.Histograms = append(entry.Histograms, fromPromHistogram(t, h))
+				hj := fromPromHistogram(t, h)
+				hj.ST = it.AtST()
+				entry.Histograms = append(entry.Histograms, hj)
 			case chunkenc.ValFloatHistogram:
 				t, fh := it.AtFloatHistogram(nil)
-				entry.Histograms = append(entry.Histograms, fromPromFloatHistogram(t, fh))
+				fhj := fromPromFloatHistogram(t, fh)
+				fhj.ST = it.AtST()
+				entry.Histograms = append(entry.Histograms, fhj)
 			}
 		}
 		if err := it.Err(); err != nil {
