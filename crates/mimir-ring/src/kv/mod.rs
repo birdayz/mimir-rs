@@ -174,6 +174,7 @@ where
     }
 
     pub fn decode_msg(&self, bytes: &[u8]) -> Result<M, KvError> {
+        const MAX_SNAPPY_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
         let dec_len = snap::raw::decompress_len(bytes)
             .map_err(|e| KvError::Codec(format!("snappy decode: {e}")))?;
         if dec_len > bytes.len().saturating_mul(32).saturating_add(64) {
@@ -182,9 +183,20 @@ where
                 bytes.len()
             )));
         }
+        if dec_len > MAX_SNAPPY_DECOMPRESSED_BYTES {
+            return Err(KvError::Codec(format!(
+                "snappy decode: uncompressed length {dec_len} exceeds max bound {MAX_SNAPPY_DECOMPRESSED_BYTES} bytes"
+            )));
+        }
         let decompressed = snap::raw::Decoder::new()
             .decompress_vec(bytes)
             .map_err(|e| KvError::Codec(format!("snappy decode: {e}")))?;
+        if decompressed.len() > MAX_SNAPPY_DECOMPRESSED_BYTES {
+            return Err(KvError::Codec(format!(
+                "snappy decode: decompressed length {} exceeds max {MAX_SNAPPY_DECOMPRESSED_BYTES} bytes",
+                decompressed.len()
+            )));
+        }
         let mut msg = M::decode(decompressed.as_slice())
             .map_err(|e| KvError::Codec(format!("proto decode: {e}")))?;
         if let Some(post) = self.post_decode {

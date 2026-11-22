@@ -123,6 +123,7 @@ struct Parser {
     event: Option<Event>,
     anchors: HashMap<String, usize>,
     nodes: Vec<Node>,
+    depth: usize,
     _input: Vec<u8>,
 }
 
@@ -163,6 +164,7 @@ impl Parser {
             event: None,
             anchors: HashMap::new(),
             nodes: Vec::new(),
+            depth: 0,
             _input: input,
         })
     }
@@ -306,8 +308,16 @@ impl Parser {
     }
 
     fn parse_child(&mut self, parent: usize) -> Result<usize, String> {
-        let child = self
-            .parse()?
+        const MAX_PARSE_DEPTH: usize = 256;
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(format!(
+                "yaml: exceeded maximum nesting depth of {MAX_PARSE_DEPTH}"
+            ));
+        }
+        self.depth += 1;
+        let res = self.parse();
+        self.depth -= 1;
+        let child = res?
             .ok_or_else(|| "yaml: attempted to go past the end of stream; corrupted value?".to_string())?;
         self.nodes[parent].content.push(child);
         Ok(child)
@@ -784,6 +794,22 @@ fn load_types() -> Result<Types, String> {
 #[derive(Debug)]
 struct Fail(String);
 
+const MAX_ALIAS_DEPTH: usize = 64;
+const MAX_CALL_DEPTH: usize = 128;
+const ALIAS_RATIO_RANGE_LOW: usize = 400_000;
+const ALIAS_RATIO_RANGE_HIGH: usize = 4_000_000;
+const ALIAS_RATIO_RANGE: f64 = (ALIAS_RATIO_RANGE_HIGH - ALIAS_RATIO_RANGE_LOW) as f64;
+
+fn allowed_alias_ratio(decode_count: usize) -> f64 {
+    if decode_count <= ALIAS_RATIO_RANGE_LOW {
+        0.99
+    } else if decode_count >= ALIAS_RATIO_RANGE_HIGH {
+        0.10
+    } else {
+        0.99 - 0.89 * ((decode_count - ALIAS_RATIO_RANGE_LOW) as f64 / ALIAS_RATIO_RANGE)
+    }
+}
+
 struct Decoder<'a> {
     doc: &'a Document,
     types: &'static Types,
@@ -792,6 +818,10 @@ struct Decoder<'a> {
     aliases: HashSet<usize>,
     merge_visited: HashSet<usize>,
     merged_fields: Option<HashSet<String>>,
+    decode_count: usize,
+    alias_count: usize,
+    alias_depth: usize,
+    call_depth: usize,
 }
 
 /// `TypeError.Error()`.
@@ -809,14 +839,45 @@ impl<'a> Decoder<'a> {
             aliases: HashSet::new(),
             merge_visited: HashSet::new(),
             merged_fields: None,
+            decode_count: 0,
+            alias_count: 0,
+            alias_depth: 0,
+            call_depth: 0,
         }
+    }
+
+    fn new_sub(&self, known_fields: bool) -> Self {
+        let mut sub = Decoder::new(self.doc, self.types, known_fields);
+        sub.decode_count = self.decode_count;
+        sub.alias_count = self.alias_count;
+        sub.alias_depth = self.alias_depth;
+        sub.call_depth = self.call_depth;
+        sub
+    }
+
+    fn count_and_check_aliases(&mut self) -> Result<(), Fail> {
+        self.decode_count += 1;
+        if self.alias_depth > 0 {
+            self.alias_count += 1;
+        }
+        if self.alias_count > 100
+            && self.decode_count > 1000
+            && (self.alias_count as f64) / (self.decode_count as f64)
+                > allowed_alias_ratio(self.decode_count)
+        {
+            return Err(Fail("yaml: document contains excessive aliasing".to_string()));
+        }
+        Ok(())
     }
 
     /// `node.DecodeWithOptions(out, opts)` / `node.Decode(out)` from inside an unmarshaler:
     /// a fresh decoder whose `TypeError` is merged into ours by `callUnmarshaler`.
     fn sub_decode(&mut self, n: usize, ty: usize, known_fields: bool) -> Result<bool, Fail> {
-        let mut sub = Decoder::new(self.doc, self.types, known_fields);
-        sub.unmarshal(n, ty)?;
+        let mut sub = self.new_sub(known_fields);
+        let res = sub.unmarshal(n, ty);
+        self.decode_count = sub.decode_count;
+        self.alias_count = sub.alias_count;
+        res?;
         let good = sub.terrors.is_empty();
         self.terrors.append(&mut sub.terrors);
         Ok(good)
@@ -845,6 +906,17 @@ impl<'a> Decoder<'a> {
     }
 
     fn unmarshal(&mut self, n: usize, ty: usize) -> Result<bool, Fail> {
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(Fail("yaml: document exceeds maximum nesting depth".to_string()));
+        }
+        self.call_depth += 1;
+        let res = self.unmarshal_inner(n, ty);
+        self.call_depth -= 1;
+        res
+    }
+
+    fn unmarshal_inner(&mut self, n: usize, ty: usize) -> Result<bool, Fail> {
+        self.count_and_check_aliases()?;
         let node = self.doc.node(n);
         match node.kind {
             Kind::Document => {
@@ -858,8 +930,16 @@ impl<'a> Decoder<'a> {
                 if !self.aliases.insert(n) {
                     return Err(Fail(format!("yaml: anchor '{}' value contains itself", node.value)));
                 }
-                let target = node.alias.expect("resolved alias");
+                let target = node.alias.ok_or_else(|| {
+                    Fail(format!("yaml: unknown anchor '{}' referenced", node.value))
+                })?;
+                if self.alias_depth >= MAX_ALIAS_DEPTH {
+                    self.aliases.remove(&n);
+                    return Err(Fail("yaml: document contains excessive alias nesting".to_string()));
+                }
+                self.alias_depth += 1;
                 let good = self.unmarshal(target, ty);
+                self.alias_depth -= 1;
                 self.aliases.remove(&n);
                 return good;
             }
@@ -904,8 +984,11 @@ impl<'a> Decoder<'a> {
             } else {
                 (self.types.storage_backend, "blocks_storage")
             };
-            let mut sub = Decoder::new(self.doc, self.types, true);
-            sub.unmarshal(n, loc_ty)?;
+            let mut sub = self.new_sub(true);
+            let res = sub.unmarshal(n, loc_ty);
+            self.decode_count = sub.decode_count;
+            self.alias_count = sub.alias_count;
+            res?;
             if !sub.terrors.is_empty() {
                 return Err(Fail(format!("key {loc:?}: {}", type_error(&sub.terrors))));
             }
@@ -915,8 +998,11 @@ impl<'a> Decoder<'a> {
             // `type plain T; DecodeWithOptions((*plain)(x), KnownFields: true)` / unmarshal((*plain)(x)).
             let known = kind == "obsolete" && self.known_fields || kind == "node";
             if kind == "node" {
-                let mut sub = Decoder::new(self.doc, self.types, known);
-                let good = sub.mapping_or_other_named(n, ty, &delegate)?;
+                let mut sub = self.new_sub(known);
+                let res = sub.mapping_or_other_named(n, ty, &delegate);
+                self.decode_count = sub.decode_count;
+                self.alias_count = sub.alias_count;
+                let good = res?;
                 self.terrors.append(&mut sub.terrors);
                 return Ok(good);
             }
@@ -979,8 +1065,11 @@ impl<'a> Decoder<'a> {
                     .position(|t| t.name == elem)
                     .unwrap_or(self.types.string);
                 let map_name = format!("map[string]{elem}");
-                let mut sub = Decoder::new(self.doc, self.types, false);
-                let good = sub.mapping_typed(n, &map_name, self.types.string, elem_ty)?;
+                let mut sub = self.new_sub(false);
+                let res = sub.mapping_typed(n, &map_name, self.types.string, elem_ty);
+                self.decode_count = sub.decode_count;
+                self.alias_count = sub.alias_count;
+                let good = res?;
                 self.terrors.append(&mut sub.terrors);
                 Ok(good)
             }
@@ -1347,23 +1436,36 @@ impl<'a> Decoder<'a> {
                 };
                 return Err(Fail(msg));
             }
-            let res = match &strukt {
-                Some((ty, name)) => {
-                    if self.check_unique_keys(tn) {
-                        self.mapping_struct(tn, *ty, name)
-                    } else {
-                        Ok(true)
-                    }
+            if is_alias {
+                if self.alias_depth >= MAX_ALIAS_DEPTH {
+                    self.aliases.remove(&tgt);
+                    self.merged_fields = saved;
+                    return Err(Fail("yaml: document contains excessive alias nesting".to_string()));
                 }
-                None => {
-                    if self.check_unique_keys(tn) {
-                        self.mapping_entries(tn, key, elem)
-                    } else {
-                        Ok(true)
+                self.alias_depth += 1;
+            }
+            let count_res = self.count_and_check_aliases();
+            let res = match count_res {
+                Err(e) => Err(e),
+                Ok(()) => match &strukt {
+                    Some((ty, name)) => {
+                        if self.check_unique_keys(tn) {
+                            self.mapping_struct(tn, *ty, name)
+                        } else {
+                            Ok(true)
+                        }
                     }
-                }
+                    None => {
+                        if self.check_unique_keys(tn) {
+                            self.mapping_entries(tn, key, elem)
+                        } else {
+                            Ok(true)
+                        }
+                    }
+                },
             };
             if is_alias {
+                self.alias_depth -= 1;
                 self.aliases.remove(&tgt);
             }
             res?;
@@ -1637,11 +1739,54 @@ fn doc_scalar_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<
     }
 }
 
+#[derive(Default)]
+struct DocAliasBudget {
+    decode_count: usize,
+    alias_count: usize,
+    alias_depth: usize,
+    call_depth: usize,
+    active_aliases: HashSet<usize>,
+}
+
+impl DocAliasBudget {
+    fn tick(&mut self) -> Result<(), String> {
+        self.decode_count = self.decode_count.saturating_add(1);
+        if self.alias_depth > 0 {
+            self.alias_count = self.alias_count.saturating_add(1);
+        }
+        if self.alias_count > 100
+            && self.decode_count > 1000
+            && (self.alias_count as f64) / (self.decode_count as f64)
+                > allowed_alias_ratio(self.decode_count)
+        {
+            return Err("yaml: document contains excessive aliasing".to_string());
+        }
+        Ok(())
+    }
+}
+
 fn collect_merged_pairs(
     doc: &Document,
     n: usize,
     visited: &mut HashSet<usize>,
+    budget: &mut DocAliasBudget,
 ) -> Result<Vec<(usize, usize)>, String> {
+    if budget.call_depth >= MAX_CALL_DEPTH {
+        return Err("yaml: document exceeds maximum nesting depth".to_string());
+    }
+    budget.call_depth += 1;
+    let res = collect_merged_pairs_inner(doc, n, visited, budget);
+    budget.call_depth -= 1;
+    res
+}
+
+fn collect_merged_pairs_inner(
+    doc: &Document,
+    n: usize,
+    visited: &mut HashSet<usize>,
+    budget: &mut DocAliasBudget,
+) -> Result<Vec<(usize, usize)>, String> {
+    budget.tick()?;
     let n = doc_deref(doc, n);
     if !visited.insert(n) {
         return Err("yaml: anchor value contains itself".to_string());
@@ -1663,23 +1808,36 @@ fn collect_merged_pairs(
         }
     }
     if let Some(mv) = merge_val {
+        let mv_is_alias = doc.node(mv).kind == Kind::Alias;
         let mv = doc_deref(doc, mv);
         let mnode = doc.node(mv);
-        let mut targets = Vec::new();
+        let mut targets: Vec<(usize, bool)> = Vec::new();
         match mnode.kind {
-            Kind::Mapping => targets.push(mv),
+            Kind::Mapping => targets.push((mv, mv_is_alias)),
             Kind::Sequence => {
                 for &c in &mnode.content {
+                    let c_is_alias = mv_is_alias || doc.node(c).kind == Kind::Alias;
                     let cn = doc_deref(doc, c);
                     if doc.node(cn).kind == Kind::Mapping {
-                        targets.push(cn);
+                        targets.push((cn, c_is_alias));
                     }
                 }
             }
             _ => {}
         }
-        for tgt in targets {
-            let merged = match collect_merged_pairs(doc, tgt, visited) {
+        for (tgt, is_alias) in targets {
+            if is_alias {
+                if budget.alias_depth >= MAX_ALIAS_DEPTH {
+                    visited.remove(&n);
+                    return Err("yaml: document contains excessive alias nesting".to_string());
+                }
+                budget.alias_depth += 1;
+            }
+            let merged_res = collect_merged_pairs(doc, tgt, visited, budget);
+            if is_alias {
+                budget.alias_depth -= 1;
+            }
+            let merged = match merged_res {
                 Ok(m) => m,
                 Err(e) => {
                     visited.remove(&n);
@@ -1699,13 +1857,53 @@ fn collect_merged_pairs(
     Ok(explicit_keys)
 }
 
-fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<serde_yaml::Value, String> {
+fn doc_node_to_yaml(
+    doc: &Document,
+    t: &Types,
+    n: usize,
+    ty: usize,
+    budget: &mut DocAliasBudget,
+) -> Result<serde_yaml::Value, String> {
+    if budget.call_depth >= MAX_CALL_DEPTH {
+        return Err("yaml: document exceeds maximum nesting depth".to_string());
+    }
+    budget.call_depth += 1;
+    let res = doc_node_to_yaml_inner(doc, t, n, ty, budget);
+    budget.call_depth -= 1;
+    res
+}
+
+fn doc_node_to_yaml_inner(
+    doc: &Document,
+    t: &Types,
+    n: usize,
+    ty: usize,
+    budget: &mut DocAliasBudget,
+) -> Result<serde_yaml::Value, String> {
     use serde_yaml::{Mapping, Value};
-    let n = doc_deref(doc, n);
+    budget.tick()?;
+
     let node = doc.node(n);
+    if node.kind == Kind::Alias {
+        if budget.alias_depth >= MAX_ALIAS_DEPTH {
+            return Err("yaml: document contains excessive alias nesting".to_string());
+        }
+        if !budget.active_aliases.insert(n) {
+            return Err(format!("yaml: anchor '{}' value contains itself", node.value));
+        }
+        budget.alias_depth += 1;
+        let res = match node.alias {
+            Some(target) => doc_node_to_yaml(doc, t, target, ty, budget),
+            None => Ok(Value::Null),
+        };
+        budget.alias_depth -= 1;
+        budget.active_aliases.remove(&n);
+        return res;
+    }
+
     if node.kind == Kind::Document {
         return match node.content.first() {
-            Some(&c) => doc_node_to_yaml(doc, t, c, ty),
+            Some(&c) => doc_node_to_yaml(doc, t, c, ty, budget),
             None => Ok(Value::Null),
         };
     }
@@ -1723,49 +1921,49 @@ fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<se
             };
             let mut seq = Vec::with_capacity(node.content.len());
             for &c in &node.content {
-                seq.push(doc_node_to_yaml(doc, t, c, elem_ty)?);
+                seq.push(doc_node_to_yaml(doc, t, c, elem_ty, budget)?);
             }
             Ok(Value::Sequence(seq))
         }
         Kind::Mapping => {
             let mut merge_visited = HashSet::new();
-            let pairs = collect_merged_pairs(doc, n, &mut merge_visited)?;
+            let pairs = collect_merged_pairs(doc, n, &mut merge_visited, budget)?;
             let mut out = Mapping::with_capacity(pairs.len());
             if info.name == "activeseriesmodel.CustomTrackersConfig" {
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
-                    let vv = doc_node_to_yaml(doc, t, v, t.string)?;
+                    let kv = doc_node_to_yaml(doc, t, k, t.string, budget)?;
+                    let vv = doc_node_to_yaml(doc, t, v, t.string, budget)?;
                     out.insert(kv, vv);
                 }
             } else if let Some(elem_ty) = limits_map_elem_ty(t, &info.name) {
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
-                    let vv = doc_node_to_yaml(doc, t, v, elem_ty)?;
+                    let kv = doc_node_to_yaml(doc, t, k, t.string, budget)?;
+                    let vv = doc_node_to_yaml(doc, t, v, elem_ty, budget)?;
                     out.insert(kv, vv);
                 }
             } else if info.kind == "struct" {
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, t.string)?;
+                    let kv = doc_node_to_yaml(doc, t, k, t.string, budget)?;
                     let field_ty = kv
                         .as_str()
                         .and_then(|key| info.fields.iter().find(|f| f.key == key).map(|f| f.ty))
                         .or(info.inline_map)
                         .unwrap_or(t.iface);
-                    let vv = doc_node_to_yaml(doc, t, v, field_ty)?;
+                    let vv = doc_node_to_yaml(doc, t, v, field_ty, budget)?;
                     out.insert(kv, vv);
                 }
             } else if info.kind == "map" {
                 let key_ty = info.key.unwrap_or(t.string);
                 let elem_ty = info.elem.unwrap_or(t.iface);
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, key_ty)?;
-                    let vv = doc_node_to_yaml(doc, t, v, elem_ty)?;
+                    let kv = doc_node_to_yaml(doc, t, k, key_ty, budget)?;
+                    let vv = doc_node_to_yaml(doc, t, v, elem_ty, budget)?;
                     out.insert(kv, vv);
                 }
             } else {
                 for (k, v) in pairs {
-                    let kv = doc_node_to_yaml(doc, t, k, t.iface)?;
-                    let vv = doc_node_to_yaml(doc, t, v, t.iface)?;
+                    let kv = doc_node_to_yaml(doc, t, k, t.iface, budget)?;
+                    let vv = doc_node_to_yaml(doc, t, v, t.iface, budget)?;
                     out.insert(kv, vv);
                 }
             }
@@ -1779,7 +1977,8 @@ fn doc_node_to_yaml(doc: &Document, t: &Types, n: usize, ty: usize) -> Result<se
 /// `yaml.v3` scalar coercions applied according to the Go type graph.
 pub fn doc_to_serde_value(doc: &Document) -> Result<serde_yaml::Value, String> {
     let t = types()?;
-    doc_node_to_yaml(doc, t, doc.root, t.root)
+    let mut budget = DocAliasBudget::default();
+    doc_node_to_yaml(doc, t, doc.root, t.root, &mut budget)
 }
 
 fn normalize_serde_scalar(t: &Types, val: &mut serde_yaml::Value, ty: usize) {

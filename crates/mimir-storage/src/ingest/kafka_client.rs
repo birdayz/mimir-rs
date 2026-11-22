@@ -264,6 +264,14 @@ pub(crate) fn join_host_port(host: &str, port: i32) -> String {
     }
 }
 
+const MAX_STALE_TOMBSTONES: usize = 64;
+const MAX_TOMBSTONE_AGE: Duration = Duration::from_secs(60);
+
+struct PendingEntry {
+    tx: Option<oneshot::Sender<ReadFrame>>,
+    tombstoned_at: Option<Instant>,
+}
+
 struct BrokerConn {
     addr: String,
     kind: ConnKind,
@@ -271,7 +279,7 @@ struct BrokerConn {
     transport: Option<Arc<KafkaTransport>>,
     next_corr_id: AtomicI32,
     write_tx: mpsc::Sender<OutboundFrame>,
-    pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<ReadFrame>>>>,
+    pending: Arc<parking_lot::Mutex<HashMap<i32, PendingEntry>>>,
     pending_drained: Arc<tokio::sync::Notify>,
     api_versions: RwLock<HashMap<i16, (i16, i16)>>,
     alive: Arc<std::sync::atomic::AtomicBool>,
@@ -298,27 +306,48 @@ impl Drop for BrokerConn {
     fn drop(&mut self) {
         self.reader_abort.abort();
         self.writer_abort.abort();
+        if let Some(ref k) = self.kprom {
+            if !self.disconnected.swap(true, Ordering::SeqCst) {
+                let n = self.node.read().clone();
+                k.on_broker_disconnect(&n);
+            }
+        }
     }
 }
 
 struct PendingGuard<'a> {
-    pending: &'a parking_lot::Mutex<HashMap<i32, oneshot::Sender<ReadFrame>>>,
-    pending_drained: &'a tokio::sync::Notify,
+    conn: &'a BrokerConn,
     corr_id: i32,
     completed: bool,
 }
 
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
-        if !self.completed {
-            let now_empty = {
-                let mut map = self.pending.lock();
-                map.remove(&self.corr_id);
-                map.is_empty()
-            };
-            if now_empty {
-                self.pending_drained.notify_waiters();
+        if self.completed {
+            return;
+        }
+        let now = Instant::now();
+        let should_retire = {
+            let mut map = self.conn.pending.lock();
+            if let Some(entry) = map.get_mut(&self.corr_id) {
+                entry.tx = None;
+                entry.tombstoned_at = Some(now);
             }
+            let mut tombstones = 0usize;
+            let mut oldest: Option<Instant> = None;
+            for e in map.values() {
+                if e.tx.is_none() {
+                    tombstones += 1;
+                    if let Some(ts) = e.tombstoned_at {
+                        oldest = Some(oldest.map_or(ts, |o| o.min(ts)));
+                    }
+                }
+            }
+            tombstones > MAX_STALE_TOMBSTONES
+                || oldest.is_some_and(|o| now.saturating_duration_since(o) > MAX_TOMBSTONE_AGE)
+        };
+        if should_retire {
+            self.conn.retire();
         }
     }
 }
@@ -367,7 +396,7 @@ impl BrokerConn {
 
         let (mut reader, mut writer) = established.stream.into_split();
         let (write_tx, mut write_rx) = mpsc::channel::<OutboundFrame>(512);
-        let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<ReadFrame>>>> =
+        let pending: Arc<parking_lot::Mutex<HashMap<i32, PendingEntry>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let pending_drained = Arc::new(tokio::sync::Notify::new());
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -425,25 +454,45 @@ impl BrokerConn {
                     m.read_bytes_total.inc_by((frame_len + 4) as f64);
                 }
                 let corr_id = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let (tx, now_empty) = {
-                    let mut map = pending_r.lock();
-                    let tx = map.remove(&corr_id);
-                    (tx, map.is_empty())
-                };
-                if now_empty {
-                    pending_drained_r.notify_waiters();
+                enum LookupOutcome {
+                    Deliver(oneshot::Sender<ReadFrame>, bool),
+                    TombstoneDiscarded(bool),
+                    Mismatch,
                 }
-                if let Some(tx) = tx {
-                    let _ = tx.send(ReadFrame {
-                        payload: Bytes::from(payload),
-                        header_at,
-                        done_at,
-                    });
-                } else {
-                    *fatal_err_r.lock() = Some("correlation ID mismatch".to_string());
-                    pending_r.lock().clear();
-                    pending_drained_r.notify_waiters();
-                    break;
+                let outcome = {
+                    let mut map = pending_r.lock();
+                    match map.remove(&corr_id) {
+                        Some(PendingEntry { tx: Some(tx), .. }) => {
+                            LookupOutcome::Deliver(tx, map.is_empty())
+                        }
+                        Some(PendingEntry { tx: None, .. }) => {
+                            LookupOutcome::TombstoneDiscarded(map.is_empty())
+                        }
+                        None => LookupOutcome::Mismatch,
+                    }
+                };
+                match outcome {
+                    LookupOutcome::Deliver(tx, now_empty) => {
+                        if now_empty {
+                            pending_drained_r.notify_waiters();
+                        }
+                        let _ = tx.send(ReadFrame {
+                            payload: Bytes::from(payload),
+                            header_at,
+                            done_at,
+                        });
+                    }
+                    LookupOutcome::TombstoneDiscarded(now_empty) => {
+                        if now_empty {
+                            pending_drained_r.notify_waiters();
+                        }
+                    }
+                    LookupOutcome::Mismatch => {
+                        *fatal_err_r.lock() = Some("correlation ID mismatch".to_string());
+                        pending_r.lock().clear();
+                        pending_drained_r.notify_waiters();
+                        break;
+                    }
                 }
             }
             alive_r.store(false, Ordering::SeqCst);
@@ -557,8 +606,9 @@ impl BrokerConn {
 
         self.requests_since_auth.fetch_add(1, Ordering::SeqCst);
 
+        let send_budget = timeout.saturating_sub(start.elapsed());
         let (rx, guard, written, e2e_start, read_start) =
-            match self.enqueue_frame(api_key, api_version, req).await {
+            match self.enqueue_frame(api_key, api_version, req, send_budget).await {
                 Ok(v) => v,
                 Err(e) => return SendOutcome::Err(e),
             };
@@ -663,7 +713,7 @@ impl BrokerConn {
         hs_req.mechanism = StrBytes::from_static_str(mech);
         let hs_resp: kafka_protocol::messages::SaslHandshakeResponse = tokio::time::timeout(
             timeout,
-            self.send_raw_internal(ApiKey::SaslHandshake, hs_ver, &hs_req, false),
+            self.send_raw_internal(ApiKey::SaslHandshake, hs_ver, &hs_req, false, timeout),
         )
         .await
         .map_err(|_| KafkaClientError::RequestTimeout(timeout))??;
@@ -680,11 +730,11 @@ impl BrokerConn {
             let auth_resp: kafka_protocol::messages::SaslAuthenticateResponse =
                 tokio::time::timeout(
                     timeout,
-                    self.send_raw_internal(ApiKey::SaslAuthenticate, auth_ver, &auth_req, false),
+                    self.send_raw_internal(ApiKey::SaslAuthenticate, auth_ver, &auth_req, false, timeout),
                 )
                 .await
                 .map_err(|_| KafkaClientError::RequestTimeout(timeout))??;
-            flow.on_authenticate_response(auth_resp)?;
+            flow.on_authenticate_response(auth_resp).await?;
         }
         let new_expiry = flow.finish()?;
         abort_guard.armed = false;
@@ -700,6 +750,7 @@ impl BrokerConn {
         api_version: i16,
         req: &Req,
         track_success: bool,
+        send_timeout: Duration,
     ) -> Result<Resp, KafkaClientError>
     where
         Req: Request + Encodable,
@@ -709,7 +760,7 @@ impl BrokerConn {
             return Err(KafkaClientError::ConnectionClosed);
         }
         let (rx, mut guard, written, timing, read_fallback) =
-            self.enqueue_frame_with_tracking(api_key, api_version, req, track_success)
+            self.enqueue_frame_with_tracking(api_key, api_version, req, track_success, send_timeout)
                 .await?;
         let read_frame = match rx.await {
             Ok(rf) => rf,
@@ -777,6 +828,7 @@ impl BrokerConn {
         api_key: ApiKey,
         api_version: i16,
         req: &Req,
+        send_timeout: Duration,
     ) -> Result<
         (
             oneshot::Receiver<ReadFrame>,
@@ -787,7 +839,7 @@ impl BrokerConn {
         ),
         KafkaClientError,
     > {
-        self.enqueue_frame_with_tracking(api_key, api_version, req, true)
+        self.enqueue_frame_with_tracking(api_key, api_version, req, true, send_timeout)
             .await
     }
 
@@ -797,6 +849,7 @@ impl BrokerConn {
         api_version: i16,
         req: &Req,
         track_metrics: bool,
+        send_timeout: Duration,
     ) -> Result<
         (
             oneshot::Receiver<ReadFrame>,
@@ -823,11 +876,36 @@ impl BrokerConn {
         let frame_len = (body.len() - 4) as u32;
         body[0..4].copy_from_slice(&frame_len.to_be_bytes());
 
+        // Reserve channel capacity BEFORE inserting into self.pending so dropping/cancelling
+        // this future while write_tx is full never leaves a phantom tombstone for an unsent frame.
+        let permit = match tokio::time::timeout(send_timeout, self.write_tx.reserve()).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => {
+                if let Some(ref k) = self.kprom {
+                    let n = self.node.read().clone();
+                    k.on_write_error(&n);
+                }
+                return Err(KafkaClientError::ConnectionClosed);
+            }
+            Err(_) => {
+                if let Some(ref k) = self.kprom {
+                    let n = self.node.read().clone();
+                    k.on_write_error(&n);
+                }
+                return Err(KafkaClientError::RequestTimeout(send_timeout));
+            }
+        };
+
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(corr_id, tx);
+        self.pending.lock().insert(
+            corr_id,
+            PendingEntry {
+                tx: Some(tx),
+                tombstoned_at: None,
+            },
+        );
         let guard = PendingGuard {
-            pending: &self.pending,
-            pending_drained: &self.pending_drained,
+            conn: self,
             corr_id,
             completed: false,
         };
@@ -847,13 +925,7 @@ impl BrokerConn {
             timing: timing.clone(),
             track_metrics,
         };
-        if self.write_tx.send(outbound).await.is_err() {
-            if let Some(ref k) = self.kprom {
-                let n = self.node.read().clone();
-                k.on_write_error(&n);
-            }
-            return Err(KafkaClientError::ConnectionClosed);
-        }
+        permit.send(outbound);
         Ok((rx, guard, written, timing, enqueued_at))
     }
 
@@ -3151,7 +3223,7 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
             }
         }
         let next_fetch_offset =
-            last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end + 1));
+            last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end.saturating_add(1)));
 
         // Verify CRC32C and decode EVERY frame (including `is_control` batches) inside
         // `decode_single_batch_slice` so a bit-flip setting `attributes & 0x20` on a data
@@ -3446,7 +3518,7 @@ fn decode_mixed_or_legacy_batches(
     }
 
     let next_fetch_offset =
-        last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end + 1));
+        last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end.saturating_add(1)));
     Ok((decoded_records, next_fetch_offset, last_batch_end_offset))
 }
 
@@ -3531,7 +3603,7 @@ fn decode_legacy_message_set(
     }
 
     let next_fetch_offset =
-        last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end + 1));
+        last_batch_end_offset.map_or(fetch_offset, |end| fetch_offset.max(end.saturating_add(1)));
     Ok((decoded_records, next_fetch_offset, last_batch_end_offset))
 }
 
@@ -3567,7 +3639,7 @@ impl KgoBrokerConn {
     {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (write_tx, mut write_rx) = mpsc::channel::<OutboundFrame>(64);
-        let pending: Arc<parking_lot::Mutex<HashMap<i32, oneshot::Sender<ReadFrame>>>> =
+        let pending: Arc<parking_lot::Mutex<HashMap<i32, PendingEntry>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let pending_drained = Arc::new(tokio::sync::Notify::new());
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3610,25 +3682,45 @@ impl KgoBrokerConn {
                     cb();
                 }
                 let corr_id = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let (tx, now_empty) = {
-                    let mut map = pending_r.lock();
-                    let tx = map.remove(&corr_id);
-                    (tx, map.is_empty())
-                };
-                if now_empty {
-                    pending_drained_r.notify_waiters();
+                enum LookupOutcome {
+                    Deliver(oneshot::Sender<ReadFrame>, bool),
+                    TombstoneDiscarded(bool),
+                    Mismatch,
                 }
-                if let Some(tx) = tx {
-                    let _ = tx.send(ReadFrame {
-                        payload: Bytes::from(payload),
-                        header_at,
-                        done_at,
-                    });
-                } else {
-                    *fatal_err_r.lock() = Some("correlation ID mismatch".to_string());
-                    pending_r.lock().clear();
-                    pending_drained_r.notify_waiters();
-                    break;
+                let outcome = {
+                    let mut map = pending_r.lock();
+                    match map.remove(&corr_id) {
+                        Some(PendingEntry { tx: Some(tx), .. }) => {
+                            LookupOutcome::Deliver(tx, map.is_empty())
+                        }
+                        Some(PendingEntry { tx: None, .. }) => {
+                            LookupOutcome::TombstoneDiscarded(map.is_empty())
+                        }
+                        None => LookupOutcome::Mismatch,
+                    }
+                };
+                match outcome {
+                    LookupOutcome::Deliver(tx, now_empty) => {
+                        if now_empty {
+                            pending_drained_r.notify_waiters();
+                        }
+                        let _ = tx.send(ReadFrame {
+                            payload: Bytes::from(payload),
+                            header_at,
+                            done_at,
+                        });
+                    }
+                    LookupOutcome::TombstoneDiscarded(now_empty) => {
+                        if now_empty {
+                            pending_drained_r.notify_waiters();
+                        }
+                    }
+                    LookupOutcome::Mismatch => {
+                        *fatal_err_r.lock() = Some("correlation ID mismatch".to_string());
+                        pending_r.lock().clear();
+                        pending_drained_r.notify_waiters();
+                        break;
+                    }
                 }
             }
             alive_r.store(false, Ordering::SeqCst);
@@ -3702,7 +3794,19 @@ impl KgoBrokerConn {
         self.warnings.lock().clone()
     }
 
+    pub fn pending_len(&self) -> usize {
+        self.inner.pending.lock().len()
+    }
+
     pub async fn request_metadata(&self) -> Result<MetadataResponse, KafkaClientError> {
+        self.request_metadata_with_timeout(Duration::from_secs(5))
+            .await
+    }
+
+    pub async fn request_metadata_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<MetadataResponse, KafkaClientError> {
         let req = MetadataRequest::default();
         let res = self
             .inner
@@ -3710,7 +3814,7 @@ impl KgoBrokerConn {
                 ApiKey::Metadata,
                 4,
                 &req,
-                Duration::from_secs(5),
+                timeout,
             )
             .await;
         match res {
@@ -4738,7 +4842,13 @@ mod tests {
             let pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             let pending_drained = Arc::new(tokio::sync::Notify::new());
             let (tx_pending, _rx_pending) = oneshot::channel();
-            pending.lock().insert(99, tx_pending);
+            pending.lock().insert(
+                99,
+                PendingEntry {
+                    tx: Some(tx_pending),
+                    tombstoned_at: None,
+                },
+            );
 
             let conn = Arc::new(BrokerConn {
                 addr: "127.0.0.1:9092".to_string(),

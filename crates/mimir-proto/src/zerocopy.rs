@@ -254,46 +254,6 @@ fn push_utf8_or_lossy(
     }
 }
 
-#[inline]
-fn ensure_utf8_slice_ref(
-    r: SliceRef,
-    input: &[u8],
-    utf8_arena: &mut Vec<u8>,
-) -> SliceRef {
-    match r {
-        SliceRef::Input { start, len } => {
-            let s = start as usize;
-            let e = s + len as usize;
-            push_utf8_or_lossy(&input[s..e], s, utf8_arena)
-        }
-        other => other,
-    }
-}
-
-#[inline]
-fn materialize_common_into_scratch(
-    r: SliceRef,
-    common_symbols: &[&str],
-    utf8_arena: &mut Vec<u8>,
-) -> SliceRef {
-    match r {
-        SliceRef::Common { idx, len } => {
-            let sym = common_symbols.get(idx as usize).copied().unwrap_or("");
-            let slice = &sym[..(len as usize).min(sym.len())];
-            if slice.is_empty() {
-                SliceRef::Empty
-            } else {
-                let start = utf8_arena.len();
-                utf8_arena.extend_from_slice(slice.as_bytes());
-                SliceRef::Scratch {
-                    start: start as u32,
-                    len: slice.len() as u32,
-                }
-            }
-        }
-        other => other,
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BorrowedLabel<'a> {
@@ -367,12 +327,110 @@ pub struct BorrowedMetadata<'a> {
     pub unit: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MetaStrRef {
+    Empty,
+    Input { start: u32, len: u32 },
+    Common { idx: u32, len: u32 },
+    Lossy { start: u32, len: u32 },
+}
+
+impl MetaStrRef {
+    #[inline]
+    fn resolve_str<'r>(
+        self,
+        input: &'r [u8],
+        common_symbols: &'r [&'r str],
+        lossy_utf8_arena: &'r [u8],
+    ) -> &'r str {
+        match self {
+            MetaStrRef::Empty => "",
+            MetaStrRef::Input { start, len } => {
+                let s = start as usize;
+                let e = s + len as usize;
+                std::str::from_utf8(&input[s..e]).unwrap_or("")
+            }
+            MetaStrRef::Common { idx, len } => common_symbols
+                .get(idx as usize)
+                .map_or("", |s| &s[..(len as usize).min(s.len())]),
+            MetaStrRef::Lossy { start, len } => {
+                let s = start as usize;
+                let e = s + len as usize;
+                std::str::from_utf8(&lossy_utf8_arena[s..e]).unwrap_or("")
+            }
+        }
+    }
+
+    #[inline]
+    fn truncate(self, new_len: usize) -> Self {
+        if new_len == 0 {
+            return MetaStrRef::Empty;
+        }
+        match self {
+            MetaStrRef::Empty => MetaStrRef::Empty,
+            MetaStrRef::Input { start, len } => MetaStrRef::Input {
+                start,
+                len: (new_len as u32).min(len),
+            },
+            MetaStrRef::Common { idx, len } => MetaStrRef::Common {
+                idx,
+                len: (new_len as u32).min(len),
+            },
+            MetaStrRef::Lossy { start, len } => MetaStrRef::Lossy {
+                start,
+                len: (new_len as u32).min(len),
+            },
+        }
+    }
+
+    #[inline]
+    fn is_empty(self) -> bool {
+        matches!(self, MetaStrRef::Empty)
+            || matches!(self, MetaStrRef::Input { len: 0, .. })
+            || matches!(self, MetaStrRef::Common { len: 0, .. })
+            || matches!(self, MetaStrRef::Lossy { len: 0, .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingStreamMeta {
+    metric_type: i32,
+    family_name: MetaStrRef,
+    help: MetaStrRef,
+    unit: MetaStrRef,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpansionBudget {
+    used: usize,
+    limit: usize,
+}
+
+impl ExpansionBudget {
+    #[inline(always)]
+    fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    #[inline(always)]
+    fn try_add(&mut self, bytes: usize) -> Result<(), DecodeError> {
+        let next = self.used.saturating_add(bytes);
+        if next > self.limit {
+            return Err(DecodeError::LabelArenaLimitExceeded { limit: self.limit });
+        }
+        self.used = next;
+        Ok(())
+    }
+}
+
 /// Reusable flat resolved symbol table scratch for `decode_rw2_stream`.
 #[derive(Debug, Default)]
 pub struct Rw2ResolvedScratch {
     v2_resolved: Vec<Option<(&'static [u8], bool)>>,
     custom_resolved: Vec<Option<(&'static [u8], bool)>>,
-    lossy_strings: Vec<Box<str>>,
+    lossy_utf8_arena: Vec<u8>,
+    lossy_map: HashMap<u32, (u32, u32)>,
+    pending_meta: Vec<PendingStreamMeta>,
 }
 
 impl Rw2ResolvedScratch {
@@ -382,7 +440,9 @@ impl Rw2ResolvedScratch {
         Self {
             v2_resolved,
             custom_resolved: Vec::with_capacity(128),
-            lossy_strings: Vec::new(),
+            lossy_utf8_arena: Vec::new(),
+            lossy_map: HashMap::new(),
+            pending_meta: Vec::new(),
         }
     }
 }
@@ -546,7 +606,12 @@ pub struct WriteRequestScratch {
     timeseries: Vec<TimeSeriesMeta>,
     metadata: Vec<MetadataMeta>,
     rw2_symbols: Vec<SliceRef>,
+    rw2_symbols_utf8: Vec<bool>,
     rw2_label_refs: Vec<u32>,
+    rw2_exemplar_label_refs: Vec<u32>,
+    rw2_deferred_meta: Vec<(i32, u32, u32)>,
+    rw2_lossy_cache: HashMap<u32, SliceRef>,
+    rw2_common_lossy_cache: HashMap<u32, SliceRef>,
     dedup_hashes: HashMap<u64, Vec<usize>>,
     utf8_arena: Vec<u8>,
     uses_v2_common_symbols: bool,
@@ -570,7 +635,12 @@ impl WriteRequestScratch {
             timeseries: Vec::with_capacity(100),
             metadata: Vec::with_capacity(32),
             rw2_symbols: Vec::with_capacity(128),
+            rw2_symbols_utf8: Vec::with_capacity(128),
             rw2_label_refs: Vec::with_capacity(64),
+            rw2_exemplar_label_refs: Vec::with_capacity(16),
+            rw2_deferred_meta: Vec::with_capacity(4),
+            rw2_lossy_cache: HashMap::new(),
+            rw2_common_lossy_cache: HashMap::new(),
             dedup_hashes: HashMap::with_capacity(32),
             utf8_arena: Vec::new(),
             uses_v2_common_symbols: false,
@@ -593,7 +663,12 @@ impl WriteRequestScratch {
         self.timeseries.clear();
         self.metadata.clear();
         self.rw2_symbols.clear();
+        self.rw2_symbols_utf8.clear();
         self.rw2_label_refs.clear();
+        self.rw2_exemplar_label_refs.clear();
+        self.rw2_deferred_meta.clear();
+        self.rw2_lossy_cache.clear();
+        self.rw2_common_lossy_cache.clear();
         self.dedup_hashes.clear();
         self.utf8_arena.clear();
         self.uses_v2_common_symbols = false;
@@ -962,6 +1037,16 @@ pub fn decode_write_request<'a, 's>(
     opts: DecodeOptions<'a>,
     scratch: &'s mut WriteRequestScratch,
 ) -> Result<BorrowedWriteRequest<'a, 's>, DecodeError> {
+    decode_write_request_with_limit(input, opts, scratch, DEFAULT_MAX_RW2_LABEL_BYTES)
+}
+
+/// Like [`decode_write_request`], with an explicit cap on expanded RW2 label/metadata/exemplar bytes.
+pub fn decode_write_request_with_limit<'a, 's>(
+    input: &'a [u8],
+    opts: DecodeOptions<'a>,
+    scratch: &'s mut WriteRequestScratch,
+    max_expanded_label_bytes: usize,
+) -> Result<BorrowedWriteRequest<'a, 's>, DecodeError> {
     if input.len() > u32::MAX as usize {
         return Err(DecodeError::InputTooLarge);
     }
@@ -985,6 +1070,7 @@ pub fn decode_write_request<'a, 's>(
     let mut skip_label_count_validation = false;
     let mut seen_first_symbol = false;
     let mut all_symbols_utf8 = true;
+    let mut budget = ExpansionBudget::new(max_expanded_label_bytes);
 
     let mut pos = 0usize;
     let len = input.len();
@@ -1048,7 +1134,8 @@ pub fn decode_write_request<'a, 's>(
                     return Err(DecodeError::InvalidFirstSymbol);
                 }
                 seen_first_symbol = true;
-                if std::str::from_utf8(&input[sub.clone()]).is_err() {
+                let valid_utf8 = is_valid_utf8_fast(&input[sub.clone()]);
+                if !valid_utf8 {
                     all_symbols_utf8 = false;
                 }
                 scratch.rw2_symbols.push(if sub.is_empty() {
@@ -1059,6 +1146,7 @@ pub fn decode_write_request<'a, 's>(
                         len: sub.len() as u32,
                     }
                 });
+                scratch.rw2_symbols_utf8.push(valid_utf8);
             }
             5 => {
                 if !is_rw2 {
@@ -1078,6 +1166,7 @@ pub fn decode_write_request<'a, 's>(
                     common_symbols,
                     &opts,
                     scratch,
+                    &mut budget,
                 )?;
                 scratch.timeseries.push(ts_meta);
             }
@@ -1185,48 +1274,29 @@ fn append_raw_classic_labels(
 
 #[cold]
 #[inline(never)]
-fn append_raw_rw2_labels(
-    input: &[u8],
-    range: Range<usize>,
+fn append_raw_rw2_labels_from_refs(
+    label_refs: &[u32],
     symbol_offset: u32,
     resolved: &[Option<(&[u8], bool)>],
     label_bytes_arena: &mut Vec<u8>,
-    label_base: usize,
-    max_expanded_label_bytes: usize,
+    budget: &mut ExpansionBudget,
 ) -> Result<(), DecodeError> {
-    let mut pos = range.start;
-    let end = range.end;
-    while pos < end {
-        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
-        if field_num == 1 && wire_type == 2 {
-            let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
-            let mut p = packed.start;
-            while p < packed.end {
-                let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                let (k_bytes, _) = lookup_resolved(resolved, name_idx).ok_or(
-                    DecodeError::InvalidLabelRef {
-                        index: name_idx,
-                        offset: symbol_offset,
-                    },
-                )?;
-                let (v_bytes, _) = lookup_resolved(resolved, val_idx).ok_or(
-                    DecodeError::InvalidLabelRef {
-                        index: val_idx,
-                        offset: symbol_offset,
-                    },
-                )?;
-                append_stringlabel_pair_proto_bounded(
-                    label_bytes_arena,
-                    k_bytes,
-                    v_bytes,
-                    label_base,
-                    max_expanded_label_bytes,
-                )?;
-            }
-        } else {
-            skip_field_bounded(input, &mut pos, end, wire_type)?;
-        }
+    for &pair in label_refs.as_chunks::<2>().0 {
+        let name_idx = pair[0];
+        let val_idx = pair[1];
+        let (k_bytes, _) = lookup_resolved(resolved, name_idx).ok_or(
+            DecodeError::InvalidLabelRef {
+                index: name_idx,
+                offset: symbol_offset,
+            },
+        )?;
+        let (v_bytes, _) = lookup_resolved(resolved, val_idx).ok_or(
+            DecodeError::InvalidLabelRef {
+                index: val_idx,
+                offset: symbol_offset,
+            },
+        )?;
+        append_stringlabel_pair_proto_budgeted(label_bytes_arena, k_bytes, v_bytes, budget)?;
     }
     Ok(())
 }
@@ -1471,11 +1541,19 @@ fn decode_timeseries_classic_stream<'v, 'a>(
     }
 
     let mut raw_label_bytes_range = None;
-    let label_bytes_end = if !bad_utf8 && !labels_sorted_unique && dropped_empty {
+    let label_bytes_end = if bad_utf8 {
+        if dropped_empty {
+            label_bytes_arena.truncate(label_bytes_start);
+            append_raw_classic_labels(input, range, label_bytes_arena)?;
+        }
+        let end_raw = label_bytes_arena.len();
+        raw_label_bytes_range = Some(label_bytes_start..end_raw);
+        label_bytes_start
+    } else if !labels_sorted_unique && dropped_empty {
         label_bytes_arena.truncate(label_bytes_start);
         append_raw_classic_labels(input, range, label_bytes_arena)?;
         label_bytes_arena.len()
-    } else if !bad_utf8 && labels_sorted_unique && dropped_empty {
+    } else if labels_sorted_unique && dropped_empty {
         let enc_end = label_bytes_arena.len();
         append_raw_classic_labels(input, range, label_bytes_arena)?;
         raw_label_bytes_range = Some(enc_end..label_bytes_arena.len());
@@ -1543,25 +1621,15 @@ fn stringlabel_part_encoded_len(len: usize) -> Result<usize, DecodeError> {
 }
 
 #[inline(always)]
-fn append_stringlabel_pair_proto_bounded(
+fn append_stringlabel_pair_proto_budgeted(
     buf: &mut Vec<u8>,
     name: &[u8],
     value: &[u8],
-    label_base: usize,
-    max_expanded_label_bytes: usize,
+    budget: &mut ExpansionBudget,
 ) -> Result<(), DecodeError> {
     let pair_len = stringlabel_part_encoded_len(name.len())?
         .saturating_add(stringlabel_part_encoded_len(value.len())?);
-    if buf
-        .len()
-        .saturating_sub(label_base)
-        .saturating_add(pair_len)
-        > max_expanded_label_bytes
-    {
-        return Err(DecodeError::LabelArenaLimitExceeded {
-            limit: max_expanded_label_bytes,
-        });
-    }
+    budget.try_add(pair_len)?;
     append_stringlabel_pair_proto(buf, name, value)
 }
 
@@ -1685,85 +1753,122 @@ where
         } => (offset, common_symbols, false),
     };
 
-    resolved_scratch.lossy_strings.clear();
-    let lossy_strings = &mut resolved_scratch.lossy_strings;
-    let guard = if is_kafka_v2 {
-        if resolved_scratch.v2_resolved.len() < 64 {
-            resolved_scratch.v2_resolved.clear();
-            resolved_scratch
-                .v2_resolved
-                .extend_from_slice(&V2_COMMON_SYMBOLS_64);
-        }
-        ResolvedTableGuard {
-            vec: &mut resolved_scratch.v2_resolved,
-            base_len: 64,
-        }
-    } else {
-        resolved_scratch.custom_resolved.clear();
-        resolved_scratch
-            .custom_resolved
-            .resize(rw2_offset as usize, None);
-        ResolvedTableGuard {
-            vec: &mut resolved_scratch.custom_resolved,
-            base_len: 0,
-        }
-    };
-
-    // SAFETY: `guard` truncates `guard.vec` back to `base_len` (`'static` common symbols or empty)
-    // on every return/unwind path before `'r` ends.
-    let resolved: &mut Vec<Option<(&'r [u8], bool)>> = unsafe {
-        &mut *(guard.vec as *mut Vec<Option<(&'static [u8], bool)>>).cast()
-    };
-    if !is_kafka_v2 {
-        for (i, &sym) in common_symbols.iter().enumerate() {
-            if i < resolved.len() {
-                resolved[i] = Some((sym.as_bytes(), true));
-            }
-        }
-        if !resolved.is_empty() {
-            resolved[0] = Some((b"", true));
-        }
-    }
+resolved_scratch.lossy_utf8_arena.clear();
+    resolved_scratch.lossy_map.clear();
+    resolved_scratch.pending_meta.clear();
 
     let mut source: i32 = 0;
     let mut skip_label_validation = false;
     let mut skip_label_count_validation = false;
-    let mut seen_first_symbol = false;
-    let mut emitted_any_series = false;
     let mut header_changed_after_series = false;
+    let mut budget = ExpansionBudget::new(max_expanded_label_bytes);
 
-    let res: Result<(), DecodeError> = (|| {
+    let res: Result<(), DecodeError> = {
+        let lossy_utf8_arena = &mut resolved_scratch.lossy_utf8_arena;
+        let lossy_map = &mut resolved_scratch.lossy_map;
+        let pending_meta = &mut resolved_scratch.pending_meta;
+        let guard = if is_kafka_v2 {
+            if resolved_scratch.v2_resolved.len() < 64 {
+                resolved_scratch.v2_resolved.clear();
+                resolved_scratch
+                    .v2_resolved
+                    .extend_from_slice(&V2_COMMON_SYMBOLS_64);
+            }
+            ResolvedTableGuard {
+                vec: &mut resolved_scratch.v2_resolved,
+                base_len: 64,
+            }
+        } else {
+            resolved_scratch.custom_resolved.clear();
+            resolved_scratch
+                .custom_resolved
+                .resize(rw2_offset as usize, None);
+            ResolvedTableGuard {
+                vec: &mut resolved_scratch.custom_resolved,
+                base_len: 0,
+            }
+        };
+
+        // SAFETY: `guard` truncates `guard.vec` back to `base_len` (`'static` common symbols or empty)
+        // on every return/unwind path before `'a` ends.
+        let resolved: &mut Vec<Option<(&'a [u8], bool)>> = unsafe {
+            &mut *(guard.vec as *mut Vec<Option<(&'static [u8], bool)>>).cast()
+        };
+        if !is_kafka_v2 {
+            for (i, &sym) in common_symbols.iter().enumerate() {
+                if i < resolved.len() {
+                    resolved[i] = Some((sym.as_bytes(), true));
+                }
+            }
+            if !resolved.is_empty() {
+                resolved[0] = Some((b"", true));
+            }
+        }
+
+        let mut seen_first_symbol = false;
+        let mut emitted_any_series = false;
+
         let mut pos = 0usize;
         let len = input.len();
+        let mut loop_res = Ok(());
         while pos < len {
-            let (field_num, wire_type) = read_key_bounded(input, &mut pos, len)?;
+            let (field_num, wire_type) = match read_key_bounded(input, &mut pos, len) {
+                Ok(k) => k,
+                Err(e) => {
+                    loop_res = Err(e);
+                    break;
+                }
+            };
             match field_num {
-                1 => return Err(DecodeError::UnexpectedRw1Timeseries),
+                1 => {
+                    loop_res = Err(DecodeError::UnexpectedRw1Timeseries);
+                    break;
+                }
                 2 => {
                     if wire_type != 0 {
-                        return Err(DecodeError::InvalidWireType {
+                        loop_res = Err(DecodeError::InvalidWireType {
                             field: 2,
                             wire_type,
                         });
+                        break;
                     }
-                    let new_src = read_varint(input, &mut pos)? as i32;
-                    if emitted_any_series && new_src != source {
-                        header_changed_after_series = true;
+                    match read_varint(input, &mut pos) {
+                        Ok(v) => {
+                            let new_src = v as i32;
+                            if emitted_any_series && new_src != source {
+                                header_changed_after_series = true;
+                            }
+                            source = new_src;
+                        }
+                        Err(e) => {
+                            loop_res = Err(e);
+                            break;
+                        }
                     }
-                    source = new_src;
                 }
-                3 => return Err(DecodeError::UnexpectedRw1Metadata),
+                3 => {
+                    loop_res = Err(DecodeError::UnexpectedRw1Metadata);
+                    break;
+                }
                 4 => {
                     if wire_type != 2 {
-                        return Err(DecodeError::InvalidWireType {
+                        loop_res = Err(DecodeError::InvalidWireType {
                             field: 4,
                             wire_type,
                         });
+                        break;
                     }
-                    let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
+                    let sub = match read_length_delimited_range_bounded(input, &mut pos, len) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            loop_res = Err(e);
+                            break;
+                        }
+                    };
                     let sym_bytes = &input[sub];
                     if !seen_first_symbol && !sym_bytes.is_empty() {
-                        return Err(DecodeError::InvalidFirstSymbol);
+                        loop_res = Err(DecodeError::InvalidFirstSymbol);
+                        break;
                     }
                     seen_first_symbol = true;
                     let valid_utf8 = is_valid_utf8_fast(sym_bytes);
@@ -1771,72 +1876,131 @@ where
                 }
                 5 => {
                     if wire_type != 2 {
-                        return Err(DecodeError::InvalidWireType {
+                        loop_res = Err(DecodeError::InvalidWireType {
                             field: 5,
                             wire_type,
                         });
+                        break;
                     }
-                    let sub = read_length_delimited_range_bounded(input, &mut pos, len)?;
-                    let series = decode_timeseries_rw2_stream(
+                    let sub = match read_length_delimited_range_bounded(input, &mut pos, len) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            loop_res = Err(e);
+                            break;
+                        }
+                    };
+                    let series = match decode_timeseries_rw2_stream(
                         input,
                         sub,
                         rw2_offset,
                         common_symbols,
                         resolved,
-                        lossy_strings,
+                        lossy_utf8_arena,
+                        lossy_map,
+                        pending_meta,
                         &opts,
                         scratch,
                         label_bytes_arena,
-                        label_base,
-                        max_expanded_label_bytes,
+                        &mut budget,
                         samples_arena,
-                        meta_out,
                         source,
                         skip_label_validation,
                         skip_label_count_validation,
-                    )?;
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            loop_res = Err(e);
+                            break;
+                        }
+                    };
                     emitted_any_series = true;
                     on_series(series);
                 }
                 1000 => {
                     if wire_type != 0 {
-                        return Err(DecodeError::InvalidWireType {
+                        loop_res = Err(DecodeError::InvalidWireType {
                             field: 1000,
                             wire_type,
                         });
+                        break;
                     }
-                    let val = read_varint(input, &mut pos)? != 0;
-                    if emitted_any_series && val != skip_label_validation {
-                        header_changed_after_series = true;
+                    match read_varint(input, &mut pos) {
+                        Ok(v) => {
+                            let val = v != 0;
+                            if emitted_any_series && val != skip_label_validation {
+                                header_changed_after_series = true;
+                            }
+                            skip_label_validation = val;
+                        }
+                        Err(e) => {
+                            loop_res = Err(e);
+                            break;
+                        }
                     }
-                    skip_label_validation = val;
                 }
                 1001 => {
                     if wire_type != 0 {
-                        return Err(DecodeError::InvalidWireType {
+                        loop_res = Err(DecodeError::InvalidWireType {
                             field: 1001,
                             wire_type,
                         });
+                        break;
                     }
-                    let val = read_varint(input, &mut pos)? != 0;
-                    if emitted_any_series && val != skip_label_count_validation {
-                        header_changed_after_series = true;
+                    match read_varint(input, &mut pos) {
+                        Ok(v) => {
+                            let val = v != 0;
+                            if emitted_any_series && val != skip_label_count_validation {
+                                header_changed_after_series = true;
+                            }
+                            skip_label_count_validation = val;
+                        }
+                        Err(e) => {
+                            loop_res = Err(e);
+                            break;
+                        }
                     }
-                    skip_label_count_validation = val;
                 }
                 _ => {
-                    skip_field_bounded(input, &mut pos, len, wire_type)?;
+                    if let Err(e) = skip_field_bounded(input, &mut pos, len, wire_type) {
+                        loop_res = Err(e);
+                        break;
+                    }
                 }
             }
         }
-        Ok(())
-    })();
+        drop(guard);
+        loop_res
+    };
 
     if let Err(e) = res {
         label_bytes_arena.truncate(label_base);
         samples_arena.truncate(samples_base);
         meta_out.truncate(meta_base);
         return Err(e);
+    }
+
+    // Safe downgrade `&'r mut Rw2ResolvedScratch` -> `&'r Rw2ResolvedScratch` after mutation ends.
+    let scratch_ref: &'r Rw2ResolvedScratch = resolved_scratch;
+    meta_out.reserve(scratch_ref.pending_meta.len());
+    for pm in &scratch_ref.pending_meta {
+        meta_out.push(BorrowedMetadata {
+            metric_type: pm.metric_type,
+            metric_family_name: pm.family_name.resolve_str(
+                input,
+                common_symbols,
+                &scratch_ref.lossy_utf8_arena,
+            ),
+            help: pm.help.resolve_str(
+                input,
+                common_symbols,
+                &scratch_ref.lossy_utf8_arena,
+            ),
+            unit: pm.unit.resolve_str(
+                input,
+                common_symbols,
+                &scratch_ref.lossy_utf8_arena,
+            ),
+        });
     }
 
     Ok(StreamedRw2Header {
@@ -1848,20 +2012,20 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
+fn decode_timeseries_rw2_stream<'v, 'a>(
     input: &'a [u8],
     range: Range<usize>,
     symbol_offset: u32,
     common_symbols: &'a [&'a str],
-    resolved: &[Option<(&'r [u8], bool)>],
-    lossy_strings: &mut Vec<Box<str>>,
+    resolved: &[Option<(&'a [u8], bool)>],
+    lossy_utf8_arena: &mut Vec<u8>,
+    lossy_map: &mut HashMap<u32, (u32, u32)>,
+    pending_meta: &mut Vec<PendingStreamMeta>,
     opts: &DecodeOptions<'a>,
     scratch: &'v mut WriteRequestScratch,
     label_bytes_arena: &'v mut Vec<u8>,
-    label_base: usize,
-    max_expanded_label_bytes: usize,
+    budget: &mut ExpansionBudget,
     samples_arena: &mut Vec<cortexpb::Sample>,
-    meta_out: &mut Vec<BorrowedMetadata<'r>>,
     source: i32,
     skip_label_validation: bool,
     skip_label_count_validation: bool,
@@ -1872,12 +2036,14 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
     let histograms_start = scratch.histograms.len();
     let mut created_timestamp = 0i64;
     let mut min_sample_ts = i64::MAX;
-    let mut metric_name_bytes: &'r [u8] = b"";
-    let mut metric_name_utf8 = true;
-    let mut prev_name: Option<&'r [u8]> = None;
+    let mut metric_name_sym_idx: Option<u32> = None;
+    let mut prev_name: Option<&'a [u8]> = None;
     let mut labels_sorted_unique = true;
     let mut bad_utf8 = false;
     let mut dropped_empty = false;
+
+    scratch.rw2_label_refs.clear();
+    scratch.rw2_deferred_meta.clear();
 
     let mut pos = range.start;
     let end = range.end;
@@ -1889,56 +2055,10 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                     return Err(DecodeError::OddNumberOfLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                    let element_count = input[packed.clone()].iter().filter(|&&b| b < 128).count();
-                    if !element_count.is_multiple_of(2) {
-                        return Err(DecodeError::OddNumberOfLabelRefs);
-                    }
                     let mut p = packed.start;
-                    label_bytes_arena
-                        .reserve((packed.end - p).saturating_mul(16).clamp(64, 65536));
                     while p < packed.end {
-                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        if p >= packed.end {
-                            return Err(DecodeError::OddNumberOfLabelRefs);
-                        }
-                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        let (k_bytes, k_utf8) = lookup_resolved(resolved, name_idx).ok_or(
-                            DecodeError::InvalidLabelRef {
-                                index: name_idx,
-                                offset: symbol_offset,
-                            },
-                        )?;
-                        let (v_bytes, v_utf8) = lookup_resolved(resolved, val_idx).ok_or(
-                            DecodeError::InvalidLabelRef {
-                                index: val_idx,
-                                offset: symbol_offset,
-                            },
-                        )?;
-                        if k_bytes == b"__name__" {
-                            metric_name_bytes = v_bytes;
-                            metric_name_utf8 = v_utf8;
-                        }
-                        if !k_utf8 || !v_utf8 {
-                            bad_utf8 = true;
-                        } else if !bad_utf8 {
-                            if let Some(pn) = prev_name {
-                                if pn >= k_bytes {
-                                    labels_sorted_unique = false;
-                                }
-                            }
-                            prev_name = Some(k_bytes);
-                            if !v_bytes.is_empty() {
-                                append_stringlabel_pair_proto_bounded(
-                                    label_bytes_arena,
-                                    k_bytes,
-                                    v_bytes,
-                                    label_base,
-                                    max_expanded_label_bytes,
-                                )?;
-                            } else {
-                                dropped_empty = true;
-                            }
-                        }
+                        let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                        scratch.rw2_label_refs.push(r);
                     }
                 } else {
                     return Err(DecodeError::InvalidWireType {
@@ -1985,6 +2105,7 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                         symbol_offset,
                         resolved,
                         scratch,
+                        budget,
                     )?;
                     scratch.exemplars.push(ex);
                 }
@@ -1997,18 +2118,10 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                decode_metadata_rw2_stream(
-                    input,
-                    sub,
-                    symbol_offset,
-                    resolved,
-                    lossy_strings,
-                    metric_name_bytes,
-                    metric_name_utf8,
-                    opts,
-                    scratch,
-                    meta_out,
-                )?;
+                let meta_fields = parse_metadata_rw2_fields(input, sub)?;
+                if meta_fields.0 != 0 || meta_fields.1 != 0 || meta_fields.2 != 0 {
+                    scratch.rw2_deferred_meta.push(meta_fields);
+                }
             }
             6 => {
                 if wire_type != 0 {
@@ -2025,32 +2138,107 @@ fn decode_timeseries_rw2_stream<'v, 'r, 'a: 'r>(
         }
     }
 
+    if !scratch.rw2_label_refs.len().is_multiple_of(2) {
+        return Err(DecodeError::OddNumberOfLabelRefs);
+    }
+
+    label_bytes_arena.reserve(
+        scratch
+            .rw2_label_refs
+            .len()
+            .saturating_mul(16)
+            .clamp(64, 65536),
+    );
+    for &pair in scratch.rw2_label_refs.as_chunks::<2>().0 {
+        let name_idx = pair[0];
+        let val_idx = pair[1];
+        let (k_bytes, k_utf8) = lookup_resolved(resolved, name_idx).ok_or(
+            DecodeError::InvalidLabelRef {
+                index: name_idx,
+                offset: symbol_offset,
+            },
+        )?;
+        let (v_bytes, v_utf8) = lookup_resolved(resolved, val_idx).ok_or(
+            DecodeError::InvalidLabelRef {
+                index: val_idx,
+                offset: symbol_offset,
+            },
+        )?;
+        if k_bytes == b"__name__" {
+            metric_name_sym_idx = Some(val_idx);
+        }
+        if !k_utf8 || !v_utf8 {
+            bad_utf8 = true;
+        } else if !bad_utf8 {
+            if let Some(pn) = prev_name {
+                if pn >= k_bytes {
+                    labels_sorted_unique = false;
+                }
+            }
+            prev_name = Some(k_bytes);
+            if !v_bytes.is_empty() {
+                append_stringlabel_pair_proto_budgeted(
+                    label_bytes_arena,
+                    k_bytes,
+                    v_bytes,
+                    budget,
+                )?;
+            } else {
+                dropped_empty = true;
+            }
+        }
+    }
+
+    if !scratch.rw2_deferred_meta.is_empty() {
+        resolve_deferred_metadata_stream(
+            input,
+            common_symbols,
+            symbol_offset,
+            resolved,
+            lossy_utf8_arena,
+            lossy_map,
+            pending_meta,
+            metric_name_sym_idx,
+            opts,
+            scratch,
+            budget,
+        )?;
+    }
+
     let mut raw_label_bytes_range = None;
     let label_bytes_end = if bad_utf8 {
+        let discarded = label_bytes_arena.len().saturating_sub(label_bytes_start);
         label_bytes_arena.truncate(label_bytes_start);
-        label_bytes_start
-    } else if !labels_sorted_unique && dropped_empty {
-        label_bytes_arena.truncate(label_bytes_start);
-        append_raw_rw2_labels(
-            input,
-            range,
+        budget.used = budget.used.saturating_sub(discarded);
+        append_raw_rw2_labels_from_refs(
+            &scratch.rw2_label_refs,
             symbol_offset,
             resolved,
             label_bytes_arena,
-            label_base,
-            max_expanded_label_bytes,
+            budget,
+        )?;
+        raw_label_bytes_range = Some(label_bytes_start..label_bytes_arena.len());
+        label_bytes_start
+    } else if !labels_sorted_unique && dropped_empty {
+        let discarded = label_bytes_arena.len().saturating_sub(label_bytes_start);
+        label_bytes_arena.truncate(label_bytes_start);
+        budget.used = budget.used.saturating_sub(discarded);
+        append_raw_rw2_labels_from_refs(
+            &scratch.rw2_label_refs,
+            symbol_offset,
+            resolved,
+            label_bytes_arena,
+            budget,
         )?;
         label_bytes_arena.len()
     } else if labels_sorted_unique && dropped_empty {
         let enc_end = label_bytes_arena.len();
-        append_raw_rw2_labels(
-            input,
-            range,
+        append_raw_rw2_labels_from_refs(
+            &scratch.rw2_label_refs,
             symbol_offset,
             resolved,
             label_bytes_arena,
-            label_base,
-            max_expanded_label_bytes,
+            budget,
         )?;
         raw_label_bytes_range = Some(enc_end..label_bytes_arena.len());
         enc_end
@@ -2114,23 +2302,96 @@ fn bytes_to_slice_ref(
     }
 }
 
-#[inline]
-fn resolve_lossy_str<'r>(
-    bytes: &'r [u8],
-    valid_utf8: bool,
-    lossy_strings: &mut Vec<Box<str>>,
-) -> &'r str {
-    if valid_utf8 {
-        // SAFETY: caller verified `bytes` is valid UTF-8.
-        unsafe { std::str::from_utf8_unchecked(bytes) }
-    } else {
-        let lossy: Box<str> = String::from_utf8_lossy(bytes).into_owned().into_boxed_str();
-        lossy_strings.push(lossy);
-        let ptr: *const str = &**lossy_strings.last().unwrap();
-        // SAFETY: `Box<str>` heap allocation does not move when `Vec<Box<str>>` pushes,
-        // and `lossy_strings` lives in `resolved_scratch` for `'r`.
-        unsafe { &*ptr }
+fn parse_metadata_rw2_fields(
+    input: &[u8],
+    range: Range<usize>,
+) -> Result<(i32, u32, u32), DecodeError> {
+    let mut metric_type = 0i32;
+    let mut help_ref = 0u32;
+    let mut unit_ref = 0u32;
+
+    let mut pos = range.start;
+    let end = range.end;
+    while pos < end {
+        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
+        match field_num {
+            1 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 1,
+                        wire_type,
+                    });
+                }
+                metric_type = read_varint_bounded(input, &mut pos, end)? as i32;
+            }
+            3 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 3,
+                        wire_type,
+                    });
+                }
+                help_ref = read_varint_bounded(input, &mut pos, end)? as u32;
+            }
+            4 => {
+                if wire_type != 0 {
+                    return Err(DecodeError::InvalidWireType {
+                        field: 4,
+                        wire_type,
+                    });
+                }
+                unit_ref = read_varint_bounded(input, &mut pos, end)? as u32;
+            }
+            _ => {
+                skip_field_bounded(input, &mut pos, end, wire_type)?;
+            }
+        }
     }
+    Ok((metric_type, help_ref, unit_ref))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_meta_sym_stream(
+    sym_idx: u32,
+    bytes: &[u8],
+    valid_utf8: bool,
+    symbol_offset: u32,
+    input: &[u8],
+    lossy_utf8_arena: &mut Vec<u8>,
+    lossy_map: &mut HashMap<u32, (u32, u32)>,
+    budget: &mut ExpansionBudget,
+) -> Result<MetaStrRef, DecodeError> {
+    if bytes.is_empty() {
+        return Ok(MetaStrRef::Empty);
+    }
+    if valid_utf8 {
+        if (sym_idx as usize) < (symbol_offset as usize) {
+            return Ok(MetaStrRef::Common {
+                idx: sym_idx,
+                len: bytes.len() as u32,
+            });
+        }
+        let input_start = input.as_ptr() as usize;
+        let b_ptr = bytes.as_ptr() as usize;
+        debug_assert!(b_ptr >= input_start && b_ptr + bytes.len() <= input_start + input.len());
+        let start = b_ptr - input_start;
+        return Ok(MetaStrRef::Input {
+            start: start as u32,
+            len: bytes.len() as u32,
+        });
+    }
+    if let Some(&(start, len)) = lossy_map.get(&sym_idx) {
+        return Ok(MetaStrRef::Lossy { start, len });
+    }
+    let lossy = String::from_utf8_lossy(bytes);
+    let lossy_bytes = lossy.as_bytes();
+    budget.try_add(lossy_bytes.len())?;
+    let start_usize = lossy_utf8_arena.len();
+    let start = u32::try_from(start_usize).map_err(|_| DecodeError::InputTooLarge)?;
+    let len = u32::try_from(lossy_bytes.len()).map_err(|_| DecodeError::InputTooLarge)?;
+    lossy_utf8_arena.extend_from_slice(lossy_bytes);
+    lossy_map.insert(sym_idx, (start, len));
+    Ok(MetaStrRef::Lossy { start, len })
 }
 
 fn decode_exemplar_rw2_resolved<'a>(
@@ -2139,10 +2400,13 @@ fn decode_exemplar_rw2_resolved<'a>(
     symbol_offset: u32,
     resolved: &[Option<(&'a [u8], bool)>],
     scratch: &mut WriteRequestScratch,
+    budget: &mut ExpansionBudget,
 ) -> Result<ExemplarMeta, DecodeError> {
     let labels_start = scratch.exemplar_labels.len();
     let mut value = 0.0f64;
     let mut timestamp_ms = 0i64;
+    scratch.rw2_exemplar_label_refs.clear();
+
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
@@ -2153,45 +2417,10 @@ fn decode_exemplar_rw2_resolved<'a>(
                     return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                    let element_count = input[packed.clone()].iter().filter(|&&b| b < 128).count();
-                    if !element_count.is_multiple_of(2) {
-                        return Err(DecodeError::OddNumberOfExemplarLabelRefs);
-                    }
                     let mut p = packed.start;
                     while p < packed.end {
-                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        if p >= packed.end {
-                            return Err(DecodeError::OddNumberOfExemplarLabelRefs);
-                        }
-                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        let (k_bytes, _) = lookup_resolved(resolved, name_idx).ok_or(
-                            DecodeError::InvalidExemplarLabelRef {
-                                index: name_idx,
-                                offset: symbol_offset,
-                            },
-                        )?;
-                        let (v_bytes, _) = lookup_resolved(resolved, val_idx).ok_or(
-                            DecodeError::InvalidExemplarLabelRef {
-                                index: val_idx,
-                                offset: symbol_offset,
-                            },
-                        )?;
-                        let name_ref = bytes_to_slice_ref(
-                            k_bytes,
-                            name_idx as usize,
-                            symbol_offset,
-                            input,
-                        );
-                        let val_ref = bytes_to_slice_ref(
-                            v_bytes,
-                            val_idx as usize,
-                            symbol_offset,
-                            input,
-                        );
-                        scratch.exemplar_labels.push(LabelRefPair {
-                            name: name_ref,
-                            value: val_ref,
-                        });
+                        let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                        scratch.rw2_exemplar_label_refs.push(r);
                     }
                 } else {
                     return Err(DecodeError::InvalidWireType {
@@ -2223,6 +2452,37 @@ fn decode_exemplar_rw2_resolved<'a>(
             }
         }
     }
+    if !scratch.rw2_exemplar_label_refs.len().is_multiple_of(2) {
+        return Err(DecodeError::OddNumberOfExemplarLabelRefs);
+    }
+    for &pair in scratch.rw2_exemplar_label_refs.as_chunks::<2>().0 {
+        let name_idx = pair[0];
+        let val_idx = pair[1];
+        let (k_bytes, _) = lookup_resolved(resolved, name_idx).ok_or(
+            DecodeError::InvalidExemplarLabelRef {
+                index: name_idx,
+                offset: symbol_offset,
+            },
+        )?;
+        let (v_bytes, _) = lookup_resolved(resolved, val_idx).ok_or(
+            DecodeError::InvalidExemplarLabelRef {
+                index: val_idx,
+                offset: symbol_offset,
+            },
+        )?;
+        budget.try_add(
+            k_bytes
+                .len()
+                .saturating_add(v_bytes.len())
+                .saturating_add(std::mem::size_of::<LabelRefPair>()),
+        )?;
+        let name_ref = bytes_to_slice_ref(k_bytes, name_idx as usize, symbol_offset, input);
+        let val_ref = bytes_to_slice_ref(v_bytes, val_idx as usize, symbol_offset, input);
+        scratch.exemplar_labels.push(LabelRefPair {
+            name: name_ref,
+            value: val_ref,
+        });
+    }
     Ok(ExemplarMeta {
         labels: labels_start..scratch.exemplar_labels.len(),
         value,
@@ -2231,112 +2491,138 @@ fn decode_exemplar_rw2_resolved<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_metadata_rw2_stream<'r>(
+fn resolve_deferred_metadata_stream(
     input: &[u8],
-    range: Range<usize>,
+    common_symbols: &[&str],
     symbol_offset: u32,
-    resolved: &[Option<(&'r [u8], bool)>],
-    lossy_strings: &mut Vec<Box<str>>,
-    metric_name_bytes: &'r [u8],
-    metric_name_utf8: bool,
+    resolved: &[Option<(&[u8], bool)>],
+    lossy_utf8_arena: &mut Vec<u8>,
+    lossy_map: &mut HashMap<u32, (u32, u32)>,
+    pending_meta: &mut Vec<PendingStreamMeta>,
+    metric_name_sym_idx: Option<u32>,
     opts: &DecodeOptions<'_>,
     scratch: &mut WriteRequestScratch,
-    meta_out: &mut Vec<BorrowedMetadata<'r>>,
+    budget: &mut ExpansionBudget,
 ) -> Result<(), DecodeError> {
-    let mut metric_type = 0i32;
-    let mut help_bytes: &'r [u8] = b"";
-    let mut help_utf8 = true;
-    let mut unit_bytes: &'r [u8] = b"";
-    let mut unit_utf8 = true;
-
-    let mut pos = range.start;
-    let end = range.end;
-    while pos < end {
-        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
-        match field_num {
-            1 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 1,
-                        wire_type,
-                    });
-                }
-                metric_type = read_varint_bounded(input, &mut pos, end)? as i32;
-            }
-            3 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 3,
-                        wire_type,
-                    });
-                }
-                let help_ref = read_varint_bounded(input, &mut pos, end)? as u32;
-                let (bytes, ok) = lookup_resolved(resolved, help_ref).ok_or(
-                    DecodeError::InvalidHelpRef {
-                        index: help_ref,
-                        offset: symbol_offset,
-                    },
-                )?;
-                help_bytes = bytes;
-                help_utf8 = ok;
-            }
-            4 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 4,
-                        wire_type,
-                    });
-                }
-                let unit_ref = read_varint_bounded(input, &mut pos, end)? as u32;
-                let (bytes, ok) = lookup_resolved(resolved, unit_ref).ok_or(
-                    DecodeError::InvalidUnitRef {
-                        index: unit_ref,
-                        offset: symbol_offset,
-                    },
-                )?;
-                unit_bytes = bytes;
-                unit_utf8 = ok;
-            }
-            _ => {
-                skip_field_bounded(input, &mut pos, end, wire_type)?;
-            }
+    // Validate all symbol references before mutating `dedup_hashes` / `pending_meta`.
+    for &(_, help_ref, unit_ref) in &scratch.rw2_deferred_meta {
+        if lookup_resolved(resolved, help_ref).is_none() {
+            return Err(DecodeError::InvalidHelpRef {
+                index: help_ref,
+                offset: symbol_offset,
+            });
+        }
+        if lookup_resolved(resolved, unit_ref).is_none() {
+            return Err(DecodeError::InvalidUnitRef {
+                index: unit_ref,
+                offset: symbol_offset,
+            });
         }
     }
 
-    let metric_name = resolve_lossy_str(metric_name_bytes, metric_name_utf8, lossy_strings);
-    let help = resolve_lossy_str(help_bytes, help_utf8, lossy_strings);
-    let unit = resolve_lossy_str(unit_bytes, unit_utf8, lossy_strings);
-
-    let normalized_name = if opts.skip_normalize_metadata_metric_name {
-        metric_name
+    let metric_name_ref = if let Some(mn_idx) = metric_name_sym_idx {
+        if let Some((bytes, ok)) = lookup_resolved(resolved, mn_idx) {
+            resolve_meta_sym_stream(
+                mn_idx,
+                bytes,
+                ok,
+                symbol_offset,
+                input,
+                lossy_utf8_arena,
+                lossy_map,
+                budget,
+            )?
+        } else {
+            MetaStrRef::Empty
+        }
     } else {
-        normalize_metric_name(metric_name, metric_type)
+        MetaStrRef::Empty
     };
-    if normalized_name.is_empty() {
-        return Ok(());
-    }
-    if unit.is_empty() && help.is_empty() && metric_type == 0 {
-        return Ok(());
-    }
 
-    if !opts.skip_deduplicate_metadata {
-        let h = fnv64a(normalized_name.as_bytes());
-        let bucket = scratch.dedup_hashes.entry(h).or_default();
-        for &existing_idx in bucket.iter() {
-            if meta_out[existing_idx].metric_family_name == normalized_name {
-                return Ok(());
+    for i in 0..scratch.rw2_deferred_meta.len() {
+        let (metric_type, help_ref, unit_ref) = scratch.rw2_deferred_meta[i];
+        let (help_bytes, help_utf8) = lookup_resolved(resolved, help_ref).ok_or(
+            DecodeError::InvalidHelpRef {
+                index: help_ref,
+                offset: symbol_offset,
+            },
+        )?;
+        let (unit_bytes, unit_utf8) = lookup_resolved(resolved, unit_ref).ok_or(
+            DecodeError::InvalidUnitRef {
+                index: unit_ref,
+                offset: symbol_offset,
+            },
+        )?;
+
+        let help = resolve_meta_sym_stream(
+            help_ref,
+            help_bytes,
+            help_utf8,
+            symbol_offset,
+            input,
+            lossy_utf8_arena,
+            lossy_map,
+            budget,
+        )?;
+        let unit = resolve_meta_sym_stream(
+            unit_ref,
+            unit_bytes,
+            unit_utf8,
+            symbol_offset,
+            input,
+            lossy_utf8_arena,
+            lossy_map,
+            budget,
+        )?;
+
+        let normalized_len = {
+            let metric_name =
+                metric_name_ref.resolve_str(input, common_symbols, lossy_utf8_arena);
+            if opts.skip_normalize_metadata_metric_name {
+                metric_name.len()
+            } else {
+                normalize_metric_name(metric_name, metric_type).len()
             }
+        };
+        if normalized_len == 0 {
+            continue;
         }
-        let idx = meta_out.len();
-        bucket.push(idx);
-    }
+        if unit.is_empty() && help.is_empty() && metric_type == 0 {
+            continue;
+        }
 
-    meta_out.push(BorrowedMetadata {
-        metric_type,
-        metric_family_name: normalized_name,
-        help,
-        unit,
-    });
+        let family_name = metric_name_ref.truncate(normalized_len);
+
+        if !opts.skip_deduplicate_metadata {
+            let normalized_name =
+                family_name.resolve_str(input, common_symbols, lossy_utf8_arena);
+            let h = fnv64a(normalized_name.as_bytes());
+            let bucket = scratch.dedup_hashes.entry(h).or_default();
+            let mut dup = false;
+            for &existing_idx in bucket.iter() {
+                if pending_meta[existing_idx]
+                    .family_name
+                    .resolve_str(input, common_symbols, lossy_utf8_arena)
+                    == normalized_name
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if dup {
+                continue;
+            }
+            let idx = pending_meta.len();
+            bucket.push(idx);
+        }
+
+        pending_meta.push(PendingStreamMeta {
+            metric_type,
+            family_name,
+            help,
+            unit,
+        });
+    }
     Ok(())
 }
 
@@ -2434,13 +2720,17 @@ fn decode_timeseries_rw2(
     common_symbols: &[&str],
     opts: &DecodeOptions<'_>,
     scratch: &mut WriteRequestScratch,
+    budget: &mut ExpansionBudget,
 ) -> Result<TimeSeriesMeta, DecodeError> {
     let labels_start = scratch.labels.len();
     let samples_start = scratch.samples.len();
     let exemplars_start = scratch.exemplars.len();
     let histograms_start = scratch.histograms.len();
     let mut created_timestamp = 0i64;
-    let mut metric_name_ref: SliceRef = SliceRef::Empty;
+    let mut metric_name_sym_idx: Option<u32> = None;
+
+    scratch.rw2_label_refs.clear();
+    scratch.rw2_deferred_meta.clear();
 
     let mut pos = range.start;
     let end = range.end;
@@ -2448,48 +2738,14 @@ fn decode_timeseries_rw2(
         let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
-                scratch.rw2_label_refs.clear();
                 if wire_type == 0 {
-                    // Single unpacked varint means odd number of refs (matching Mimir compat_rw2.go).
                     return Err(DecodeError::OddNumberOfLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                    let element_count = input[packed.clone()].iter().filter(|&&b| b < 128).count();
-                    if !element_count.is_multiple_of(2) {
-                        return Err(DecodeError::OddNumberOfLabelRefs);
-                    }
                     let mut p = packed.start;
-                    scratch.labels.reserve(((packed.end - p) / 2).min(4096));
                     while p < packed.end {
-                        let name_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        if p >= packed.end {
-                            return Err(DecodeError::OddNumberOfLabelRefs);
-                        }
-                        let val_idx = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        let name = resolve_symbol_ref(
-                            name_idx,
-                            symbol_offset,
-                            common_symbols,
-                            &scratch.rw2_symbols,
-                        )
-                        .ok_or(DecodeError::InvalidLabelRef {
-                            index: name_idx,
-                            offset: symbol_offset,
-                        })?;
-                        let value = resolve_symbol_ref(
-                            val_idx,
-                            symbol_offset,
-                            common_symbols,
-                            &scratch.rw2_symbols,
-                        )
-                        .ok_or(DecodeError::InvalidLabelRef {
-                            index: val_idx,
-                            offset: symbol_offset,
-                        })?;
-                        if name.resolve(input, common_symbols) == b"__name__" {
-                            metric_name_ref = value;
-                        }
-                        scratch.labels.push(LabelRefPair { name, value });
+                        let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                        scratch.rw2_label_refs.push(r);
                     }
                 } else {
                     return Err(DecodeError::InvalidWireType {
@@ -2529,8 +2785,14 @@ fn decode_timeseries_rw2(
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
                 if !opts.skip_unmarshaling_exemplars {
-                    let ex =
-                        decode_exemplar_rw2(input, sub, symbol_offset, common_symbols, scratch)?;
+                    let ex = decode_exemplar_rw2(
+                        input,
+                        sub,
+                        symbol_offset,
+                        common_symbols,
+                        scratch,
+                        budget,
+                    )?;
                     scratch.exemplars.push(ex);
                 }
             }
@@ -2542,15 +2804,10 @@ fn decode_timeseries_rw2(
                     });
                 }
                 let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                decode_metadata_rw2(
-                    input,
-                    sub,
-                    symbol_offset,
-                    common_symbols,
-                    metric_name_ref,
-                    opts,
-                    scratch,
-                )?;
+                let meta_fields = parse_metadata_rw2_fields(input, sub)?;
+                if meta_fields.0 != 0 || meta_fields.1 != 0 || meta_fields.2 != 0 {
+                    scratch.rw2_deferred_meta.push(meta_fields);
+                }
             }
             6 => {
                 if wire_type != 0 {
@@ -2565,6 +2822,62 @@ fn decode_timeseries_rw2(
                 skip_field_bounded(input, &mut pos, end, wire_type)?;
             }
         }
+    }
+
+    if !scratch.rw2_label_refs.len().is_multiple_of(2) {
+        return Err(DecodeError::OddNumberOfLabelRefs);
+    }
+
+    scratch
+        .labels
+        .reserve((scratch.rw2_label_refs.len() / 2).min(4096));
+    for i in (0..scratch.rw2_label_refs.len()).step_by(2) {
+        let name_idx = scratch.rw2_label_refs[i];
+        let val_idx = scratch.rw2_label_refs[i + 1];
+        let name = resolve_symbol_ref(
+            name_idx,
+            symbol_offset,
+            common_symbols,
+            &scratch.rw2_symbols,
+        )
+        .ok_or(DecodeError::InvalidLabelRef {
+            index: name_idx,
+            offset: symbol_offset,
+        })?;
+        let value = resolve_symbol_ref(
+            val_idx,
+            symbol_offset,
+            common_symbols,
+            &scratch.rw2_symbols,
+        )
+        .ok_or(DecodeError::InvalidLabelRef {
+            index: val_idx,
+            offset: symbol_offset,
+        })?;
+        let k_bytes = name.resolve(input, common_symbols);
+        let v_bytes = value.resolve(input, common_symbols);
+        budget.try_add(
+            k_bytes
+                .len()
+                .saturating_add(v_bytes.len())
+                .saturating_add(std::mem::size_of::<LabelRefPair>()),
+        )?;
+        if k_bytes == b"__name__" {
+            metric_name_sym_idx = Some(val_idx);
+        }
+        scratch.labels.push(LabelRefPair { name, value });
+    }
+
+    if !scratch.rw2_deferred_meta.is_empty() {
+        resolve_deferred_metadata_nonstream(
+            input,
+            symbol_offset,
+            common_symbols,
+            metric_name_sym_idx,
+            opts,
+            scratch,
+            budget,
+        )?;
     }
 
     Ok(TimeSeriesMeta {
@@ -2739,61 +3052,27 @@ fn decode_exemplar_rw2(
     symbol_offset: u32,
     common_symbols: &[&str],
     scratch: &mut WriteRequestScratch,
+    budget: &mut ExpansionBudget,
 ) -> Result<ExemplarMeta, DecodeError> {
     let labels_start = scratch.exemplar_labels.len();
     let mut value = 0.0f64;
     let mut timestamp_ms = 0i64;
+    scratch.rw2_exemplar_label_refs.clear();
+
     let mut pos = range.start;
     let end = range.end;
     while pos < end {
         let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
         match field_num {
             1 => {
-                scratch.rw2_label_refs.clear();
                 if wire_type == 0 {
                     return Err(DecodeError::OddNumberOfExemplarLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                    let element_count = input[packed.clone()].iter().filter(|&&b| b < 128).count();
-                    if !element_count.is_multiple_of(2) {
-                        return Err(DecodeError::OddNumberOfExemplarLabelRefs);
-                    }
                     let mut p = packed.start;
                     while p < packed.end {
                         let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        scratch.rw2_label_refs.push(r);
-                    }
-                    if !scratch.rw2_label_refs.len().is_multiple_of(2) {
-                        return Err(DecodeError::OddNumberOfExemplarLabelRefs);
-                    }
-                    let mut i = 0;
-                    while i < scratch.rw2_label_refs.len() {
-                        let name_idx = scratch.rw2_label_refs[i];
-                        let val_idx = scratch.rw2_label_refs[i + 1];
-                        let name = resolve_symbol_ref(
-                            name_idx,
-                            symbol_offset,
-                            common_symbols,
-                            &scratch.rw2_symbols,
-                        )
-                        .ok_or(DecodeError::InvalidExemplarLabelRef {
-                            index: name_idx,
-                            offset: symbol_offset,
-                        })?;
-                        let val = resolve_symbol_ref(
-                            val_idx,
-                            symbol_offset,
-                            common_symbols,
-                            &scratch.rw2_symbols,
-                        )
-                        .ok_or(DecodeError::InvalidExemplarLabelRef {
-                            index: val_idx,
-                            offset: symbol_offset,
-                        })?;
-                        scratch
-                            .exemplar_labels
-                            .push(LabelRefPair { name, value: val });
-                        i += 2;
+                        scratch.rw2_exemplar_label_refs.push(r);
                     }
                 } else {
                     return Err(DecodeError::InvalidWireType {
@@ -2824,6 +3103,44 @@ fn decode_exemplar_rw2(
                 skip_field_bounded(input, &mut pos, end, wire_type)?;
             }
         }
+    }
+    if !scratch.rw2_exemplar_label_refs.len().is_multiple_of(2) {
+        return Err(DecodeError::OddNumberOfExemplarLabelRefs);
+    }
+    for i in (0..scratch.rw2_exemplar_label_refs.len()).step_by(2) {
+        let name_idx = scratch.rw2_exemplar_label_refs[i];
+        let val_idx = scratch.rw2_exemplar_label_refs[i + 1];
+        let name = resolve_symbol_ref(
+            name_idx,
+            symbol_offset,
+            common_symbols,
+            &scratch.rw2_symbols,
+        )
+        .ok_or(DecodeError::InvalidExemplarLabelRef {
+            index: name_idx,
+            offset: symbol_offset,
+        })?;
+        let val = resolve_symbol_ref(
+            val_idx,
+            symbol_offset,
+            common_symbols,
+            &scratch.rw2_symbols,
+        )
+        .ok_or(DecodeError::InvalidExemplarLabelRef {
+            index: val_idx,
+            offset: symbol_offset,
+        })?;
+        let k_bytes = name.resolve(input, common_symbols);
+        let v_bytes = val.resolve(input, common_symbols);
+        budget.try_add(
+            k_bytes
+                .len()
+                .saturating_add(v_bytes.len())
+                .saturating_add(std::mem::size_of::<LabelRefPair>()),
+        )?;
+        scratch
+            .exemplar_labels
+            .push(LabelRefPair { name, value: val });
     }
     Ok(ExemplarMeta {
         labels: labels_start..scratch.exemplar_labels.len(),
@@ -3178,135 +3495,201 @@ fn decode_metadata_rw1(
     })
 }
 
-fn decode_metadata_rw2(
-    input: &[u8],
-    range: Range<usize>,
+fn resolve_meta_sym_nonstream(
+    sym_idx: u32,
+    sym_ref: SliceRef,
     symbol_offset: u32,
     common_symbols: &[&str],
-    metric_name_ref: SliceRef,
+    input: &[u8],
+    scratch: &mut WriteRequestScratch,
+    budget: &mut ExpansionBudget,
+) -> Result<SliceRef, DecodeError> {
+    if sym_idx == 0 || sym_ref.is_empty() {
+        return Ok(SliceRef::Empty);
+    }
+    if (sym_idx as usize) < (symbol_offset as usize) {
+        if !scratch.uses_v2_common_symbols && !common_symbols.is_empty() {
+            if let Some(&cached) = scratch.rw2_common_lossy_cache.get(&sym_idx) {
+                return Ok(cached);
+            }
+            let bytes = sym_ref.resolve(input, common_symbols);
+            if bytes.is_empty() {
+                return Ok(SliceRef::Empty);
+            }
+            budget.try_add(bytes.len())?;
+            let start = u32::try_from(scratch.utf8_arena.len())
+                .map_err(|_| DecodeError::InputTooLarge)?;
+            let len = u32::try_from(bytes.len()).map_err(|_| DecodeError::InputTooLarge)?;
+            scratch.utf8_arena.extend_from_slice(bytes);
+            let sref = SliceRef::Scratch { start, len };
+            scratch.rw2_common_lossy_cache.insert(sym_idx, sref);
+            return Ok(sref);
+        }
+        return Ok(sym_ref);
+    }
+    let local_idx = (sym_idx - symbol_offset) as usize;
+    if scratch.rw2_symbols_utf8.get(local_idx).copied().unwrap_or(false) {
+        return Ok(sym_ref);
+    }
+    if let Some(&cached) = scratch.rw2_lossy_cache.get(&sym_idx) {
+        return Ok(cached);
+    }
+    let bytes = sym_ref.resolve(input, common_symbols);
+    let lossy = String::from_utf8_lossy(bytes);
+    let lossy_bytes = lossy.as_bytes();
+    budget.try_add(lossy_bytes.len())?;
+    let start = u32::try_from(scratch.utf8_arena.len())
+        .map_err(|_| DecodeError::InputTooLarge)?;
+    let len = u32::try_from(lossy_bytes.len())
+        .map_err(|_| DecodeError::InputTooLarge)?;
+    scratch.utf8_arena.extend_from_slice(lossy_bytes);
+    let sref = SliceRef::Scratch { start, len };
+    scratch.rw2_lossy_cache.insert(sym_idx, sref);
+    Ok(sref)
+}
+
+fn resolve_deferred_metadata_nonstream(
+    input: &[u8],
+    symbol_offset: u32,
+    common_symbols: &[&str],
+    metric_name_sym_idx: Option<u32>,
     opts: &DecodeOptions<'_>,
     scratch: &mut WriteRequestScratch,
+    budget: &mut ExpansionBudget,
 ) -> Result<(), DecodeError> {
-    let mut metric_type = 0i32;
-    let mut help = SliceRef::Empty;
-    let mut unit = SliceRef::Empty;
-
-    let mut pos = range.start;
-    let end = range.end;
-    while pos < end {
-        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
-        match field_num {
-            1 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 1,
-                        wire_type,
-                    });
-                }
-                metric_type = read_varint_bounded(input, &mut pos, end)? as i32;
-            }
-            3 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 3,
-                        wire_type,
-                    });
-                }
-                let help_ref = read_varint_bounded(input, &mut pos, end)? as u32;
-                help = resolve_symbol_ref(
-                    help_ref,
-                    symbol_offset,
-                    common_symbols,
-                    &scratch.rw2_symbols,
-                )
-                .ok_or(DecodeError::InvalidHelpRef {
-                    index: help_ref,
-                    offset: symbol_offset,
-                })?;
-                help = ensure_utf8_slice_ref(help, input, &mut scratch.utf8_arena);
-            }
-            4 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 4,
-                        wire_type,
-                    });
-                }
-                let unit_ref = read_varint_bounded(input, &mut pos, end)? as u32;
-                unit = resolve_symbol_ref(
-                    unit_ref,
-                    symbol_offset,
-                    common_symbols,
-                    &scratch.rw2_symbols,
-                )
-                .ok_or(DecodeError::InvalidUnitRef {
-                    index: unit_ref,
-                    offset: symbol_offset,
-                })?;
-                unit = ensure_utf8_slice_ref(unit, input, &mut scratch.utf8_arena);
-            }
-            _ => {
-                skip_field_bounded(input, &mut pos, end, wire_type)?;
-            }
+    // Validate all symbol references before mutating `dedup_hashes` / `metadata`.
+    for &(_, help_ref, unit_ref) in &scratch.rw2_deferred_meta {
+        if resolve_symbol_ref(help_ref, symbol_offset, common_symbols, &scratch.rw2_symbols)
+            .is_none()
+        {
+            return Err(DecodeError::InvalidHelpRef {
+                index: help_ref,
+                offset: symbol_offset,
+            });
+        }
+        if resolve_symbol_ref(unit_ref, symbol_offset, common_symbols, &scratch.rw2_symbols)
+            .is_none()
+        {
+            return Err(DecodeError::InvalidUnitRef {
+                index: unit_ref,
+                offset: symbol_offset,
+            });
         }
     }
 
-    let utf8_metric_name_ref =
-        ensure_utf8_slice_ref(metric_name_ref, input, &mut scratch.utf8_arena);
-    let series_name = utf8_metric_name_ref.resolve_str(
-        input,
-        common_symbols,
-        &scratch.utf8_arena,
-    );
-    let normalized_name = if opts.skip_normalize_metadata_metric_name {
-        series_name
-    } else {
-        normalize_metric_name(series_name, metric_type)
-    };
-    if normalized_name.is_empty() {
-        return Ok(());
-    }
-    if unit.is_empty() && help.is_empty() && metric_type == 0 {
-        return Ok(());
-    }
-
-    let final_family_ref = truncate_slice_ref(utf8_metric_name_ref, normalized_name.len());
-
-    if !opts.skip_deduplicate_metadata {
-        let h = fnv64a(normalized_name.as_bytes());
-        let bucket = scratch.dedup_hashes.entry(h).or_default();
-        for &existing_idx in bucket.iter() {
-            let existing = scratch.metadata[existing_idx];
-            if resolve_str_any(
-                existing.family_name,
-                input,
+    let utf8_metric_name_ref = if let Some(mn_idx) = metric_name_sym_idx {
+        if let Some(mn_ref) =
+            resolve_symbol_ref(mn_idx, symbol_offset, common_symbols, &scratch.rw2_symbols)
+        {
+            resolve_meta_sym_nonstream(
+                mn_idx,
+                mn_ref,
+                symbol_offset,
                 common_symbols,
-                &scratch.utf8_arena,
-            ) == normalized_name
-            {
-                return Ok(());
-            }
+                input,
+                scratch,
+                budget,
+            )?
+        } else {
+            SliceRef::Empty
         }
-        let idx = scratch.metadata.len();
-        bucket.push(idx);
-    }
-
-    let (family_name, help, unit) = if !scratch.uses_v2_common_symbols && !common_symbols.is_empty() {
-        (
-            materialize_common_into_scratch(final_family_ref, common_symbols, &mut scratch.utf8_arena),
-            materialize_common_into_scratch(help, common_symbols, &mut scratch.utf8_arena),
-            materialize_common_into_scratch(unit, common_symbols, &mut scratch.utf8_arena),
-        )
     } else {
-        (final_family_ref, help, unit)
+        SliceRef::Empty
     };
 
-    scratch.metadata.push(MetadataMeta {
-        metric_type,
-        family_name,
-        help,
-        unit,
-    });
+    for i in 0..scratch.rw2_deferred_meta.len() {
+        let (metric_type, help_ref, unit_ref) = scratch.rw2_deferred_meta[i];
+        let help_sym = resolve_symbol_ref(
+            help_ref,
+            symbol_offset,
+            common_symbols,
+            &scratch.rw2_symbols,
+        )
+        .ok_or(DecodeError::InvalidHelpRef {
+            index: help_ref,
+            offset: symbol_offset,
+        })?;
+        let unit_sym = resolve_symbol_ref(
+            unit_ref,
+            symbol_offset,
+            common_symbols,
+            &scratch.rw2_symbols,
+        )
+        .ok_or(DecodeError::InvalidUnitRef {
+            index: unit_ref,
+            offset: symbol_offset,
+        })?;
+
+        let help = resolve_meta_sym_nonstream(
+            help_ref,
+            help_sym,
+            symbol_offset,
+            common_symbols,
+            input,
+            scratch,
+            budget,
+        )?;
+        let unit = resolve_meta_sym_nonstream(
+            unit_ref,
+            unit_sym,
+            symbol_offset,
+            common_symbols,
+            input,
+            scratch,
+            budget,
+        )?;
+
+        let normalized_len = {
+            let series_name =
+                utf8_metric_name_ref.resolve_str(input, common_symbols, &scratch.utf8_arena);
+            if opts.skip_normalize_metadata_metric_name {
+                series_name.len()
+            } else {
+                normalize_metric_name(series_name, metric_type).len()
+            }
+        };
+        if normalized_len == 0 {
+            continue;
+        }
+        if unit.is_empty() && help.is_empty() && metric_type == 0 {
+            continue;
+        }
+
+        let final_family_ref = truncate_slice_ref(utf8_metric_name_ref, normalized_len);
+
+        if !opts.skip_deduplicate_metadata {
+            let normalized_name =
+                final_family_ref.resolve_str(input, common_symbols, &scratch.utf8_arena);
+            let h = fnv64a(normalized_name.as_bytes());
+            let bucket = scratch.dedup_hashes.entry(h).or_default();
+            let mut dup = false;
+            for &existing_idx in bucket.iter() {
+                let existing = scratch.metadata[existing_idx];
+                if resolve_str_any(
+                    existing.family_name,
+                    input,
+                    common_symbols,
+                    &scratch.utf8_arena,
+                ) == normalized_name
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if dup {
+                continue;
+            }
+            let idx = scratch.metadata.len();
+            bucket.push(idx);
+        }
+
+        scratch.metadata.push(MetadataMeta {
+            metric_type,
+            family_name: final_family_ref,
+            help,
+            unit,
+        });
+    }
     Ok(())
 }
 
@@ -4480,7 +4863,7 @@ mod tests {
         }
 
         // Test out-of-order RW2 fields: field 5 encoded BEFORE field 4 MUST fail with InvalidLabelRef
-        // in single-pass Go WriteRequest.Unmarshal parity.
+        // (matching Go mimir.pb.go single-pass unmarshaling).
         let rw2 = from_write_request_to_rw2(&rw1, 0, None).unwrap();
         let part_ts = cortexpb::WriteRequest {
             timeseries_rw2: rw2.timeseries_rw2.clone(),
@@ -4601,19 +4984,15 @@ mod tests {
         assert!(streamed_labels[0].windows(2).any(|w| w == b"m1"));
         assert!(streamed_labels[1].windows(2).any(|w| w == b"m2"));
 
-        // 2. Kafka v2: field 5 before field 4 referencing local symbol >= 64 fails,
-        //    while referencing only common symbols (< 64) succeeds.
+        // 2. Kafka v2: field 5 before field 4 referencing local symbol >= 64 fails with InvalidLabelRef
+        //    (matching Go mimir.pb.go single-pass unmarshaling).
         let mut kv2_local_before_sym = Vec::new();
         push_ts(&mut kv2_local_before_sym, &[1, 65], 1.0, 100, 0, 0);
         push_sym(&mut kv2_local_before_sym, "");
         push_sym(&mut kv2_local_before_sym, "custom_metric");
         assert_eq!(
-            decode_write_request(&kv2_local_before_sym, DecodeOptions::kafka_v2(), &mut scratch)
-                .err(),
-            Some(DecodeError::InvalidLabelRef {
-                index: 65,
-                offset: V2_RECORD_SYMBOL_OFFSET
-            })
+            decode_write_request(&kv2_local_before_sym, DecodeOptions::kafka_v2(), &mut scratch).err(),
+            Some(DecodeError::InvalidLabelRef { index: 65, offset: 64 })
         );
         {
             let mut m = Vec::new();
@@ -4629,12 +5008,20 @@ mod tests {
                     |_| {},
                 )
                 .err(),
-                Some(DecodeError::InvalidLabelRef {
-                    index: 65,
-                    offset: V2_RECORD_SYMBOL_OFFSET
-                })
+                Some(DecodeError::InvalidLabelRef { index: 65, offset: 64 })
             );
         }
+        let mut kv2_missing_sym = Vec::new();
+        push_ts(&mut kv2_missing_sym, &[1, 99], 1.0, 100, 0, 0);
+        push_sym(&mut kv2_missing_sym, "");
+        push_sym(&mut kv2_missing_sym, "custom_metric");
+        assert_eq!(
+            decode_write_request(&kv2_missing_sym, DecodeOptions::kafka_v2(), &mut scratch).err(),
+            Some(DecodeError::InvalidLabelRef {
+                index: 99,
+                offset: V2_RECORD_SYMBOL_OFFSET
+            })
+        );
 
         let mut kv2_common_before_sym = Vec::new();
         push_ts(&mut kv2_common_before_sym, &[1, 6], 1.0, 100, 0, 0);
@@ -4687,7 +5074,7 @@ mod tests {
         let mut label_bytes = Vec::new();
         let mut samples = Vec::new();
 
-        // (a) Unpacked wire_type=0 with truncated EOF (tag 0x08 only) -> OddNumberOfLabelRefs
+        // (a) Unpacked wire_type=0 with truncated EOF (tag 0x08 only) -> OddNumberOfLabelRefs (Go mimir.pb.go parity)
         let ts_wire_wt0 = vec![0x08];
         let mut wr_wt0 = vec![0x2a, ts_wire_wt0.len() as u8];
         wr_wt0.extend_from_slice(&ts_wire_wt0);
@@ -4713,7 +5100,7 @@ mod tests {
             );
         }
 
-        // (b) Exemplar unpacked wire_type=0 with truncated EOF (tag 0x08 only) -> OddNumberOfExemplarLabelRefs
+        // (b) Exemplar unpacked wire_type=0 with truncated EOF (tag 0x08 only) -> OddNumberOfExemplarLabelRefs (Go mimir.pb.go parity)
         let ex_wire_wt0 = vec![0x08];
         let mut ts_ex_wt0 = vec![0x22, ex_wire_wt0.len() as u8];
         ts_ex_wt0.extend_from_slice(&ex_wire_wt0);

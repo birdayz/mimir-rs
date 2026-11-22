@@ -4,8 +4,8 @@ use std::sync::OnceLock;
 
 use super::block::{
     decode_block_uvarint, emit_copy, emit_literal, emit_repeat, encode_block_best, hash4, hash6,
-    hash7, hash8, load32, load64, max_encoded_len, put_uvarint, s2_decode_dict, INPUT_MARGIN,
-    MIN_NON_LITERAL_BLOCK_SIZE,
+    hash7, hash8, load32, load64, max_encoded_len, put_uvarint, s2_decode_dict_vec,
+    DEFAULT_MAX_BLOCK_DECODE_LEN, INPUT_MARGIN, MIN_NON_LITERAL_BLOCK_SIZE,
 };
 use super::{S2Error, MAX_DICT_SRC_OFFSET};
 
@@ -269,10 +269,12 @@ impl Dict {
     }
 
     pub fn decode(&self, src: &[u8]) -> Result<Vec<u8>, S2Error> {
+        self.decode_bounded(src, DEFAULT_MAX_BLOCK_DECODE_LEN)
+    }
+
+    pub fn decode_bounded(&self, src: &[u8], max_len: usize) -> Result<Vec<u8>, S2Error> {
         let (d_len, hdr) = decode_block_uvarint(src)?;
-        let mut dst = vec![0u8; d_len];
-        s2_decode_dict(&mut dst, &src[hdr..], Some(self))?;
-        Ok(dst)
+        s2_decode_dict_vec(d_len, &src[hdr..], Some(self), max_len)
     }
 
     pub fn encode_block_fast(&self, dst: &mut [u8], src: &[u8]) -> usize {

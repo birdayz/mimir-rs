@@ -639,12 +639,225 @@ pub fn s2_decode_dict(dst: &mut [u8], src: &[u8], dict: Option<&Dict>) -> Result
     Ok(())
 }
 
-/// Decodes a complete S2/Snappy block (with varint header) into a newly allocated `Vec<u8>`.
-pub fn decode(src: &[u8]) -> Result<Vec<u8>, S2Error> {
-    let (d_len, hdr) = decode_block_uvarint(src)?;
-    let mut dst = vec![0u8; d_len];
-    s2_decode(&mut dst, &src[hdr..])?;
+/// Default maximum decoded S2 block length allowed by [`decode`] and [`Dict::decode`] (64 MiB).
+pub const DEFAULT_MAX_BLOCK_DECODE_LEN: usize = 64 << 20;
+
+/// Incrementally decodes an S2/Snappy block body (without varint header) into a `Vec<u8>`,
+/// avoiding upfront `vec![0u8; d_len]` allocation on untrusted varint headers.
+pub(crate) fn s2_decode_dict_vec(
+    d_len: usize,
+    src: &[u8],
+    dict: Option<&Dict>,
+    max_len: usize,
+) -> Result<Vec<u8>, S2Error> {
+    if d_len > max_len {
+        return Err(S2Error::TooLarge);
+    }
+    if d_len > 0 && src.is_empty() {
+        return Err(S2Error::Corrupt);
+    }
+    let initial_cap = d_len.min(src.len().saturating_mul(8)).min(64 * 1024);
+    let mut dst = Vec::with_capacity(initial_cap);
+    let mut s = 0usize;
+    let mut offset = match dict {
+        Some(dk) => dk.dict.len() - dk.repeat,
+        None => 0,
+    };
+
+    while s < src.len() {
+        let tag_byte = src[s];
+        match tag_byte & 0x03 {
+            0x00 => {
+                let mut x = (tag_byte >> 2) as usize;
+                match x {
+                    0..=59 => {
+                        s += 1;
+                    }
+                    60 => {
+                        let b = *src.get(s + 1).ok_or(S2Error::Corrupt)?;
+                        x = b as usize;
+                        s += 2;
+                    }
+                    61 => {
+                        let bytes = src.get(s + 1..s + 3).ok_or(S2Error::Corrupt)?;
+                        x = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+                        s += 3;
+                    }
+                    62 => {
+                        let bytes = src.get(s + 1..s + 4).ok_or(S2Error::Corrupt)?;
+                        x = (bytes[0] as usize)
+                            | ((bytes[1] as usize) << 8)
+                            | ((bytes[2] as usize) << 16);
+                        s += 4;
+                    }
+                    _ => {
+                        let bytes = src.get(s + 1..s + 5).ok_or(S2Error::Corrupt)?;
+                        x = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+                        s += 5;
+                    }
+                }
+                let length = x.checked_add(1).ok_or(S2Error::Corrupt)?;
+                if length > d_len - dst.len() || length > src.len() - s {
+                    return Err(S2Error::Corrupt);
+                }
+                dst.extend_from_slice(&src[s..s + length]);
+                s += length;
+                continue;
+            }
+            0x01 => {
+                let b1 = *src.get(s + 1).ok_or(S2Error::Corrupt)?;
+                s += 2;
+                let mut length = ((tag_byte >> 2) & 0x07) as usize;
+                let toffset = (((tag_byte as usize) & 0xe0) << 3) | (b1 as usize);
+                if toffset == 0 {
+                    match length {
+                        5 => {
+                            let b = *src.get(s).ok_or(S2Error::Corrupt)?;
+                            length = (b as usize) + 4;
+                            s += 1;
+                        }
+                        6 => {
+                            let bytes = src.get(s..s + 2).ok_or(S2Error::Corrupt)?;
+                            length = u16::from_le_bytes([bytes[0], bytes[1]]) as usize + (1 << 8);
+                            s += 2;
+                        }
+                        7 => {
+                            let bytes = src.get(s..s + 3).ok_or(S2Error::Corrupt)?;
+                            length = ((bytes[0] as usize)
+                                | ((bytes[1] as usize) << 8)
+                                | ((bytes[2] as usize) << 16))
+                                + (1 << 16);
+                            s += 3;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    offset = toffset;
+                }
+                length += 4;
+                if offset == 0 || length > d_len - dst.len() {
+                    return Err(S2Error::Corrupt);
+                }
+                let d = dst.len();
+                if d < offset {
+                    let dk = dict.ok_or(S2Error::Corrupt)?;
+                    if d > MAX_DICT_SRC_OFFSET {
+                        return Err(S2Error::Corrupt);
+                    }
+                    let back = offset - d;
+                    if back > dk.dict.len() {
+                        return Err(S2Error::Corrupt);
+                    }
+                    let start_off = dk.dict.len() - back;
+                    if start_off + length > dk.dict.len() {
+                        return Err(S2Error::Corrupt);
+                    }
+                    dst.extend_from_slice(&dk.dict[start_off..start_off + length]);
+                    continue;
+                }
+                if offset >= length {
+                    dst.extend_from_within(d - offset..d - offset + length);
+                } else {
+                    dst.reserve(length);
+                    let base = d - offset;
+                    for i in 0..length {
+                        let b = dst[base + i];
+                        dst.push(b);
+                    }
+                }
+            }
+            0x02 => {
+                let bytes = src.get(s + 1..s + 3).ok_or(S2Error::Corrupt)?;
+                let length = 1 + (tag_byte >> 2) as usize;
+                offset = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+                s += 3;
+                if offset == 0 || length > d_len - dst.len() {
+                    return Err(S2Error::Corrupt);
+                }
+                let d = dst.len();
+                if d < offset {
+                    let dk = dict.ok_or(S2Error::Corrupt)?;
+                    if d > MAX_DICT_SRC_OFFSET {
+                        return Err(S2Error::Corrupt);
+                    }
+                    let back = offset - d;
+                    if back > dk.dict.len() {
+                        return Err(S2Error::Corrupt);
+                    }
+                    let start_off = dk.dict.len() - back;
+                    if start_off + length > dk.dict.len() {
+                        return Err(S2Error::Corrupt);
+                    }
+                    dst.extend_from_slice(&dk.dict[start_off..start_off + length]);
+                    continue;
+                }
+                if offset >= length {
+                    dst.extend_from_within(d - offset..d - offset + length);
+                } else {
+                    dst.reserve(length);
+                    let base = d - offset;
+                    for i in 0..length {
+                        let b = dst[base + i];
+                        dst.push(b);
+                    }
+                }
+            }
+            _ => {
+                let bytes = src.get(s + 1..s + 5).ok_or(S2Error::Corrupt)?;
+                let length = 1 + (tag_byte >> 2) as usize;
+                offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+                s += 5;
+                if offset == 0 || length > d_len - dst.len() {
+                    return Err(S2Error::Corrupt);
+                }
+                let d = dst.len();
+                if d < offset {
+                    let dk = dict.ok_or(S2Error::Corrupt)?;
+                    if d > MAX_DICT_SRC_OFFSET {
+                        return Err(S2Error::Corrupt);
+                    }
+                    let back = offset - d;
+                    if back > dk.dict.len() {
+                        return Err(S2Error::Corrupt);
+                    }
+                    let start_off = dk.dict.len() - back;
+                    if start_off + length > dk.dict.len() {
+                        return Err(S2Error::Corrupt);
+                    }
+                    dst.extend_from_slice(&dk.dict[start_off..start_off + length]);
+                    continue;
+                }
+                if offset >= length {
+                    dst.extend_from_within(d - offset..d - offset + length);
+                } else {
+                    dst.reserve(length);
+                    let base = d - offset;
+                    for i in 0..length {
+                        let b = dst[base + i];
+                        dst.push(b);
+                    }
+                }
+            }
+        }
+    }
+
+    if dst.len() != d_len {
+        return Err(S2Error::Corrupt);
+    }
     Ok(dst)
+}
+
+/// Decodes a complete S2/Snappy block (with varint header) into a newly allocated `Vec<u8>`,
+/// bounded by [`DEFAULT_MAX_BLOCK_DECODE_LEN`].
+pub fn decode(src: &[u8]) -> Result<Vec<u8>, S2Error> {
+    decode_bounded(src, DEFAULT_MAX_BLOCK_DECODE_LEN)
+}
+
+/// Decodes a complete S2/Snappy block (with varint header) into a newly allocated `Vec<u8>`,
+/// returning [`S2Error::TooLarge`] if the declared length exceeds `max_len`.
+pub fn decode_bounded(src: &[u8], max_len: usize) -> Result<Vec<u8>, S2Error> {
+    let (d_len, hdr) = decode_block_uvarint(src)?;
+    s2_decode_dict_vec(d_len, &src[hdr..], None, max_len)
 }
 
 /// Decodes a complete S2/Snappy block into a caller-provided slice `buf`, returning the decoded length.

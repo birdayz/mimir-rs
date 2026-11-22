@@ -24,7 +24,8 @@
 //! (dual-stack unless `dualstack_enabled: false`) endpoint of the bucket location.
 
 mod client;
-mod credentials;
+#[doc(hidden)]
+pub mod credentials;
 mod signer;
 mod transport;
 
@@ -592,13 +593,22 @@ struct PutOptions {
     storage_class: String,
     part_size: u64,
     send_content_md5: bool,
+    content_type: Option<String>,
+    if_match: Option<String>,
+    if_none_match: Option<String>,
 }
 
 impl PutOptions {
     /// `PutObjectOptions.Header()`.
     fn header(&self) -> Result<HeaderMap, S3Error> {
         let mut h = HeaderMap::new();
-        h.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+        if let Some(ct) = &self.content_type {
+            let val = HeaderValue::from_str(ct)
+                .map_err(|e| S3Error::Other(format!("invalid content_type header: {e}")))?;
+            h.insert("content-type", val);
+        } else {
+            h.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+        }
         if let Some(sse) = &self.sse {
             sse.marshal(&mut h).map_err(S3Error::Other)?;
         }
@@ -606,6 +616,16 @@ impl PutOptions {
             let val = HeaderValue::from_str(&self.storage_class)
                 .map_err(|e| S3Error::Other(format!("invalid storage_class header: {e}")))?;
             h.insert("x-amz-storage-class", val);
+        }
+        if let Some(etag) = &self.if_match {
+            let val = HeaderValue::from_str(etag)
+                .map_err(|e| S3Error::Other(format!("invalid if_match header: {e}")))?;
+            h.insert("if-match", val);
+        }
+        if let Some(val_str) = &self.if_none_match {
+            let val = HeaderValue::from_str(val_str)
+                .map_err(|e| S3Error::Other(format!("invalid if_none_match header: {e}")))?;
+            h.insert("if-none-match", val);
         }
         Ok(h)
     }
@@ -728,6 +748,19 @@ impl S3Bucket {
         source: UploadSource,
         sse_override: Option<ServerSideEncryption>,
     ) -> Result<(), S3BucketError> {
+        self.upload_with_options(name, source, sse_override, None, None, None)
+            .await
+    }
+
+    pub async fn upload_with_options(
+        &self,
+        name: &str,
+        source: UploadSource,
+        sse_override: Option<ServerSideEncryption>,
+        content_type: Option<String>,
+        if_match: Option<String>,
+        if_none_match: Option<String>,
+    ) -> Result<(), S3BucketError> {
         let size = source.body().len();
         let mut part_size = self.part_size;
         if size < part_size {
@@ -738,6 +771,9 @@ impl S3Bucket {
             storage_class: self.storage_class.clone(),
             part_size,
             send_content_md5: self.send_content_md5,
+            content_type,
+            if_match,
+            if_none_match,
         };
         self.put_object(name, &source, size, &opts)
             .await
@@ -805,7 +841,10 @@ impl S3Bucket {
         check_valid_object_name(name)?;
         let mut meta = RequestMetadata::new(&self.name, name);
         meta.query = vec![("uploads".into(), String::new())];
-        meta.custom_header = opts.header()?;
+        let mut hdrs = opts.header()?;
+        hdrs.remove("if-match");
+        hdrs.remove("if-none-match");
+        meta.custom_header = hdrs;
         let resp = self.client.execute_method("POST", meta).await?;
         if resp.status != 200 {
             return Err(response_error(&resp, &self.name, name));
@@ -856,7 +895,7 @@ impl S3Bucket {
         name: &str,
         upload_id: &str,
         parts: &[(u64, String)],
-        sse: &Option<ServerSideEncryption>,
+        opts: &PutOptions,
     ) -> Result<(), S3Error> {
         let mut xml = String::from(
             "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
@@ -870,10 +909,13 @@ impl S3Bucket {
         xml.push_str("</CompleteMultipartUpload>");
         let body = Bytes::from(xml);
         let mut headers = PutOptions {
-            sse: sse.clone(),
+            sse: opts.sse.clone(),
             storage_class: String::new(),
             part_size: 0,
             send_content_md5: false,
+            content_type: None,
+            if_match: opts.if_match.clone(),
+            if_none_match: opts.if_none_match.clone(),
         }
         .header()?;
         if s3utils::is_amazon_endpoint(&self.client.endpoint.hostname) {
@@ -991,7 +1033,7 @@ impl S3Bucket {
             }
         };
         if let Err(e) = self
-            .complete_multipart_upload(name, &upload_id, &parts, &opts.sse)
+            .complete_multipart_upload(name, &upload_id, &parts, opts)
             .await
         {
             abort_guard.disarm();
@@ -1048,7 +1090,7 @@ impl S3Bucket {
             }
         }
         if let Err(e) = self
-            .complete_multipart_upload(name, &upload_id, &parts, &opts.sse)
+            .complete_multipart_upload(name, &upload_id, &parts, opts)
             .await
         {
             abort_guard.disarm();
@@ -1061,10 +1103,24 @@ impl S3Bucket {
 
     /// thanos `getRange` (`length == -1` reads to the end).
     pub async fn get_range(&self, name: &str, off: i64, length: i64) -> Result<Bytes, S3BucketError> {
+        if off < 0 || length < -1 {
+            return Err(S3BucketError::new(err_invalid_argument(format!(
+                "Invalid range specified: off={off} length={length}"
+            ))));
+        }
+        self.bucket_check().map_err(S3BucketError::new)?;
+        check_valid_object_name(name).map_err(S3BucketError::new)?;
+        if length == 0 {
+            // Verify object existence via HEAD instead of sending an invalid HTTP Range.
+            let _ = self.stat_object(name).await.map_err(S3BucketError::new)?;
+            return Ok(Bytes::new());
+        }
         let mut headers = HeaderMap::new();
         if length != -1 {
-            let (start, end) = (off, off + length - 1);
-            let range = range_header(start, end).map_err(S3BucketError::new)?;
+            let end = off
+                .checked_add(length - 1)
+                .ok_or_else(|| S3BucketError::new(err_invalid_argument("range end overflow")))?;
+            let range = range_header(off, end).map_err(S3BucketError::new)?;
             let val = HeaderValue::from_str(&range)
                 .map_err(|e| S3BucketError::new(S3Error::Other(format!("invalid range header: {e}"))))?;
             headers.insert("range", val);
@@ -1073,8 +1129,6 @@ impl S3Bucket {
                 .map_err(|e| S3BucketError::new(S3Error::Other(format!("invalid range header: {e}"))))?;
             headers.insert("range", val);
         }
-        self.bucket_check().map_err(S3BucketError::new)?;
-        check_valid_object_name(name).map_err(S3BucketError::new)?;
         if let Some(s @ ServerSideEncryption::C(_)) = &self.default_sse {
             s.marshal(&mut headers)
                 .map_err(|e| S3BucketError::new(S3Error::Other(e)))?;
@@ -1091,6 +1145,30 @@ impl S3Bucket {
             return Err(S3BucketError::new(response_error(&resp, &self.name, name)));
         }
         Ok(resp.body)
+    }
+
+    /// Streaming full-object download (for `download_dir`).
+    pub async fn get_stream(
+        &self,
+        name: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<Bytes, S3BucketError>>, S3BucketError> {
+        use futures::StreamExt as _;
+        self.bucket_check().map_err(S3BucketError::new)?;
+        check_valid_object_name(name).map_err(S3BucketError::new)?;
+        let mut headers = HeaderMap::new();
+        if let Some(s @ ServerSideEncryption::C(_)) = &self.default_sse {
+            s.marshal(&mut headers)
+                .map_err(|e| S3BucketError::new(S3Error::Other(e)))?;
+        }
+        let mut meta = RequestMetadata::new(&self.name, name);
+        meta.custom_header = headers;
+        meta.content_sha256_hex = signer::EMPTY_SHA256_HEX.to_string();
+        let stream = self
+            .client
+            .execute_get_stream(meta)
+            .await
+            .map_err(S3BucketError::new)?;
+        Ok(Box::pin(stream.map(|r| r.map_err(S3BucketError::new))))
     }
 
     /// thanos `Get`.
@@ -1248,12 +1326,30 @@ impl S3Bucket {
                 });
             }
             if use_v1 {
-                if !page.next_marker.is_empty() {
-                    marker = page.next_marker;
-                } else if let Some(last) = v1_last_entry {
-                    marker = last;
+                let next_marker = if !page.next_marker.is_empty() {
+                    page.next_marker
+                } else {
+                    v1_last_entry.unwrap_or_default()
+                };
+                if page.is_truncated && (next_marker.is_empty() || next_marker == marker) {
+                    return Err(S3BucketError::new(S3Error::Response(Box::new(client::ErrorResponse {
+                        code: "NotImplemented".into(),
+                        message: "Truncated V1 list response did not advance marker".into(),
+                        ..Default::default()
+                    }))));
                 }
-            } else if !page.next_continuation_token.is_empty() {
+                marker = next_marker;
+            } else {
+                if page.is_truncated
+                    && (page.next_continuation_token.is_empty()
+                        || page.next_continuation_token == token)
+                {
+                    return Err(S3BucketError::new(S3Error::Response(Box::new(client::ErrorResponse {
+                        code: "NotImplemented".into(),
+                        message: "Truncated V2 list response did not advance continuation token".into(),
+                        ..Default::default()
+                    }))));
+                }
                 token = page.next_continuation_token;
             }
             if !page.is_truncated {

@@ -1980,7 +1980,8 @@ fn test_ingester_active_series() {
             let f = reg.gather();
             assert!(metric_value_map(&f, "cortex_ingester_active_series").is_empty());
 
-            let resp = ing
+            assert_eq!(ing.get_tsdb(user1).unwrap().active_series.active(), (0, 0, 0, 0));
+            let err = ing
                 .handle_active_series(
                     &MetadataMap::new(),
                     user1,
@@ -1994,8 +1995,11 @@ fn test_ingester_active_series() {
                     },
                 )
                 .await
-                .unwrap();
-            assert!(resp.is_empty());
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "error listing active series: active series tracker is not initialized"
+            );
             ing.stop().await.unwrap();
         }
 

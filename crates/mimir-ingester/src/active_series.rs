@@ -58,13 +58,13 @@ pub enum AmMatchType {
 }
 
 impl AmMatchType {
-    pub fn from_u8(v: u8) -> Self {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Self::Equal,
-            1 => Self::NotEqual,
-            2 => Self::RegexMatch,
-            3 => Self::RegexNotMatch,
-            _ => panic!("unknown match type"),
+            0 => Some(Self::Equal),
+            1 => Some(Self::NotEqual),
+            2 => Some(Self::RegexMatch),
+            3 => Some(Self::RegexNotMatch),
+            _ => None,
         }
     }
 
@@ -1004,8 +1004,57 @@ struct SlabPage {
     slots: [AtomicU64; SLAB_PAGE_SIZE],
 }
 
+#[cfg(all(unix, not(miri)))]
+mod slab_mmap {
+    use std::ffi::c_void;
+
+    pub(super) const PROT_READ: std::ffi::c_int = 1;
+    pub(super) const PROT_WRITE: std::ffi::c_int = 2;
+    pub(super) const MAP_PRIVATE: std::ffi::c_int = 2;
+    #[cfg(target_os = "linux")]
+    pub(super) const MAP_ANONYMOUS: std::ffi::c_int = 0x20;
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+    pub(super) const MAP_ANONYMOUS: std::ffi::c_int = 0x1000;
+    pub(super) const MAP_FAILED: *mut c_void = (!0usize) as *mut c_void;
+
+    extern "C" {
+        pub(super) fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: std::ffi::c_int,
+            flags: std::ffi::c_int,
+            fd: std::ffi::c_int,
+            offset: i64,
+        ) -> *mut c_void;
+        pub(super) fn munmap(addr: *mut c_void, len: usize) -> std::ffi::c_int;
+    }
+}
+
 impl SlabPage {
-    fn new_boxed() -> Box<Self> {
+    #[cfg(all(unix, not(miri)))]
+    fn alloc_raw() -> *mut Self {
+        let size = std::mem::size_of::<Self>();
+        // SAFETY: Dedicated anonymous `MAP_PRIVATE | MAP_ANONYMOUS` mapping of exact `SlabPage`
+        // size (32 KiB) so `madvise(MADV_DONTNEED)` never operates on jemalloc/allocator heap
+        // extents, and the kernel zero-initializes every `AtomicU64` slot to `SLOT_INACTIVE_RAW`.
+        let ptr = unsafe {
+            slab_mmap::mmap(
+                std::ptr::null_mut(),
+                size,
+                slab_mmap::PROT_READ | slab_mmap::PROT_WRITE,
+                slab_mmap::MAP_PRIVATE | slab_mmap::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == slab_mmap::MAP_FAILED || ptr.is_null() {
+            std::alloc::handle_alloc_error(std::alloc::Layout::new::<Self>());
+        }
+        ptr.cast::<Self>()
+    }
+
+    #[cfg(not(all(unix, not(miri))))]
+    fn alloc_raw() -> *mut Self {
         let layout = std::alloc::Layout::new::<Self>();
         // SAFETY: `Self` has non-zero size (32 KiB) and 4 KiB alignment; all-zero bytes
         // initialize every `AtomicU64` to `SLOT_INACTIVE_RAW` (`0`), decoding to `SLOT_INACTIVE`.
@@ -1014,7 +1063,21 @@ impl SlabPage {
             std::alloc::handle_alloc_error(layout);
         }
         // SAFETY: `ptr` was allocated with `layout` and zero-initialized.
-        unsafe { Box::from_raw(ptr) }
+        Box::into_raw(unsafe { Box::from_raw(ptr) })
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    unsafe fn free_raw(page_ptr: *mut Self) {
+        // SAFETY: `page_ptr` was allocated by `SlabPage::alloc_raw` via `mmap`.
+        unsafe {
+            let _ = slab_mmap::munmap(page_ptr.cast::<std::ffi::c_void>(), std::mem::size_of::<Self>());
+        }
+    }
+
+    #[cfg(not(all(unix, not(miri))))]
+    unsafe fn free_raw(page_ptr: *mut Self) {
+        // SAFETY: `page_ptr` was allocated by `SlabPage::alloc_raw` via `Box::into_raw`.
+        unsafe { drop(Box::from_raw(page_ptr)) };
     }
 }
 
@@ -1059,8 +1122,9 @@ fn madvise_dontneed_page(page_ptr: *mut SlabPage) -> bool {
         && (page_ptr as usize).is_multiple_of(os_page_size)
         && size.is_multiple_of(os_page_size)
     {
-        // SAFETY: `page_ptr` points to a `size`-byte OS-page-aligned allocation whose slots
-        // are all `SLOT_INACTIVE_RAW` (`0`), and `PAGE_STATE_RECLAIMING` blocks concurrent stores.
+        // SAFETY: `page_ptr` points to a dedicated anonymous `mmap` region (never jemalloc heap)
+        // whose slots are all `SLOT_INACTIVE_RAW` (`0`), and `PAGE_STATE_RECLAIMING` blocks
+        // concurrent stores.
         unsafe { madvise(page_ptr.cast::<std::ffi::c_void>(), size, MADV_DONTNEED) == 0 }
     } else {
         false
@@ -1161,7 +1225,7 @@ impl NanosSlab {
             let _g = self.alloc_mtx.lock();
             page_ptr = dir_ref.pages[dir].load(Ordering::Acquire);
             if page_ptr.is_null() {
-                page_ptr = Box::into_raw(SlabPage::new_boxed());
+                page_ptr = SlabPage::alloc_raw();
                 dir_ref.pages[dir].store(page_ptr, Ordering::Release);
             }
         }
@@ -1196,14 +1260,20 @@ impl NanosSlab {
     #[inline(always)]
     fn write_nanos_if_active(&self, ref_id: u32, now_ns: i64) -> Option<bool> {
         let encoded_now = encode_nanos(sanitize_nanos(now_ns));
-        let slot_atomic = self.slot_ref(ref_id)?;
-        let mut cur = slot_atomic.load(Ordering::Relaxed);
+        let (slot_atomic, state_atomic) = self.slot_and_state(ref_id)?;
+        if (state_atomic.load(Ordering::Acquire) & (PAGE_STATE_RECLAIMING | PAGE_STATE_RECLAIMED)) != 0 {
+            return None;
+        }
+        let mut cur = slot_atomic.load(Ordering::Acquire);
         while cur != SLOT_INACTIVE_RAW && encoded_now > cur {
+            if (state_atomic.load(Ordering::Acquire) & (PAGE_STATE_RECLAIMING | PAGE_STATE_RECLAIMED)) != 0 {
+                return None;
+            }
             match slot_atomic.compare_exchange_weak(
                 cur,
                 encoded_now,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             ) {
                 Ok(_) => return Some(true),
                 Err(actual) => cur = actual,
@@ -1342,8 +1412,8 @@ impl Drop for NanosSlab {
                 for page_atomic in dir.pages.iter_mut() {
                     let page_ptr = *page_atomic.get_mut();
                     if !page_ptr.is_null() {
-                        // SAFETY: every non-null entry came from `Box::into_raw(SlabPage::new_boxed())`.
-                        unsafe { drop(Box::from_raw(page_ptr)) };
+                        // SAFETY: every non-null entry came from `SlabPage::alloc_raw()`.
+                        unsafe { SlabPage::free_raw(page_ptr) };
                     }
                 }
             }

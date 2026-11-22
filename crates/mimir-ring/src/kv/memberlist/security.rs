@@ -293,12 +293,19 @@ pub fn pkcs7_decode(buf: &[u8], _block_size: usize) -> Result<&[u8], String> {
     Ok(&buf[..n - last])
 }
 
-pub fn encrypt_overhead(vsn: u8) -> usize {
+pub fn try_encrypt_overhead(vsn: u8) -> Result<usize, String> {
     match vsn {
-        0 => 45,
-        1 => 29,
-        _ => panic!("unsupported encryption version {vsn}"),
+        0 => Ok(45),
+        1 => Ok(29),
+        _ => Err(format!("unsupported encryption version {vsn}")),
     }
+}
+
+pub fn encrypt_overhead(vsn: u8) -> usize {
+    try_encrypt_overhead(vsn).unwrap_or_else(|err| {
+        tracing::warn!("{err}; falling back to conservative encryption overhead");
+        45
+    })
 }
 
 pub fn encrypted_length(vsn: u8, inp: usize) -> usize {

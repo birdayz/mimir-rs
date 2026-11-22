@@ -977,6 +977,177 @@ impl Client {
         })
     }
 
+    async fn send_raw(
+        &self,
+        req: &SignableRequest,
+        raw_query: Option<String>,
+    ) -> Result<reqwest::Response, SendError> {
+        let query = match raw_query {
+            Some(q) => q,
+            None => signer::canonical_query(&req.query),
+        };
+        let canonical_path = signer::canonical_uri_path(&req.path);
+        let mut url = format!("{}://{}{}", self.endpoint.scheme, req.host, canonical_path);
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query);
+        }
+        let (client, dial_url) = if self.endpoint.scheme == "https" {
+            if let Some(sni) = &self.http.sni {
+                let (raw_target_host, target_port) = split_authority_host_port(&req.host);
+                let target_host = raw_target_host
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(raw_target_host);
+                let client = sni
+                    .client_for_host(target_host)
+                    .map_err(|message| SendError {
+                        message,
+                        retryable: false,
+                    })?;
+                let dial_url = if !sni.sni_host.eq_ignore_ascii_case(target_host) {
+                    let dial_host = match target_port {
+                        Some(p) => format!("{}:{p}", sni.sni_host),
+                        None => sni.sni_host.clone(),
+                    };
+                    let mut u = format!("{}://{}{}", self.endpoint.scheme, dial_host, canonical_path);
+                    if !query.is_empty() {
+                        u.push('?');
+                        u.push_str(&query);
+                    }
+                    u
+                } else {
+                    url.clone()
+                };
+                (client, dial_url)
+            } else {
+                (self.http.client.clone(), url.clone())
+            }
+        } else {
+            (self.http.client.clone(), url.clone())
+        };
+        let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|e| SendError {
+            message: format!("invalid HTTP method {}: {e}", req.method),
+            retryable: false,
+        })?;
+        let mut builder = client.request(method, &dial_url);
+        let mut headers = req.headers.clone();
+        if !req.host.is_empty() && !headers.contains_key(reqwest::header::HOST) {
+            let host_val = HeaderValue::from_str(&req.host).map_err(|e| SendError {
+                message: format!("invalid host header {:?}: {e}", req.host),
+                retryable: false,
+            })?;
+            headers.insert(reqwest::header::HOST, host_val);
+        }
+        builder = builder.headers(headers.clone());
+        if self.trace {
+            tracing::debug!(s3TraceMsg = %dump_request(req.method, &url, &headers), "s3 trace");
+        }
+        let _permit = match &self.http.conn_limit {
+            Some(sem) => Some(sem.clone().acquire_owned().await.map_err(|e| SendError {
+                message: format!("HTTP connection limit semaphore closed: {e}"),
+                retryable: false,
+            })?),
+            None => None,
+        };
+        let send = builder.send();
+        let resp = match self.http.response_header_timeout {
+            None => send.await?,
+            Some(timeout) => {
+                tokio::pin!(send);
+                let deadline = tokio::time::sleep(timeout);
+                tokio::select! {
+                    r = &mut send => r?,
+                    _ = deadline => {
+                        return Err(SendError {
+                            message: format!("{} \"{url}\": net/http: timeout awaiting response headers", go_method_name(req.method)),
+                            retryable: true,
+                        });
+                    }
+                }
+            }
+        };
+        if self.trace {
+            tracing::debug!(s3TraceMsg = %dump_response(resp.status().as_u16(), resp.headers()), "s3 trace");
+        }
+        Ok(resp)
+    }
+
+    /// Streaming `GET` execution (avoids buffering multi-GB objects in RAM).
+    pub async fn execute_get_stream(
+        &self,
+        meta: RequestMetadata,
+    ) -> Result<futures::stream::BoxStream<'static, Result<Bytes, S3Error>>, S3Error> {
+        use futures::StreamExt as _;
+        let mut last_err: Option<S3Error> = None;
+        for attempt in 0..self.max_retries {
+            let (req, raw_query, _) = match self.new_request("GET", &meta).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if matches!(
+                        e.code(),
+                        "ExpiredToken" | "ExpiredTokenException" | "TokenRefreshRequired"
+                    ) {
+                        self.credentials.expire().await;
+                    }
+                    if is_s3_code_retryable(e.code()) {
+                        last_err = Some(e);
+                        tokio::time::sleep(self.backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            let resp = match self.send_raw(&req, raw_query).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let retryable = e.retryable;
+                    let err = S3Error::Request(e.message);
+                    if retryable {
+                        last_err = Some(err);
+                        tokio::time::sleep(self.backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let status = resp.status().as_u16();
+            if matches!(status, 200 | 206) {
+                let stream = resp
+                    .bytes_stream()
+                    .map(|chunk| chunk.map_err(|e| S3Error::Request(e.to_string())));
+                return Ok(Box::pin(stream));
+            }
+            let resp_headers = resp.headers().clone();
+            let body = resp.bytes().await.unwrap_or_default();
+            let api_err = match http_resp_to_error_response(
+                status,
+                &resp_headers,
+                &body,
+                &meta.bucket_name,
+                &meta.object_name,
+            ) {
+                Some(e) => e,
+                None => {
+                    return Err(S3Error::Other(format!("unexpected HTTP status {status}")));
+                }
+            };
+            if matches!(
+                api_err.code.as_str(),
+                "ExpiredToken" | "ExpiredTokenException" | "TokenRefreshRequired"
+            ) {
+                self.credentials.expire().await;
+            }
+            if is_s3_code_retryable(&api_err.code) || is_http_status_retryable(status) {
+                last_err = Some(S3Error::Response(Box::new(api_err)));
+                tokio::time::sleep(self.backoff(attempt)).await;
+                continue;
+            }
+            return Err(S3Error::Response(Box::new(api_err)));
+        }
+        Err(last_err.unwrap_or_else(|| S3Error::Other("request was not attempted".into())))
+    }
+
     /// `executeMethod`.
     pub async fn execute_method(
         &self,

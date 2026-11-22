@@ -155,13 +155,15 @@ pub fn decompress_record_batch_with_limit(
             Ok(raw)
         }
         Compression::Gzip => {
-            let mut out = Vec::with_capacity(raw.len().saturating_mul(2).min(max_bytes));
+            let cap = raw.len().saturating_mul(4).min(4 * 1024 * 1024).min(max_bytes);
+            let mut out = Vec::with_capacity(cap);
             read_bounded(MultiGzDecoder::new(&raw[..]), max_bytes, &mut out, "gzip")?;
             Ok(Bytes::from(out))
         }
         Compression::Snappy => decompress_snappy(&raw, max_bytes),
         Compression::Lz4 => {
-            let mut out = Vec::with_capacity(raw.len().saturating_mul(2).min(max_bytes));
+            let cap = raw.len().saturating_mul(4).min(4 * 1024 * 1024).min(max_bytes);
+            let mut out = Vec::with_capacity(cap);
             read_bounded(FrameDecoder::new(&raw[..]), max_bytes, &mut out, "lz4")?;
             Ok(Bytes::from(out))
         }
@@ -188,12 +190,41 @@ fn read_bounded<R: Read>(
 }
 
 thread_local! {
-    static ZSTD_DECOMPRESSOR: RefCell<zstd::bulk::Decompressor<'static>> =
-        RefCell::new(zstd::bulk::Decompressor::default());
     static SNAPPY_DECODER: RefCell<snap::raw::Decoder> =
         RefCell::new(snap::raw::Decoder::new());
     static SNAPPY_ENCODER: RefCell<snap::raw::Encoder> =
         RefCell::new(snap::raw::Encoder::new());
+}
+
+/// Max theoretical expansion ratio for valid Snappy blocks (3-byte copy tag -> 64 bytes < 22x).
+/// Using 32x as a safe upper bound prevents a 5-byte corrupt varint header from pre-allocating 256 MiB.
+const SNAPPY_MAX_EXPANSION_RATIO: usize = 32;
+const INITIAL_DECOMPRESS_CAP: usize = 4 * 1024 * 1024;
+
+fn snappy_raw_decompress_into(src: &[u8], max_bytes: usize, out: &mut Vec<u8>) -> Result<()> {
+    let dec_len = snap::raw::decompress_len(src).context("snappy raw decompress_len")?;
+    if dec_len > max_bytes {
+        return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+    }
+    let start = out.len();
+    let new_len = start
+        .checked_add(dec_len)
+        .ok_or(CompressionError::DecompressedSizeExceeded { limit: max_bytes })?;
+    if new_len > max_bytes {
+        return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+    }
+    if dec_len > src.len().saturating_mul(SNAPPY_MAX_EXPANSION_RATIO) {
+        bail!(
+            "corrupt snappy block: declared length {dec_len} exceeds maximum expansion of {} input bytes",
+            src.len()
+        );
+    }
+    out.resize(new_len, 0);
+    let actual = SNAPPY_DECODER
+        .with(|dec| dec.borrow_mut().decompress(src, &mut out[start..]))
+        .context("snappy raw decompress")?;
+    out.truncate(start + actual);
+    Ok(())
 }
 
 fn decompress_zstd(raw: &[u8], max_bytes: usize) -> Result<Bytes> {
@@ -201,69 +232,33 @@ fn decompress_zstd(raw: &[u8], max_bytes: usize) -> Result<Bytes> {
         if sz > max_bytes as u64 {
             return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
         }
-        if sz <= 64 * 1024 * 1024 {
-            let mut out = Vec::with_capacity(sz as usize);
-            let bulk_res = ZSTD_DECOMPRESSOR
-                .with(|dec| dec.borrow_mut().decompress_to_buffer(raw, &mut out));
-            if bulk_res.is_ok() {
-                return Ok(Bytes::from(out));
-            }
-        }
     }
-    let decoder = zstd::stream::read::Decoder::new(raw).context("zstd decompress record batch")?;
-    let mut out = Vec::with_capacity(raw.len().saturating_mul(3).min(max_bytes));
+    let mut decoder = zstd::stream::read::Decoder::new(raw).context("zstd decompress record batch")?;
+    decoder
+        .window_log_max(23)
+        .context("zstd configure window_log_max")?;
+    let cap = raw
+        .len()
+        .saturating_mul(4)
+        .min(INITIAL_DECOMPRESS_CAP)
+        .min(max_bytes);
+    let mut out = Vec::with_capacity(cap);
     read_bounded(decoder, max_bytes, &mut out, "zstd")?;
     Ok(Bytes::from(out))
 }
 
 fn decompress_snappy(src: &[u8], max_bytes: usize) -> Result<Bytes> {
+    let cap = src
+        .len()
+        .saturating_mul(4)
+        .min(INITIAL_DECOMPRESS_CAP)
+        .min(max_bytes);
+    let mut out = Vec::with_capacity(cap);
     if src.len() >= 16 && &src[..8] == XERIAL_MAGIC {
-        let mut rem = &src[16..];
-        let mut out = Vec::with_capacity(src.len().saturating_mul(2).min(max_bytes));
-        SNAPPY_DECODER.with(|dec| {
-            let mut dec = dec.borrow_mut();
-            while !rem.is_empty() {
-                if rem.len() < 4 {
-                    bail!("malformed xerial snappy chunk header");
-                }
-                let size = u32::from_be_bytes([rem[0], rem[1], rem[2], rem[3]]) as usize;
-                rem = &rem[4..];
-                if rem.len() < size {
-                    bail!(
-                        "truncated xerial snappy chunk: expected {size}, got {}",
-                        rem.len()
-                    );
-                }
-                let chunk = &rem[..size];
-                rem = &rem[size..];
-                let dec_len = snap::raw::decompress_len(chunk).context("snappy xerial chunk len")?;
-                let start = out.len();
-                let new_len = start
-                    .checked_add(dec_len)
-                    .ok_or(CompressionError::DecompressedSizeExceeded { limit: max_bytes })?;
-                if new_len > max_bytes {
-                    return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
-                }
-                out.resize(new_len, 0);
-                let actual = dec
-                    .decompress(chunk, &mut out[start..])
-                    .context("snappy xerial chunk decompress")?;
-                out.truncate(start + actual);
-            }
-            Ok(())
-        })?;
-        return Ok(Bytes::from(out));
+        xerial_decode_into(&mut out, src, max_bytes)?;
+    } else {
+        snappy_raw_decompress_into(src, max_bytes, &mut out)?;
     }
-
-    let dec_len = snap::raw::decompress_len(src).context("snappy raw decompress_len")?;
-    if dec_len > max_bytes {
-        return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
-    }
-    let mut out = vec![0u8; dec_len];
-    let actual = SNAPPY_DECODER
-        .with(|dec| dec.borrow_mut().decompress(src, &mut out))
-        .context("snappy raw decompress")?;
-    out.truncate(actual);
     Ok(Bytes::from(out))
 }
 
@@ -485,16 +480,7 @@ fn decompress_into(
             if src.len() >= 16 && &src[..8] == XERIAL_MAGIC {
                 xerial_decode_into(out, src, max_bytes)
             } else {
-                let dec_len = snap::raw::decompress_len(src).context("snappy raw decompress_len")?;
-                if dec_len > max_bytes {
-                    return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
-                }
-                out.resize(dec_len, 0);
-                let actual = SNAPPY_DECODER
-                    .with(|dec| dec.borrow_mut().decompress(src, out))
-                    .context("snappy raw decompress")?;
-                out.truncate(actual);
-                Ok(())
+                snappy_raw_decompress_into(src, max_bytes, out)
             }
         }
         KafkaCompression::Lz4 => {
@@ -551,6 +537,12 @@ fn xerial_decode_into(out: &mut Vec<u8>, src: &[u8], max_bytes: usize) -> Result
                 .ok_or(CompressionError::DecompressedSizeExceeded { limit: max_bytes })?;
             if new_len > max_bytes {
                 return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+            }
+            if dec_len > chunk.len().saturating_mul(SNAPPY_MAX_EXPANSION_RATIO) {
+                bail!(
+                    "corrupt xerial snappy chunk: declared length {dec_len} exceeds maximum expansion of {} input bytes",
+                    chunk.len()
+                );
             }
             out.resize(new_len, 0);
             let actual = dec

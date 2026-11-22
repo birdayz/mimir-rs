@@ -49,7 +49,7 @@ impl TraceContext {
     }
 
     pub fn to_traceparent(&self) -> String {
-        let mut flags = self.trace_flags & 0x03;
+        let mut flags = self.trace_flags;
         if self.sampled {
             flags |= 0x01;
         } else {
@@ -719,11 +719,14 @@ pub fn parse_traceparent(header: &str) -> Option<TraceContext> {
     if parts[3].len() != 2 || !parts[3].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
         return None;
     }
-    let flags = u8::from_str_radix(parts[3], 16).ok()?;
-    if version == "00" && flags > 3 {
+    let raw_flags = u8::from_str_radix(parts[3], 16).ok()?;
+    // Exact Go go.opentelemetry.io/otel/propagation/trace_context.go:108-114 parity:
+    // version 00 rejects reserved flag bits (> 0x03); future versions (01..=fe) mask to
+    // FlagsSampled (0x01) | FlagsRandom (0x02).
+    if version == "00" && raw_flags > 0x03 {
         return None;
     }
-    let trace_flags = flags & 0x03;
+    let trace_flags = raw_flags & 0x03;
     let sc = TraceContext {
         trace_id,
         span_id,
@@ -2126,8 +2129,16 @@ mod tests {
         assert!(j_dbg.jaeger_debug_id.is_some());
 
         assert!(parse_traceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
+        // Go OTel trace_context.go:108-114: version 00 rejects reserved flag bits (> 0x03),
+        // while future versions (01..=fe) accept 00..=ff and mask to sampled|random (0x03).
         assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff").is_none());
         assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04").is_none());
+        let tp_v1_ff = parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff").unwrap();
+        assert!(tp_v1_ff.is_sampled());
+        assert_eq!(tp_v1_ff.trace_flags, 0x03);
+        let tp_v1_04 = parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-04").unwrap();
+        assert!(!tp_v1_04.is_sampled());
+        assert_eq!(tp_v1_04.trace_flags, 0x00);
         assert!(parse_uber_trace_id("0:70e8b02d28e4337b:0:1").is_none());
 
         let tp_random_sampled = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03").unwrap();

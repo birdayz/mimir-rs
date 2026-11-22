@@ -154,6 +154,8 @@ impl GrpcInflightMethodLimiter {
     pub fn rpc_call_finished(&self, ctx: CallContext) {
         match ctx.kind {
             Some(RpcCallKind::IngesterPush) => {
+                // Upstream pkg/mimir/grpc_call_check.go panics on nil receiver in RPCCallFinished,
+                // asserted directly by TestGrpcInflightMethodLimiter.
                 let ing = self
                     .get_ingester
                     .as_ref()
@@ -162,6 +164,8 @@ impl GrpcInflightMethodLimiter {
                 ing.finish_push_request();
             }
             Some(RpcCallKind::DistributorPush) => {
+                // Upstream pkg/mimir/grpc_call_check.go panics on nil receiver in RPCCallFinished,
+                // asserted directly by TestGrpcInflightMethodLimiter.
                 let dist = self
                     .get_distributor
                     .as_ref()

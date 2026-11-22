@@ -495,6 +495,8 @@ fn configure_tcp_socket(tcp: &TcpStream) {
 
 /// Memberlist `Transport` over TCP: every packet / stream uses a new connection (dskit
 /// `TCPTransport`).
+pub(crate) const MAX_CONCURRENT_INCOMING_CONNS: usize = 256;
+
 pub struct TcpTransport {
     me: Weak<TcpTransport>,
     stream_timeout: Duration,
@@ -503,6 +505,7 @@ pub struct TcpTransport {
     acquire_writer_timeout: Duration,
     max_concurrent_writes: u32,
     write_sem: Arc<Semaphore>,
+    conn_sem: Arc<Semaphore>,
     /// `cfg.BindAddrs` as configured (Go switches on the string value of `BindAddrs[0]`).
     bind_addrs: Vec<String>,
     tls: Option<TransportTls>,
@@ -599,6 +602,7 @@ impl TcpTransport {
             acquire_writer_timeout: cfg.acquire_writer_timeout.as_std().unwrap_or(Duration::ZERO),
             max_concurrent_writes: concurrent_writes,
             write_sem: Arc::new(Semaphore::new(concurrent_writes as usize)),
+            conn_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING_CONNS)),
             bind_addrs: bind_addrs.clone(),
             tls,
             transport_debug: AtomicBool::new(false),
@@ -699,8 +703,22 @@ impl TcpTransport {
                     match res {
                         Ok((stream, _remote)) => {
                             loop_delay = Duration::ZERO;
+                            let permit = tokio::select! {
+                                biased;
+                                res = shutdown_rx.changed() => {
+                                    if res.is_err() || *shutdown_rx.borrow() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                p = self.conn_sem.clone().acquire_owned() => match p {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                }
+                            };
                             let tr = self.clone();
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 tr.handle_connection(stream).await;
                             });
                         }
@@ -1175,6 +1193,10 @@ impl TcpTransport {
     /// listener tasks to finish.
     pub fn accept_errors_for_test(&self) -> usize {
         self.accept_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn available_conn_permits_for_test(&self) -> usize {
+        self.conn_sem.available_permits()
     }
 
     pub fn spawn_errored_tcp_listen_for_test(self: &Arc<Self>) -> io::Result<()> {

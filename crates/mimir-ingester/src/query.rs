@@ -3700,6 +3700,13 @@ impl Ingester {
                 return Err(e);
             }
         };
+        if !self.cfg.active_series.active_series_metrics_enabled {
+            permit.finish(false);
+            return Err(IngesterError::Internal {
+                message: "error listing active series: active series tracker is not initialized"
+                    .to_string(),
+            });
+        }
 
         let (shard, matchers) = match remove_shard_from_matchers(matchers) {
             Ok(v) => v,
@@ -3812,6 +3819,12 @@ impl Ingester {
         let Some(db) = self.get_open_tsdb_for_query(user_id)? else {
             return Ok(Vec::new());
         };
+        if !self.cfg.active_series.active_series_metrics_enabled {
+            return Err(IngesterError::Internal {
+                message: "error listing active series: active series tracker is not initialized"
+                    .to_string(),
+            });
+        }
         let (shard, matchers) =
             remove_shard_from_matchers(matchers).map_err(|e| IngesterError::Internal {
                 message: format!("error listing active series: error removing shard matcher: {e}"),
@@ -5557,6 +5570,7 @@ pub type LabelValueCountFn =
 /// Values are split into `chunk_size` chunks, each submitted to the shared pool on behalf of
 /// `tenant_id`. Results arrive in completion order; the receiver ends once every submitted chunk
 /// has finished. Submission stops at the first cancellation (`context canceled`) or pool error.
+#[allow(clippy::too_many_arguments)]
 fn submit_label_values_chunk(
     pool: &ComputeWorkerPool,
     tenant_id: &str,
@@ -5565,6 +5579,7 @@ fn submit_label_values_chunk(
     is_canceled: &Arc<dyn Fn() -> bool + Send + Sync>,
     count_fn: &LabelValueCountFn,
     tx: &mpsc::Sender<LabelValueCountResult>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> bool {
     let (values, cancel, count_fn, tx_c) = (
         Arc::clone(lbl_values),
@@ -5598,7 +5613,7 @@ fn submit_label_values_chunk(
                     break;
                 }
             }
-            tx_c
+            (tx_c, permit)
         },
         drop,
     )
@@ -5626,7 +5641,9 @@ pub fn compute_label_values_counts(
     }
     let pool = Arc::clone(pool);
     let tenant_id = tenant_id.to_string();
+    let max_outstanding = (pool.workers() / 2).clamp(1, 16);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(max_outstanding));
         handle.spawn(async move {
             let mut start = 0usize;
             while start < lbl_values.len() {
@@ -5643,6 +5660,13 @@ pub fn compute_label_values_counts(
                         .await;
                     return;
                 }
+                let permit = tokio::select! {
+                    p = Arc::clone(&sem).acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    },
+                    _ = tx.closed() => return,
+                };
                 let end = (start + chunk_size).min(lbl_values.len());
                 if !submit_label_values_chunk(
                     &pool,
@@ -5652,6 +5676,7 @@ pub fn compute_label_values_counts(
                     &is_canceled,
                     &count_fn,
                     &tx,
+                    Some(permit),
                 ) {
                     let _ = tx
                         .send(LabelValueCountResult {
@@ -5689,6 +5714,7 @@ pub fn compute_label_values_counts(
                     &is_canceled,
                     &count_fn,
                     &tx,
+                    None,
                 ) {
                     let _ = tx.blocking_send(LabelValueCountResult {
                         val: String::new(),

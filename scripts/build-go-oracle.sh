@@ -23,6 +23,8 @@ for arg in "$@"; do
     esac
 done
 
+"$ROOT_DIR/scripts/fetch-upstream-mimir.sh" --check
+
 mkdir -p "$TARGET_DIR"
 
 if [[ ! -x "$GO_MIMIR_BIN" || "$REBUILD_MIMIR" == "true" ]]; then

@@ -167,6 +167,7 @@ pub struct FetchResult {
     pub records: Vec<FetchedRecord>,
     pub high_watermark: i64,
     pub log_start_offset: i64,
+    pub next_fetch_offset: i64,
     pub fetched_bytes: usize,
     pub err: Option<KafkaFetchError>,
 }
@@ -178,6 +179,7 @@ impl FetchResult {
             records: Vec::new(),
             high_watermark: -1,
             log_start_offset: -1,
+            next_fetch_offset: -1,
             fetched_bytes: 0,
             err: None,
         }
@@ -193,6 +195,7 @@ impl FetchResult {
             records: Vec::new(),
             high_watermark: -1,
             log_start_offset: -1,
+            next_fetch_offset: -1,
             fetched_bytes: 0,
             err: Some(err),
         }
@@ -211,6 +214,9 @@ impl FetchResult {
         combined.extend(self.records);
         self.records = combined;
         self.fetched_bytes = self.fetched_bytes.saturating_add(older.fetched_bytes);
+        if self.next_fetch_offset < 0 {
+            self.next_fetch_offset = older.next_fetch_offset;
+        }
         self
     }
 }
@@ -1068,11 +1074,11 @@ impl WorkerCtx {
 
         let raw = part_resp.records.clone().unwrap_or_default();
         let raw_len = raw.len();
-        let records = if raw.is_empty() {
-            Vec::new()
+        let (records, next_fetch_offset) = if raw.is_empty() {
+            (Vec::new(), start_offset)
         } else {
             match self.client.decode_fetched_partition(raw, start_offset) {
-                Ok((records, _, _)) => records,
+                Ok((records, next_off, _)) => (records, next_off),
                 Err(e) => return err(format!("decode batch: {e}")),
             }
         };
@@ -1088,6 +1094,7 @@ impl WorkerCtx {
             records,
             high_watermark: part_resp.high_watermark,
             log_start_offset: part_resp.log_start_offset,
+            next_fetch_offset,
             fetched_bytes,
             err: None,
         }
@@ -1210,9 +1217,24 @@ async fn run_worker(
                     ) => r,
                 };
                 match handled {
-                    Ok(adjusted) => w = adjusted,
+                    Ok(adjusted) => {
+                        w = adjusted;
+                        continue;
+                    }
                     Err(fatal) => {
                         tracing::warn!(partition = partition_id, error = %fatal, "failed to handle Kafka fetch error");
+                        if !buffered.records.is_empty() {
+                            tokio::select! {
+                                biased;
+                                _ = stop_rx.changed() => return,
+                                send_res = result_tx.send(buffered) => {
+                                    if send_res.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            buffered = FetchResult::empty(partition_id);
+                        }
                         tokio::select! {
                             biased;
                             _ = stop_rx.changed() => return,
@@ -1222,25 +1244,35 @@ async fn run_worker(
                         break;
                     }
                 }
-            } else {
-                // Count buffered records as soon as they are fetched.
-                buffered_recs.fetch_add(res.records.len() as i64, Ordering::SeqCst);
-                if res.high_watermark >= 0 {
-                    cas_hwm(&hwm, res.high_watermark);
-                }
-                // Keep non-mergeable fields from res: the last response is the most updated.
-                buffered = res.merge(buffered);
             }
 
+            // Count buffered records as soon as they are fetched.
+            buffered_recs.fetch_add(res.records.len() as i64, Ordering::SeqCst);
+            if res.high_watermark >= 0 {
+                cas_hwm(&hwm, res.high_watermark);
+            }
+            let res_next_offset = res.next_fetch_offset;
+            // Keep non-mergeable fields from res: the last response is the most updated.
+            buffered = res.merge(buffered);
+
             if buffered.records.is_empty() {
+                if res_next_offset > w.start_offset {
+                    // Advance past control-only or compacted empty batches so we never spin.
+                    w.start_offset = res_next_offset;
+                    err_backoff.0.lock().reset();
+                }
                 if *stop_rx.borrow() {
                     return;
                 }
                 continue;
             }
 
-            // The next attempt is from the last record onwards.
-            w.start_offset = buffered.records.last().expect("non-empty").offset + 1;
+            // The next attempt is from the last record (or control-batch end) onwards.
+            let last_rec_next = buffered
+                .records
+                .last()
+                .map_or(w.start_offset, |r| r.offset.saturating_add(1));
+            w.start_offset = last_rec_next.max(res_next_offset);
             w = w.update_bytes_per_record(buffered.fetched_bytes, buffered.records.len());
 
             // Any received record means some success: reset the backoff.
@@ -1249,12 +1281,17 @@ async fn run_worker(
             match result_tx.try_send(buffered) {
                 Ok(()) => buffered = FetchResult::empty(partition_id),
                 Err(mpsc::error::TrySendError::Full(b)) => {
-                    if w.start_offset >= w.end_offset {
-                        // The whole want is fetched: we definitely have to wait to send now.
+                    let max_bytes = w.max_bytes().max(0) as usize;
+                    if w.start_offset >= w.end_offset || b.fetched_bytes > max_bytes {
+                        // The whole want is fetched or buffered bytes exceed max_bytes: wait to send.
                         tokio::select! {
                             biased;
                             _ = stop_rx.changed() => return,
-                            _ = result_tx.send(b) => {}
+                            send_res = result_tx.send(b) => {
+                                if send_res.is_err() {
+                                    return;
+                                }
+                            }
                         }
                         buffered = FetchResult::empty(partition_id);
                     } else {
@@ -1262,6 +1299,14 @@ async fn run_worker(
                     }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+        // Flush any remaining buffered records (e.g. after OffsetOutOfRange truncation) before closing.
+        if !buffered.records.is_empty() {
+            tokio::select! {
+                biased;
+                _ = stop_rx.changed() => return,
+                _ = result_tx.send(buffered) => {}
             }
         }
         // Closing the result channel tells the coordinator this want is done.

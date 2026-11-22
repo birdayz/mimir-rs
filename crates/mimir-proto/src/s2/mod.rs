@@ -12,7 +12,8 @@ pub mod lz4;
 pub mod stream;
 
 pub use block::{
-    concat_blocks, decode, decode_into_slice, decoded_len, emit_copy, emit_copy_no_repeat,
+    concat_blocks, decode, decode_bounded, decode_into_slice, decoded_len, emit_copy,
+    emit_copy_no_repeat,
     emit_literal, emit_repeat, encode, encode_best, encode_better, encode_block,
     encode_block_best, encode_block_better, encode_block_better_snappy, encode_block_snappy,
     encode_snappy, encode_snappy_best, encode_snappy_better, estimate_block_size, match_len,
