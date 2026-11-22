@@ -16,7 +16,10 @@ pub mod ring;
 pub mod watcher;
 pub mod watchers;
 
-pub use instance_ring::{InstanceRingReader, PartitionInstanceRing, PartitionRingReader};
+pub use instance_ring::{
+    InstanceRingReader, MultiPartitionInstanceRing, PartitionInstanceRing, PartitionInstanceRings,
+    PartitionRingReader, StaticPartitionRingReader,
+};
 pub use lifecycler::{
     change_partition_state_in_desc, is_partition_state_change_allowed,
     multi_partition_owner_instance_id, PartitionInstanceLifecycler,
@@ -26,6 +29,9 @@ pub use model::{
     clean_partition_state_name, clean_token_scheme_name, partition_ring_desc_codec,
     PartitionDescExt, PartitionRingDescExt, PartitionRingError,
 };
-pub use ring::{resolve_partition_tokens, ActivePartitionBatchRing, PartitionRing, PartitionRingOptions};
+pub use ring::{
+    resolve_partition_tokens, same_except_pending, ActivePartitionBatchRing, CacheKey,
+    CacheStorage, PartitionKeys, PartitionRing, PartitionRingOptions,
+};
 pub use watcher::{PartitionRingWatcher, PartitionRingWatcherDelegate};
 pub use watchers::PartitionRingWatchers;

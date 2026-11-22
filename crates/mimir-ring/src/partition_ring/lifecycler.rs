@@ -357,7 +357,7 @@ impl PartitionInstanceLifecycler {
         }
     }
 
-    async fn create_partition_and_register_owner(&self) -> Result<(), PartitionRingError> {
+    pub async fn create_partition_and_register_owner(&self) -> Result<(), PartitionRingError> {
         let pid = self.cfg.partition_id;
         let derived = self.cfg.create_partitions_with_derived_tokens;
         let owner_id = self.partition_owner_id();
@@ -619,6 +619,16 @@ impl PartitionRingEditor {
         to_state: PartitionState,
     ) -> Result<(), PartitionRingError> {
         self.update_ring(move |desc| change_partition_state_in_desc(desc, partition_id, to_state))
+            .await
+    }
+
+    pub async fn remove_multi_partition_owner(
+        &self,
+        instance_id: &str,
+        partition_id: i32,
+    ) -> Result<(), PartitionRingError> {
+        let owner_id = multi_partition_owner_instance_id(instance_id, partition_id);
+        self.update_ring(move |desc| Ok(desc.remove_owner(&owner_id)))
             .await
     }
 
