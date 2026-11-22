@@ -948,7 +948,9 @@ pub fn map_native_histogram_err(kind: HistogramErrorKind) -> Option<GlobalErrorI
         | HistogramErrorKind::CustomBucketsNegSpans
         | HistogramErrorKind::CustomBucketsNegBuckets
         | HistogramErrorKind::ExpSchemaCustomBounds
-        | HistogramErrorKind::InvalidSchema => None,
+        | HistogramErrorKind::InvalidSchema
+        | HistogramErrorKind::IncompatibleSchema
+        | HistogramErrorKind::UnknownSchema => None,
     }
 }
 
