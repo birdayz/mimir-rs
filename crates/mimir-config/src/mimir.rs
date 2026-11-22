@@ -704,6 +704,7 @@ impl MimirConfig {
                 ConfigError::Validation(msg) | ConfigError::Flag(msg) => ConfigError::Yaml(msg),
                 other => other,
             })?;
+            core.limits.canonicalize_queries();
         }
         if core.limits.name_validation_scheme == crate::types::NameValidationScheme::Unset {
             core.limits.name_validation_scheme = prev_name_validation_scheme;

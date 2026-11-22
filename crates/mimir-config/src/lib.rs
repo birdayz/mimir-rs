@@ -46,16 +46,26 @@ pub use ingester::{
     ReactiveLimiterConfig, RingConfig,
 };
 pub use limits::{
-    BlockedQuery, BlockedRequest, BlockedRequestQueryParam, CostAttributionLabel,
-    CostAttributionTrackerConfig, CostAttributionTrackerConfigs, LimitedQuery, LimitsConfig,
-    MetricRelabelConfig, OAuth2ClientConfig, RulerAlertmanagerClientConfig,
+    all_true_booleans_per_tenant, clear_registered_extensions, handle_user_limits_request,
+    is_limit_error, largest_positive_non_zero_duration_per_tenant, max_duration_per_tenant,
+    min_duration_per_tenant, must_register_extension, new_limit_error, parse_float_chunk_encoding,
+    parse_histogram_st_encoding_enabled, smallest_positive_int_per_tenant,
+    smallest_positive_non_zero_duration_per_tenant, smallest_positive_non_zero_int_per_tenant,
+    validate_blocked_queries, BlockedQueriesConfig, BlockedQuery, BlockedRequest,
+    BlockedRequestQueryParam, CostAttributionLabel, CostAttributionTrackerConfig,
+    CostAttributionTrackerConfigs, FloatChunkEncoding, LimitError, LimitedQuery, LimitsConfig,
+    LimitsExtensionDefault, MetricRelabelConfig, NotificationRateLimitMap, OAuth2ClientConfig,
+    RulerAlertmanagerClientConfig, UserLimitsResponse, DEFAULT_FLOAT_CHUNK_ENCODING_VALUE,
+    DEFAULT_HISTOGRAM_CHUNK_ENCODING_VALUE, FLOAT_CHUNK_ENCODING_VALUES,
+    HISTOGRAM_CHUNK_ENCODING_ST, HISTOGRAM_CHUNK_ENCODING_VALUES, LABEL_VALUE_HASH_LEN,
 };
 pub use mimir::{
     parse_cli_and_load_config, parse_cli_and_load_config_test_mode, CommonConfig,
     InstrumentRefLeaksConfig, LoadedConfig, MimirConfig,
 };
 pub use runtime_config::{
-    is_url, parse_runtime_config_yaml, parse_runtime_config_yaml_with_defaults,
+    is_url, merge_limits, merge_limits_in_place, parse_runtime_config_yaml,
+    parse_runtime_config_yaml_with_defaults, parse_tenant_id_with_metadata,
     runtime_config_source_ids, DistributorInstanceLimits, MultiRuntimeConfig, Overrides,
     RuntimeConfigHttpObserver, RuntimeConfigLoadEvent, RuntimeConfigManager,
     RuntimeConfigManagerOptions, RuntimeConfigObserver, RuntimeConfigSourceStatus,
@@ -78,7 +88,7 @@ pub use storage::{
     StorageBackendConfig, SwiftConfig, TSDBConfig,
 };
 pub use types::{
-    parse_go_bool, parse_go_yaml_timestamp, CIDRSliceCSV, HumanBytes,
+    parse_go_bool, parse_go_yaml_timestamp, parse_go_yaml_timestamp_dt, CIDRSliceCSV, HumanBytes,
     LabelValueLengthOverLimitStrategy, LimitsMap, LogLevel, NameValidationScheme,
     OTelTranslationStrategy, S3BucketLookupType, SASLMechanism, StringSliceCSV,
     StringSliceCSVMulti,

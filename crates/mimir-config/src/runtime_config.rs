@@ -24,12 +24,16 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Deserializer as YamlDeserializer, Mapping, Value};
 
-use crate::duration::GoDuration;
+use crate::duration::{GoDuration, ModelDuration};
 use crate::error::ConfigError;
 use crate::ingester::InstanceLimits;
-use crate::limits::LimitsConfig;
+use crate::limits::{
+    parse_float_chunk_encoding, parse_histogram_st_encoding_enabled, BlockedQuery, BlockedRequest,
+    FloatChunkEncoding, LimitedQuery, LimitsConfig, RulerAlertmanagerClientConfig,
+    DEFAULT_FLOAT_CHUNK_ENCODING_VALUE,
+};
 use crate::server::RuntimeConfigConfig;
-use crate::types::{NameValidationScheme, OTelTranslationStrategy};
+use crate::types::{LimitsMap, NameValidationScheme, OTelTranslationStrategy};
 use crate::sha256::{sha256, sha256_hex};
 
 use self::provider::{HttpFetcher, Provider};
@@ -478,6 +482,7 @@ fn parse_runtime_config_value(
                 limits.validate().map_err(|e| {
                     ConfigError::RuntimeConfig(format!("tenant {tenant_id:?}: {e}"))
                 })?;
+                limits.canonicalize_queries();
                 if limits.query_ingesters_within.0 != 0
                     && querier_query_store_after.0 != 0
                     && querier_query_store_after.0 >= limits.query_ingesters_within.0
@@ -1123,21 +1128,58 @@ impl Overrides {
         *self.default_limits.write() = Arc::new(default_limits);
     }
 
-    /// Returns the effective `LimitsConfig` for `tenant_id` (falling back to global defaults).
     #[inline]
-    pub fn for_tenant(&self, tenant_id: &str) -> Arc<LimitsConfig> {
+    fn lookup_raw(&self, key: &str) -> Option<Arc<LimitsConfig>> {
         if let Some(ref mgr) = self.manager {
             let cfg = mgr.get_config();
-            if let Some(Some(limits)) = cfg.overrides.get(tenant_id) {
-                return Arc::clone(limits);
-            }
+            cfg.overrides.get(key).and_then(|o| o.as_ref().map(Arc::clone))
         } else {
-            let g = self.static_overrides.read();
-            if let Some(limits) = g.get(tenant_id) {
-                return Arc::clone(limits);
-            }
+            self.static_overrides.read().get(key).map(Arc::clone)
+        }
+    }
+
+    /// Returns the effective `LimitsConfig` for `tenant_id` (trimming any `:key=value`
+    /// metadata and falling back to global defaults; Go: `Overrides.getOverridesForUser`).
+    #[inline]
+    pub fn for_tenant(&self, tenant_id: &str) -> Arc<LimitsConfig> {
+        let user_id = mimir_common::tenant::trim_metadata(tenant_id);
+        if let Some(limits) = self.lookup_raw(user_id) {
+            return limits;
         }
         Arc::clone(&self.default_limits.read())
+    }
+
+    /// Alias for `for_tenant` matching Go `Overrides.getOverridesForUser`.
+    #[inline]
+    pub fn get_overrides_for_user(&self, user_id: &str) -> Arc<LimitsConfig> {
+        self.for_tenant(user_id)
+    }
+
+    /// Resolves effective limits for a `limitsKey` that may contain tenant metadata and/or a
+    /// `/rc/<id>` read-compartment suffix (`pkg/util/validation/limits.go:getOverridesForLimitsKey`).
+    pub fn get_overrides_for_limits_key(&self, limits_key: &str) -> Arc<LimitsConfig> {
+        let base = self.get_overrides_for_user(limits_key);
+        let Ok((user_id, tenant_md)) = parse_tenant_id_with_metadata(limits_key) else {
+            return base;
+        };
+        if user_id == limits_key {
+            return base;
+        }
+        let mut dst = self.get_overrides_for_user(&user_id).as_ref().clone();
+        for (k, v) in tenant_md.iter() {
+            let kv_only = format!(":{k}={v}");
+            if let Some(ov) = self.lookup_raw(&kv_only) {
+                merge_limits_in_place(&mut dst, ov.as_ref());
+            }
+            let kv_tenant = format!("{user_id}:{k}={v}");
+            if let Some(ov) = self.lookup_raw(&kv_tenant) {
+                merge_limits_in_place(&mut dst, ov.as_ref());
+            }
+        }
+        if let Some(ov) = self.lookup_raw(limits_key) {
+            merge_limits_in_place(&mut dst, ov.as_ref());
+        }
+        Arc::new(dst)
     }
 
     /// Returns a snapshot of the global default `LimitsConfig`.
@@ -1147,13 +1189,35 @@ impl Overrides {
     }
 
     #[inline]
-    pub fn ingestion_rate(&self, tenant_id: &str) -> f64 {
-        self.for_tenant(tenant_id).ingestion_rate
+    pub fn ingestion_rate(&self, limits_key: &str) -> f64 {
+        self.get_overrides_for_limits_key(limits_key).ingestion_rate
     }
 
     #[inline]
-    pub fn ingestion_burst_size(&self, tenant_id: &str) -> i64 {
-        self.for_tenant(tenant_id).ingestion_burst_size
+    pub fn ingestion_burst_size(&self, limits_key: &str) -> i64 {
+        self.get_overrides_for_limits_key(limits_key).ingestion_burst_size
+    }
+
+    #[inline]
+    pub fn ingestion_burst_factor(&self, limits_key: &str) -> f64 {
+        let f = self.get_overrides_for_limits_key(limits_key).ingestion_burst_factor;
+        if f < 1.0 { 0.0 } else { f }
+    }
+
+    #[inline]
+    pub fn max_active_or_global_series_per_user(&self, limits_key: &str) -> i64 {
+        let ov = self.get_overrides_for_limits_key(limits_key);
+        if ov.max_active_series_per_user > 0 {
+            ov.max_active_series_per_user
+        } else {
+            ov.max_global_series_per_user
+        }
+    }
+
+    #[inline]
+    pub fn active_series_limit_response_code(&self, limits_key: &str) -> i64 {
+        self.get_overrides_for_limits_key(limits_key)
+            .active_series_limit_response_code
     }
 
     #[inline]
@@ -1223,8 +1287,11 @@ impl Overrides {
 
     /// Go `Overrides.OTelMetricSuffixesEnabled`: falls back to `default_limits` when unset (`None`).
     #[inline]
-    pub fn otel_metric_suffixes_enabled(&self, tenant_id: &str) -> bool {
-        if let Some(v) = self.for_tenant(tenant_id).otel_metric_suffixes_enabled {
+    pub fn otel_metric_suffixes_enabled(&self, limits_key: &str) -> bool {
+        if let Some(v) = self
+            .get_overrides_for_limits_key(limits_key)
+            .otel_metric_suffixes_enabled
+        {
             return v;
         }
         self.defaults().otel_metric_suffixes_enabled.unwrap_or(false)
@@ -1233,8 +1300,10 @@ impl Overrides {
     /// Go `Overrides.NameValidationScheme`: falls back to `default_limits` when `Unset`,
     /// then to `Legacy`.
     #[inline]
-    pub fn name_validation_scheme(&self, tenant_id: &str) -> NameValidationScheme {
-        let scheme = self.for_tenant(tenant_id).name_validation_scheme;
+    pub fn name_validation_scheme(&self, limits_key: &str) -> NameValidationScheme {
+        let scheme = self
+            .get_overrides_for_limits_key(limits_key)
+            .name_validation_scheme;
         if scheme != NameValidationScheme::Unset {
             return scheme;
         }
@@ -1248,13 +1317,16 @@ impl Overrides {
     /// Go `Overrides.OTelTranslationStrategy`: returns explicit strategy if non-empty, otherwise
     /// derives it from `name_validation_scheme` + `otel_metric_suffixes_enabled`.
     #[inline]
-    pub fn otel_translation_strategy(&self, tenant_id: &str) -> OTelTranslationStrategy {
-        let strategy = self.for_tenant(tenant_id).otel_translation_strategy.clone();
+    pub fn otel_translation_strategy(&self, limits_key: &str) -> OTelTranslationStrategy {
+        let strategy = self
+            .get_overrides_for_limits_key(limits_key)
+            .otel_translation_strategy
+            .clone();
         if !strategy.0.is_empty() {
             return strategy;
         }
-        let suffixes = self.otel_metric_suffixes_enabled(tenant_id);
-        let s = match self.name_validation_scheme(tenant_id) {
+        let suffixes = self.otel_metric_suffixes_enabled(limits_key);
+        let s = match self.name_validation_scheme(limits_key) {
             NameValidationScheme::Legacy | NameValidationScheme::Unset => {
                 if suffixes {
                     "UnderscoreEscapingWithSuffixes"
@@ -1271,6 +1343,236 @@ impl Overrides {
             }
         };
         OTelTranslationStrategy(s.to_string())
+    }
+
+    #[inline]
+    pub fn max_query_parallelism(&self, user_id: &str) -> i64 {
+        self.for_tenant(user_id).max_query_parallelism
+    }
+
+    #[inline]
+    pub fn max_queriers_per_user(&self, user_id: &str) -> i64 {
+        self.for_tenant(user_id).max_queriers_per_tenant
+    }
+
+    #[inline]
+    pub fn max_partial_query_length(&self, user_id: &str) -> ModelDuration {
+        self.for_tenant(user_id).max_partial_query_length
+    }
+
+    #[inline]
+    pub fn max_total_query_length(&self, user_id: &str) -> ModelDuration {
+        self.for_tenant(user_id).max_total_query_length
+    }
+
+    #[inline]
+    pub fn results_cache_ttl_for_cardinality_query(&self, user_id: &str) -> ModelDuration {
+        self.for_tenant(user_id).results_cache_ttl_for_cardinality_query
+    }
+
+    #[inline]
+    pub fn distributor_ingestion_artificial_delay(&self, tenant_id: &str) -> ModelDuration {
+        self.for_tenant(tenant_id).ingestion_artificial_delay
+    }
+
+    pub fn notification_rate_limit(&self, user: &str, integration: &str) -> f64 {
+        let u = self.for_tenant(user);
+        let l = u
+            .alertmanager_notification_rate_limit_per_integration
+            .get(integration)
+            .copied()
+            .unwrap_or(u.alertmanager_notification_rate_limit);
+        if l == 0.0 || (l.is_infinite() && l.is_sign_positive()) {
+            return f64::INFINITY;
+        }
+        if l < 0.0 {
+            return 0.0;
+        }
+        l
+    }
+
+    pub fn notification_burst_size(&self, user: &str, integration: &str) -> i64 {
+        let l = self.notification_rate_limit(user, integration);
+        if l == 0.0 {
+            return 0;
+        }
+        if l.is_infinite() || l >= (i64::MAX as f64) {
+            return i64::MAX;
+        }
+        if l < 1.0 {
+            return 1;
+        }
+        l as i64
+    }
+
+    pub fn ruler_max_rules_per_rule_group(&self, user_id: &str, namespace: &str) -> i64 {
+        let u = self.for_tenant(user_id);
+        u.ruler_max_rules_per_rule_group_by_namespace
+            .get(namespace)
+            .copied()
+            .unwrap_or(u.ruler_max_rules_per_rule_group)
+    }
+
+    pub fn ruler_max_rule_groups_per_tenant(&self, user_id: &str, namespace: &str) -> i64 {
+        let u = self.for_tenant(user_id);
+        u.ruler_max_rule_groups_per_tenant_by_namespace
+            .get(namespace)
+            .copied()
+            .unwrap_or(u.ruler_max_rule_groups_per_tenant)
+    }
+
+    pub fn ruler_max_rule_groups_per_tenant_by_namespace_configured(
+        &self,
+        user_id: &str,
+        namespace: &str,
+    ) -> bool {
+        self.for_tenant(user_id)
+            .ruler_max_rule_groups_per_tenant_by_namespace
+            .contains_key(namespace)
+    }
+
+    pub fn ruler_protected_namespaces(&self, user_id: &str) -> Vec<String> {
+        self.for_tenant(user_id).ruler_protected_namespaces.0.clone()
+    }
+
+    pub fn ruler_max_independent_rule_evaluation_concurrency_per_tenant(
+        &self,
+        user_id: &str,
+    ) -> i64 {
+        self.for_tenant(user_id)
+            .ruler_max_independent_rule_evaluation_concurrency_per_tenant
+    }
+
+    pub fn ruler_alertmanager_client_config(&self, user_id: &str) -> RulerAlertmanagerClientConfig {
+        self.for_tenant(user_id).ruler_alertmanager_client_config.clone()
+    }
+
+    pub fn ruler_min_rule_evaluation_interval(&self, user_id: &str) -> ModelDuration {
+        self.for_tenant(user_id).ruler_min_rule_evaluation_interval
+    }
+
+    pub fn ruler_max_rule_evaluation_results(&self, user_id: &str) -> i64 {
+        self.for_tenant(user_id).ruler_max_rule_evaluation_results
+    }
+
+    /// Merges `active_series_custom_trackers` and `active_series_additional_custom_trackers`
+    /// (additional overrides base on duplicate keys; Go: `Overrides.ActiveSeriesCustomTrackersConfig`).
+    pub fn active_series_custom_trackers_config(&self, user_id: &str) -> LimitsMap<String> {
+        let limits = self.for_tenant(user_id);
+        let mut merged = limits.active_series_custom_trackers.clone();
+        for (k, v) in &limits.active_series_additional_custom_trackers {
+            merged.insert(k.clone(), v.clone());
+        }
+        merged
+    }
+
+    pub fn blocked_requests(&self, user_id: &str) -> Vec<BlockedRequest> {
+        self.for_tenant(user_id).blocked_requests.clone()
+    }
+
+    pub fn blocked_queries(&self, user_id: &str) -> Vec<BlockedQuery> {
+        self.for_tenant(user_id).blocked_queries.clone()
+    }
+
+    pub fn limited_queries(&self, user_id: &str) -> Vec<LimitedQuery> {
+        self.for_tenant(user_id).limited_queries.clone()
+    }
+
+    pub fn float_chunk_encoding(&self, user_id: &str) -> FloatChunkEncoding {
+        parse_float_chunk_encoding(&self.for_tenant(user_id).float_chunk_encoding)
+    }
+
+    pub fn float_chunk_encoding_value(&self, user_id: &str) -> &'static str {
+        match self.for_tenant(user_id).float_chunk_encoding.as_str() {
+            "xor2" => "xor2",
+            "xor" => "xor",
+            _ => DEFAULT_FLOAT_CHUNK_ENCODING_VALUE,
+        }
+    }
+
+    pub fn histogram_st_encoding_enabled(&self, user_id: &str) -> bool {
+        parse_histogram_st_encoding_enabled(&self.for_tenant(user_id).histogram_chunk_encoding)
+    }
+
+    pub fn effective_ingestion_partitions_tenant_write_shard_size(&self, user_id: &str) -> i64 {
+        self.for_tenant(user_id)
+            .effective_ingestion_partitions_tenant_write_shard_size()
+    }
+}
+
+/// Ported from `pkg/compartments/tenant_id.go:ParseTenantIDWithMetadata`.
+pub fn parse_tenant_id_with_metadata(
+    tenant_id_with_metadata: &str,
+) -> Result<(String, mimir_common::tenant::Metadata), mimir_common::tenant::TenantError> {
+    if let Some((base_tenant_id, metadata_src)) =
+        split_read_compartment_tenant_id(tenant_id_with_metadata)
+    {
+        mimir_common::tenant::valid_tenant_id(base_tenant_id)?;
+        let md = mimir_common::tenant::Metadata::parse(metadata_src)?;
+        let prefix = &tenant_id_with_metadata[..tenant_id_with_metadata.len() - metadata_src.len()];
+        return Ok((prefix.to_string(), md));
+    }
+    mimir_common::tenant::parse_with_metadata(tenant_id_with_metadata)
+}
+
+fn split_read_compartment_tenant_id(s: &str) -> Option<(&str, &str)> {
+    const INFIX: &str = "/rc/";
+    if !s.contains('/') {
+        return None;
+    }
+    let (tenant_with_comp, metadata) = match s.find(':') {
+        Some(idx) => (&s[..idx], &s[idx..]),
+        None => (s, ""),
+    };
+    let rc_idx = tenant_with_comp.rfind(INFIX)?;
+    let comp_id = &tenant_with_comp[rc_idx + INFIX.len()..];
+    if comp_id.parse::<i64>().is_err() {
+        return None;
+    }
+    Some((&tenant_with_comp[..rc_idx], metadata))
+}
+
+/// Merges `overlay` into `dst` in place (`pkg/util/validation/limits.go:mergeLimits`).
+pub fn merge_limits_in_place(dst: &mut LimitsConfig, overlay: &LimitsConfig) {
+    if overlay.max_active_series_per_user > 0 {
+        dst.max_active_series_per_user = overlay.max_active_series_per_user;
+    }
+    if overlay.active_series_limit_response_code > 0 {
+        dst.active_series_limit_response_code = overlay.active_series_limit_response_code;
+    }
+    if overlay.ingestion_rate > 0.0 {
+        dst.ingestion_rate = overlay.ingestion_rate;
+    }
+    if overlay.ingestion_burst_size > 0 {
+        dst.ingestion_burst_size = overlay.ingestion_burst_size;
+    }
+    if overlay.ingestion_burst_factor > 0.0 {
+        dst.ingestion_burst_factor = overlay.ingestion_burst_factor;
+    }
+    if let Some(v) = overlay.otel_metric_suffixes_enabled {
+        dst.otel_metric_suffixes_enabled = Some(v);
+    }
+    if overlay.name_validation_scheme != NameValidationScheme::Unset {
+        dst.name_validation_scheme = overlay.name_validation_scheme;
+    }
+    if !overlay.otel_translation_strategy.0.is_empty() {
+        dst.otel_translation_strategy = overlay.otel_translation_strategy.clone();
+    }
+}
+
+/// Merges `overlay` into `dst` (`pkg/util/validation/limits.go:mergeLimits`).
+pub fn merge_limits(
+    dst: Option<LimitsConfig>,
+    overlay: Option<&LimitsConfig>,
+) -> Option<LimitsConfig> {
+    match (dst, overlay) {
+        (None, None) => None,
+        (Some(d), None) => Some(d),
+        (None, Some(ov)) => Some(ov.clone()),
+        (Some(mut d), Some(ov)) => {
+            merge_limits_in_place(&mut d, ov);
+            Some(d)
+        }
     }
 }
 
