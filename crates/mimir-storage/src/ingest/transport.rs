@@ -914,32 +914,79 @@ impl KafkaTransport {
             })?
     }
 
-    /// Dials `addr`, discovers API versions and authenticates (kgo `brokerCxn.init`). Each setup
-    /// request is bounded by `request_timeout` (minimum 2s).
+    /// Dials `addr`, discovers API versions (with EventHubs ApiVersions-reset retry up to
+    /// 3 attempts: max, max, then v0) and authenticates (kgo `brokerCxn.init`).
     pub async fn connect(
         &self,
         addr: &str,
         client_id: &str,
         request_timeout: Duration,
     ) -> Result<EstablishedConn, KafkaClientError> {
-        let stream = self.dial(addr).await?;
-        let mut io = HandshakeIo {
-            stream,
-            next_corr_id: 0,
-            client_id: Some(StrBytes::from_string(client_id.to_string())),
-            timeout: request_timeout.max(Duration::from_secs(2)),
-            addr,
-            eof_kind: super::kgo_retry::FirstReadEofKind::Tls,
-        };
-        let api_versions = io.request_api_versions().await?;
-        io.eof_kind = super::kgo_retry::FirstReadEofKind::Sasl;
-        let sasl_expiry = self.authenticate(&mut io, &api_versions).await?;
-        Ok(EstablishedConn {
-            next_correlation_id: io.next_corr_id,
-            stream: io.stream,
-            api_versions,
-            sasl_expiry,
-        })
+        self.connect_with_hooks(addr, client_id, request_timeout, |_| {}, |_| {})
+            .await
+    }
+
+    /// Same as `connect`, invoking `on_connect` whenever a TCP stream opens and
+    /// `on_disconnect` whenever an opened connection is abandoned during setup (e.g.
+    /// EventHubs ApiVersions RST retry).
+    pub async fn connect_with_hooks(
+        &self,
+        addr: &str,
+        client_id: &str,
+        request_timeout: Duration,
+        mut on_connect: impl FnMut(&str),
+        mut on_disconnect: impl FnMut(&str),
+    ) -> Result<EstablishedConn, KafkaClientError> {
+        let mut tries = 0u32;
+        loop {
+            tries += 1;
+            let stream = self.dial(addr).await?;
+            on_connect(addr);
+            let mut io = HandshakeIo {
+                stream,
+                next_corr_id: 0,
+                client_id: Some(StrBytes::from_string(client_id.to_string())),
+                timeout: request_timeout.max(Duration::from_secs(2)),
+                addr,
+                eof_kind: super::kgo_retry::FirstReadEofKind::Tls,
+            };
+            let max_ver = if tries >= 3 { 0 } else { 3 };
+            match io.request_api_versions_with_max(max_ver).await {
+                Ok(api_versions) => {
+                    io.eof_kind = super::kgo_retry::FirstReadEofKind::Sasl;
+                    match self.authenticate(&mut io, &api_versions).await {
+                        Ok(sasl_expiry) => {
+                            return Ok(EstablishedConn {
+                                next_correlation_id: io.next_corr_id,
+                                stream: io.stream,
+                                api_versions,
+                                sasl_expiry,
+                            });
+                        }
+                        Err(e) => {
+                            drop(io);
+                            on_disconnect(addr);
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(KafkaClientError::Io(ref e))
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    ) && tries < 3 =>
+                {
+                    drop(io);
+                    on_disconnect(addr);
+                    continue;
+                }
+                Err(e) => {
+                    drop(io);
+                    on_disconnect(addr);
+                    return Err(e);
+                }
+            }
+        }
     }
 
     /// kgo `brokerCxn.sasl` + `doSasl`.
@@ -1299,19 +1346,31 @@ impl HandshakeIo<'_> {
         Ok(Resp::decode(&mut buf, version)?)
     }
 
-    /// `ApiVersions` v3 (falls back to v0 if the broker rejects v3).
-    async fn request_api_versions(&mut self) -> Result<HashMap<i16, (i16, i16)>, KafkaClientError> {
+    /// `ApiVersions` starting at `max_version` (falls back to v0 if broker rejects with
+    /// `UnsupportedVersion`).
+    async fn request_api_versions_with_max(
+        &mut self,
+        max_version: i16,
+    ) -> Result<HashMap<i16, (i16, i16)>, KafkaClientError> {
         let mut req = ApiVersionsRequest::default();
         req.client_software_name = StrBytes::from_static_str("mimir-rs");
         req.client_software_version = StrBytes::from_static_str("0.1.0");
 
-        let resp: ApiVersionsResponse = match self.roundtrip::<_, ApiVersionsResponse>(ApiKey::ApiVersions, 3, &req).await {
-            Ok(r) if r.error_code.err() != Some(ResponseError::UnsupportedVersion) => r,
-            Ok(_) | Err(KafkaClientError::Protocol(_)) => {
-                self.roundtrip(ApiKey::ApiVersions, 0, &ApiVersionsRequest::default())
-                    .await?
+        let resp: ApiVersionsResponse = if max_version == 0 {
+            self.roundtrip(ApiKey::ApiVersions, 0, &ApiVersionsRequest::default())
+                .await?
+        } else {
+            match self
+                .roundtrip::<_, ApiVersionsResponse>(ApiKey::ApiVersions, max_version, &req)
+                .await
+            {
+                Ok(r) if r.error_code.err() != Some(ResponseError::UnsupportedVersion) => r,
+                Ok(_) | Err(KafkaClientError::Protocol(_)) => {
+                    self.roundtrip(ApiKey::ApiVersions, 0, &ApiVersionsRequest::default())
+                        .await?
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         };
         if let Some(err) = resp.error_code.err() {
             return Err(KafkaClientError::Broker(err));

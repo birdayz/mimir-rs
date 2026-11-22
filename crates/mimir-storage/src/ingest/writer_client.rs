@@ -45,6 +45,11 @@ pub enum ProducerError {
     RecordTimeout,
     #[error("message too large")]
     MessageTooLarge,
+    #[error("message too large (uncompressed_bytes={uncompressed_bytes}{})", compressed_bytes.map(|c| format!(" compressed_bytes={c}")).unwrap_or_default())]
+    MessageTooLargeDetail {
+        uncompressed_bytes: usize,
+        compressed_bytes: Option<usize>,
+    },
     #[error("client closed")]
     Closed,
     #[error("kafka error: {0}")]
@@ -56,7 +61,7 @@ impl ProducerError {
         match self {
             Self::RecordTimeout | Self::DeadlineExceeded => "timeout",
             Self::MaxBuffered => "buffer-full",
-            Self::MessageTooLarge => "record-too-large",
+            Self::MessageTooLarge | Self::MessageTooLargeDetail { .. } => "record-too-large",
             Self::Canceled => "canceled",
             Self::CancelledWhileWaiting(msg) | Self::CancelledBeforeProducing(msg) => {
                 if msg.contains("deadline exceeded") {
@@ -69,6 +74,10 @@ impl ProducerError {
             }
             _ => "other",
         }
+    }
+
+    pub fn is_message_too_large(&self) -> bool {
+        matches!(self, Self::MessageTooLarge | Self::MessageTooLargeDetail { .. })
     }
 
     pub fn is_timeout(&self) -> bool {
@@ -268,6 +277,7 @@ pub struct KafkaWriterClient {
     compression: KafkaCompression,
     linger: Duration,
     write_timeout: Duration,
+    batch_max_bytes: AtomicUsize,
     buffered_bytes: Arc<AtomicI64>,
     buffered_records: Arc<AtomicI64>,
     queue: Arc<SyncMutex<VecDeque<QueuedItem>>>,
@@ -334,6 +344,7 @@ impl KafkaWriterClient {
             } else {
                 write_timeout
             },
+            batch_max_bytes: AtomicUsize::new(PRODUCER_BATCH_MAX_BYTES),
             buffered_bytes: Arc::new(AtomicI64::new(0)),
             buffered_records: Arc::new(AtomicI64::new(0)),
             queue: Arc::new(SyncMutex::new(VecDeque::new())),
@@ -363,6 +374,10 @@ impl KafkaWriterClient {
 
     pub fn inner(&self) -> &Arc<IngestKafkaClient> {
         &self.inner
+    }
+
+    pub fn set_batch_max_bytes(&self, bytes: usize) {
+        self.batch_max_bytes.store(bytes, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -407,11 +422,12 @@ impl KafkaWriterClient {
     }
 
     fn fail_items_with_err(&self, items: Vec<QueuedItem>, err: ProducerError) {
-        for item in items {
+        for mut item in items {
             let bytes = Self::record_buf_bytes(&item.record);
             self.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
             self.buffered_records.fetch_sub(1, Ordering::SeqCst);
             self.update_buffered_gauges();
+            item.record.offset = -1;
             (item.on_done)(item.record, Err(err.clone()));
         }
     }
@@ -661,15 +677,23 @@ impl KafkaWriterClient {
         partition: i32,
         items: Vec<QueuedItem>,
     ) {
+        let max_batch_bytes = self.batch_max_bytes.load(Ordering::Relaxed);
         let mut valid_items = Vec::with_capacity(items.len());
-        for item in items {
+        for mut item in items {
             let rec_bytes = item.record.key.len() + item.record.value.len();
-            if rec_bytes > PRODUCER_BATCH_MAX_BYTES {
+            if rec_bytes > max_batch_bytes {
                 let bytes = Self::record_buf_bytes(&item.record);
                 self.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
                 self.buffered_records.fetch_sub(1, Ordering::SeqCst);
                 self.update_buffered_gauges();
-                (item.on_done)(item.record, Err(ProducerError::MessageTooLarge));
+                item.record.offset = -1;
+                (item.on_done)(
+                    item.record,
+                    Err(ProducerError::MessageTooLargeDetail {
+                        uncompressed_bytes: rec_bytes,
+                        compressed_bytes: None,
+                    }),
+                );
             } else {
                 valid_items.push(item);
             }
@@ -684,7 +708,7 @@ impl KafkaWriterClient {
         let mut curr_bytes: usize = Self::RECORD_BATCH_V2_OVERHEAD;
         for item in valid_items {
             let rec_wire = Self::v2_record_wire_bytes(&item.record, curr_batch.len() as i32);
-            if !curr_batch.is_empty() && curr_bytes + rec_wire > PRODUCER_BATCH_MAX_BYTES {
+            if !curr_batch.is_empty() && curr_bytes + rec_wire > max_batch_bytes {
                 sub_batches.push(curr_batch);
                 curr_batch = Vec::new();
                 curr_bytes = Self::RECORD_BATCH_V2_OVERHEAD
@@ -759,7 +783,11 @@ impl KafkaWriterClient {
                     return;
                 }
                 Ok(Err(KafkaClientError::Broker(ResponseError::MessageTooLarge))) => {
-                    last_err = Some(ProducerError::MessageTooLarge);
+                    let uncomp: usize = items.iter().map(|i| i.record.key.len() + i.record.value.len()).sum();
+                    last_err = Some(ProducerError::MessageTooLargeDetail {
+                        uncompressed_bytes: uncomp,
+                        compressed_bytes: Some(uncomp),
+                    });
                     break;
                 }
                 Ok(Err(KafkaClientError::Broker(ResponseError::UnknownTopicOrPartition))) => {
@@ -818,11 +846,12 @@ impl KafkaWriterClient {
         }
 
         let err = last_err.unwrap_or(ProducerError::RecordTimeout);
-        for item in items.drain(..) {
+        for mut item in items.drain(..) {
             let bytes = Self::record_buf_bytes(&item.record);
             self.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
             self.buffered_records.fetch_sub(1, Ordering::SeqCst);
             self.update_buffered_gauges();
+            item.record.offset = -1;
             (item.on_done)(item.record, Err(err.clone()));
         }
     }
@@ -866,6 +895,19 @@ impl KafkaProducerClient for KafkaWriterClient {
             if let Some(ref t) = self.default_topic {
                 record.topic = t.clone();
             }
+        }
+        if record.topic.is_empty() {
+            record.offset = -1;
+            (on_done)(record, Err(ProducerError::Other("missing topic".to_string())));
+            return;
+        }
+        if record.partition < 0 {
+            record.offset = -1;
+            (on_done)(
+                record,
+                Err(ProducerError::Other("invalid record partitioning choice".to_string())),
+            );
+            return;
         }
 
         // Go `newSampledOnlyTracer()`: on enqueue, if the active trace context is sampled,

@@ -1,4 +1,4 @@
-//! 1:1 upstream test ports for `github.com/thanos-io/objstore` (9 files, 53 tests).
+//! 1:1 upstream test ports for `github.com/thanos-io/objstore` (10 files, 54 tests).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -2421,3 +2421,234 @@ async fn test_s3_new_bucket_with_error_round_tripper() {
     );
     srv.abort();
 }
+
+// Upstream: github.com/thanos-io/objstore/providers/s3/s3_e2e_test.go::TestSSECencryption
+#[tokio::test]
+async fn test_s3_ssec_encryption() {
+    use md5::{Digest, Md5};
+    use mimir_storage::bucket::s3::UploadSource;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // Exact 32-byte key from upstream providers/s3/testdata/encryption_key.
+    const KEY_BYTES: &[u8; 32] = b"suchSecretVeryCryptographicKeyZ\n";
+    let wrong_key = [0x42u8; 32];
+
+    assert_eq!(
+        ServerSideEncryption::new_ssec(b"too-short").unwrap_err(),
+        "encrypt: SSE-C key must be 256 bit long"
+    );
+    let sse = ServerSideEncryption::new_ssec(KEY_BYTES).unwrap();
+
+    #[derive(Default)]
+    struct SsecStore {
+        objects: HashMap<String, (Vec<u8>, String, String)>,
+    }
+
+    fn decode_aws_chunked_body(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            let Some(rel_end) = body[i..].windows(2).position(|w| w == b"\r\n") else {
+                break;
+            };
+            let line_end = i + rel_end;
+            let header = std::str::from_utf8(&body[i..line_end]).unwrap_or("");
+            let size = usize::from_str_radix(header.split(';').next().unwrap_or("0"), 16).unwrap_or(0);
+            let start = line_end + 2;
+            if start + size > body.len() {
+                break;
+            }
+            out.extend_from_slice(&body[start..start + size]);
+            i = start + size + 2;
+            if size == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    let store: Arc<Mutex<SsecStore>> = Arc::default();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let st = Arc::clone(&store);
+    let srv = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let st = Arc::clone(&st);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                loop {
+                    let head_end = loop {
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                        let mut tmp = [0u8; 8192];
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let mut lines = head.lines();
+                    let first = lines.next().unwrap_or("");
+                    let mut parts = first.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let target = parts.next().unwrap_or("").to_string();
+                    let headers: HashMap<String, String> = lines
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                        .collect();
+                    buf.drain(..head_end + 4);
+
+                    let cl: usize = headers
+                        .get("content-length")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < cl {
+                        let mut tmp = [0u8; 8192];
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let raw_body: Vec<u8> = buf.drain(..cl).collect();
+                    let payload = if headers
+                        .get("x-amz-content-sha256")
+                        .is_some_and(|v| v.starts_with("STREAMING-"))
+                    {
+                        decode_aws_chunked_body(&raw_body)
+                    } else {
+                        raw_body
+                    };
+
+                    let path_only = target.split('?').next().unwrap_or("");
+                    let key = path_only.trim_start_matches('/').to_string();
+
+                    let ssec_algo = headers
+                        .get("x-amz-server-side-encryption-customer-algorithm")
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let ssec_key = headers
+                        .get("x-amz-server-side-encryption-customer-key")
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let ssec_md5 = headers
+                        .get("x-amz-server-side-encryption-customer-key-md5")
+                        .map(String::as_str)
+                        .unwrap_or("");
+
+                    let write_resp = |status: u16, reason: &str, extra_hdrs: &str, body: &[u8]| -> Vec<u8> {
+                        let mut out = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n{extra_hdrs}\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(body);
+                        out
+                    };
+
+                    let resp_bytes = match method.as_str() {
+                        "PUT" => {
+                            let valid_ssec = ssec_algo == "AES256"
+                                && base64::engine::general_purpose::STANDARD
+                                    .decode(ssec_key)
+                                    .ok()
+                                    .is_some_and(|raw| {
+                                        raw.len() == 32
+                                            && base64::engine::general_purpose::STANDARD
+                                                .encode(Md5::digest(&raw))
+                                                == ssec_md5
+                                    });
+                            if !valid_ssec {
+                                let err_xml = b"<Error><Code>InvalidArgument</Code><Message>Missing or invalid SSE-C headers</Message></Error>";
+                                write_resp(400, "Bad Request", "Content-Type: application/xml\r\n", err_xml)
+                            } else {
+                                st.lock().unwrap().objects.insert(
+                                    key,
+                                    (payload, ssec_key.to_string(), ssec_md5.to_string()),
+                                );
+                                write_resp(200, "OK", "ETag: \"ssec-etag\"\r\n", b"")
+                            }
+                        }
+                        "HEAD" | "GET" => {
+                            let guard = st.lock().unwrap();
+                            if let Some((data, want_key, want_md5)) = guard.objects.get(&key) {
+                                if ssec_algo != "AES256" || ssec_key != want_key || ssec_md5 != want_md5 {
+                                    let err_xml = if method == "HEAD" {
+                                        Vec::new()
+                                    } else {
+                                        b"<Error><Code>AccessDenied</Code><Message>The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.</Message></Error>".to_vec()
+                                    };
+                                    write_resp(400, "Bad Request", "Content-Type: application/xml\r\n", &err_xml)
+                                } else {
+                                    let hdrs = format!(
+                                        "Content-Type: application/octet-stream\r\nETag: \"ssec-etag\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nx-amz-server-side-encryption-customer-algorithm: AES256\r\nx-amz-server-side-encryption-customer-key-md5: {want_md5}\r\n"
+                                    );
+                                    if method == "HEAD" {
+                                        format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{hdrs}\r\n",
+                                            data.len()
+                                        )
+                                        .into_bytes()
+                                    } else {
+                                        write_resp(200, "OK", &hdrs, data)
+                                    }
+                                }
+                            } else {
+                                let err_xml = if method == "HEAD" {
+                                    Vec::new()
+                                } else {
+                                    b"<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>".to_vec()
+                                };
+                                write_resp(404, "Not Found", "Content-Type: application/xml\r\n", &err_xml)
+                            }
+                        }
+                        _ => write_resp(405, "Method Not Allowed", "", b""),
+                    };
+
+                    if sock.write_all(&resp_bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let cfg = S3Config {
+        bucket_name: "sse-c-encryption".into(),
+        endpoint: addr.to_string(),
+        region: "us-east-1".into(),
+        access_key_id: "minioadmin".into(),
+        secret_access_key: "minioadmin".into(),
+        insecure: true,
+        ..Default::default()
+    };
+
+    let bkt = S3Bucket::new(&cfg, "test-ssec")
+        .unwrap()
+        .with_default_sse(Some(sse));
+
+    let upload = "secret content";
+    bkt.upload("encrypted", UploadSource::Bytes(Bytes::from_static(upload.as_bytes())), None)
+        .await
+        .unwrap();
+
+    assert!(bkt.exists("encrypted").await.unwrap(), "upload failed");
+
+    let got = bkt.get("encrypted").await.unwrap();
+    assert_eq!(std::str::from_utf8(&got).unwrap(), upload);
+
+    let unencrypted_bkt = S3Bucket::new(&cfg, "test-ssec-no-key").unwrap();
+    assert!(unencrypted_bkt.get("encrypted").await.is_err());
+
+    let wrong_bkt = S3Bucket::new(&cfg, "test-ssec-wrong-key")
+        .unwrap()
+        .with_default_sse(Some(ServerSideEncryption::new_ssec(&wrong_key).unwrap()));
+    assert!(wrong_bkt.get("encrypted").await.is_err());
+
+    srv.abort();
+}
+
