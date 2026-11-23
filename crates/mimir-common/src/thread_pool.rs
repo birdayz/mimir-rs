@@ -123,6 +123,7 @@ impl ScopedWorkerPool {
             handles.push(handle);
         }
 
+        crate::record_scoped_worker_pool_threads_added(num_workers);
         Self {
             exec_lock: Mutex::new(()),
             shared,
@@ -216,6 +217,7 @@ impl ScopedWorkerPool {
             task: &task,
         };
 
+        crate::record_scoped_worker_pool_execution();
         {
             let mut st = sync_impl::lock(&self.shared.state);
             st.task = Some(&task as *const TaskDescriptor);
@@ -257,6 +259,7 @@ impl Drop for ScopedWorkerPool {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+        crate::record_scoped_worker_pool_threads_removed(self.num_workers);
     }
 }
 

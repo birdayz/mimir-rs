@@ -1050,6 +1050,7 @@ impl SlabPage {
         if ptr == slab_mmap::MAP_FAILED || ptr.is_null() {
             std::alloc::handle_alloc_error(std::alloc::Layout::new::<Self>());
         }
+        mimir_common::record_nanos_slab_page_alloc(size);
         ptr.cast::<Self>()
     }
 
@@ -1062,22 +1063,27 @@ impl SlabPage {
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
+        mimir_common::record_nanos_slab_page_alloc(layout.size());
         // SAFETY: `ptr` was allocated with `layout` and zero-initialized.
         Box::into_raw(unsafe { Box::from_raw(ptr) })
     }
 
     #[cfg(all(unix, not(miri)))]
     unsafe fn free_raw(page_ptr: *mut Self) {
+        let size = std::mem::size_of::<Self>();
         // SAFETY: `page_ptr` was allocated by `SlabPage::alloc_raw` via `mmap`.
         unsafe {
-            let _ = slab_mmap::munmap(page_ptr.cast::<std::ffi::c_void>(), std::mem::size_of::<Self>());
+            let _ = slab_mmap::munmap(page_ptr.cast::<std::ffi::c_void>(), size);
         }
+        mimir_common::record_nanos_slab_page_free(size);
     }
 
     #[cfg(not(all(unix, not(miri))))]
     unsafe fn free_raw(page_ptr: *mut Self) {
+        let size = std::mem::size_of::<Self>();
         // SAFETY: `page_ptr` was allocated by `SlabPage::alloc_raw` via `Box::into_raw`.
         unsafe { drop(Box::from_raw(page_ptr)) };
+        mimir_common::record_nanos_slab_page_free(size);
     }
 }
 
@@ -1362,6 +1368,7 @@ impl NanosSlab {
                 {
                     let next_state = if madvise_dontneed_page(page_ptr) {
                         reclaimed += 1;
+                        mimir_common::record_nanos_slab_page_reclaimed();
                         PAGE_STATE_RECLAIMED
                     } else {
                         0

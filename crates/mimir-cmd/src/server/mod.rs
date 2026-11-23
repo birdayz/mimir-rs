@@ -381,6 +381,7 @@ impl Server {
             .enable_all()
             .build()
             .context("building mimir-rpc runtime")?;
+        let rpc_handle = rt.handle().clone();
         http_listener.set_nonblocking(true)?;
         grpc_listener.set_nonblocking(true)?;
         let (http_l, grpc_l) = {
@@ -436,6 +437,7 @@ impl Server {
         Ok(RunningServers {
             shutdown_tx: Arc::new(shutdown_tx),
             stopped_rx,
+            rpc_handle,
         })
     }
 }
@@ -470,11 +472,16 @@ impl ServerShutdownHandle {
 pub struct RunningServers {
     shutdown_tx: Arc<watch::Sender<bool>>,
     stopped_rx: watch::Receiver<bool>,
+    rpc_handle: tokio::runtime::Handle,
 }
 
 impl RunningServers {
     pub fn subscribe_stopped(&self) -> watch::Receiver<bool> {
         self.stopped_rx.clone()
+    }
+
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.rpc_handle.clone()
     }
 
     pub fn shutdown_handle(&self) -> ServerShutdownHandle {

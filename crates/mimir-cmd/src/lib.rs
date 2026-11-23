@@ -24,6 +24,7 @@ pub mod modules;
 pub mod pprof;
 pub mod process_collector;
 pub mod runtime_config_metrics;
+pub mod rust_metrics;
 pub mod sanity_check;
 pub mod server;
 pub mod usagestats;

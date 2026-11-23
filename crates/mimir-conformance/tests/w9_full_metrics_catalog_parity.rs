@@ -777,6 +777,7 @@ limits:
             let rust_only: Vec<&String> = rust_names
                 .difference(&go_names)
                 .copied()
+                .filter(|n| !n.starts_with("mimir_rs_"))
                 .collect();
 
             assert!(
@@ -786,9 +787,48 @@ limits:
             );
             assert!(
                 rust_only.is_empty(),
-                "[{format_name}] rust_only metric families ({}): {rust_only:?}",
+                "[{format_name}] non-mimir_rs_* rust_only metric families ({}): {rust_only:?}",
                 rust_only.len()
             );
+
+            // Verify our intentional Rust-runtime-specific `mimir_rs_*` metrics are emitted
+            // cleanly in both text and protobuf exposition formats.
+            for expected_rs in [
+                "mimir_rs_tokio_workers",
+                "mimir_rs_tokio_alive_tasks",
+                "mimir_rs_tokio_global_queue_depth",
+                "mimir_rs_tokio_worker_busy_seconds_total",
+                "mimir_rs_tokio_worker_park_total",
+                "mimir_rs_nanos_slab_mapped_bytes",
+                "mimir_rs_nanos_slab_pages",
+                "mimir_rs_nanos_slab_reclaimed_pages_total",
+                "mimir_rs_scoped_worker_pool_threads",
+                "mimir_rs_scoped_worker_pool_executions_total",
+            ] {
+                assert!(
+                    rust_cat.contains_key(expected_rs),
+                    "[{format_name}] missing expected Rust runtime metric family {expected_rs}"
+                );
+            }
+            #[cfg(target_os = "linux")]
+            for expected_linux_rs in [
+                "mimir_rs_jemalloc_allocated_bytes",
+                "mimir_rs_jemalloc_active_bytes",
+                "mimir_rs_jemalloc_resident_bytes",
+                "mimir_rs_jemalloc_mapped_bytes",
+                "mimir_rs_jemalloc_retained_bytes",
+                "mimir_rs_jemalloc_metadata_bytes",
+                "mimir_rs_jemalloc_arena_purges_total",
+                "mimir_rs_process_rss_anon_bytes",
+                "mimir_rs_process_rss_file_bytes",
+                "mimir_rs_process_rss_shmem_bytes",
+                "mimir_rs_process_threads",
+            ] {
+                assert!(
+                    rust_cat.contains_key(expected_linux_rs),
+                    "[{format_name}] missing expected Linux Rust runtime metric family {expected_linux_rs}"
+                );
+            }
 
             let mut type_mismatches = Vec::new();
             let mut label_mismatches = Vec::new();
