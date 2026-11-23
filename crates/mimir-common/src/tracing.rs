@@ -697,33 +697,46 @@ fn parse_jaeger_tags(raw: &str) -> Result<Vec<SpanAttribute>, String> {
     Ok(out)
 }
 
-/// Parses W3C traceparent (00-<32hex>-<16hex>-<2hex>).
+/// Parses W3C traceparent (`00-<32hex>-<16hex>-<2hex>`), matching
+/// `go.opentelemetry.io/otel/propagation/trace_context.go` (`TraceContext.extract` + `extractPart`).
 pub fn parse_traceparent(header: &str) -> Option<TraceContext> {
-    let header = header.trim();
-    let parts: Vec<&str> = header.split('-').collect();
-    if parts.len() < 4 {
+    if header.is_empty() {
         return None;
     }
-    let version = parts[0];
-    if version.len() != 2 || !version.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+    fn extract_part<'a>(h: &mut &'a str, expected_len: usize) -> Option<&'a str> {
+        let (part, left) = match h.split_once('-') {
+            Some((p, l)) => (p, l),
+            None => (*h, ""),
+        };
+        *h = left;
+        if part.len() != expected_len {
+            return None;
+        }
+        if !part
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return None;
+        }
+        Some(part)
+    }
+
+    let mut rest = header;
+    let ver_s = extract_part(&mut rest, 2)?;
+    let version = u8::from_str_radix(ver_s, 16).ok()?;
+    if version > 0xfe {
         return None;
     }
-    if version == "ff" {
-        return None;
-    }
-    if version == "00" && parts.len() != 4 {
-        return None;
-    }
-    let trace_id = decode_lower_hex_16(parts[1])?;
-    let span_id = decode_lower_hex_8(parts[2])?;
-    if parts[3].len() != 2 || !parts[3].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
-        return None;
-    }
-    let raw_flags = u8::from_str_radix(parts[3], 16).ok()?;
+    let tid_s = extract_part(&mut rest, 32)?;
+    let trace_id = decode_lower_hex_16(tid_s)?;
+    let sid_s = extract_part(&mut rest, 16)?;
+    let span_id = decode_lower_hex_8(sid_s)?;
+    let opts_s = extract_part(&mut rest, 2)?;
+    let raw_flags = u8::from_str_radix(opts_s, 16).ok()?;
     // Exact Go go.opentelemetry.io/otel/propagation/trace_context.go:108-114 parity:
-    // version 00 rejects reserved flag bits (> 0x03); future versions (01..=fe) mask to
-    // FlagsSampled (0x01) | FlagsRandom (0x02).
-    if version == "00" && raw_flags > 0x03 {
+    // version 00 rejects extra non-empty trailing fields and reserved flag bits (> 0x03);
+    // future versions (01..=fe) mask to FlagsSampled (0x01) | FlagsRandom (0x02).
+    if version == 0 && (!rest.is_empty() || raw_flags > 0x03) {
         return None;
     }
     let trace_flags = raw_flags & 0x03;

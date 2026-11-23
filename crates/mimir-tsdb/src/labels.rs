@@ -1771,11 +1771,15 @@ pub mod prom_regexp {
         cap_idx: usize,
         alts: Vec<Vec<SyntaxRegexp>>,
         cur: Vec<SyntaxRegexp>,
+        /// True when the last element of `cur` came from a closed parenthesized group
+        /// (`(?:...)`, `(?flags:...)`, or `(...)`), so a following quantifier applies to
+        /// the whole group rather than splitting only the last rune of a multi-rune literal.
+        last_was_group: bool,
     }
 
     impl ParserFrame {
         fn push_node(&mut self, node: SyntaxRegexp) {
-            if node.op == SyntaxOp::Literal && !node.runes.is_empty() {
+            if !self.last_was_group && node.op == SyntaxOp::Literal && !node.runes.is_empty() {
                 if let Some(last) = self.cur.last_mut() {
                     if last.op == SyntaxOp::Literal
                         && (last.flags & FLAG_FOLD_CASE) == (node.flags & FLAG_FOLD_CASE)
@@ -1786,11 +1790,18 @@ pub mod prom_regexp {
                 }
             }
             self.cur.push(node);
+            self.last_was_group = false;
+        }
+
+        fn push_grouped_node(&mut self, node: SyntaxRegexp) {
+            self.cur.push(node);
+            self.last_was_group = true;
         }
 
         fn push_alt(&mut self) {
             let cur = std::mem::take(&mut self.cur);
             self.alts.push(cur);
+            self.last_was_group = false;
         }
     }
 
@@ -2306,7 +2317,7 @@ pub mod prom_regexp {
                     frames
                         .last_mut()
                         .ok_or_else(|| syntax_err(pattern, "unexpected parser state"))?
-                        .push_node(node);
+                        .push_grouped_node(node);
                     pos += 1;
                 }
                 b'^' => {
@@ -2363,11 +2374,12 @@ pub mod prom_regexp {
                         flags ^= FLAG_NON_GREEDY;
                         pos += 1;
                     }
+                    let was_group = std::mem::replace(&mut frame.last_was_group, false);
                     let sub = frame
                         .cur
                         .pop()
                         .ok_or_else(|| syntax_err(pattern, "missing argument to repetition operator"))?;
-                    let sub = if sub.op == SyntaxOp::Literal && sub.runes.len() > 1 {
+                    let sub = if !was_group && sub.op == SyntaxOp::Literal && sub.runes.len() > 1 {
                         let mut head = sub.clone();
                         let last_ch = head
                             .runes
@@ -2395,10 +2407,11 @@ pub mod prom_regexp {
                             flags ^= FLAG_NON_GREEDY;
                             pos += 1;
                         }
+                        let was_group = std::mem::replace(&mut frame.last_was_group, false);
                         let sub = frame.cur.pop().ok_or_else(|| {
                             syntax_err(pattern, "missing argument to repetition operator")
                         })?;
-                        let sub = if sub.op == SyntaxOp::Literal && sub.runes.len() > 1 {
+                        let sub = if !was_group && sub.op == SyntaxOp::Literal && sub.runes.len() > 1 {
                             let mut head = sub.clone();
                             let last_ch = head
                                 .runes

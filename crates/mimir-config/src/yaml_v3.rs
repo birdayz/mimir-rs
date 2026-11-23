@@ -239,6 +239,13 @@ impl Parser {
                         String::from_utf8_lossy(bytes).into_owned()
                     };
                     out.scalar_style = Some(s.style);
+                    if s.style == unsafe_sys::YAML_DOUBLE_QUOTED_SCALAR_STYLE {
+                        let start = (*ev).start_mark.index as usize;
+                        let end = (*ev).end_mark.index as usize;
+                        if let Some(raw_slice) = self._input.get(start..end) {
+                            validate_go_yaml_v3_double_quoted_escapes(raw_slice, out.line)?;
+                        }
+                    }
                 }
                 unsafe_sys::YAML_SEQUENCE_START_EVENT => {
                     let s = (*ev).data.sequence_start;
@@ -389,6 +396,54 @@ impl Parser {
         self.expect(unsafe_sys::YAML_MAPPING_END_EVENT)?;
         Ok(n)
     }
+}
+
+/// Validates double-quoted scalar escape sequences against Go `go.yaml.in/yaml/v3/scannerc.go`
+/// (`yaml_parser_scan_flow_scalar`, lines 2497–2552). Specifically, Go `yaml.v3` omits `\/`
+/// from its escape switch and rejects it with `found unknown escape character`, whereas
+/// newer `libyaml` accepts `\/`.
+fn validate_go_yaml_v3_double_quoted_escapes(raw: &[u8], start_line: usize) -> Result<(), String> {
+    let body = raw
+        .strip_prefix(b"\"")
+        .and_then(|s| s.strip_suffix(b"\""))
+        .unwrap_or(raw);
+    let mut i = 0usize;
+    let mut line = start_line;
+    while i < body.len() {
+        if body[i] == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if body[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let Some(&next) = body.get(i + 1) else {
+            break;
+        };
+        match next {
+            b'0' | b'a' | b'b' | b't' | b'\t' | b'n' | b'v' | b'f' | b'r' | b'e'
+            | b' ' | b'"' | b'\'' | b'\\' | b'N' | b'_' | b'L' | b'P' => {
+                i += 2;
+            }
+            b'x' => i += 4,
+            b'u' => i += 6,
+            b'U' => i += 10,
+            b'\n' => {
+                line += 1;
+                i += 2;
+            }
+            b'\r' => {
+                line += 1;
+                i += if body.get(i + 2) == Some(&b'\n') { 3 } else { 2 };
+            }
+            _ => {
+                return Err(format!("yaml: line {line}: found unknown escape character"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parses the first document of `input` like `yaml.NewDecoder(r).Decode` does. Returns
@@ -2018,7 +2073,17 @@ fn normalize_serde_scalar(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
             }
         }
         "int" | "int8" | "int16" | "int32" | "int64" => {
-            if let Value::Number(n) = val {
+            if let Value::String(s) = val {
+                if s.contains('_') {
+                    match resolve_untyped("", s).1 {
+                        Resolved::Int(v) => *val = Value::Number(v.into()),
+                        Resolved::Uint(v) if v <= i64::MAX as u64 => {
+                            *val = Value::Number((v as i64).into())
+                        }
+                        _ => {}
+                    }
+                }
+            } else if let Value::Number(n) = val {
                 if !n.is_i64() && !n.is_u64() {
                     if let Some(f) = n.as_f64() {
                         if !f.is_nan() && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
@@ -2029,12 +2094,34 @@ fn normalize_serde_scalar(t: &Types, val: &mut serde_yaml::Value, ty: usize) {
             }
         }
         "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr" => {
-            if let Value::Number(n) = val {
+            if let Value::String(s) = val {
+                if s.contains('_') {
+                    match resolve_untyped("", s).1 {
+                        Resolved::Uint(v) => *val = Value::Number(v.into()),
+                        Resolved::Int(v) if v >= 0 => *val = Value::Number((v as u64).into()),
+                        _ => {}
+                    }
+                }
+            } else if let Value::Number(n) = val {
                 if !n.is_u64() {
                     if let Some(f) = n.as_f64() {
                         if !f.is_nan() && f >= 0.0 && f <= u64::MAX as f64 {
                             *val = Value::Number((f as u64).into());
                         }
+                    }
+                }
+            }
+        }
+        "float32" | "float64" => {
+            if let Value::String(s) = val {
+                if s.contains('_') {
+                    match resolve_untyped("", s).1 {
+                        Resolved::Int(v) => *val = Value::Number(v.into()),
+                        Resolved::Uint(v) => *val = Value::Number(v.into()),
+                        Resolved::Float(f) if f.is_finite() => {
+                            *val = Value::Number(serde_yaml::Number::from(f))
+                        }
+                        _ => {}
                     }
                 }
             }
