@@ -56,6 +56,7 @@ fn default_ingester_test_config(tsdb_dir: &Path) -> (IngesterConfig, BlocksStora
     blocks.tsdb.head_compaction_interval = GoDuration::from_hours(1);
     blocks.tsdb.head_compaction_idle_timeout = GoDuration::from_hours(1);
     blocks.tsdb.ship_interval = GoDuration::ZERO;
+    blocks.tsdb.head_compaction_interval_jitter_enabled = false;
     (cfg, blocks)
 }
 
