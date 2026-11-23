@@ -14,6 +14,7 @@ pub mod ring;
 pub mod token_gen;
 
 // Re-export runtime dependencies for downstream conformance tests.
+pub use hickory_resolver;
 pub use mimir_proto::prost;
 pub use reqwest;
 pub use tokio;

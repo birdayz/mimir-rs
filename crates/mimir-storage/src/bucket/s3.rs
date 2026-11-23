@@ -1476,6 +1476,34 @@ impl Drop for S3AbortOnDrop {
     }
 }
 
+/// Fuzz helper exposing `parse_list_page` for `mimir-conformance` XML mutation tests.
+#[doc(hidden)]
+pub fn fuzz_parse_list_page(body: &[u8]) -> Result<Vec<String>, String> {
+    parse_list_page(body)
+        .map(|p| p.keys)
+        .map_err(|e| e.to_string())
+}
+
+/// Fuzz helper exposing `xml_root_children` for `mimir-conformance` XML mutation tests.
+#[doc(hidden)]
+pub fn fuzz_xml_root_children(body: &[u8]) -> Option<(String, Vec<(String, String)>)> {
+    client::xml_root_children(body)
+}
+
+/// Fuzz helper exposing `http_resp_to_error_response` for `mimir-conformance` XML mutation tests.
+#[doc(hidden)]
+pub fn fuzz_http_resp_to_error_response(status: u16, body: &[u8]) -> Option<String> {
+    let headers = HeaderMap::new();
+    client::http_resp_to_error_response(status, &headers, body, "fuzz-bucket", "fuzz-obj")
+        .map(|e| e.code)
+}
+
+/// Fuzz helper exposing `query_unescape` for `mimir-conformance` mutation tests.
+#[doc(hidden)]
+pub fn fuzz_query_unescape(s: &str) -> Result<String, String> {
+    query_unescape(s)
+}
+
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests;
