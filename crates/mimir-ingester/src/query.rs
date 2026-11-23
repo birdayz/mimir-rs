@@ -5580,7 +5580,7 @@ fn submit_label_values_chunk(
     count_fn: &LabelValueCountFn,
     tx: &mpsc::Sender<LabelValueCountResult>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> bool {
+) -> Result<(), crate::workerpool::SubmitError> {
     let (values, cancel, count_fn, tx_c) = (
         Arc::clone(lbl_values),
         Arc::clone(is_canceled),
@@ -5617,7 +5617,6 @@ fn submit_label_values_chunk(
         },
         drop,
     )
-    .is_ok()
 }
 
 /// Go: `computeLabelValuesSeriesCount`, generic over the per-value counting function.
@@ -5668,7 +5667,7 @@ pub fn compute_label_values_counts(
                     _ = tx.closed() => return,
                 };
                 let end = (start + chunk_size).min(lbl_values.len());
-                if !submit_label_values_chunk(
+                if let Err(submit_err) = submit_label_values_chunk(
                     &pool,
                     &tenant_id,
                     &lbl_values,
@@ -5678,11 +5677,19 @@ pub fn compute_label_values_counts(
                     &tx,
                     Some(permit),
                 ) {
+                    let err = match submit_err {
+                        crate::workerpool::SubmitError::PoolStopped => {
+                            LabelNamesAndValuesError::PoolStopped
+                        }
+                        crate::workerpool::SubmitError::InvalidTenantId => {
+                            LabelNamesAndValuesError::Other(submit_err.to_string())
+                        }
+                    };
                     let _ = tx
                         .send(LabelValueCountResult {
                             val: String::new(),
                             count: 0,
-                            err: Some(LabelNamesAndValuesError::PoolStopped),
+                            err: Some(err),
                         })
                         .await;
                     return;
@@ -5706,7 +5713,7 @@ pub fn compute_label_values_counts(
                     return;
                 }
                 let end = (start + chunk_size).min(lbl_values.len());
-                if !submit_label_values_chunk(
+                if let Err(submit_err) = submit_label_values_chunk(
                     &pool,
                     &tenant_id,
                     &lbl_values,
@@ -5716,10 +5723,18 @@ pub fn compute_label_values_counts(
                     &tx,
                     None,
                 ) {
+                    let err = match submit_err {
+                        crate::workerpool::SubmitError::PoolStopped => {
+                            LabelNamesAndValuesError::PoolStopped
+                        }
+                        crate::workerpool::SubmitError::InvalidTenantId => {
+                            LabelNamesAndValuesError::Other(submit_err.to_string())
+                        }
+                    };
                     let _ = tx.blocking_send(LabelValueCountResult {
                         val: String::new(),
                         count: 0,
-                        err: Some(LabelNamesAndValuesError::PoolStopped),
+                        err: Some(err),
                     });
                     return;
                 }

@@ -1063,12 +1063,8 @@ fn w9_grpc_tenant_and_matcher_error_status_parity() {
         let mut labels = Vec::new();
         for (label, ids, matchers) in &cases {
             for rpc in s24::RPCS {
-                // Once Push("") creates an empty-tenant TSDB, Go's `pkg/queue` worker pool
-                // rejects `tenantID == ""` on `LabelValuesCardinality` with `invalid tenant id`
-                // (`mimir-ingester/src/workerpool.rs`); all other 13 RPCs accept `""`.
-                if *label == "empty header" && *rpc == "LabelValuesCardinality" {
-                    continue;
-                }
+                // All 14 RPCs x 12 cases (168 total, including empty header on LabelValuesCardinality
+                // returning Go pkg/queue.ErrInvalidTenantID "invalid tenant id") must match Go 100%.
                 let g = s24::call(&mut clients[0], rpc, ids, matchers, now_ms).await;
                 let c = s24::call(&mut clients[1], rpc, ids, matchers, now_ms).await;
                 labels.push(format!("{rpc} [{label}]"));

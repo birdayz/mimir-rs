@@ -1687,11 +1687,7 @@ impl TSDBConfig {
                 "mimir-rs: -blocks-storage.tsdb.block-ranges-period with more than one range (local leveled compaction of TSDB blocks) is not supported yet".to_string(),
             ));
         }
-        if self.memory_snapshot_on_shutdown {
-            return Err(ConfigError::Validation(
-                "mimir-rs: -blocks-storage.tsdb.memory-snapshot-on-shutdown=true (TSDB chunk snapshots) is not supported yet".to_string(),
-            ));
-        }
+
         Ok(())
     }
 }
