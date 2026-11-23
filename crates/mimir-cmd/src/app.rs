@@ -169,6 +169,9 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     .context("registering global Prometheus metrics")?;
     crate::metrics::register_process_collector(&registry)
         .context("registering process collector")?;
+    let rust_metrics_handle = crate::metrics::register_rust_metrics_collector(&registry)
+        .context("registering rust runtime metrics collector")?;
+    rust_metrics_handle.register_runtime("main", tokio::runtime::Handle::current());
 
     let ref_leaks_tracker = cfg
         .instrument_ref_leaks
@@ -907,6 +910,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
 
     log_module_starting(&*logger, "server");
     let servers = server.start(http_router, grpc_routes)?;
+    rust_metrics_handle.register_runtime("rpc", servers.runtime_handle());
     server_state.set(State::Running);
 
     Ok::<_, anyhow::Error>((
@@ -1269,6 +1273,7 @@ pub async fn run_mimir(outcome: CliOutcome) -> Result<()> {
     server_stopping.store(true, Ordering::Release);
     server_monitor_task.abort();
     servers.shutdown().await;
+    rust_metrics_handle.unregister_runtime("rpc");
     if server_state.get() == State::Failed {
         logger.log(
             LogLevel::Warn,

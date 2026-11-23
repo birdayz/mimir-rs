@@ -1020,7 +1020,7 @@ limits:
             .collect();
         let extra_text: Vec<&String> = rust_tf
             .difference(go_tf)
-            .filter(|n| !n.starts_with("go_"))
+            .filter(|n| !n.starts_with("go_") && !n.starts_with("mimir_rs_"))
             .collect();
         let missing_proto: Vec<&String> = go_pf
             .difference(rust_pf)

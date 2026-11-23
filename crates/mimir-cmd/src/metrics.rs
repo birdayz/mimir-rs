@@ -52,6 +52,16 @@ pub fn register_process_collector(registry: &Registry) -> Result<(), prometheus:
     Ok(())
 }
 
+/// Registers Rust-runtime-specific operational metrics (`mimir_rs_*`: jemalloc, Linux RSS split,
+/// Tokio runtime health, off-heap `NanosSlab`, and persistent `ScopedWorkerPool`).
+pub fn register_rust_metrics_collector(
+    registry: &Registry,
+) -> Result<crate::rust_metrics::RustRuntimeMetricsHandle, prometheus::Error> {
+    let (collector, handle) = crate::rust_metrics::RustMetricsCollector::for_self();
+    registry.register(Box::new(collector))?;
+    Ok(handle)
+}
+
 /// Registers `mimir_build_info`, `cortex_build_info`, and `cortex_config_hash` on `registry`.
 pub fn register_global_metrics(
     registry: &Registry,
