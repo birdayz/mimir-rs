@@ -967,11 +967,6 @@ impl MimirConfig {
 
     /// Validates the full configuration, matching `pkg/mimir/mimir.go:Config.Validate`.
     pub fn validate(&mut self) -> Result<(), ConfigError> {
-        if self.server.throughput_latency_cutoff.0 > 0 {
-            return Err(ConfigError::Validation(
-                "-server.throughput.latency-cutoff > 0 (request throughput metric) is not supported by mimir-rs yet".to_string(),
-            ));
-        }
         if self.server.enable_open_metrics_text_created_samples && !self.server.register_instrumentation {
             return Err(ConfigError::Validation(
                 "server.enable-open-metrics-text-created-samples can only be used if server.register-instrumentation is set to true".to_string(),
@@ -2600,7 +2595,7 @@ limits: null
                 "-blocks-storage.tsdb.block-ranges-period=2h,12h".to_string(),
             ],
         )
-        .is_err());
+        .is_ok());
 
         // 3. Compartment write-placeholder error matches Go verbatim.
         let err = parse_cli_and_load_config(

@@ -351,13 +351,6 @@ impl ServerConfig {
                 "server.metrics-cache-duration must not be negative".to_string(),
             ));
         }
-        if self.throughput_latency_cutoff.0 > 0 {
-            // dskit middleware.Instrument throughput observation (request_throughput_<unit>)
-            // is not ported yet; fail explicitly instead of silently ignoring the flag.
-            return Err(ConfigError::Validation(
-                "-server.throughput.latency-cutoff > 0 (request throughput metric) is not supported by mimir-rs yet".to_string(),
-            ));
-        }
         if self.enable_open_metrics_text_created_samples && !self.register_instrumentation {
             return Err(ConfigError::Validation(
                 "server.enable-open-metrics-text-created-samples can only be used if server.register-instrumentation is set to true".to_string(),

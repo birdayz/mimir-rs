@@ -37,6 +37,9 @@ pub struct ServerMetrics {
     pub received_message_size: HistogramVec,
     pub sent_message_size: HistogramVec,
     pub inflight_requests: GaugeVec,
+    pub request_throughput: HistogramVec,
+    pub throughput_latency_cutoff: Duration,
+    pub throughput_unit: String,
     pub invalid_cluster_requests: IntCounterVec,
     pub stream_tracker: Option<Arc<StreamTracker>>,
 }
@@ -48,6 +51,24 @@ impl ServerMetrics {
         reg: &Registry,
         stats_tracking: bool,
         collect_max_streams_by_conn: bool,
+    ) -> prometheus::Result<Self> {
+        Self::new_with_throughput(
+            reg,
+            stats_tracking,
+            collect_max_streams_by_conn,
+            "samples_processed",
+            0,
+        )
+    }
+
+    /// Creates and registers server metrics with configured throughput unit and latency cutoff
+    /// (Go `dskit/server/metrics.go:NewServerMetrics`).
+    pub fn new_with_throughput(
+        reg: &Registry,
+        stats_tracking: bool,
+        collect_max_streams_by_conn: bool,
+        throughput_unit: &str,
+        throughput_latency_cutoff_ms: i64,
     ) -> prometheus::Result<Self> {
         let ns = "cortex";
         let tcp_connections = GaugeVec::new(
@@ -100,6 +121,16 @@ impl ServerMetrics {
             Opts::new("inflight_requests", "Current number of inflight requests.").namespace(ns),
             &["method", "route"],
         )?;
+        let request_throughput = HistogramVec::new(
+            HistogramOpts::new(
+                format!("{ns}_request_throughput_{throughput_unit}"),
+                "Server throughput of running requests.",
+            )
+            .const_label("cutoff_ms", throughput_latency_cutoff_ms.to_string())
+            .buckets(INSTRUMENT_DEF_BUCKETS.to_vec())
+            .native(METRICS_NATIVE_HISTOGRAM_FACTOR, 100, Duration::from_secs(3600)),
+            &["method", "route"],
+        )?;
         let invalid_cluster_requests = IntCounterVec::new(
             Opts::new(
                 "server_invalid_cluster_validation_label_requests_total",
@@ -116,6 +147,7 @@ impl ServerMetrics {
         reg.register(Box::new(received_message_size.clone()))?;
         reg.register(Box::new(sent_message_size.clone()))?;
         reg.register(Box::new(inflight_requests.clone()))?;
+        reg.register(Box::new(request_throughput.clone()))?;
         reg.register(Box::new(invalid_cluster_requests.clone()))?;
 
         let stream_tracker = if stats_tracking && collect_max_streams_by_conn {
@@ -134,6 +166,9 @@ impl ServerMetrics {
             received_message_size,
             sent_message_size,
             inflight_requests,
+            request_throughput,
+            throughput_latency_cutoff: Duration::from_millis(throughput_latency_cutoff_ms.max(0) as u64),
+            throughput_unit: throughput_unit.to_string(),
             invalid_cluster_requests,
             stream_tracker,
         })

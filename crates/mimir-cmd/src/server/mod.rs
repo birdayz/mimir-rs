@@ -118,10 +118,12 @@ impl Server {
     pub fn new(cfg: &ServerConfig, registry: &Registry, logger: Arc<dyn Logger>) -> Result<Self> {
         validate_supported(cfg)?;
 
-        let metrics = ServerMetrics::new(
+        let metrics = ServerMetrics::new_with_throughput(
             registry,
             cfg.grpc_server_stats_tracking_enabled,
             cfg.grpc_collect_max_streams_by_conn,
+            &cfg.throughput_unit,
+            cfg.throughput_latency_cutoff.0 / 1_000_000,
         )
         .context("registering server metrics")?;
 

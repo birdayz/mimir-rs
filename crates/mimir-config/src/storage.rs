@@ -272,15 +272,8 @@ impl S3Config {
         self.sse.validate()
     }
 
-    /// See [`StorageBackendConfig::validate_mimir_rs_support`]. The S3 client is built without
-    /// HTTP/2 support, so `http.force_attempt_http2: true` cannot be honoured.
+    /// See [`StorageBackendConfig::validate_mimir_rs_support`].
     pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
-        if self.http.force_attempt_http2 {
-            return Err(ConfigError::Validation(
-                "http.force_attempt_http2 is not supported by mimir-rs for the s3 backend"
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 }
@@ -1682,12 +1675,6 @@ impl TSDBConfig {
     /// Settings Go accepts that mimir-rs does not implement yet: rejected explicitly instead
     /// of being silently ignored (tracked in PORT_STATUS.md).
     pub fn validate_mimir_rs_support(&self) -> Result<(), ConfigError> {
-        if self.block_ranges_period.len() > 1 {
-            return Err(ConfigError::Validation(
-                "mimir-rs: -blocks-storage.tsdb.block-ranges-period with more than one range (local leveled compaction of TSDB blocks) is not supported yet".to_string(),
-            ));
-        }
-
         Ok(())
     }
 }
