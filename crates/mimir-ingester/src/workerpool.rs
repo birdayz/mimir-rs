@@ -27,17 +27,25 @@ use prometheus::proto::MetricFamily;
 use prometheus::{CounterVec, GaugeVec, Opts, Registry};
 use tracing::error;
 
-/// Go: `workerpool.ErrPoolStopped`.
+/// Go: `workerpool.ErrPoolStopped` / `queue.ErrInvalidTenantID`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ErrPoolStopped;
+pub enum SubmitError {
+    /// Go: `workerpool.ErrPoolStopped` ("worker pool is stopped").
+    PoolStopped,
+    /// Go: `queue.ErrInvalidTenantID` ("invalid tenant id").
+    InvalidTenantId,
+}
 
-impl std::fmt::Display for ErrPoolStopped {
+impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("worker pool is stopped")
+        match self {
+            Self::PoolStopped => f.write_str("worker pool is stopped"),
+            Self::InvalidTenantId => f.write_str("invalid tenant id"),
+        }
     }
 }
 
-impl std::error::Error for ErrPoolStopped {}
+impl std::error::Error for SubmitError {}
 
 type TaskFn = Box<dyn FnOnce() -> Option<Box<dyn FnOnce() + Send>> + Send + 'static>;
 
@@ -359,7 +367,7 @@ impl Pool {
             return Ok(());
         }
         if self.shared.state.lock().stopped {
-            return Err(ErrPoolStopped.to_string());
+            return Err(SubmitError::PoolStopped.to_string());
         }
         for worker_id in 0..self.workers {
             let shared = Arc::clone(&self.shared);
@@ -395,7 +403,7 @@ impl Pool {
         dimension: &str,
         tenant_id: &str,
         f: impl FnOnce() + Send + 'static,
-    ) -> Result<(), ErrPoolStopped> {
+    ) -> Result<(), SubmitError> {
         self.submit_inner(dimension, tenant_id, move || {
             f();
             None
@@ -413,7 +421,7 @@ impl Pool {
         tenant_id: &str,
         f: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(R) + Send + 'static,
-    ) -> Result<(), ErrPoolStopped> {
+    ) -> Result<(), SubmitError> {
         self.submit_inner(dimension, tenant_id, move || {
             let res = f();
             Some(Box::new(move || done(res)) as Box<dyn FnOnce() + Send>)
@@ -425,12 +433,15 @@ impl Pool {
         dimension: &str,
         tenant_id: &str,
         f: impl FnOnce() -> Option<Box<dyn FnOnce() + Send>> + Send + 'static,
-    ) -> Result<(), ErrPoolStopped> {
+    ) -> Result<(), SubmitError> {
         let start = Instant::now();
         let res = {
             let mut st = self.shared.state.lock();
             if st.stopped {
-                Err(ErrPoolStopped)
+                Err(SubmitError::PoolStopped)
+            } else if tenant_id.is_empty() {
+                // Go: pkg/queue/queue_broker.go enqueueItemBack rejects tenantID == "" with ErrInvalidTenantID.
+                Err(SubmitError::InvalidTenantId)
             } else {
                 st.enqueue(Task {
                     dimension: dimension.to_string(),
@@ -644,8 +655,17 @@ mod tests {
     fn submit_after_stop_returns_err_pool_stopped() {
         let p = start_pool(1);
         p.stop();
-        assert_eq!(p.submit("test", "tenant", || {}), Err(ErrPoolStopped));
-        assert_eq!(ErrPoolStopped.to_string(), "worker pool is stopped");
+        assert_eq!(
+            p.submit("test", "tenant", || {}),
+            Err(SubmitError::PoolStopped)
+        );
+        assert_eq!(SubmitError::PoolStopped.to_string(), "worker pool is stopped");
+        assert_eq!(SubmitError::InvalidTenantId.to_string(), "invalid tenant id");
+        // Empty tenant ID is rejected on a running pool like Go pkg/queue.ErrInvalidTenantID.
+        let p2 = Pool::new(1, "empty-tenant-test", None).unwrap();
+        p2.start().unwrap();
+        assert_eq!(p2.submit("test", "", || {}), Err(SubmitError::InvalidTenantId));
+        p2.stop();
     }
 
     // Upstream: pool_test.go::TestPool_StartingBlocksUntilWorkersAreRegistered

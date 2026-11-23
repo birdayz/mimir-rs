@@ -217,7 +217,10 @@ fn test_config_validate() {
 #[test]
 fn test_config_validate_rejects_unsupported_tsdb_settings() {
     type SetupFn = fn(&mut BlocksStorageConfig);
-    let cases: [(&str, SetupFn, &str); 2] = [
+    let mut snap_cfg = BlocksStorageConfig::default();
+    snap_cfg.tsdb.memory_snapshot_on_shutdown = true;
+    assert!(snap_cfg.validate(true).is_ok());
+    let cases: [(&str, SetupFn, &str); 1] = [
         (
             "multiple block ranges",
             |cfg| {
@@ -225,11 +228,6 @@ fn test_config_validate_rejects_unsupported_tsdb_settings() {
                     vec![GoDuration::from_hours(2), GoDuration::from_hours(12)]
             },
             "block-ranges-period",
-        ),
-        (
-            "memory snapshot on shutdown",
-            |cfg| cfg.tsdb.memory_snapshot_on_shutdown = true,
-            "memory-snapshot-on-shutdown",
         ),
     ];
     assert!(BlocksStorageConfig::default().validate(true).is_ok());

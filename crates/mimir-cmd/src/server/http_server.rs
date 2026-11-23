@@ -29,7 +29,7 @@ use mimir_common::logging::{LogLevel, Logger};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::Mutex;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tower::ServiceExt;
@@ -464,13 +464,42 @@ pub async fn serve(acceptor: Acceptor, cfg: HttpServerConfig, router: Router, mu
                     };
                     let remote = accepted.remote_addr;
                     let _guard = accepted.guard;
-                    let io = PrefixedIo::new(accepted.prefix, accepted.stream);
+                    let mut io = PrefixedIo::new(accepted.prefix, accepted.stream);
                     if let Some(tls) = cfg.tls.clone() {
+                        // Go net/http/server.go:1998-2001 & 4300-4306: if the first 5 bytes on
+                        // an HTTPS listener look like plaintext HTTP, reply with 400 Bad Request.
+                        let mut peek = [0u8; 5];
+                        let mut peeked = 0usize;
+                        let hs_timeout = handshake_timeout(&cfg);
+                        let deadline = tokio::time::Instant::now()
+                            .checked_add(hs_timeout)
+                            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+                        while peeked < 5 {
+                            let n = tokio::select! {
+                                biased;
+                                _ = super::wait_shutdown(&mut shutdown) => return,
+                                res = tokio::time::timeout_at(deadline, io.read(&mut peek[peeked..])) => match res {
+                                    Ok(Ok(0)) => break,
+                                    Ok(Ok(n)) => n,
+                                    _ => return,
+                                },
+                            };
+                            peeked += n;
+                        }
+                        if peeked == 5 && tls_record_header_looks_like_http(peek) {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                io.write_all(b"HTTP/1.0 400 Bad Request\r\n\r\nClient sent an HTTP request to an HTTPS server.\n"),
+                            ).await;
+                            let _ = io.shutdown().await;
+                            return;
+                        }
+                        let io = PrefixedIo::new(peek[..peeked].to_vec(), io);
                         let hs = tokio_rustls::TlsAcceptor::from(tls).accept(io);
                         let tls_stream = tokio::select! {
                             biased;
                             _ = super::wait_shutdown(&mut shutdown) => return,
-                            res = tokio::time::timeout(handshake_timeout(&cfg), hs) => match res {
+                            res = tokio::time::timeout_at(deadline, hs) => match res {
                                 Ok(Ok(s)) => s,
                                 _ => return,
                             },
@@ -519,6 +548,11 @@ async fn run_with_dynamic_deadline<F: std::future::Future>(
             }
         }
     }
+}
+
+/// Exact port of Go `net/http/server.go:4300` (`tlsRecordHeaderLooksLikeHTTP`).
+fn tls_record_header_looks_like_http(hdr: [u8; 5]) -> bool {
+    matches!(&hdr, b"GET /" | b"HEAD " | b"POST " | b"PUT /" | b"OPTIO")
 }
 
 fn handshake_timeout(cfg: &HttpServerConfig) -> Duration {
@@ -788,5 +822,16 @@ mod tests {
             .expect("http server must abort pre-handshake connection immediately")
             .unwrap();
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn tls_record_header_http_detection_matches_go_net_http() {
+        for hdr in [*b"GET /", *b"HEAD ", *b"POST ", *b"PUT /", *b"OPTIO"] {
+            assert!(tls_record_header_looks_like_http(hdr), "expected true for {hdr:?}");
+        }
+        // TLS 1.2 / 1.3 ClientHello record header (0x16 0x03 0x01 ...) and non-matching verbs.
+        for hdr in [[0x16, 0x03, 0x01, 0x00, 0x50], *b"DELET", *b"PATCH", *b"get /"] {
+            assert!(!tls_record_header_looks_like_http(hdr), "expected false for {hdr:?}");
+        }
     }
 }

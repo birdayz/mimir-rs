@@ -670,6 +670,7 @@ impl UserTsdb {
             tsdb_opts,
             TsdbExtraOptions {
                 isolation_disabled: true,
+                enable_memory_snapshot_on_shutdown: blocks_cfg.tsdb.memory_snapshot_on_shutdown,
                 ..Default::default()
             },
         )?);

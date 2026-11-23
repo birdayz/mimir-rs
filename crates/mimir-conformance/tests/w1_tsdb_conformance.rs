@@ -1322,7 +1322,8 @@ fn regex_matcher_errors_match_go_regexp_syntax() {
         go_errors,
         mismatches.iter().take(60).cloned().collect::<Vec<_>>().join("\n")
     );
-    eprintln!(
+    assert!(
+        rust_only_rejects.is_empty(),
         "{} Go-valid patterns rejected by the Rust regex engine:\n{}",
         rust_only_rejects.len(),
         rust_only_rejects.iter().take(40).cloned().collect::<Vec<_>>().join("\n")

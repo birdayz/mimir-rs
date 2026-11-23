@@ -918,6 +918,13 @@ fn parse_perl_flags(
                     }
                     out.push(c);
                 }
+                // In Go regexp/syntax a standalone flag directive `(?i)` / `(?)` produces an
+                // `OpEmptyMatch` node, so a following quantifier (`(?i)*`, `(?i){2}`) is valid.
+                // Rust `regex` rejects quantifiers directly after `(?i)`, so emit `(?:)` after
+                // standalone flag directives.
+                if c == ')' {
+                    out.push_str("(?:)");
+                }
                 return Ok(i);
             }
             _ => break,
@@ -1230,7 +1237,7 @@ fn unicode_17_script_ranges(name: &str) -> Option<&'static str> {
     }
 }
 
-fn push_unicode_class_outside(out: &mut String, orig: &str, negated: bool, name: &str) {
+fn push_unicode_class_outside(out: &mut String, _orig: &str, negated: bool, name: &str) {
     if name == "Cs" {
         if negated {
             out.push_str(r"[\x{0}-\x{10FFFF}]");
@@ -1248,10 +1255,13 @@ fn push_unicode_class_outside(out: &mut String, orig: &str, negated: bool, name:
         out.push(']');
         return;
     }
-    out.push_str(orig);
+    // Normalize Go `\p{^Name}` / `\P{^Name}` into Rust `\P{Name}` / `\p{Name}`.
+    out.push_str(if negated { r"\P{" } else { r"\p{" });
+    out.push_str(name);
+    out.push('}');
 }
 
-fn push_unicode_class_in_class(out: &mut String, orig: &str, negated: bool, name: &str) -> bool {
+fn push_unicode_class_in_class(out: &mut String, _orig: &str, negated: bool, name: &str) -> bool {
     if name == "Cs" {
         if negated {
             out.push_str(r"\x{0}-\x{10FFFF}");
@@ -1270,7 +1280,10 @@ fn push_unicode_class_in_class(out: &mut String, orig: &str, negated: bool, name
         }
         return true;
     }
-    out.push_str(orig);
+    // Normalize Go `\p{^Name}` / `\P{^Name}` into Rust `\P{Name}` / `\p{Name}`.
+    out.push_str(if negated { r"\P{" } else { r"\p{" });
+    out.push_str(name);
+    out.push('}');
     true
 }
 
