@@ -504,7 +504,8 @@ fn parse_go_float(s: &str) -> Option<f64> {
     if !s.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E')) {
         return None;
     }
-    s.parse().ok()
+    // Go strconv.ParseFloat returns ErrRange on overflow (e.g. 1e400 -> +Inf), so yaml.v3 keeps it as !!str.
+    s.parse::<f64>().ok().filter(|f| f.is_finite())
 }
 
 fn yaml_style_float(s: &str) -> bool {
@@ -624,8 +625,11 @@ fn resolve_untyped(tag: &str, input: &str) -> (String, Resolved) {
         }
         match hint {
             b'.' => {
-                if let Some(f) = parse_go_float(input) {
-                    return (FLOAT_TAG.into(), Resolved::Float(f));
+                let plain = input.replace('_', "");
+                if yaml_style_float(&plain) {
+                    if let Some(f) = parse_go_float(&plain) {
+                        return (FLOAT_TAG.into(), Resolved::Float(f));
+                    }
                 }
             }
             b'D' | b'S' => {
@@ -2034,6 +2038,194 @@ pub fn doc_to_serde_value(doc: &Document) -> Result<serde_yaml::Value, String> {
     let t = types()?;
     let mut budget = DocAliasBudget::default();
     doc_node_to_yaml(doc, t, doc.root, t.root, &mut budget)
+}
+
+fn check_generic_unique_keys(doc: &Document, n: usize) -> Result<(), String> {
+    let content = &doc.node(n).content;
+    let mut i = 0;
+    while i < content.len() {
+        let ni = doc.node(content[i]);
+        let mut j = i + 2;
+        while j < content.len() {
+            let nj = doc.node(content[j]);
+            if ni.kind == nj.kind && ni.value == nj.value {
+                return Err(format!(
+                    "yaml: unmarshal errors:\n  line {}: mapping key {:?} already defined at line {}",
+                    nj.line, nj.value, ni.line
+                ));
+            }
+            j += 2;
+        }
+        i += 2;
+    }
+    Ok(())
+}
+
+fn generic_scalar_to_yaml(doc: &Document, n: usize) -> serde_yaml::Value {
+    use serde_yaml::Value;
+    let node = doc.node(n);
+    if doc.indicated_string(n) {
+        return Value::String(node.value.clone());
+    }
+    let stag = short_tag(&node.tag);
+    if !stag.is_empty()
+        && stag != "!"
+        && !matches!(
+            stag.as_str(),
+            NULL_TAG | BOOL_TAG | STR_TAG | INT_TAG | FLOAT_TAG | TIMESTAMP_TAG | MERGE_TAG
+        )
+    {
+        // Go yaml.v3 keeps explicit non-core tagged scalars as raw strings in interface{}.
+        return Value::String(node.value.clone());
+    }
+    match stag.as_str() {
+        NULL_TAG => return Value::Null,
+        STR_TAG => return Value::String(node.value.clone()),
+        _ => {}
+    }
+    let (_, resolved) = resolve_untyped(&stag, &node.value);
+    match resolved {
+        Resolved::Null => Value::Null,
+        Resolved::Bool(b) => Value::Bool(b),
+        Resolved::Int(i) => Value::Number(i.into()),
+        Resolved::Uint(u) => Value::Number(u.into()),
+        Resolved::Float(f) => Value::Number(f.into()),
+        Resolved::Timestamp => {
+            if let Some(rfc) = crate::yaml_v3_emit::format_timestamp_rfc3339_nano(&node.value) {
+                Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+                    tag: serde_yaml::value::Tag::new("!go-timestamp"),
+                    value: Value::String(rfc),
+                }))
+            } else {
+                Value::String(node.value.clone())
+            }
+        }
+        Resolved::Str(s) => Value::String(s),
+        Resolved::Merge => Value::String(node.value.clone()),
+    }
+}
+
+fn generic_node_to_yaml(
+    doc: &Document,
+    n: usize,
+    budget: &mut DocAliasBudget,
+) -> Result<serde_yaml::Value, String> {
+    if budget.call_depth >= MAX_CALL_DEPTH {
+        return Err("yaml: document exceeds maximum nesting depth".to_string());
+    }
+    budget.call_depth += 1;
+    let res = generic_node_to_yaml_inner(doc, n, budget);
+    budget.call_depth -= 1;
+    res
+}
+
+fn generic_node_to_yaml_inner(
+    doc: &Document,
+    n: usize,
+    budget: &mut DocAliasBudget,
+) -> Result<serde_yaml::Value, String> {
+    use serde_yaml::{Mapping, Value};
+    budget.tick()?;
+
+    let node = doc.node(n);
+    if node.kind == Kind::Alias {
+        if budget.alias_depth >= MAX_ALIAS_DEPTH {
+            return Err("yaml: document contains excessive alias nesting".to_string());
+        }
+        if !budget.active_aliases.insert(n) {
+            return Err(format!("yaml: anchor '{}' value contains itself", node.value));
+        }
+        budget.alias_depth += 1;
+        let res = match node.alias {
+            Some(target) => generic_node_to_yaml(doc, target, budget),
+            None => Ok(Value::Null),
+        };
+        budget.alias_depth -= 1;
+        budget.active_aliases.remove(&n);
+        return res;
+    }
+    if node.kind == Kind::Document {
+        return match node.content.first() {
+            Some(&c) => generic_node_to_yaml(doc, c, budget),
+            None => Ok(Value::Null),
+        };
+    }
+    if doc.short_tag_of(n) == NULL_TAG {
+        return Ok(Value::Null);
+    }
+    match node.kind {
+        Kind::Scalar => Ok(generic_scalar_to_yaml(doc, n)),
+        Kind::Sequence => {
+            let mut seq = Vec::with_capacity(node.content.len());
+            for &c in &node.content {
+                seq.push(generic_node_to_yaml(doc, c, budget)?);
+            }
+            Ok(Value::Sequence(seq))
+        }
+        Kind::Mapping => {
+            check_generic_unique_keys(doc, n)?;
+            let mut merge_visited = HashSet::new();
+            let pairs = collect_merged_pairs(doc, n, &mut merge_visited, budget)?;
+            let mut out = Mapping::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                let kv = generic_node_to_yaml(doc, k, budget)?;
+                if matches!(kv, Value::Sequence(_) | Value::Mapping(_)) {
+                    return Err("yaml: unmarshal errors:\n  invalid map key: non-scalar key".to_string());
+                }
+                let vv = generic_node_to_yaml(doc, v, budget)?;
+                out.insert(kv, vv);
+            }
+            Ok(Value::Mapping(out))
+        }
+        Kind::Document | Kind::Alias => Ok(Value::Null),
+    }
+}
+
+/// Unmarshals the first YAML document into a generic `map[string]interface{}` matching
+/// Go `go.yaml.in/yaml/v3` (`1_000` -> int, `0777` -> octal int, `09` -> float,
+/// timestamps -> `!go-timestamp` RFC3339Nano, duplicate key rejection, merge keys `<<`).
+pub fn unmarshal_generic_map(input: &[u8]) -> Result<serde_yaml::Mapping, String> {
+    use serde_yaml::{Mapping, Value};
+    let Some(doc) = parse_first_document(input)? else {
+        return Ok(Mapping::new());
+    };
+    let mut budget = DocAliasBudget::default();
+    let mut cur = doc.root;
+    while doc.node(cur).kind == Kind::Document {
+        let Some(&c) = doc.node(cur).content.first() else {
+            return Ok(Mapping::new());
+        };
+        cur = c;
+    }
+    cur = doc_deref(&doc, cur);
+    if doc.short_tag_of(cur) == NULL_TAG {
+        return Ok(Mapping::new());
+    }
+    let root_node = doc.node(cur);
+    if root_node.kind != Kind::Mapping {
+        let tag = doc.short_tag_of(cur);
+        return Err(format!(
+            "yaml: unmarshal errors:\n  cannot unmarshal {tag} into map[string]interface {{}}"
+        ));
+    }
+    check_generic_unique_keys(&doc, cur)?;
+    let mut merge_visited = HashSet::new();
+    let pairs = collect_merged_pairs(&doc, cur, &mut merge_visited, &mut budget)?;
+    let mut out = Mapping::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        let k_ref = doc_deref(&doc, k);
+        let kn = doc.node(k_ref);
+        if kn.kind != Kind::Scalar {
+            return Err("yaml: unmarshal errors:\n  invalid map key: non-scalar key".to_string());
+        }
+        // Go yaml.v3 decoding into map[string]any skips null keys because d.null cannot set a string.
+        if !doc.indicated_string(k_ref) && doc.short_tag_of(k_ref) == NULL_TAG {
+            continue;
+        }
+        let vv = generic_node_to_yaml(&doc, v, &mut budget)?;
+        out.insert(Value::String(kn.value.clone()), vv);
+    }
+    Ok(out)
 }
 
 fn normalize_serde_scalar(t: &Types, val: &mut serde_yaml::Value, ty: usize) {

@@ -1048,13 +1048,20 @@ impl RuntimeConfigManager {
                     buf.extend_from_slice(&digest);
                 }
                 let hash = sha256_hex(&buf);
+                let mut clean_map = Value::Mapping(merged);
+                merge::strip_internal_tags(&mut clean_map);
+                let clean_merged = match clean_map {
+                    Value::Mapping(m) => m,
+                    _ => serde_yaml::Mapping::new(),
+                };
                 let values = self
-                    .decode_map(merged)
+                    .decode_map(clean_merged)
                     .map_err(|e| ConfigError::RuntimeConfig(format!("load file: {e}")))?;
                 (values, hash)
             }
             LoaderKind::Yaml => {
-                let root = Value::Mapping(merged);
+                let mut root = Value::Mapping(merged);
+                merge::strip_internal_tags(&mut root);
                 // sha256 of yaml.v3 `yaml.Marshal(mergedConfig)`.
                 let marshalled = crate::yaml_v3_emit::marshal_generic(&Value::Mapping(hash_merged))
                     .map_err(|e| ConfigError::RuntimeConfig(format!("marshal file: {e}")))?;

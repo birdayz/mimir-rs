@@ -13,7 +13,6 @@
 
 use std::io::Read;
 
-use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
 /// True if `v` is what yaml.v3 decodes into `map[string]interface{}`.
@@ -102,34 +101,34 @@ fn json_to_yaml(v: serde_json::Value) -> Value {
     }
 }
 
-/// `yaml.Unmarshal(data, &map[string]any{})`: first document only, top-level keys stringified.
+/// `yaml.Unmarshal(data, &map[string]any{})`: first document only, Go yaml.v3 scalar resolution.
 fn unmarshal_yaml_map(data: &[u8]) -> Result<Mapping, String> {
-    let Some(doc) = serde_yaml::Deserializer::from_slice(data).next() else {
-        return Ok(Mapping::new());
-    };
-    let mut val = Value::deserialize(doc).map_err(|e| format!("yaml: {e}"))?;
-    val.apply_merge().map_err(|e| format!("yaml: {e}"))?;
+    crate::yaml_v3::unmarshal_generic_map(data)
+}
+
+/// Strips internal `!go-timestamp` tags into plain strings for typed struct decoding while
+/// preserving them on the generic map hashed by `yaml_v3_emit::marshal_generic`.
+pub(crate) fn strip_internal_tags(val: &mut Value) {
     match val {
-        Value::Null => Ok(Mapping::new()),
-        Value::Mapping(m) => {
-            let mut out = Mapping::with_capacity(m.len());
-            for (k, v) in m {
-                let key = scalar_key_to_string(&k).ok_or_else(|| {
-                    "yaml: unmarshal errors:\n  invalid map key: non-scalar key".to_string()
-                })?;
-                out.insert(Value::String(key), v);
-            }
-            Ok(out)
+        Value::Tagged(tagged) if tagged.tag == "!go-timestamp" => {
+            let inner = std::mem::replace(&mut tagged.value, Value::Null);
+            *val = inner;
         }
-        other => Err(format!(
-            "yaml: unmarshal errors:\n  cannot unmarshal {} into map[string]interface {{}}",
-            match other {
-                Value::Sequence(_) => "!!seq",
-                Value::Bool(_) => "!!bool",
-                Value::Number(_) => "!!int",
-                _ => "!!str",
+        Value::Tagged(tagged) => strip_internal_tags(&mut tagged.value),
+        Value::Sequence(seq) => {
+            for item in seq {
+                strip_internal_tags(item);
             }
-        )),
+        }
+        Value::Mapping(map) => {
+            let entries: Vec<(Value, Value)> = std::mem::take(map).into_iter().collect();
+            for (mut k, mut v) in entries {
+                strip_internal_tags(&mut k);
+                strip_internal_tags(&mut v);
+                map.insert(k, v);
+            }
+        }
+        _ => {}
     }
 }
 

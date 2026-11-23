@@ -268,6 +268,13 @@ fn marshal_with_parent<'a>(
             }
             events.push(Event::MappingEnd);
         }
+        Value::Tagged(tagged) if tagged.tag == "!go-timestamp" => {
+            if let Value::String(s) = &tagged.value {
+                events.push(scalar(Cow::Borrowed(s.as_str()), ScalarStyle::Plain));
+            } else {
+                marshal(&tagged.value, order, events)?;
+            }
+        }
         Value::Tagged(tagged) => marshal(&tagged.value, order, events)?,
     }
     Ok(())
@@ -1058,10 +1065,16 @@ fn go_hex_float_value(text: &str) -> Option<f64> {
 
 /// resolve.go `parseTimestamp`.
 fn parse_timestamp(s: &str) -> bool {
+    format_timestamp_rfc3339_nano(s).is_some()
+}
+
+/// Parses a YAML 1.1/1.2 timestamp exactly like Go `go.yaml.in/yaml/v3/resolve.go:parseTimestamp`
+/// and returns its canonical Go `time.Time.Format(time.RFC3339Nano)` string.
+pub(crate) fn format_timestamp_rfc3339_nano(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let i = b.iter().take_while(|c| c.is_ascii_digit()).count();
     if i != 4 || i == b.len() || b[i] != b'-' {
-        return false;
+        return None;
     }
     use TimeTok::*;
     const RFC3339_NANO_SHORT: &[TimeTok] = &[
@@ -1109,14 +1122,17 @@ fn parse_timestamp(s: &str) -> bool {
         FracSecond9,
     ];
     const DATE_ONLY: &[TimeTok] = &[LongYear, Lit("-"), NumMonth, Lit("-"), Day];
-    [
+    for layout in [
         RFC3339_NANO_SHORT,
         RFC3339_NANO_SHORT_LOWER_T,
         SPACE_SEPARATED,
         DATE_ONLY,
-    ]
-    .iter()
-    .any(|layout| go_time_parse(layout, b))
+    ] {
+        if let Some(formatted) = go_time_parse_format(layout, b) {
+            return Some(formatted);
+        }
+    }
+    None
 }
 
 /// The `time.Parse` layout elements used by yaml.v3's timestamp formats
@@ -1179,9 +1195,12 @@ fn days_in(month: i32, year: i32) -> i32 {
     }
 }
 
-/// Go `time.Parse(layout, value)` succeeding, for the layout elements in [`TimeTok`].
-fn go_time_parse(layout: &[TimeTok], mut value: &[u8]) -> bool {
+/// Go `time.Parse(layout, value)` formatted via `time.RFC3339Nano`.
+fn go_time_parse_format(layout: &[TimeTok], mut value: &[u8]) -> Option<String> {
     let (mut year, mut month, mut day) = (0i32, -1i32, -1i32);
+    let (mut hour, mut minute, mut second) = (0i32, 0i32, 0i32);
+    let mut frac_digits: &[u8] = b"";
+    let mut tz = String::from("Z");
     for tok in layout {
         let next = match *tok {
             TimeTok::Lit(prefix) => time_skip(value, prefix),
@@ -1189,7 +1208,6 @@ fn go_time_parse(layout: &[TimeTok], mut value: &[u8]) -> bool {
                 if value.len() < 4 || !value[0].is_ascii_digit() {
                     None
                 } else {
-                    // parseTimestamp already checked for four leading digits.
                     year = value[..4]
                         .iter()
                         .fold(0, |acc, c| acc * 10 + i32::from(c.wrapping_sub(b'0')));
@@ -1204,26 +1222,32 @@ fn go_time_parse(layout: &[TimeTok], mut value: &[u8]) -> bool {
                 day = d;
                 rest
             }),
-            TimeTok::Hour => {
-                getnum(value, false).and_then(|(h, rest)| (0..24).contains(&h).then_some(rest))
-            }
-            TimeTok::Minute | TimeTok::Second => {
-                // Every layout here follows seconds with ".999999999", so stdSecond's
-                // fractional-second special case defers to FracSecond9.
-                getnum(value, false).and_then(|(m, rest)| (0..60).contains(&m).then_some(rest))
-            }
+            TimeTok::Hour => getnum(value, false).and_then(|(h, rest)| {
+                hour = h;
+                (0..24).contains(&h).then_some(rest)
+            }),
+            TimeTok::Minute => getnum(value, false).and_then(|(m, rest)| {
+                minute = m;
+                (0..60).contains(&m).then_some(rest)
+            }),
+            TimeTok::Second => getnum(value, false).and_then(|(s, rest)| {
+                second = s;
+                (0..60).contains(&s).then_some(rest)
+            }),
             TimeTok::FracSecond9 => {
                 if value.len() < 2 || !matches!(value[0], b'.' | b',') || !value[1].is_ascii_digit()
                 {
-                    // Fractional second omitted.
                     Some(value)
                 } else {
-                    let n = 1 + value[1..].iter().take_while(|c| c.is_ascii_digit()).count();
-                    Some(&value[n..])
+                    let ndigits = value[1..].iter().take_while(|c| c.is_ascii_digit()).count();
+                    // Go time.Parse stdFracSecond9 consumes all fractional digits and truncates to 9.
+                    frac_digits = &value[1..1 + ndigits.min(9)];
+                    Some(&value[1 + ndigits..])
                 }
             }
             TimeTok::Iso8601ColonTz => {
                 if value.first() == Some(&b'Z') {
+                    tz = String::from("Z");
                     Some(&value[1..])
                 } else if value.len() < 6 || value[3] != b':' {
                     None
@@ -1234,6 +1258,12 @@ fn go_time_parse(layout: &[TimeTok], mut value: &[u8]) -> bool {
                         (Some((hr, _)), Some((mm, _)))
                             if hr <= 24 && mm <= 60 && matches!(value[0], b'+' | b'-') =>
                         {
+                            if hr == 0 && mm == 0 {
+                                tz = String::from("Z");
+                            } else {
+                                let sign = value[0] as char;
+                                tz = format!("{sign}{hr:02}:{mm:02}");
+                            }
                             Some(&value[6..])
                         }
                         _ => None,
@@ -1241,16 +1271,22 @@ fn go_time_parse(layout: &[TimeTok], mut value: &[u8]) -> bool {
                 }
             }
         };
-        match next {
-            Some(rest) => value = rest,
-            None => return false,
-        }
+        value = next?;
     }
-    if !value.is_empty() {
-        // extra text
-        return false;
+    if !value.is_empty() || day < 1 || day > days_in(month, year) {
+        return None;
     }
-    day >= 1 && day <= days_in(month, year)
+    let trimmed = match std::str::from_utf8(frac_digits) {
+        Ok(s) => s.trim_end_matches('0'),
+        Err(_) => "",
+    };
+    if trimmed.is_empty() {
+        Some(format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{tz}"))
+    } else {
+        Some(format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{trimmed}{tz}"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4224,6 +4260,23 @@ r#""1": x
             assert_ne!(go, rust, "case {i} no longer diverges; move it to GO_CASES");
             assert_eq!(marshal_str(input), *rust, "case {i}");
         }
+    }
+
+    #[test]
+    fn yaml_v3_unmarshal_generic_map_eliminates_all_plain_scalar_divergences() {
+        for (i, (input, go, _old_serde_yaml)) in DIVERGENT_CASES.iter().enumerate() {
+            let map = crate::yaml_v3::unmarshal_generic_map(input.as_bytes())
+                .unwrap_or_else(|e| panic!("case {i} parse error: {e}"));
+            let got = marshal_generic(&Value::Mapping(map))
+                .unwrap_or_else(|e| panic!("case {i} marshal error: {e}"));
+            assert_eq!(got, *go, "case {i} mismatch vs Go yaml.v3:\n--- input\n{input}\n--- go\n{go}\n--- rust\n{got}");
+        }
+        // Integers beyond u64 decode as float64 matching Go yaml.v3.
+        let big = crate::yaml_v3::unmarshal_generic_map(b"a: 18446744073709551616\n").unwrap();
+        assert_eq!(
+            marshal_generic(&Value::Mapping(big)).unwrap(),
+            "a: 1.8446744073709552e+19\n"
+        );
     }
 
     #[test]
