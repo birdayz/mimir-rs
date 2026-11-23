@@ -939,6 +939,8 @@ fn test_db_read_only_append_v2() {
     let dir = tempfile::tempdir().unwrap();
     for (mint, maxt) in [(10, 12), (12, 14), (14, 16)] {
         xor_block(dir.path(), mint, maxt, 1, 1);
+        // Ensure distinct ULID millisecond timestamps across consecutive blocks.
+        std::thread::sleep(Duration::from_millis(2));
     }
     let db_w = Tsdb::open(dir.path(), TsdbOptions::default()).unwrap();
     db_w.disable_compactions();

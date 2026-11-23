@@ -582,6 +582,14 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
         Some(r) if !r.is_empty() => format!("HTTP {method} - {r}"),
         _ => format!("HTTP {method}"),
     };
+    let server_timing = if !m.throughput_latency_cutoff.is_zero() {
+        resp.headers()
+            .get("Server-Timing")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    } else {
+        None
+    };
     let inflight = inflight_guard.take();
     let on_done = Box::new(move |_completed: bool| {
         let elapsed = begin.elapsed();
@@ -627,6 +635,22 @@ pub async fn dskit_http_middleware(State(cfg): State<Arc<HttpMiddlewareConfig>>,
         m.request_duration
             .with_label_values(&[&method, &route, &code.to_string(), &ws.to_string()])
             .observe(elapsed.as_secs_f64());
+        if !m.throughput_latency_cutoff.is_zero() && elapsed > m.throughput_latency_cutoff {
+            if let Some(ref st) = server_timing {
+                if let Ok(volume) = super::dskit_mw::extract_value_from_multi_value_header(
+                    st,
+                    &m.throughput_unit,
+                    "val",
+                ) {
+                    let secs = elapsed.as_secs_f64();
+                    if secs > 0.0 {
+                        m.request_throughput
+                            .with_label_values(&[&method, &route])
+                            .observe(volume / secs);
+                    }
+                }
+            }
+        }
         if let Some(g) = inflight {
             g.dec();
         }
@@ -912,7 +936,103 @@ mod tests {
                 }
             }
         }
+    }
 
+    #[tokio::test]
+    async fn dskit_http_middleware_observes_request_throughput_above_cutoff() {
+        use axum::routing::get;
+        use axum::Router;
+        use http_body_util::BodyExt;
+        use prometheus::Registry;
+        use std::time::Duration;
+        use tower::ServiceExt;
 
+        struct NoopLogger;
+        impl Logger for NoopLogger {
+            fn log(&self, _: LogLevel, _: &[(&str, &str)]) {}
+        }
+        let reg = Registry::new();
+        let metrics = ServerMetrics::new_with_throughput(
+            &reg,
+            false,
+            false,
+            "processed_bytes",
+            25,
+        )
+        .unwrap();
+        let cfg = Arc::new(HttpMiddlewareConfig {
+            metrics,
+            logger: Arc::new(NoopLogger),
+            log_request_headers: false,
+            log_request_at_info_level: false,
+            log_source_ips: None,
+            trace_source_ips: None,
+            exclude_headers: Vec::new(),
+            trace_request_headers: false,
+            trace_exclude_headers: Vec::new(),
+            create_new_traces: false,
+            cluster_validation: None,
+            http_path_prefix: String::new(),
+            cost_attribution_path: None,
+            compartments_enabled: false,
+        });
+        let app = Router::new()
+            .route(
+                "/fast",
+                get(|| async {
+                    ([(http::header::HeaderName::from_static("server-timing"), "processed_bytes;val=1000")], "ok")
+                }),
+            )
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    ([(http::header::HeaderName::from_static("server-timing"), "processed_bytes;val=2048")], "ok")
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&cfg),
+                dskit_http_middleware,
+            ));
+
+        // Fast request (< 25ms cutoff) must NOT observe request_throughput.
+        let mut r_fast = Request::builder().method("GET").uri("/fast").body(Body::empty()).unwrap();
+        r_fast.extensions_mut().insert(ServedOverHttp {
+            remote_addr: "127.0.0.1:12345".parse().unwrap(),
+        });
+        let resp_fast = app.clone().oneshot(r_fast).await.unwrap();
+        let _ = resp_fast.into_body().collect().await.unwrap();
+        assert!(
+            reg.gather()
+                .iter()
+                .all(|mf| mf.get_name() != "cortex_request_throughput_processed_bytes"),
+            "fast request below cutoff must not record throughput"
+        );
+
+        // Slow request (> 25ms cutoff) MUST observe request_throughput with cutoff_ms="25", route="slow".
+        let mut r_slow = Request::builder().method("GET").uri("/slow").body(Body::empty()).unwrap();
+        r_slow.extensions_mut().insert(ServedOverHttp {
+            remote_addr: "127.0.0.1:12345".parse().unwrap(),
+        });
+        let resp_slow = app.oneshot(r_slow).await.unwrap();
+        let _ = resp_slow.into_body().collect().await.unwrap();
+        let mfs = reg.gather();
+        let tp = mfs
+            .iter()
+            .find(|mf| mf.get_name() == "cortex_request_throughput_processed_bytes")
+            .expect("expected cortex_request_throughput_processed_bytes metric");
+        assert_eq!(tp.get_help(), "Server throughput of running requests.");
+        assert_eq!(tp.get_metric().len(), 1);
+        let m = &tp.get_metric()[0];
+        assert_eq!(m.get_histogram().get_sample_count(), 1);
+        assert!(m.get_histogram().get_sample_sum() > 0.0);
+        let labels: std::collections::BTreeMap<&str, &str> = m
+            .get_label()
+            .iter()
+            .map(|lp| (lp.get_name(), lp.get_value()))
+            .collect();
+        assert_eq!(labels.get("cutoff_ms"), Some(&"25"));
+        assert_eq!(labels.get("method"), Some(&"GET"));
+        assert_eq!(labels.get("route"), Some(&"slow"));
     }
 }

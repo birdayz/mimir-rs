@@ -472,13 +472,11 @@ fn test_http_config_to_exthttp_default_transport() {
     assert!(exthttp::client_options(&cfg, None).is_ok());
     assert!(exthttp::reqwest_client(&cfg, None, false).is_ok());
 
-    // S3 HttpTransport builds with BucketHTTPConfig (HTTP/1.1; HTTP/2 is explicitly rejected for S3).
-    let mut s3_http = cfg.clone();
-    s3_http.force_attempt_http2 = false;
+    // S3 HttpTransport builds with BucketHTTPConfig including force_attempt_http2: true.
     let s3_cfg = S3Config {
         endpoint: "localhost:9000".into(),
         bucket_name: "bkt".into(),
-        http: s3_http,
+        http: cfg.clone(),
         ..Default::default()
     };
     assert!(S3Bucket::new(&s3_cfg, "test").is_ok());

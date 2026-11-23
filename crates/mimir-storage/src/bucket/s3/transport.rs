@@ -95,6 +95,7 @@ pub(crate) struct SniClientPool {
     idle_conn_timeout: Option<Duration>,
     max_idle_per_host: usize,
     connect_timeout: Option<Duration>,
+    force_attempt_http2: bool,
     clients: Arc<parking_lot::RwLock<std::collections::HashMap<String, reqwest::Client>>>,
 }
 
@@ -111,8 +112,10 @@ impl SniClientPool {
             .tcp_keepalive(DIAL_KEEP_ALIVE)
             .pool_idle_timeout(self.idle_conn_timeout)
             .pool_max_idle_per_host(self.max_idle_per_host)
-            .http1_only()
             .dns_resolver(resolver);
+        if !self.force_attempt_http2 {
+            builder = builder.http1_only();
+        }
         if let Some(t) = self.connect_timeout {
             builder = builder.connect_timeout(t);
         }
@@ -333,10 +336,13 @@ pub(crate) fn new_tls_config(cfg: &BucketHTTPConfig) -> Result<rustls::ClientCon
         .map_err(|e| e.to_string())?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier));
-    let config = match client_cert {
+    let mut config = match client_cert {
         None => builder.with_no_client_auth(),
         Some(r) => builder.with_client_cert_resolver(r),
     };
+    if cfg.force_attempt_http2 {
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    }
     Ok(config)
 }
 
@@ -351,9 +357,6 @@ fn duration_opt(d: Duration) -> Option<Duration> {
 impl HttpTransport {
     /// exthttp `DefaultTransport(config)` wrapped in minio-go's `http.Client`.
     pub fn new(cfg: &BucketHTTPConfig) -> Result<Self, String> {
-        if cfg.force_attempt_http2 {
-            return Err("http.force_attempt_http2 is not supported by mimir-rs for the s3 backend".to_string());
-        }
         let tls = new_tls_config(cfg)?;
         let idle_conn_timeout = duration_opt(Duration::from_nanos(
             cfg.idle_conn_timeout.0.max(0) as u64,
@@ -377,6 +380,7 @@ impl HttpTransport {
                             idle_conn_timeout,
                             max_idle_per_host,
                             connect_timeout,
+                            force_attempt_http2: cfg.force_attempt_http2,
                             clients: Arc::new(parking_lot::RwLock::new(
                                 std::collections::HashMap::new(),
                             )),
@@ -390,8 +394,10 @@ impl HttpTransport {
             .redirect(reqwest::redirect::Policy::none())
             .tcp_keepalive(DIAL_KEEP_ALIVE)
             .pool_idle_timeout(idle_conn_timeout)
-            .pool_max_idle_per_host(max_idle_per_host)
-            .http1_only();
+            .pool_max_idle_per_host(max_idle_per_host);
+        if !cfg.force_attempt_http2 {
+            builder = builder.http1_only();
+        }
         if let Some(t) = connect_timeout {
             builder = builder.connect_timeout(t);
         }
@@ -494,11 +500,13 @@ mod tests {
         assert!(c.client_auth_cert_resolver.has_certs());
         assert!(c.alpn_protocols.is_empty());
         HttpTransport::new(&BucketHTTPConfig::default()).unwrap();
-        assert!(HttpTransport::new(&BucketHTTPConfig {
+        let h2_cfg = BucketHTTPConfig {
             force_attempt_http2: true,
             ..Default::default()
-        })
-        .is_err());
+        };
+        let h2_tls = new_tls_config(&h2_cfg).unwrap();
+        assert_eq!(h2_tls.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        HttpTransport::new(&h2_cfg).unwrap();
     }
 
     #[test]
