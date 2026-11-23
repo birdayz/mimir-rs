@@ -2868,21 +2868,21 @@ impl TsdbReadOnly {
 
     pub fn last_block_id(&self) -> Result<String, TsdbError> {
         self.ensure_open()?;
+        // Go os.ReadDir sorts entries lexicographically by filename and checks `timestamp > maxT`.
+        let mut names: Vec<String> = fs::read_dir(&self.dir)?
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        names.sort();
         let mut max_ts = 0u64;
         let mut last = String::new();
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            let Ok(uid) = Ulid::from_string(name_str) else {
+        for name_str in names {
+            let Ok(uid) = Ulid::from_string(&name_str) else {
                 continue;
             };
             let ts = uid.timestamp_ms();
-            if ts >= max_ts {
+            if ts > max_ts {
                 max_ts = ts;
-                last = name_str.to_string();
+                last = name_str;
             }
         }
         if last.is_empty() {
