@@ -380,6 +380,7 @@ impl Server {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(rpc_workers)
             .thread_name("mimir-rpc")
+            .thread_keep_alive(std::time::Duration::from_secs(300))
             .enable_all()
             .build()
             .context("building mimir-rpc runtime")?;

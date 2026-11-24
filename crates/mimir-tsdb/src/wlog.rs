@@ -116,6 +116,79 @@ pub fn compress_wal_record(
     Ok(out.len() < rec.len())
 }
 
+/// Compresses `rec` and appends the resulting payload (compressed if smaller than `rec`,
+/// otherwise uncompressed `rec`) directly onto `out`, returning `true` if the appended
+/// slice is compressed. Reuses `out`'s capacity across multiple WAL records with zero
+/// per-record heap allocations.
+pub fn compress_wal_record_append(
+    rec: &[u8],
+    compression: WlogCompression,
+    out: &mut Vec<u8>,
+) -> Result<bool, WlogError> {
+    if rec.is_empty() || compression == CompressionType::None {
+        out.extend_from_slice(rec);
+        return Ok(false);
+    }
+
+    let base = out.len();
+    match compression {
+        CompressionType::None => unreachable!(),
+        CompressionType::Snappy => {
+            let max_len = snap::raw::max_compress_len(rec.len());
+            out.resize(base + max_len, 0);
+            let n = TLS_SNAPPY_ENCODER
+                .with(|cell| {
+                    if let Ok(mut enc) = cell.try_borrow_mut() {
+                        enc.compress(rec, &mut out[base..base + max_len])
+                    } else {
+                        snap::raw::Encoder::new().compress(rec, &mut out[base..base + max_len])
+                    }
+                })
+                .map_err(|e| WlogError::Compression(e.to_string()))?;
+            if n < rec.len() {
+                out.truncate(base + n);
+                Ok(true)
+            } else {
+                out.truncate(base);
+                out.extend_from_slice(rec);
+                Ok(false)
+            }
+        }
+        CompressionType::Zstd => {
+            let bound = zstd::zstd_safe::compress_bound(rec.len());
+            out.resize(base + bound, 0);
+            let n = TLS_ZSTD_COMPRESSOR.with(|cell| -> Result<usize, WlogError> {
+                if let Ok(mut slot) = cell.try_borrow_mut() {
+                    if slot.is_none() {
+                        *slot = Some(
+                            zstd::bulk::Compressor::new(3)
+                                .map_err(|e| WlogError::Compression(e.to_string()))?,
+                        );
+                    }
+                    if let Some(comp) = slot.as_mut() {
+                        return comp
+                            .compress_to_buffer(rec, &mut out[base..base + bound])
+                            .map_err(|e| WlogError::Compression(e.to_string()));
+                    }
+                }
+                let mut fallback = zstd::bulk::Compressor::new(3)
+                    .map_err(|e| WlogError::Compression(e.to_string()))?;
+                fallback
+                    .compress_to_buffer(rec, &mut out[base..base + bound])
+                    .map_err(|e| WlogError::Compression(e.to_string()))
+            })?;
+            if n < rec.len() {
+                out.truncate(base + n);
+                Ok(true)
+            } else {
+                out.truncate(base);
+                out.extend_from_slice(rec);
+                Ok(false)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum WlogError {
     #[error("I/O error: {0}")]

@@ -206,7 +206,7 @@ impl FloatHistogramStChunk {
         t: i64,
         fh: &FloatHistogram,
     ) -> Result<AppendFloatHistogramStOutcome, ChunkError> {
-        let mut app = match cached.take() {
+        let app = match cached.take() {
             Some((state, st_enc)) => FloatHistogramStAppender {
                 chunk: self,
                 state,
@@ -338,7 +338,7 @@ impl<'a> FloatHistogramStAppender<'a> {
     }
 
     fn append_float_histogram_with_state(
-        &mut self,
+        mut self,
         prev: Option<&FloatHistogramAppenderState>,
         st: i64,
         t: i64,
@@ -350,10 +350,7 @@ impl<'a> FloatHistogramStAppender<'a> {
     > {
         let (out, next_cached) =
             self.append_float_histogram_inner(prev, st, t, h, append_only, true)?;
-        let cached = match next_cached {
-            Some(c) => c,
-            None => (self.state.clone(), self.st_enc.clone()),
-        };
+        let cached = next_cached.unwrap_or((self.state, self.st_enc));
         Ok((out, cached))
     }
 

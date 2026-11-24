@@ -480,7 +480,7 @@ async fn w34_push_parity_created_ts_bad_utf8_series_str_and_reset_hint_bounds() 
             "t-utf8",
             cortexpb::write_request::SourceEnum::Api,
             ts,
-            &[PrehashedSeriesItem {
+            &mut [PrehashedSeriesItem {
                 encoded_labels: &[],
                 raw_encoded_labels: b"\x08__name__\x0bprehashed_m\x03job\x03a\xffb",
                 samples: &[cortexpb::Sample {
@@ -491,7 +491,7 @@ async fn w34_push_parity_created_ts_bad_utf8_series_str_and_reset_hint_bounds() 
                 prom_hash: 0,
                 labels_sorted_unique: false,
                 bad_utf8: true,
-                histograms: &[],
+                histograms: &mut [],
                 exemplars: &[],
             }],
             &[],

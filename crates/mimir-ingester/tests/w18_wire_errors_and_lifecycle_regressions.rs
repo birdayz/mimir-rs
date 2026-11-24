@@ -633,7 +633,7 @@ async fn w18_wpe_04_empty_value_labels_preserved_in_soft_push_errors_and_rw2() {
         prom_hash: 0,
         labels_sorted_unique: *sorted,
         bad_utf8: *bad,
-        histograms: &[],
+        histograms: &mut [],
         exemplars: &[],
     };
     let err_rw2 = ing
@@ -641,7 +641,7 @@ async fn w18_wpe_04_empty_value_labels_preserved_in_soft_push_errors_and_rw2() {
             "u-e3",
             cortexpb::write_request::SourceEnum::Api,
             *min_ts,
-            &[item],
+            &mut [item],
             &[],
             None,
         )

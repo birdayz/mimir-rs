@@ -2980,6 +2980,12 @@ impl Ingester {
             } else {
                 None
             };
+            // W3-09: match Go `LabelNamesAndValues(ACTIVE, matchers)`: filter postings by
+            // `matchers` first (accelerated by dense bitset), then check if ANY series carrying
+            // the label value is active.
+            let ref_filter = base_refs_arc
+                .as_deref()
+                .map(mimir_tsdb::postings::DenseRefFilter::from_sorted_refs);
             let label_names = match head.label_names(&[]) {
                 Ok(n) => n,
                 Err(e) => {
@@ -2995,28 +3001,45 @@ impl Ingester {
             let mut resp_bytes = 0usize;
             for label_name in label_names {
                 let mut filtered = Vec::new();
-                head.visit_all_values_postings_for_name(&label_name, |val_str, small, large| {
-                    if val_str.is_empty() {
-                        return;
-                    }
-                    let matched = match base_refs_arc.as_deref() {
-                        Some(base) => mimir_tsdb::postings::intersect_sorted_any(small, large, base),
-                        None => !small.is_empty() || !large.is_empty(),
-                    };
-                    if !matched {
-                        return;
-                    }
-                    let is_active = !active_only
-                        || small
-                            .iter()
-                            .any(|&r| db.active_series.is_ref_active_fast(r as u64, i64::MIN))
-                        || large
-                            .iter()
-                            .any(|&r| db.active_series.is_ref_active_fast(r, i64::MIN));
-                    if is_active {
-                        filtered.push(val_str.to_owned());
-                    }
-                });
+                if let Some(ref filter) = ref_filter {
+                    head.visit_matching_values_postings_for_name(
+                        &label_name,
+                        |small, large| {
+                            filter.matches_any(small, large)
+                                && (!active_only
+                                    || small.iter().any(|&r| {
+                                        db.active_series.is_ref_active_fast(r as u64, i64::MIN)
+                                    })
+                                    || large.iter().any(|&r| {
+                                        db.active_series.is_ref_active_fast(r, i64::MIN)
+                                    }))
+                        },
+                        |val_str| {
+                            if !val_str.is_empty() {
+                                filtered.push(val_str.to_owned());
+                            }
+                        },
+                    );
+                } else {
+                    head.visit_matching_values_postings_for_name(
+                        &label_name,
+                        |small, large| {
+                            (!small.is_empty() || !large.is_empty())
+                                && (!active_only
+                                    || small.iter().any(|&r| {
+                                        db.active_series.is_ref_active_fast(r as u64, i64::MIN)
+                                    })
+                                    || large.iter().any(|&r| {
+                                        db.active_series.is_ref_active_fast(r, i64::MIN)
+                                    }))
+                        },
+                        |val_str| {
+                            if !val_str.is_empty() {
+                                filtered.push(val_str.to_owned());
+                            }
+                        },
+                    );
+                }
                 if filtered.is_empty() {
                     continue;
                 }
@@ -3112,6 +3135,12 @@ impl Ingester {
             } else {
                 None
             };
+            // W3-09: match Go `LabelNamesAndValues(ACTIVE, matchers)`: filter postings by
+            // `matchers` first (accelerated by dense bitset), then check if ANY series carrying
+            // the label value is active.
+            let ref_filter = base_refs_arc
+                .as_deref()
+                .map(mimir_tsdb::postings::DenseRefFilter::from_sorted_refs);
 
             let label_names = head
                 .label_names(&[])
@@ -3125,30 +3154,45 @@ impl Ingester {
 
             for label_name in label_names {
                 let mut filtered = Vec::new();
-                head.visit_all_values_postings_for_name(&label_name, |val_str, small, large| {
-                    if val_str.is_empty() {
-                        return;
-                    }
-                    let matched = match base_refs_arc.as_deref() {
-                        Some(base) => {
-                            mimir_tsdb::postings::intersect_sorted_any(small, large, base)
-                        }
-                        None => !small.is_empty() || !large.is_empty(),
-                    };
-                    if !matched {
-                        return;
-                    }
-                    let is_active = !active_only
-                        || small
-                            .iter()
-                            .any(|&r| db.active_series.is_ref_active_fast(r as u64, i64::MIN))
-                        || large
-                            .iter()
-                            .any(|&r| db.active_series.is_ref_active_fast(r, i64::MIN));
-                    if is_active {
-                        filtered.push(val_str.to_owned());
-                    }
-                });
+                if let Some(ref filter) = ref_filter {
+                    head.visit_matching_values_postings_for_name(
+                        &label_name,
+                        |small, large| {
+                            filter.matches_any(small, large)
+                                && (!active_only
+                                    || small.iter().any(|&r| {
+                                        db.active_series.is_ref_active_fast(r as u64, i64::MIN)
+                                    })
+                                    || large.iter().any(|&r| {
+                                        db.active_series.is_ref_active_fast(r, i64::MIN)
+                                    }))
+                        },
+                        |val_str| {
+                            if !val_str.is_empty() {
+                                filtered.push(val_str.to_owned());
+                            }
+                        },
+                    );
+                } else {
+                    head.visit_matching_values_postings_for_name(
+                        &label_name,
+                        |small, large| {
+                            (!small.is_empty() || !large.is_empty())
+                                && (!active_only
+                                    || small.iter().any(|&r| {
+                                        db.active_series.is_ref_active_fast(r as u64, i64::MIN)
+                                    })
+                                    || large.iter().any(|&r| {
+                                        db.active_series.is_ref_active_fast(r, i64::MIN)
+                                    }))
+                        },
+                        |val_str| {
+                            if !val_str.is_empty() {
+                                filtered.push(val_str.to_owned());
+                            }
+                        },
+                    );
+                }
 
                 if filtered.is_empty() {
                     continue;

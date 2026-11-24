@@ -217,7 +217,7 @@ impl FloatHistogramChunk {
         t: i64,
         fh: &FloatHistogram,
     ) -> Result<AppendFloatHistogramOutcome, ChunkError> {
-        let mut app = match state.take() {
+        let app = match state.take() {
             Some(s) => FloatHistogramAppender { chunk: self, state: s },
             None => self.appender()?,
         };
@@ -601,7 +601,7 @@ impl<'a> FloatHistogramAppender<'a> {
     }
 
     fn append_float_histogram_with_state(
-        &mut self,
+        mut self,
         prev: Option<&FloatHistogramAppenderState>,
         st: i64,
         t: i64,
@@ -609,10 +609,7 @@ impl<'a> FloatHistogramAppender<'a> {
         append_only: bool,
     ) -> Result<(AppendFloatHistogramOutcome, FloatHistogramAppenderState), ChunkError> {
         let (out, next_state) = self.append_float_histogram_inner(prev, st, t, h, append_only, true)?;
-        let st_out = match next_state {
-            Some(s) => s,
-            None => self.state.clone(),
-        };
+        let st_out = next_state.unwrap_or(self.state);
         Ok((out, st_out))
     }
 
@@ -770,6 +767,17 @@ pub fn expand_float_spans_and_buckets(
     a_buckets: &[XorValue],
     b_buckets: &[f64],
 ) -> Option<(Vec<Insert>, Vec<Insert>)> {
+    if a == b && a_buckets.len() == b_buckets.len() {
+        let total_len: usize = a.iter().map(|s| s.length as usize).sum();
+        if total_len == a_buckets.len() {
+            for (av, &bv) in a_buckets.iter().zip(b_buckets.iter()) {
+                if av.value > bv {
+                    return None;
+                }
+            }
+            return Some((Vec::new(), Vec::new()));
+        }
+    }
     let mut ai = BucketIterator::new(a);
     let mut bi = BucketIterator::new(b);
 
