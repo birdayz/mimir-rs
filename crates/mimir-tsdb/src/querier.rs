@@ -1976,7 +1976,7 @@ pub fn chunk_to_samples(chunk: &EncodedChunk) -> Result<Vec<DecodedSample>, Chun
 
 const PARALLEL_SORT_THRESHOLD: usize = 16_384;
 
-fn read_sort_pool() -> &'static ScopedWorkerPool {
+pub(crate) fn read_sort_pool() -> &'static ScopedWorkerPool {
     static POOL: OnceLock<ScopedWorkerPool> = OnceLock::new();
     // 3 background workers + calling thread = 4 sort threads.
     POOL.get_or_init(|| ScopedWorkerPool::new("read-sort", 3))
@@ -2251,7 +2251,7 @@ fn merge_sorted_keys_raw(
 /// Sorts `items` in exact `Labels::cmp` lexicographical order, skipping the shared
 /// pair-aligned prefix across all entries, packing a 16-byte `u128` prefix key
 /// for fast comparisons, and sorting in parallel across 4 threads when large.
-fn sort_by_labels<T, F>(items: &mut [T], get_labels: F)
+pub(crate) fn sort_by_labels<T, F>(items: &mut [T], get_labels: F)
 where
     T: Sync,
     F: Fn(&T) -> &Labels + Sync,

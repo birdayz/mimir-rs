@@ -1729,41 +1729,51 @@ where
         let mut batch: Vec<Vec<u8>> = Vec::new();
         let mut batch_bytes = 0usize;
         let mut latest_metadata: HashMap<u64, RefMetadata> = HashMap::new();
+        let mut series_buf = Vec::new();
+        let mut samples_buf = Vec::new();
+        let mut hists_buf = Vec::new();
+        let mut fhists_buf = Vec::new();
+        let mut stones_buf = Vec::new();
+        let mut exs_buf = Vec::new();
+        let mut metas_buf = Vec::new();
 
         while let Some(rec) = reader.next_record()? {
             match dec.record_type(rec) {
                 RecordType::Series => {
-                    let series = dec.series(rec)?;
-                    let n = series.len();
+                    series_buf.clear();
+                    dec.series_into(rec, &mut series_buf)?;
+                    let n = series_buf.len();
                     stats.total_series += n;
-                    let kept: Vec<_> = series.into_iter().filter(|s| keep(s.ref_id)).collect();
-                    stats.dropped_series += n - kept.len();
-                    if !kept.is_empty() {
-                        let encoded = enc.series(&kept, Vec::new());
+                    series_buf.retain(|s| keep(s.ref_id));
+                    stats.dropped_series += n - series_buf.len();
+                    if !series_buf.is_empty() {
+                        let encoded = enc.series(&series_buf, Vec::new());
                         batch_bytes += encoded.len();
                         batch.push(encoded);
                     }
                 }
                 RecordType::Samples | RecordType::SamplesV2 => {
-                    let samples = dec.samples(rec)?;
-                    let n = samples.len();
+                    samples_buf.clear();
+                    dec.samples_into(rec, &mut samples_buf)?;
+                    let n = samples_buf.len();
                     stats.total_samples += n;
-                    let kept: Vec<_> = samples.into_iter().filter(|s| s.t >= mint).collect();
-                    stats.dropped_samples += n - kept.len();
-                    if !kept.is_empty() {
-                        let encoded = enc.samples(&kept, Vec::new());
+                    samples_buf.retain(|s| s.t >= mint);
+                    stats.dropped_samples += n - samples_buf.len();
+                    if !samples_buf.is_empty() {
+                        let encoded = enc.samples(&samples_buf, Vec::new());
                         batch_bytes += encoded.len();
                         batch.push(encoded);
                     }
                 }
                 RecordType::HistogramSamples | RecordType::HistogramSamplesV2 => {
-                    let hists = dec.histogram_samples(rec)?;
-                    let n = hists.len();
+                    hists_buf.clear();
+                    dec.histogram_samples_into(rec, &mut hists_buf)?;
+                    let n = hists_buf.len();
                     stats.total_samples += n;
-                    let kept: Vec<_> = hists.into_iter().filter(|h| h.t >= mint).collect();
-                    stats.dropped_samples += n - kept.len();
-                    if !kept.is_empty() {
-                        let (encoded, leftover) = enc.histogram_samples(&kept, Vec::new());
+                    hists_buf.retain(|h| h.t >= mint);
+                    stats.dropped_samples += n - hists_buf.len();
+                    if !hists_buf.is_empty() {
+                        let (encoded, leftover) = enc.histogram_samples(&hists_buf, Vec::new());
                         if !encoded.is_empty() {
                             batch_bytes += encoded.len();
                             batch.push(encoded);
@@ -1776,26 +1786,29 @@ where
                     }
                 }
                 RecordType::CustomBucketsHistogramSamples => {
-                    let hists = dec.histogram_samples(rec)?;
-                    let n = hists.len();
+                    hists_buf.clear();
+                    dec.histogram_samples_into(rec, &mut hists_buf)?;
+                    let n = hists_buf.len();
                     stats.total_samples += n;
-                    let kept: Vec<_> = hists.into_iter().filter(|h| h.t >= mint).collect();
-                    stats.dropped_samples += n - kept.len();
-                    if !kept.is_empty() {
-                        let refs: Vec<_> = kept.iter().collect();
+                    hists_buf.retain(|h| h.t >= mint);
+                    stats.dropped_samples += n - hists_buf.len();
+                    if !hists_buf.is_empty() {
+                        let refs: Vec<_> = hists_buf.iter().collect();
                         let encoded = enc.custom_buckets_histogram_samples(&refs, Vec::new());
                         batch_bytes += encoded.len();
                         batch.push(encoded);
                     }
                 }
                 RecordType::FloatHistogramSamples | RecordType::FloatHistogramSamplesV2 => {
-                    let hists = dec.float_histogram_samples(rec)?;
-                    let n = hists.len();
+                    fhists_buf.clear();
+                    dec.float_histogram_samples_into(rec, &mut fhists_buf)?;
+                    let n = fhists_buf.len();
                     stats.total_samples += n;
-                    let kept: Vec<_> = hists.into_iter().filter(|h| h.t >= mint).collect();
-                    stats.dropped_samples += n - kept.len();
-                    if !kept.is_empty() {
-                        let (encoded, leftover) = enc.float_histogram_samples(&kept, Vec::new());
+                    fhists_buf.retain(|h| h.t >= mint);
+                    stats.dropped_samples += n - fhists_buf.len();
+                    if !fhists_buf.is_empty() {
+                        let (encoded, leftover) =
+                            enc.float_histogram_samples(&fhists_buf, Vec::new());
                         if !encoded.is_empty() {
                             batch_bytes += encoded.len();
                             batch.push(encoded);
@@ -1809,13 +1822,14 @@ where
                     }
                 }
                 RecordType::CustomBucketsFloatHistogramSamples => {
-                    let hists = dec.float_histogram_samples(rec)?;
-                    let n = hists.len();
+                    fhists_buf.clear();
+                    dec.float_histogram_samples_into(rec, &mut fhists_buf)?;
+                    let n = fhists_buf.len();
                     stats.total_samples += n;
-                    let kept: Vec<_> = hists.into_iter().filter(|h| h.t >= mint).collect();
-                    stats.dropped_samples += n - kept.len();
-                    if !kept.is_empty() {
-                        let refs: Vec<_> = kept.iter().collect();
+                    fhists_buf.retain(|h| h.t >= mint);
+                    stats.dropped_samples += n - fhists_buf.len();
+                    if !fhists_buf.is_empty() {
+                        let refs: Vec<_> = fhists_buf.iter().collect();
                         let encoded =
                             enc.custom_buckets_float_histogram_samples(&refs, Vec::new());
                         batch_bytes += encoded.len();
@@ -1823,36 +1837,36 @@ where
                     }
                 }
                 RecordType::Tombstones => {
-                    let stones = dec.tombstones(rec)?;
-                    let n = stones.len();
+                    stones_buf.clear();
+                    dec.tombstones_into(rec, &mut stones_buf)?;
+                    let n = stones_buf.len();
                     stats.total_tombstones += n;
-                    let kept: Vec<_> = stones
-                        .into_iter()
-                        .filter(|s| keep(s.ref_id) && s.maxt >= mint)
-                        .collect();
-                    stats.dropped_tombstones += n - kept.len();
-                    if !kept.is_empty() {
-                        let encoded = enc.tombstones(&kept, Vec::new());
+                    stones_buf.retain(|s| keep(s.ref_id) && s.maxt >= mint);
+                    stats.dropped_tombstones += n - stones_buf.len();
+                    if !stones_buf.is_empty() {
+                        let encoded = enc.tombstones(&stones_buf, Vec::new());
                         batch_bytes += encoded.len();
                         batch.push(encoded);
                     }
                 }
                 RecordType::Exemplars => {
-                    let exs = dec.exemplars(rec)?;
-                    let n = exs.len();
+                    exs_buf.clear();
+                    dec.exemplars_into(rec, &mut exs_buf)?;
+                    let n = exs_buf.len();
                     stats.total_exemplars += n;
-                    let kept: Vec<_> = exs.into_iter().filter(|e| e.t >= mint).collect();
-                    stats.dropped_exemplars += n - kept.len();
-                    if !kept.is_empty() {
-                        let encoded = enc.exemplars(&kept, Vec::new());
+                    exs_buf.retain(|e| e.t >= mint);
+                    stats.dropped_exemplars += n - exs_buf.len();
+                    if !exs_buf.is_empty() {
+                        let encoded = enc.exemplars(&exs_buf, Vec::new());
                         batch_bytes += encoded.len();
                         batch.push(encoded);
                     }
                 }
                 RecordType::Metadata => {
-                    let metas = dec.metadata(rec)?;
-                    stats.total_metadata += metas.len();
-                    for m in metas {
+                    metas_buf.clear();
+                    dec.metadata_into(rec, &mut metas_buf)?;
+                    stats.total_metadata += metas_buf.len();
+                    for m in metas_buf.drain(..) {
                         if keep(m.ref_id) {
                             if latest_metadata.insert(m.ref_id, m).is_some() {
                                 stats.dropped_metadata += 1;

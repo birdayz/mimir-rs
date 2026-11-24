@@ -773,6 +773,20 @@ impl HeadChunksWriter {
         self.cut_on_next_chunk = true;
     }
 
+    /// Flushes and closes the active segment file if it has at least `min_bytes` written so
+    /// `HeadChunksReader` can mmap it read-only (avoiding per-chunk `pread()` syscalls during
+    /// head compaction). The next write automatically creates segment `seq + 1`.
+    pub fn seal_active_file_if_at_least(
+        &mut self,
+        min_bytes: usize,
+    ) -> Result<bool, HeadChunksError> {
+        if self.closed || self.cur_file.is_none() || self.offset < min_bytes {
+            return Ok(false);
+        }
+        self.finalize_current()?;
+        Ok(true)
+    }
+
     pub fn current_seq(&self) -> usize {
         self.seq
     }
@@ -2380,8 +2394,7 @@ impl ChunkDiskMapper {
         off: usize,
         active_file: &ActiveReadFile,
     ) -> Result<EncodedChunk, HeadChunksError> {
-        const HDR_PREFIX_LEN: usize =
-            SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE + CHUNK_ENCODING_SIZE + MAX_CHUNK_LENGTH_FIELD_SIZE;
+        const STACK_READ_LEN: usize = 512;
         let chk_start = off
             .checked_add(SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE)
             .ok_or_else(|| HeadChunksError::Corruption {
@@ -2389,8 +2402,10 @@ impl ChunkDiskMapper {
                 file_index: seq as i64,
                 message: "chunk offset overflow".to_string(),
             })?;
-        let mut hdr = [0u8; HDR_PREFIX_LEN];
-        let hdr_read = active_file.read_at_all(&mut hdr, off as u64)?;
+        // Single 512-byte stack pread covers 99.9% of float XOR chunks in 1 syscall with zero
+        // fstat() and zero intermediate heap buffer allocation.
+        let mut stack_buf = [0u8; STACK_READ_LEN];
+        let hdr_read = active_file.read_at_all(&mut stack_buf, off as u64)?;
         let min_hdr_for_len = SERIES_REF_SIZE + 2 * MINT_MAXT_SIZE + MAX_CHUNK_LENGTH_FIELD_SIZE;
         if hdr_read < min_hdr_for_len {
             return Err(HeadChunksError::Corruption {
@@ -2400,7 +2415,7 @@ impl ChunkDiskMapper {
             });
         }
         let rel_enc = chk_start - off;
-        let raw_enc = hdr[rel_enc] & !OUT_OF_ORDER_MASK;
+        let raw_enc = stack_buf[rel_enc] & !OUT_OF_ORDER_MASK;
         let encoding = Encoding::from_u8(raw_enc).map_err(|_| HeadChunksError::Corruption {
             dir: dir.to_path_buf(),
             file_index: seq as i64,
@@ -2408,7 +2423,7 @@ impl ChunkDiskMapper {
         })?;
         let rel_len = rel_enc + CHUNK_ENCODING_SIZE;
         let (data_len, ulen) = decode_uvarint(
-            &hdr[rel_len..hdr_read.min(rel_len + MAX_CHUNK_LENGTH_FIELD_SIZE)],
+            &stack_buf[rel_len..hdr_read.min(rel_len + MAX_CHUNK_LENGTH_FIELD_SIZE)],
         )
         .ok_or_else(|| HeadChunksError::Corruption {
             dir: dir.to_path_buf(),
@@ -2442,27 +2457,30 @@ impl ChunkDiskMapper {
                 file_index: seq as i64,
                 message: "chunk data length overflow".to_string(),
             })?;
-        let file_len = active_file.file_len()?;
-        let abs_end = (off as u64)
-            .checked_add(rel_chk_end as u64)
-            .ok_or_else(|| HeadChunksError::Corruption {
-                dir: dir.to_path_buf(),
-                file_index: seq as i64,
-                message: "chunk data length overflow".to_string(),
-            })?;
-        if abs_end > file_len {
-            return Err(HeadChunksError::Corruption {
-                dir: dir.to_path_buf(),
-                file_index: seq as i64,
-                message: "not enough bytes to read chunk data and CRC".to_string(),
-            });
-        }
-        let mut buf = vec![0u8; rel_chk_end];
-        let copy_len = hdr_read.min(rel_chk_end);
-        buf[..copy_len].copy_from_slice(&hdr[..copy_len]);
-        if rel_chk_end > hdr_read {
+
+        let mut heap_buf;
+        let full: &[u8] = if rel_chk_end <= hdr_read {
+            &stack_buf[..rel_chk_end]
+        } else {
+            let file_len = active_file.file_len()?;
+            let abs_end = (off as u64)
+                .checked_add(rel_chk_end as u64)
+                .ok_or_else(|| HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "chunk data length overflow".to_string(),
+                })?;
+            if abs_end > file_len {
+                return Err(HeadChunksError::Corruption {
+                    dir: dir.to_path_buf(),
+                    file_index: seq as i64,
+                    message: "not enough bytes to read chunk data and CRC".to_string(),
+                });
+            }
+            heap_buf = vec![0u8; rel_chk_end];
+            heap_buf[..hdr_read].copy_from_slice(&stack_buf[..hdr_read]);
             let tail_read =
-                active_file.read_at_all(&mut buf[hdr_read..], (off + hdr_read) as u64)?;
+                active_file.read_at_all(&mut heap_buf[hdr_read..], (off + hdr_read) as u64)?;
             if hdr_read + tail_read < rel_chk_end {
                 return Err(HeadChunksError::Corruption {
                     dir: dir.to_path_buf(),
@@ -2470,14 +2488,15 @@ impl ChunkDiskMapper {
                     message: "not enough bytes to read chunk data and CRC".to_string(),
                 });
             }
-        }
+            &heap_buf
+        };
         let expected_crc = u32::from_be_bytes([
-            buf[rel_data_end],
-            buf[rel_data_end + 1],
-            buf[rel_data_end + 2],
-            buf[rel_data_end + 3],
+            full[rel_data_end],
+            full[rel_data_end + 1],
+            full[rel_data_end + 2],
+            full[rel_data_end + 3],
         ]);
-        let actual_crc = crc32c::crc32c(&buf[..rel_data_end]);
+        let actual_crc = crc32c::crc32c(&full[..rel_data_end]);
         if actual_crc != expected_crc {
             return Err(HeadChunksError::Corruption {
                 dir: dir.to_path_buf(),
@@ -2487,7 +2506,7 @@ impl ChunkDiskMapper {
                 ),
             });
         }
-        EncodedChunk::from_bytes(encoding, buf[rel_data_start..rel_data_end].to_vec()).map_err(
+        EncodedChunk::from_bytes(encoding, full[rel_data_start..rel_data_end].to_vec()).map_err(
             |e| HeadChunksError::Corruption {
                 dir: dir.to_path_buf(),
                 file_index: seq as i64,

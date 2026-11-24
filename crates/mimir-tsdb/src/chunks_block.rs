@@ -7,6 +7,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::{Mmap, MmapOptions};
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::chunkenc::{
@@ -195,7 +196,7 @@ impl BlockChunksWriter {
 
         let mut batch_size: usize = 0;
         let mut batch_start: usize = 0;
-        let mut batches: Vec<std::ops::Range<usize>> = Vec::with_capacity(1);
+        let mut batches: SmallVec<[std::ops::Range<usize>; 2]> = SmallVec::new();
         batches.push(0..0);
         let mut first_batch = true;
 
@@ -251,9 +252,8 @@ impl BlockChunksWriter {
                 chk.ref_id = BlockChunkRef::new(seg_idx, self.pos as u32).as_u64();
 
                 let ulen = put_uvarint(&mut len_buf, data.len() as u64);
-                let enc_byte = [encoded.encoding().as_u8()];
-                let crc = crc32c::crc32c(&enc_byte);
-                let crc = crc32c::crc32c_append(crc, data);
+                let enc_u8 = encoded.encoding().as_u8();
+                let crc = crc32c::crc32c_append(crc32c::crc32c(&[enc_u8]), data);
 
                 let w = self.cur_writer.as_mut().ok_or_else(|| {
                     BlockChunksError::Io(io::Error::new(
@@ -261,10 +261,22 @@ impl BlockChunksWriter {
                         "chunk writer is closed",
                     ))
                 })?;
-                w.write_all(&len_buf[..ulen])?;
-                w.write_all(&enc_byte)?;
-                w.write_all(data)?;
-                w.write_all(&crc.to_be_bytes())?;
+                let total_len = ulen + CHUNK_ENCODING_SIZE + data.len() + CRC_SIZE;
+                if total_len <= 528 {
+                    let mut staged = [0u8; 528];
+                    staged[..ulen].copy_from_slice(&len_buf[..ulen]);
+                    staged[ulen] = enc_u8;
+                    let data_start = ulen + CHUNK_ENCODING_SIZE;
+                    let data_end = data_start + data.len();
+                    staged[data_start..data_end].copy_from_slice(data);
+                    staged[data_end..total_len].copy_from_slice(&crc.to_be_bytes());
+                    w.write_all(&staged[..total_len])?;
+                } else {
+                    len_buf[ulen] = enc_u8;
+                    w.write_all(&len_buf[..ulen + CHUNK_ENCODING_SIZE])?;
+                    w.write_all(data)?;
+                    w.write_all(&crc.to_be_bytes())?;
+                }
 
                 self.pos += ulen + CHUNK_ENCODING_SIZE + data.len() + CRC_SIZE;
             }

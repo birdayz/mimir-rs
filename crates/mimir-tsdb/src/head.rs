@@ -1180,49 +1180,102 @@ impl SeriesState {
         }
 
         let mut head_chks = Vec::with_capacity(self.head_chunks_len());
-        let mut push_hc = |hc_chunk: EncodedChunk, hc_min: i64, hc_max: i64| -> Result<(), HeadError> {
-            let num_s = hc_chunk.num_samples();
-            let stop_after = match use_iso {
-                Some(info) => tx_stop_after_for_chunk(tx_ring, info, total_samples, prev_samples, num_s),
-                None => num_s,
-            };
-            prev_samples += num_s;
-            if hc_min <= maxt_inclusive && mint <= hc_max && stop_after > 0 {
-                if stop_after < num_s {
-                    if let Some((sliced, smint, smaxt)) = slice_chunk_prefix(&hc_chunk, stop_after)? {
-                        if smint <= maxt_inclusive && mint <= smaxt {
-                            head_chks.push(ChunkMeta {
-                                ref_id: in_order_pos,
-                                min_time: smint,
-                                max_time: smaxt,
-                                chunk: Some(sliced),
-                            });
-                            in_order_pos += 1;
-                        }
+        let mut push_hc =
+            |num_s: usize, hc_min: i64, hc_max: i64, mk_chunk: &dyn Fn() -> EncodedChunk| -> Result<(), HeadError> {
+                let stop_after = match use_iso {
+                    Some(info) => {
+                        tx_stop_after_for_chunk(tx_ring, info, total_samples, prev_samples, num_s)
                     }
-                } else {
-                    head_chks.push(ChunkMeta {
-                        ref_id: in_order_pos,
-                        min_time: hc_min,
-                        max_time: hc_max,
-                        chunk: Some(hc_chunk),
-                    });
-                    in_order_pos += 1;
+                    None => num_s,
+                };
+                prev_samples += num_s;
+                if hc_min <= maxt_inclusive && mint <= hc_max && stop_after > 0 {
+                    let hc_chunk = mk_chunk();
+                    if stop_after < num_s {
+                        if let Some((sliced, smint, smaxt)) =
+                            slice_chunk_prefix(&hc_chunk, stop_after)?
+                        {
+                            if smint <= maxt_inclusive && mint <= smaxt {
+                                head_chks.push(ChunkMeta {
+                                    ref_id: in_order_pos,
+                                    min_time: smint,
+                                    max_time: smaxt,
+                                    chunk: Some(sliced),
+                                });
+                                in_order_pos += 1;
+                            }
+                        }
+                    } else {
+                        head_chks.push(ChunkMeta {
+                            ref_id: in_order_pos,
+                            min_time: hc_min,
+                            max_time: hc_max,
+                            chunk: Some(hc_chunk),
+                        });
+                        in_order_pos += 1;
+                    }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
         if let Some(ref c) = self.cold {
             for hc in &c.extra_head_chunks {
-                push_hc(hc.chunk.clone(), hc.min_time, hc.max_time)?;
+                push_hc(hc.chunk.num_samples(), hc.min_time, hc.max_time, &|| {
+                    hc.chunk.clone()
+                })?;
             }
         }
         let enc = self.active_encoding();
         if enc != Encoding::None {
-            let chunk = EncodedChunk::from_bstream(enc, self.active_bstream.clone());
-            push_hc(chunk, self.active_min_time, self.active_max_time())?;
+            push_hc(
+                self.active_chunk_num_samples(),
+                self.active_min_time,
+                self.active_max_time(),
+                &|| EncodedChunk::from_bstream(enc, self.active_bstream.clone()),
+            )?;
         }
         Ok((mmapped_in_order, head_chks))
+    }
+
+    /// Zero-allocation in-order chunk collector for compaction (no tx isolation): pushes overlapping
+    /// mmapped refs directly into `pending_mmapped` and clones ONLY overlapping head chunks into `out_chunks`.
+    fn collect_in_order_chunks_no_iso_into(
+        &self,
+        mint: i64,
+        maxt_inclusive: i64,
+        slot: usize,
+        pending_mmapped: &mut Vec<(usize, MmappedChunk)>,
+        out_chunks: &mut Vec<ChunkMeta>,
+    ) {
+        for mc in self.mmapped() {
+            if mc.overlaps_closed_interval(mint, maxt_inclusive) {
+                pending_mmapped.push((slot, *mc));
+            }
+        }
+        if let Some(ref c) = self.cold {
+            for hc in &c.extra_head_chunks {
+                if hc.min_time <= maxt_inclusive && mint <= hc.max_time {
+                    out_chunks.push(ChunkMeta {
+                        ref_id: 0,
+                        min_time: hc.min_time,
+                        max_time: hc.max_time,
+                        chunk: Some(hc.chunk.clone()),
+                    });
+                }
+            }
+        }
+        let enc = self.active_encoding();
+        if enc != Encoding::None {
+            let hc_min = self.active_min_time;
+            let hc_max = self.active_max_time();
+            if hc_min <= maxt_inclusive && mint <= hc_max {
+                out_chunks.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: hc_min,
+                    max_time: hc_max,
+                    chunk: Some(EncodedChunk::from_bstream(enc, self.active_bstream.clone())),
+                });
+            }
+        }
     }
 }
 
@@ -9119,6 +9172,122 @@ impl Head {
     }
 
     /// Collects lightweight `(ref_id, Labels)` candidates for streaming head compaction over `[mint, maxt_inclusive]`.
+    /// Collects `Arc<SeriesEntry>` compaction candidates overlapping `[mint, maxt_inclusive]`
+    /// directly without cloning `Labels` or forcing per-series `series.get_by_id` hash lookups.
+    /// Seals the active `chunks_head` segment file if it has >= 1 MiB written and refreshes
+    /// `chunk_reader` so compaction reads those chunks from zero-copy `Mmap` instead of per-chunk
+    /// `pread()` syscalls. Lock order: `chunk_writer` -> `chunk_reader`.
+    fn seal_active_chunks_head_for_compaction(&self) {
+        let mut wg = self.chunk_writer.lock();
+        if let Some(ref mut writer) = *wg {
+            if matches!(writer.seal_active_file_if_at_least(1024 * 1024), Ok(true)) {
+                let _ = self.refresh_chunk_reader_with_active(None);
+            }
+        }
+    }
+
+    pub fn collect_compaction_candidate_entries(
+        &self,
+        mint: i64,
+        maxt_inclusive: i64,
+    ) -> Result<Vec<Arc<SeriesEntry>>, HeadError> {
+        self.seal_active_chunks_head_for_compaction();
+        let has_tombs = self.tombstones.has_any();
+        let mut tombs_buf = Vec::new();
+        let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
+        let mut out = Vec::with_capacity(self.num_series() as usize);
+
+        for stripe in &self.series.stripes {
+            stripe_buf.clear();
+            StripeSeries::collect_stripe_into(stripe, &mut stripe_buf);
+            for entry in stripe_buf.drain(..) {
+                let has_overlap = {
+                    let st = entry.inner.lock();
+                    if !has_tombs {
+                        st.mmapped()
+                            .iter()
+                            .any(|mc| mc.overlaps_closed_interval(mint, maxt_inclusive))
+                            || st.any_head_chunk_bounds(|hc_min, hc_max| {
+                                hc_min <= maxt_inclusive && mint <= hc_max
+                            })
+                    } else {
+                        self.tombstones.get_into(entry.ref_id, &mut tombs_buf);
+                        st.mmapped().iter().any(|mc| {
+                            mc.overlaps_closed_interval(mint, maxt_inclusive)
+                                && !is_completely_deleted(&tombs_buf, mc.min_time, mc.max_time)
+                        }) || st.any_head_chunk_bounds(|hc_min, hc_max| {
+                            hc_min <= maxt_inclusive
+                                && mint <= hc_max
+                                && !is_completely_deleted(&tombs_buf, hc_min, hc_max)
+                        })
+                    }
+                };
+                if has_overlap {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-loads in-order chunks overlapping `[mint, maxt_inclusive]` and tombstones for a slice
+    /// of pre-resolved `SeriesEntry` handles, acquiring `self.chunk_reader.read()` at most ONCE per
+    /// batch (after dropping all `entry.inner` locks to preserve strict lock ordering) and avoiding
+    /// per-series `series.get_by_id` stripe locks & hash lookups.
+    pub fn load_entries_batch_in_order_chunks_into(
+        &self,
+        entries: &[Arc<SeriesEntry>],
+        mint: i64,
+        maxt_inclusive: i64,
+        out: &mut [(Vec<ChunkMeta>, Vec<Interval>)],
+    ) -> Result<(), HeadError> {
+        let mut pending_mmapped: Vec<(usize, MmappedChunk)> = Vec::with_capacity(entries.len() * 2);
+        let has_tombs = self.tombstones.has_any();
+
+        for (slot, entry) in entries.iter().enumerate() {
+            let (out_chunks, out_tombs) = &mut out[slot];
+            out_chunks.clear();
+            out_tombs.clear();
+
+            {
+                let st = entry.inner.lock();
+                if entry.is_gced() {
+                    continue;
+                }
+                st.collect_in_order_chunks_no_iso_into(
+                    mint,
+                    maxt_inclusive,
+                    slot,
+                    &mut pending_mmapped,
+                    out_chunks,
+                );
+            }
+            if has_tombs {
+                self.tombstones.get_into(entry.ref_id, out_tombs);
+            }
+        }
+
+        if !pending_mmapped.is_empty() {
+            if self.is_closed() {
+                return Err(HeadChunksError::Closed.into());
+            }
+            let chunk_reader_guard = self.chunk_reader.read();
+            let Some(r) = chunk_reader_guard.as_ref() else {
+                return Err(HeadChunksError::Closed.into());
+            };
+            for (slot, mc) in pending_mmapped {
+                let enc = r.chunk(mc.ref_id)?;
+                out[slot].0.push(ChunkMeta {
+                    ref_id: mc.ref_id.as_u64(),
+                    min_time: mc.min_time,
+                    max_time: mc.max_time,
+                    chunk: Some(enc),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn collect_compaction_candidates(
         &self,
         mint: i64,

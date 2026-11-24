@@ -2161,6 +2161,29 @@ pub fn trim_and_merge_chunks(
         return Ok(Vec::new());
     }
 
+    // Fast path for the 99% head-compaction case: no tombstones, every chunk already
+    // strictly inside [mint, maxt_inclusive], sorted, and non-overlapping.
+    if tombstones.is_empty() {
+        let mut all_clean = true;
+        let mut prev_max = i64::MIN;
+        for (i, c) in chunks.iter().enumerate() {
+            if c.min_time < mint
+                || c.max_time > maxt_inclusive
+                || (i > 0 && c.min_time <= prev_max)
+            {
+                all_clean = false;
+                break;
+            }
+            prev_max = c.max_time;
+        }
+        if all_clean {
+            for c in &mut chunks {
+                compact_chunk_in_place(c);
+            }
+            return Ok(chunks);
+        }
+    }
+
     // Drop chunks completely outside [mint, maxt_inclusive] or completely covered by tombstones.
     chunks.retain(|c| {
         c.overlaps_closed_interval(mint, maxt_inclusive)
@@ -2172,7 +2195,9 @@ pub fn trim_and_merge_chunks(
         return Ok(Vec::new());
     }
 
-    chunks.sort_by_key(|c| (c.min_time, c.ref_id));
+    if chunks.len() > 1 {
+        chunks.sort_by_key(|c| (c.min_time, c.ref_id));
+    }
 
     let mut out = Vec::with_capacity(chunks.len());
     let mut cluster: Vec<ChunkMeta> = Vec::new();
@@ -2275,28 +2300,97 @@ where
 /// Like [`write_head_block_streaming`], accepting an explicit `maxt_inclusive` bound (so
 /// `i64::MAX` samples are never dropped) and optional `CompactorMetrics`, and deferring
 /// `.tmp-for-creation` directory creation until the first surviving series with chunks.
+fn sort_and_dedup_candidates<T, RefFn, LblFn>(
+    candidates: &mut Vec<T>,
+    get_ref: RefFn,
+    get_labels: LblFn,
+) where
+    T: Sync,
+    RefFn: Fn(&T) -> u64,
+    LblFn: Fn(&T) -> &Labels + Sync,
+{
+    crate::querier::sort_by_labels(candidates, &get_labels);
+    // Preserve exact tie-breaking by ref_id for any synthetic inputs with equal labels.
+    let mut i = 0usize;
+    while i + 1 < candidates.len() {
+        if get_labels(&candidates[i]) == get_labels(&candidates[i + 1]) {
+            let mut end = i + 2;
+            while end < candidates.len() && get_labels(&candidates[end]) == get_labels(&candidates[i])
+            {
+                end += 1;
+            }
+            candidates[i..end].sort_unstable_by_key(&get_ref);
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    candidates.dedup_by_key(|c| get_ref(c));
+}
+
+fn collect_sorted_symbols<'a, T, LblFn>(slice: &'a [T], get_labels: LblFn) -> Vec<&'a str>
+where
+    LblFn: Fn(&T) -> &Labels,
+{
+    let mut sym_set: hashbrown::HashSet<&'a str> =
+        hashbrown::HashSet::with_capacity(slice.len().min(65536));
+    sym_set.insert("");
+    // `slice` is already sorted by Labels, so adjacent series share ~80% of label names and
+    // values at identical positions; skip HashSet hashing whenever a pair matches the previous series.
+    let mut prev_pairs: smallvec::SmallVec<[(&'a str, &'a str); 24]> = smallvec::SmallVec::new();
+    for item in slice {
+        let mut idx = 0usize;
+        for (k, v) in get_labels(item).iter() {
+            if let Some(prev) = prev_pairs.get_mut(idx) {
+                if prev.0 != k {
+                    prev.0 = k;
+                    sym_set.insert(k);
+                }
+                if prev.1 != v {
+                    prev.1 = v;
+                    sym_set.insert(v);
+                }
+            } else {
+                prev_pairs.push((k, v));
+                sym_set.insert(k);
+                sym_set.insert(v);
+            }
+            idx += 1;
+        }
+        prev_pairs.truncate(idx);
+    }
+    let mut symbols: Vec<&'a str> = sym_set.into_iter().collect();
+    symbols.sort_unstable();
+    symbols
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn write_head_block_streaming_with_options<F>(
+fn write_head_block_streaming_core<T, RefFn, LblFn, BatchLoadFn>(
     dest: &Path,
     mint: i64,
     maxt: i64,
     maxt_inclusive: i64,
-    mut candidates: Vec<(u64, Labels)>,
+    mut candidates: Vec<T>,
     compaction: BlockMetaCompaction,
     out_of_order: bool,
     segment_size: usize,
     metrics: Option<&CompactorMetrics>,
-    mut load_series_chunks: F,
+    batch_size: usize,
+    get_ref: RefFn,
+    get_labels: LblFn,
+    mut load_batch: BatchLoadFn,
 ) -> Result<Option<BlockMeta>, CompactError>
 where
-    F: FnMut(u64, &mut Vec<ChunkMeta>, &mut Vec<Interval>) -> Result<(), CompactError>,
+    T: Sync,
+    RefFn: Fn(&T) -> u64,
+    LblFn: Fn(&T) -> &Labels + Sync,
+    BatchLoadFn: FnMut(&[T], &mut [(Vec<ChunkMeta>, Vec<Interval>)]) -> Result<(), CompactError>,
 {
     if maxt < mint || maxt_inclusive < mint || candidates.is_empty() {
         return Ok(None);
     }
 
-    candidates.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    candidates.dedup_by_key(|a| a.0);
+    sort_and_dedup_candidates(&mut candidates, &get_ref, &get_labels);
 
     let uid = Ulid::new();
     let final_dir = dest.join(uid.to_string());
@@ -2311,92 +2405,94 @@ where
     let write_res = (|| -> Result<Option<BlockMeta>, CompactError> {
         let mut writers: Option<(BlockChunksWriter, IndexWriter)> = None;
         let mut stats = BlockStats::default();
-        let mut chks_buf: Vec<ChunkMeta> = Vec::with_capacity(4);
-        let mut tombs_buf: Vec<Interval> = Vec::with_capacity(2);
+        let eff_batch = batch_size.max(1);
+        let mut batch_bufs: Vec<(Vec<ChunkMeta>, Vec<Interval>)> = (0..eff_batch)
+            .map(|_| (Vec::with_capacity(4), Vec::with_capacity(2)))
+            .collect();
         let mut series_idx = 0u64;
 
-        for (idx, (ref_id, labels)) in candidates.iter().enumerate() {
-            chks_buf.clear();
-            tombs_buf.clear();
-            load_series_chunks(*ref_id, &mut chks_buf, &mut tombs_buf)?;
-            if chks_buf.is_empty() {
-                continue;
-            }
-            let mut trimmed = trim_and_merge_chunks(
-                std::mem::take(&mut chks_buf),
-                &tombs_buf,
-                mint,
-                maxt_inclusive,
-                DEFAULT_SAMPLES_PER_CHUNK,
-            )?;
-            if trimmed.is_empty() {
-                chks_buf = trimmed;
-                continue;
-            }
+        let mut base = 0usize;
+        while base < candidates.len() {
+            let end = (base + eff_batch).min(candidates.len());
+            let slice = &candidates[base..end];
+            let bufs = &mut batch_bufs[..slice.len()];
+            load_batch(slice, bufs)?;
 
-            let (chunkw, indexw) = match writers {
-                Some(ref mut w) => w,
-                None => {
-                    if tmp_dir.exists() {
-                        fs::remove_dir_all(&tmp_dir)?;
+            for (local_i, item) in slice.iter().enumerate() {
+                let (chks_buf, tombs_buf) = &mut bufs[local_i];
+                if chks_buf.is_empty() {
+                    continue;
+                }
+                let mut trimmed = trim_and_merge_chunks(
+                    std::mem::take(chks_buf),
+                    tombs_buf,
+                    mint,
+                    maxt_inclusive,
+                    DEFAULT_SAMPLES_PER_CHUNK,
+                )?;
+                if trimmed.is_empty() {
+                    *chks_buf = trimmed;
+                    continue;
+                }
+
+                let (chunkw, indexw) = match writers {
+                    Some(ref mut w) => w,
+                    None => {
+                        let global_idx = base + local_i;
+                        if tmp_dir.exists() {
+                            fs::remove_dir_all(&tmp_dir)?;
+                        }
+                        fs::create_dir_all(&tmp_dir)?;
+                        let seg_sz = if segment_size == 0 {
+                            DEFAULT_CHUNK_SEGMENT_SIZE
+                        } else {
+                            segment_size
+                        };
+                        let cw =
+                            BlockChunksWriter::with_segment_size(tmp_dir.join("chunks"), seg_sz)?;
+                        let mut iw = IndexWriter::new(tmp_dir.join(INDEX_FILENAME))?;
+
+                        let symbols =
+                            collect_sorted_symbols(&candidates[global_idx..], &get_labels);
+                        for sym in symbols {
+                            iw.add_symbol(sym)?;
+                        }
+                        writers.insert((cw, iw))
                     }
-                    fs::create_dir_all(&tmp_dir)?;
-                    let seg_sz = if segment_size == 0 {
-                        DEFAULT_CHUNK_SEGMENT_SIZE
-                    } else {
-                        segment_size
-                    };
-                    let cw = BlockChunksWriter::with_segment_size(tmp_dir.join("chunks"), seg_sz)?;
-                    let mut iw = IndexWriter::new(tmp_dir.join(INDEX_FILENAME))?;
+                };
 
-                    let mut sym_set: hashbrown::HashSet<&str> =
-                        hashbrown::HashSet::with_capacity((candidates.len() - idx).min(65536));
-                    sym_set.insert("");
-                    for (_, lbls) in &candidates[idx..] {
-                        for (k, v) in lbls.iter() {
-                            sym_set.insert(k);
-                            sym_set.insert(v);
+                chunkw.write_chunks(&mut trimmed)?;
+                indexw.add_series(series_idx, get_labels(item), &trimmed)?;
+                series_idx += 1;
+
+                stats.num_series += 1;
+                stats.num_chunks += trimmed.len() as u64;
+                for chk in &trimmed {
+                    if let Some(ref enc) = chk.chunk {
+                        let n = enc.num_samples() as u64;
+                        stats.num_samples += n;
+                        if observe_l1_chunks {
+                            if let Some(m) = metrics {
+                                m.chunk_size.observe(enc.as_bytes().len() as f64);
+                                m.chunk_samples.observe(n as f64);
+                                m.chunk_range
+                                    .observe((chk.max_time as i128 - chk.min_time as i128) as f64);
+                            }
+                        }
+                        match enc.encoding() {
+                            Encoding::Xor | Encoding::Xor2 => stats.num_float_samples += n,
+                            Encoding::Histogram
+                            | Encoding::FloatHistogram
+                            | Encoding::HistogramSt
+                            | Encoding::FloatHistogramSt => stats.num_histogram_samples += n,
+                            Encoding::None => {}
                         }
                     }
-                    let mut symbols: Vec<&str> = sym_set.into_iter().collect();
-                    symbols.sort_unstable();
-                    for sym in symbols {
-                        iw.add_symbol(sym)?;
-                    }
-                    writers.insert((cw, iw))
                 }
-            };
-
-            chunkw.write_chunks(&mut trimmed)?;
-            indexw.add_series(series_idx, labels, &trimmed)?;
-            series_idx += 1;
-
-            stats.num_series += 1;
-            stats.num_chunks += trimmed.len() as u64;
-            for chk in &trimmed {
-                if let Some(ref enc) = chk.chunk {
-                    let n = enc.num_samples() as u64;
-                    stats.num_samples += n;
-                    if observe_l1_chunks {
-                        if let Some(m) = metrics {
-                            m.chunk_size.observe(enc.as_bytes().len() as f64);
-                            m.chunk_samples.observe(n as f64);
-                            m.chunk_range
-                                .observe((chk.max_time as i128 - chk.min_time as i128) as f64);
-                        }
-                    }
-                    match enc.encoding() {
-                        Encoding::Xor | Encoding::Xor2 => stats.num_float_samples += n,
-                        Encoding::Histogram
-                        | Encoding::FloatHistogram
-                        | Encoding::HistogramSt
-                        | Encoding::FloatHistogramSt => stats.num_histogram_samples += n,
-                        Encoding::None => {}
-                    }
-                }
+                trimmed.clear();
+                *chks_buf = trimmed;
             }
-            trimmed.clear();
-            chks_buf = trimmed;
+            base = end;
         }
 
         let Some((chunkw, indexw)) = writers else {
@@ -2450,6 +2546,86 @@ where
         let _ = fs::remove_dir_all(&tmp_dir);
     }
     write_res
+}
+
+/// Like [`write_head_block_streaming`], accepting an explicit `maxt_inclusive` bound (so
+/// `i64::MAX` samples are never dropped) and optional `CompactorMetrics`, and deferring
+/// `.tmp-for-creation` directory creation until the first surviving series with chunks.
+#[allow(clippy::too_many_arguments)]
+pub fn write_head_block_streaming_with_options<F>(
+    dest: &Path,
+    mint: i64,
+    maxt: i64,
+    maxt_inclusive: i64,
+    candidates: Vec<(u64, Labels)>,
+    compaction: BlockMetaCompaction,
+    out_of_order: bool,
+    segment_size: usize,
+    metrics: Option<&CompactorMetrics>,
+    mut load_series_chunks: F,
+) -> Result<Option<BlockMeta>, CompactError>
+where
+    F: FnMut(u64, &mut Vec<ChunkMeta>, &mut Vec<Interval>) -> Result<(), CompactError>,
+{
+    write_head_block_streaming_core(
+        dest,
+        mint,
+        maxt,
+        maxt_inclusive,
+        candidates,
+        compaction,
+        out_of_order,
+        segment_size,
+        metrics,
+        1,
+        |(ref_id, _)| *ref_id,
+        |(_, labels)| labels,
+        |slice, bufs| {
+            let (chks, tombs) = &mut bufs[0];
+            chks.clear();
+            tombs.clear();
+            load_series_chunks(slice[0].0, chks, tombs)
+        },
+    )
+}
+
+/// Fast path for head compaction taking pre-resolved `Arc<SeriesEntry>` candidates and a
+/// batched chunk loader (avoiding per-series `series.get_by_id` lookups and acquiring
+/// `head.chunk_reader.read()` once per 256 series).
+#[allow(clippy::too_many_arguments)]
+pub fn write_head_block_streaming_entries_with_options<F>(
+    dest: &Path,
+    mint: i64,
+    maxt: i64,
+    maxt_inclusive: i64,
+    candidates: Vec<std::sync::Arc<crate::head::SeriesEntry>>,
+    compaction: BlockMetaCompaction,
+    out_of_order: bool,
+    segment_size: usize,
+    metrics: Option<&CompactorMetrics>,
+    load_batch: F,
+) -> Result<Option<BlockMeta>, CompactError>
+where
+    F: FnMut(
+        &[std::sync::Arc<crate::head::SeriesEntry>],
+        &mut [(Vec<ChunkMeta>, Vec<Interval>)],
+    ) -> Result<(), CompactError>,
+{
+    write_head_block_streaming_core(
+        dest,
+        mint,
+        maxt,
+        maxt_inclusive,
+        candidates,
+        compaction,
+        out_of_order,
+        segment_size,
+        metrics,
+        256,
+        |entry| entry.ref_id,
+        |entry| &entry.labels,
+        load_batch,
+    )
 }
 
 fn trim_and_merge_chunks_per_chunk(
@@ -3402,8 +3578,8 @@ impl BlockWriter {
             return Ok(None);
         }
         let maxt = maxt_incl.saturating_add(1);
-        let candidates = self.head.collect_compaction_candidates(mint, maxt_incl)?;
-        let meta_opt = write_head_block_streaming_with_options(
+        let candidates = self.head.collect_compaction_candidate_entries(mint, maxt_incl)?;
+        let meta_opt = write_head_block_streaming_entries_with_options(
             &self.dest_dir,
             mint,
             maxt,
@@ -3413,9 +3589,9 @@ impl BlockWriter {
             false,
             0,
             None,
-            |ref_id, chks, tombs| {
+            |entries, bufs| {
                 self.head
-                    .load_series_in_order_chunks_into(ref_id, mint, maxt_incl, chks, tombs)
+                    .load_entries_batch_in_order_chunks_into(entries, mint, maxt_incl, bufs)
                     .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
             },
         )?;
