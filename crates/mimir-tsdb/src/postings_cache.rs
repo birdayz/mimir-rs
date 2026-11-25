@@ -252,9 +252,17 @@ struct InFlightKey {
     key_bytes: Box<[u8]>,
 }
 
+/// Singleflight slot storing lazily computed Prometheus `StableHash` values aligned 1:1 with a
+/// cached `PostingsForMatchersCache` postings slice. Dropped automatically when the cache entry
+/// expires, is evicted, or its source is removed (zero `Weak` pinning).
+pub type ShardHashSlot = Arc<Mutex<Option<Option<Arc<[u64]>>>>>;
+
+/// Upper bound on postings length eligible for shared shard-hash caching (<= 4 MiB).
+pub const MAX_SHARD_HASH_CACHE_REFS: usize = 524_288;
+
 struct InFlightState {
     done: bool,
-    result: Option<Arc<[u64]>>,
+    result: Option<(Arc<[u64]>, Option<ShardHashSlot>)>,
 }
 
 struct InFlightCall {
@@ -273,14 +281,14 @@ impl InFlightCall {
         }
     }
 
-    fn complete(&self, res: Option<Arc<[u64]>>) {
+    fn complete(&self, res: Option<(Arc<[u64]>, Option<ShardHashSlot>)>) {
         let mut g = self.state.lock();
         g.result = res;
         g.done = true;
         self.cvar.notify_all();
     }
 
-    fn wait(&self) -> Option<Arc<[u64]>> {
+    fn wait(&self) -> Option<(Arc<[u64]>, Option<ShardHashSlot>)> {
         let mut g = self.state.lock();
         while !g.done {
             g = cvar_wait(&self.cvar, g);
@@ -313,6 +321,7 @@ struct CacheEntry {
     is_per_metric: bool,
     key_bytes: Box<[u8]>,
     postings: Arc<[u64]>,
+    shard_hashes: Option<ShardHashSlot>,
     size_bytes: usize,
     inserted_at: Instant,
 }
@@ -728,6 +737,23 @@ impl PostingsForMatchersCache {
     where
         F: FnOnce() -> Result<Vec<u64>, E>,
     {
+        self.get_or_compute_with_shard_slot_for_source(source_id, matchers, concurrent, compute)
+            .map(|(postings, _)| postings)
+    }
+
+    /// Like `get_or_compute_for_source`, also returning the cache entry's singleflight
+    /// `ShardHashSlot` when `concurrent` is true and `postings.len() <= MAX_SHARD_HASH_CACHE_REFS`.
+    /// The slot shares the cache entry's exact TTL / eviction / invalidation lifecycle.
+    pub fn get_or_compute_with_shard_slot_for_source<F, E>(
+        &self,
+        source_id: u64,
+        matchers: &[LabelMatcher],
+        concurrent: bool,
+        compute: F,
+    ) -> Result<(Arc<[u64]>, Option<ShardHashSlot>), E>
+    where
+        F: FnOnce() -> Result<Vec<u64>, E>,
+    {
         if let Some(ref m) = self.metrics {
             m.requests.inc();
         }
@@ -739,7 +765,7 @@ impl PostingsForMatchersCache {
             if let Some(ref m) = self.metrics {
                 m.skips_ineligible.inc();
             }
-            return compute().map(Arc::from);
+            return compute().map(|v| (Arc::from(v), None));
         }
 
         self.expire();
@@ -763,13 +789,18 @@ impl PostingsForMatchersCache {
                     if let Some(ref m) = self.metrics {
                         m.hits.inc();
                     }
-                    return Ok(Arc::clone(&entry.postings));
+                    let slot = if concurrent {
+                        entry.shard_hashes.clone()
+                    } else {
+                        None
+                    };
+                    return Ok((Arc::clone(&entry.postings), slot));
                 }
                 drop(inner);
                 if let Some(ref m) = self.metrics {
                     m.skips_stale.inc();
                 }
-                return compute().map(Arc::from);
+                return compute().map(|v| (Arc::from(v), None));
             }
         }
 
@@ -802,6 +833,14 @@ impl PostingsForMatchersCache {
 
                 let vec = compute()?;
                 let arc: Arc<[u64]> = Arc::from(vec);
+                let shard_slot = if concurrent
+                    && !arc.is_empty()
+                    && arc.len() <= MAX_SHARD_HASH_CACHE_REFS
+                {
+                    Some(Arc::new(Mutex::new(None)))
+                } else {
+                    None
+                };
                 let (ver_after, _) = self.version_for_matchers(source_id, matchers);
 
                 if ver_after == ver_before {
@@ -813,26 +852,29 @@ impl PostingsForMatchersCache {
                             is_per_metric,
                             guard.key.key_bytes.clone(),
                             Arc::clone(&arc),
+                            shard_slot.clone(),
                         );
                     }
                     guard.map.lock().remove(&guard.key);
-                    guard.call.complete(Some(Arc::clone(&arc)));
+                    guard
+                        .call
+                        .complete(Some((Arc::clone(&arc), shard_slot.clone())));
                     guard.completed = true;
                 } else {
                     guard.map.lock().remove(&guard.key);
                     guard.call.complete(None);
                     guard.completed = true;
                 }
-                return Ok(arc);
+                return Ok((arc, shard_slot));
             }
         };
 
         if let Some(call) = existing_call {
-            if let Some(arc) = call.wait() {
+            if let Some((arc, slot)) = call.wait() {
                 if let Some(ref m) = self.metrics {
                     m.hits.inc();
                 }
-                return Ok(arc);
+                return Ok((arc, if concurrent { slot } else { None }));
             }
         }
 
@@ -841,7 +883,7 @@ impl PostingsForMatchersCache {
         if let Some(ref m) = self.metrics {
             m.skips_stale.inc();
         }
-        compute().map(Arc::from)
+        compute().map(|v| (Arc::from(v), None))
     }
 
     /// Bounded read-side TTL & size expiration matching Go `PostingsForMatchersCache.expire()`.
@@ -894,9 +936,11 @@ impl PostingsForMatchersCache {
         is_per_metric: bool,
         key_bytes: Box<[u8]>,
         postings: Arc<[u64]>,
+        shard_hashes: Option<ShardHashSlot>,
     ) {
-        let size_bytes =
-            key_bytes.len() + postings.len() * std::mem::size_of::<u64>() + std::mem::size_of::<CacheEntry>();
+        let size_bytes = key_bytes.len()
+            + postings.len() * std::mem::size_of::<u64>()
+            + (std::mem::size_of::<CacheEntry>() - std::mem::size_of::<Option<ShardHashSlot>>());
         if self.config.max_items == 0 || size_bytes > self.config.max_bytes {
             return;
         }
@@ -943,6 +987,7 @@ impl PostingsForMatchersCache {
                 is_per_metric,
                 key_bytes,
                 postings,
+                shard_hashes,
                 size_bytes,
                 inserted_at: now,
             },

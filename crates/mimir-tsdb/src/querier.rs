@@ -54,6 +54,8 @@ pub enum QuerierError {
     Closed,
     #[error("cost sampling unsupported")]
     CostSamplingUnsupported,
+    #[error("invalid query shard: index {idx} out of {count}")]
+    InvalidShard { idx: u64, count: u64 },
 }
 
 /// A queried series yielding decoded samples in `[mint, maxt]`.
@@ -75,7 +77,7 @@ pub struct QueryChunkSeries {
 /// directly from `BlockChunksReader` without decoding `IndexReader::series` a second time.
 #[derive(Clone, Debug)]
 pub struct LazyBlockChunkRef {
-    pub block_idx: u16,
+    pub block_idx: u32,
     pub series_ref: u64,
     pub chunk_ref: u64,
     pub min_time: i64,
@@ -83,6 +85,7 @@ pub struct LazyBlockChunkRef {
     pub has_tombstones: bool,
 }
 
+/// Phase 2 chunk backing source for a `LazySeriesEntry`.
 #[derive(Clone, Debug)]
 pub enum LazyChunkSource {
     Head(u64),
@@ -327,7 +330,9 @@ pub(crate) fn snapshot_query_sources_with_lock(
 #[derive(Clone, Debug)]
 pub struct PreparedChunkSelect {
     pub head_refs: Option<Arc<[u64]>>,
+    head_shard_hashes: Option<crate::postings_cache::ShardHashSlot>,
     pub block_refs: Vec<(Arc<Block>, Arc<[u64]>)>,
+    block_shard_hashes: Vec<Option<crate::postings_cache::ShardHashSlot>>,
     overlapping_blocks: Vec<Arc<Block>>,
     pub mint: i64,
     pub maxt: i64,
@@ -709,20 +714,29 @@ impl<'a> TsdbQuerier<'a> {
             None => (None, None, false),
         };
         let head = head_guard.as_ref().and(self.head);
-        let head_refs = match head {
-            Some(h) => Some(h.postings_for_matchers_with_concurrent(matchers, self.concurrent)?),
-            None => None,
+        let (head_refs, head_shard_hashes) = match head {
+            Some(h) => {
+                let (refs, slot) =
+                    h.postings_for_matchers_with_shard_slot(matchers, self.concurrent)?;
+                (Some(refs), slot)
+            }
+            None => (None, None),
         };
         let mut block_refs = Vec::with_capacity(blocks.len());
+        let mut block_shard_hashes = Vec::with_capacity(blocks.len());
         for blk in &blocks {
-            let refs = blk.postings_for_matchers_with_concurrent(matchers, self.concurrent)?;
+            let (refs, slot) =
+                blk.postings_for_matchers_with_shard_slot(matchers, self.concurrent)?;
             if !refs.is_empty() {
                 block_refs.push((Arc::clone(blk), refs));
+                block_shard_hashes.push(slot);
             }
         }
         Ok(PreparedChunkSelect {
             head_refs,
+            head_shard_hashes,
             block_refs,
+            block_shard_hashes,
             overlapping_blocks: blocks,
             _block_guards: block_guards,
             _head_guard: head_guard,
@@ -1121,6 +1135,11 @@ impl<'a> TsdbQuerier<'a> {
     where
         F: FnMut(LazyStreamEvent<'_>) -> Result<bool, QuerierError>,
     {
+        if let Some((idx, count)) = shard {
+            if count == 0 || idx >= count {
+                return Err(QuerierError::InvalidShard { idx, count });
+            }
+        }
         if !self.blocks_match_prepared(&prepared)? {
             let unordered = prepared.unordered;
             drop(prepared);
@@ -1168,7 +1187,7 @@ impl<'a> TsdbQuerier<'a> {
                         _ => refs.len(),
                     };
                     let cached_head_hashes = if shard.is_some() {
-                        h.shard_hashes_for_postings(&refs)
+                        h.resolve_shard_hashes_in_slot(&refs, prepared.head_shard_hashes.as_ref())
                     } else {
                         None
                     };
@@ -1235,7 +1254,7 @@ impl<'a> TsdbQuerier<'a> {
                 None
             };
             if order.is_none() && sort_series && entries.len() > 1 {
-                sort_by_labels(&mut entries, get_head_lbls);
+                entries.sort_unstable_by(|a, b| get_head_lbls(a).cmp(get_head_lbls(b)));
             }
 
             if let Some(ref ord) = order {
@@ -1263,70 +1282,141 @@ impl<'a> TsdbQuerier<'a> {
             }
 
             if let Some(h) = head {
+                // Strict 3-pass Phase 2 batching preserving C2 lock ordering and zero lock-held
+                // backpressure:
+                //   Pass A: snapshot each series under `entry.inner` ONLY (no `chunk_reader` lock)
+                //   Pass B: acquire leaf `chunk_reader.read()` once for all mmapped chunks in batch,
+                //           then DROP it immediately before any retry or callback
+                //   Pass C: emit `on_event` with ZERO TSDB locks held
                 const READER_BATCH: usize = 64;
+                enum HeadBatchItem {
+                    Ready(Vec<ChunkMeta>),
+                    NeedsRead {
+                        ref_id: u64,
+                        entry: Option<Arc<SeriesEntry>>,
+                        snap: HeadChunkSnapshot,
+                        mmapped: Vec<(u64, crate::head::MmappedChunk, Option<usize>)>,
+                        head_chks: Vec<ChunkMeta>,
+                    },
+                    Retry {
+                        ref_id: u64,
+                        entry: Option<Arc<SeriesEntry>>,
+                        snap: Option<HeadChunkSnapshot>,
+                    },
+                }
+
                 let total = entries.len();
+                let mut batch: Vec<(usize, HeadBatchItem)> = Vec::with_capacity(READER_BATCH);
                 let mut pos = 0usize;
                 while pos < total {
                     let end = (pos + READER_BATCH).min(total);
-                    let mut guard = Some(h.read_chunk_reader_guard());
+                    batch.clear();
+                    let mut any_mmapped = false;
+
+                    // Pass A: snapshot under `entry.inner` with NO `chunk_reader` guard held.
                     for series_idx in pos..end {
                         let e_idx = order.as_ref().map_or(series_idx, |o| o[series_idx] as usize);
                         let entry = &mut entries[e_idx];
                         let r = entry.ref_id;
                         let head_entry = entry.entry.take();
                         let snap = entry.snapshot.take();
-                        let chks = match snap {
-                            Some(HeadChunkSnapshot::Precomputed(chks)) => chks,
-                            Some(snap) => {
-                                let fast = guard
-                                    .as_ref()
-                                    .and_then(|g| g.as_ref())
-                                    .map(|reader| {
-                                        h.try_series_final_chunks_from_snapshot_with_reader(
-                                            head_entry.as_deref(),
-                                            r,
-                                            &snap,
-                                            tx_iso,
-                                            reader,
-                                        )
-                                    })
-                                    .transpose()?
-                                    .flatten();
-                                match fast {
-                                    Some(c) => c,
-                                    None => {
-                                        drop(guard.take());
-                                        let c = h.series_final_chunks_from_snapshot_with_tx_isolation(
-                                            head_entry.as_deref(),
-                                            r,
-                                            snap,
-                                            tx_iso,
-                                        )?;
-                                        guard = Some(h.read_chunk_reader_guard());
-                                        c
+                        let item = match snap {
+                            Some(HeadChunkSnapshot::Precomputed(chks)) => {
+                                HeadBatchItem::Ready(chks)
+                            }
+                            Some(HeadChunkSnapshot::InOrderByMinTime(min_times)) => {
+                                match h.snapshot_in_order_chunks_for_entry(
+                                    head_entry.as_deref(),
+                                    r,
+                                    &min_times,
+                                    tx_iso,
+                                )? {
+                                    None => HeadBatchItem::Ready(Vec::new()),
+                                    Some((mmapped, head_chks)) if mmapped.is_empty() => {
+                                        HeadBatchItem::Ready(head_chks)
+                                    }
+                                    Some((mmapped, head_chks)) => {
+                                        any_mmapped = true;
+                                        HeadBatchItem::NeedsRead {
+                                            ref_id: r,
+                                            entry: head_entry,
+                                            snap: HeadChunkSnapshot::InOrderByMinTime(min_times),
+                                            mmapped,
+                                            head_chks,
+                                        }
                                     }
                                 }
                             }
-                            None => match head_entry {
-                                Some(ref he) => {
-                                    drop(guard.take());
-                                    let c = h.series_final_chunks_for_entry_with_tx_isolation(
-                                        he, mint, maxt, head_iso, tx_iso,
-                                    )?;
-                                    guard = Some(h.read_chunk_reader_guard());
-                                    c
-                                }
-                                None => {
-                                    drop(guard.take());
-                                    let c = h.series_final_chunks_only_with_tx_isolation(
-                                        r, mint, maxt, head_iso, tx_iso,
-                                    )?;
-                                    guard = Some(h.read_chunk_reader_guard());
-                                    c
-                                }
+                            None => HeadBatchItem::Retry {
+                                ref_id: r,
+                                entry: head_entry,
+                                snap: None,
                             },
                         };
-                        drop(head_entry);
+                        batch.push((series_idx, item));
+                    }
+
+                    // Pass B: acquire leaf `chunk_reader.read()` once (NO `entry.inner` lock),
+                    // decode all mmapped chunks, then drop guard before any fallback or callback.
+                    if any_mmapped {
+                        let guard = h.read_chunk_reader_guard();
+                        if let Some(reader) = guard.as_ref() {
+                            for (_, item) in &mut batch {
+                                if let HeadBatchItem::NeedsRead {
+                                    mmapped, head_chks, ..
+                                } = item
+                                {
+                                    if let Some(chks) = h.decode_mmapped_plan_with_reader(
+                                        mmapped, head_chks, reader,
+                                    )? {
+                                        *item = HeadBatchItem::Ready(chks);
+                                    }
+                                }
+                            }
+                        } else {
+                            drop(guard);
+                            return Err(QuerierError::Head(crate::head::HeadError::from(crate::head_chunks::HeadChunksError::Closed)));
+                        }
+                        drop(guard);
+                    }
+
+                    // Pass C: resolve any rotated/fallback items (no guard held) and emit `on_event`
+                    // with ZERO TSDB locks held.
+                    for (series_idx, item) in batch.drain(..) {
+                        let chks = match item {
+                            HeadBatchItem::Ready(c) => c,
+                            HeadBatchItem::NeedsRead {
+                                ref_id,
+                                entry,
+                                snap,
+                                ..
+                            } => h.series_final_chunks_from_snapshot_with_tx_isolation(
+                                entry.as_deref(),
+                                ref_id,
+                                snap,
+                                tx_iso,
+                            )?,
+                            HeadBatchItem::Retry {
+                                ref_id,
+                                entry,
+                                snap,
+                            } => match snap {
+                                Some(s) => h.series_final_chunks_from_snapshot_with_tx_isolation(
+                                    entry.as_deref(),
+                                    ref_id,
+                                    s,
+                                    tx_iso,
+                                )?,
+                                None => match entry {
+                                    Some(ref he) => h.series_final_chunks_for_entry_with_tx_isolation(
+                                        he, mint, maxt, head_iso, tx_iso,
+                                    )?,
+                                    None => h.series_final_chunks_only_with_tx_isolation(
+                                        ref_id, mint, maxt, head_iso, tx_iso,
+                                    )?,
+                                },
+                            },
+                        };
                         if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
                             return Ok(());
                         }
@@ -1382,7 +1472,7 @@ impl<'a> TsdbQuerier<'a> {
                 block_min_time: 0,
             };
             let cached_head_hashes = if shard.is_some() {
-                h.shard_hashes_for_postings(&refs)
+                h.resolve_shard_hashes_in_slot(&refs, prepared.head_shard_hashes.as_ref())
             } else {
                 None
             };
@@ -1432,7 +1522,11 @@ impl<'a> TsdbQuerier<'a> {
             let idx = blk.index();
             let tombr = blk.tombstones();
             let blk_has_any_tombs = tombr.has_any();
-            let blk_u16 = b_idx as u16;
+            let blk_u32 = u32::try_from(b_idx).map_err(|_| {
+                QuerierError::Index(IndexError::Corrupt(format!(
+                    "overlapping block index {b_idx} exceeds u32::MAX"
+                )))
+            })?;
             let mut stats = BlockSelectStats {
                 selected_postings: refs.len() as u64,
                 series: 0,
@@ -1441,7 +1535,8 @@ impl<'a> TsdbQuerier<'a> {
                 block_min_time: blk.min_time(),
             };
             let cached_shard_hashes = if shard.is_some() {
-                blk.shard_hashes_for_postings(refs)?
+                let slot = prepared.block_shard_hashes.get(b_idx).and_then(|s| s.as_ref());
+                blk.resolve_shard_hashes_in_slot(refs, slot)?
             } else {
                 None
             };
@@ -1484,7 +1579,7 @@ impl<'a> TsdbQuerier<'a> {
                         partial_tomb = true;
                     }
                     local_chks.push(LazyBlockChunkRef {
-                        block_idx: blk_u16,
+                        block_idx: blk_u32,
                         series_ref: r,
                         chunk_ref: cm.ref_id,
                         min_time: cm.min_time,
@@ -1512,73 +1607,33 @@ impl<'a> TsdbQuerier<'a> {
         }
         self.record_select_stats(head_stats, &block_stats, &empty_block_min_times);
 
-        let load_resolved_chunks = |head_ref: Option<u64>,
-                                    head_entry: Option<&SeriesEntry>,
-                                    mut head_snap: Option<HeadChunkSnapshot>,
-                                    block_chks: &[LazyBlockChunkRef],
-                                    head_guard: &mut Option<
-                                        parking_lot::RwLockReadGuard<
-                                            'a,
-                                            Option<crate::head_chunks::HeadChunksReader>,
-                                        >,
-                                    >|
+        let combine_head_and_blocks = |head_chks: Vec<ChunkMeta>,
+                                       block_chks: &[LazyBlockChunkRef]|
          -> Result<Vec<ChunkMeta>, QuerierError> {
-            let mut head_items: Vec<(ChunkMeta, Vec<Interval>)> = Vec::new();
+            let mut head_items: Vec<(ChunkMeta, Vec<Interval>)> =
+                Vec::with_capacity(head_chks.len());
+            for c in head_chks {
+                head_items.push((c, Vec::new()));
+            }
             let mut block_items: Vec<(ChunkMeta, Vec<Interval>)> =
                 Vec::with_capacity(block_chks.len());
-            if let (Some(h), Some(r)) = (head, head_ref) {
-                let chks = match head_snap.take() {
-                    Some(HeadChunkSnapshot::Precomputed(chks)) => chks,
-                    Some(snap) => {
-                        let fast = head_guard
-                            .as_ref()
-                            .and_then(|g| g.as_ref())
-                            .map(|reader| {
-                                h.try_series_final_chunks_from_snapshot_with_reader(
-                                    head_entry, r, &snap, tx_iso, reader,
-                                )
-                            })
-                            .transpose()?
-                            .flatten();
-                        match fast {
-                            Some(c) => c,
-                            None => {
-                                // Drop the shared RwLockReadGuard BEFORE re-entering the retry
-                                // path so a waiting writer cannot deadlock `parking_lot::RwLock`.
-                                let had_guard = head_guard.take().is_some();
-                                let c = h.series_final_chunks_from_snapshot_with_tx_isolation(
-                                    head_entry, r, snap, tx_iso,
-                                )?;
-                                if had_guard {
-                                    *head_guard = Some(h.read_chunk_reader_guard());
-                                }
-                                c
-                            }
-                        }
-                    }
-                    None => {
-                        let had_guard = head_guard.take().is_some();
-                        let c = h.series_final_chunks_only_with_tx_isolation(
-                            r, mint, maxt, head_iso, tx_iso,
-                        )?;
-                        if had_guard {
-                            *head_guard = Some(h.read_chunk_reader_guard());
-                        }
-                        c
-                    }
-                };
-                for c in chks {
-                    head_items.push((c, Vec::new()));
-                }
-            }
             for bc in block_chks {
                 let blk = &blocks[bc.block_idx as usize];
-                let enc = blk.chunks().chunk(bc.chunk_ref)?;
-                let tombs = if bc.has_tombstones {
+                // Always re-check `has_any()` (1 ns atomic load) in Phase 2 so concurrent
+                // `Block::delete` mutations between Pass 1 and Phase 2 cannot emit deleted samples.
+                let tombs = if bc.has_tombstones || blk.tombstones().has_any() {
                     blk.tombstones().get(bc.series_ref)
                 } else {
                     Vec::new()
                 };
+                if !tombs.is_empty()
+                    && tombs
+                        .iter()
+                        .any(|iv| iv.is_subrange(bc.min_time, bc.max_time))
+                {
+                    continue;
+                }
+                let enc = blk.chunks().chunk(bc.chunk_ref)?;
                 block_items.push((
                     ChunkMeta {
                         ref_id: bc.chunk_ref,
@@ -1599,12 +1654,6 @@ impl<'a> TsdbQuerier<'a> {
             } else {
                 let mut all_chks = merge_chunks_with_tombstones(head_items, false)?;
                 for (cm, tombs) in block_items {
-                    if tombs
-                        .iter()
-                        .any(|iv| iv.is_subrange(cm.min_time, cm.max_time))
-                    {
-                        continue;
-                    }
                     if let Some(c) = reencode_chunk_without_tombstones(cm, &tombs)? {
                         all_chks.push(c);
                     }
@@ -1650,14 +1699,22 @@ impl<'a> TsdbQuerier<'a> {
                 };
                 (cnt, meta.head_entry.take(), meta.head_snapshot.take(), source)
             } else {
-                let mut no_guard = None;
-                let chks = load_resolved_chunks(
-                    meta.head_ref,
-                    meta.head_entry.as_deref(),
-                    meta.head_snapshot.take(),
-                    &meta.block_chks,
-                    &mut no_guard,
-                )?;
+                let head_chks = if let (Some(h), Some(r)) = (head, meta.head_ref) {
+                    match meta.head_snapshot.take() {
+                        Some(snap) => h.series_final_chunks_from_snapshot_with_tx_isolation(
+                            meta.head_entry.as_deref(),
+                            r,
+                            snap,
+                            tx_iso,
+                        )?,
+                        None => h.series_final_chunks_only_with_tx_isolation(
+                            r, mint, maxt, head_iso, tx_iso,
+                        )?,
+                    }
+                } else {
+                    Vec::new()
+                };
+                let chks = combine_head_and_blocks(head_chks, &meta.block_chks)?;
                 let cnt = chks.len() as u32;
                 (cnt, None, None, LazyChunkSource::Precomputed(chks))
             };
@@ -1679,7 +1736,7 @@ impl<'a> TsdbQuerier<'a> {
             None
         };
         if order.is_none() && sort_series && entries.len() > 1 {
-            sort_lazy_entries(&mut entries);
+            entries.sort_unstable_by(|a, b| a.entry_labels().cmp(b.entry_labels()));
         }
 
         if let Some(ref ord) = order {
@@ -1700,58 +1757,247 @@ impl<'a> TsdbQuerier<'a> {
             return Ok(());
         }
 
+        // Strict 3-pass Phase 2 batching (C2 lock order + zero locks held across `on_event`):
+        //   Pass A: snapshot Head entries under `entry.inner` ONLY (no `chunk_reader` lock)
+        //   Pass B: acquire leaf `chunk_reader.read()` once for all mmapped Head chunks in batch,
+        //           decode, then drop guard immediately
+        //   Pass C: combine Head + Block chunks and emit `on_event` with ZERO TSDB locks held
         const READER_BATCH: usize = 64;
+        enum MultiHeadState {
+            Precomputed(Vec<ChunkMeta>),
+            Ready {
+                head_chks: Vec<ChunkMeta>,
+                block_chks: Box<[LazyBlockChunkRef]>,
+            },
+            NeedsRead {
+                ref_id: u64,
+                entry: Option<Arc<SeriesEntry>>,
+                snap: HeadChunkSnapshot,
+                mmapped: Vec<(u64, crate::head::MmappedChunk, Option<usize>)>,
+                head_chks: Vec<ChunkMeta>,
+                block_chks: Box<[LazyBlockChunkRef]>,
+            },
+            Retry {
+                ref_id: u64,
+                entry: Option<Arc<SeriesEntry>>,
+                snap: Option<HeadChunkSnapshot>,
+                block_chks: Box<[LazyBlockChunkRef]>,
+            },
+        }
+
         let total = entries.len();
+        let mut batch: Vec<(usize, MultiHeadState)> = Vec::with_capacity(READER_BATCH);
         let mut pos = 0usize;
         while pos < total {
             let end = (pos + READER_BATCH).min(total);
-            let mut guard = head.map(|h| h.read_chunk_reader_guard());
+            batch.clear();
+            let mut any_mmapped = false;
+
+            // Pass A: snapshot Head entries under `entry.inner` with NO `chunk_reader` lock.
             for series_idx in pos..end {
                 let e_idx = order.as_ref().map_or(series_idx, |o| o[series_idx] as usize);
                 let entry = &mut entries[e_idx];
                 let head_entry = entry.head_entry.take();
                 let snap = entry.head_snapshot.take();
-                let src = std::mem::replace(&mut entry.source, LazyChunkSource::Precomputed(Vec::new()));
-                let chks = match src {
-                    LazyChunkSource::Precomputed(chks) => chks,
-                    LazyChunkSource::Head(r) => {
-                        let res = load_resolved_chunks(
+                let src =
+                    std::mem::replace(&mut entry.source, LazyChunkSource::Precomputed(Vec::new()));
+                let state = match src {
+                    LazyChunkSource::Precomputed(chks) => MultiHeadState::Precomputed(chks),
+                    LazyChunkSource::Head(r) => match (head, snap) {
+                        (None, _) => MultiHeadState::Ready {
+                            head_chks: Vec::new(),
+                            block_chks: Box::new([]),
+                        },
+                        (Some(_), Some(HeadChunkSnapshot::Precomputed(chks))) => {
+                            MultiHeadState::Ready {
+                                head_chks: chks,
+                                block_chks: Box::new([]),
+                            }
+                        }
+                        (Some(h), Some(HeadChunkSnapshot::InOrderByMinTime(min_times))) => {
+                            match h.snapshot_in_order_chunks_for_entry(
+                                head_entry.as_deref(),
+                                r,
+                                &min_times,
+                                tx_iso,
+                            )? {
+                                None => MultiHeadState::Ready {
+                                    head_chks: Vec::new(),
+                                    block_chks: Box::new([]),
+                                },
+                                Some((mmapped, head_chks)) if mmapped.is_empty() => {
+                                    MultiHeadState::Ready {
+                                        head_chks,
+                                        block_chks: Box::new([]),
+                                    }
+                                }
+                                Some((mmapped, head_chks)) => {
+                                    any_mmapped = true;
+                                    MultiHeadState::NeedsRead {
+                                        ref_id: r,
+                                        entry: head_entry,
+                                        snap: HeadChunkSnapshot::InOrderByMinTime(min_times),
+                                        mmapped,
+                                        head_chks,
+                                        block_chks: Box::new([]),
+                                    }
+                                }
+                            }
+                        }
+                        (Some(_), None) => MultiHeadState::Retry {
+                            ref_id: r,
+                            entry: head_entry,
+                            snap: None,
+                            block_chks: Box::new([]),
+                        },
+                    },
+                    LazyChunkSource::Resolved {
+                        head_ref,
+                        block_chks,
+                    } => match (head, head_ref, snap) {
+                        (Some(_), Some(_), Some(HeadChunkSnapshot::Precomputed(chks))) => {
+                            MultiHeadState::Ready {
+                                head_chks: chks,
+                                block_chks,
+                            }
+                        }
+                        (
+                            Some(h),
                             Some(r),
+                            Some(HeadChunkSnapshot::InOrderByMinTime(min_times)),
+                        ) => match h.snapshot_in_order_chunks_for_entry(
                             head_entry.as_deref(),
-                            snap,
-                            &[],
-                            &mut guard,
-                        );
-                        match res {
-                            Ok(c) => c,
-                            Err(e) => {
-                                drop(guard);
-                                return Err(e);
+                            r,
+                            &min_times,
+                            tx_iso,
+                        )? {
+                            None => MultiHeadState::Ready {
+                                head_chks: Vec::new(),
+                                block_chks,
+                            },
+                            Some((mmapped, head_chks)) if mmapped.is_empty() => {
+                                MultiHeadState::Ready {
+                                    head_chks,
+                                    block_chks,
+                                }
                             }
-                        }
-                    }
-                    LazyChunkSource::Resolved { head_ref, block_chks } => {
-                        let res = load_resolved_chunks(
-                            head_ref,
-                            head_entry.as_deref(),
-                            snap,
-                            &block_chks,
-                            &mut guard,
-                        );
-                        match res {
-                            Ok(c) => c,
-                            Err(e) => {
-                                drop(guard);
-                                return Err(e);
+                            Some((mmapped, head_chks)) => {
+                                any_mmapped = true;
+                                MultiHeadState::NeedsRead {
+                                    ref_id: r,
+                                    entry: head_entry,
+                                    snap: HeadChunkSnapshot::InOrderByMinTime(min_times),
+                                    mmapped,
+                                    head_chks,
+                                    block_chks,
+                                }
                             }
-                        }
-                    }
+                        },
+                        (Some(_), Some(r), None) => MultiHeadState::Retry {
+                            ref_id: r,
+                            entry: head_entry,
+                            snap: None,
+                            block_chks,
+                        },
+                        _ => MultiHeadState::Ready {
+                            head_chks: Vec::new(),
+                            block_chks,
+                        },
+                    },
                     LazyChunkSource::Block { .. } | LazyChunkSource::Multi(_) => {
-                        // Unreachable for entries produced by this method.
-                        Vec::new()
+                        return Err(QuerierError::Index(IndexError::Corrupt(
+                            "unexpected unresolved LazyChunkSource variant in multi-source lazy stream"
+                                .to_string(),
+                        )));
                     }
                 };
-                drop(head_entry);
+                batch.push((series_idx, state));
+            }
+
+            // Pass B: acquire leaf `chunk_reader.read()` once (NO `entry.inner` lock),
+            // decode all mmapped Head chunks, then drop guard immediately.
+            if any_mmapped {
+                if let Some(h) = head {
+                    let guard = h.read_chunk_reader_guard();
+                    if let Some(reader) = guard.as_ref() {
+                        for (_, state) in &mut batch {
+                            if let MultiHeadState::NeedsRead {
+                                mmapped, head_chks, ..
+                            } = state
+                            {
+                                if let Some(chks) =
+                                    h.decode_mmapped_plan_with_reader(mmapped, head_chks, reader)?
+                                {
+                                    let prev = std::mem::replace(
+                                        state,
+                                        MultiHeadState::Precomputed(Vec::new()),
+                                    );
+                                    if let MultiHeadState::NeedsRead { block_chks, .. } = prev {
+                                        *state = MultiHeadState::Ready {
+                                            head_chks: chks,
+                                            block_chks,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        drop(guard);
+                        return Err(QuerierError::Head(crate::head::HeadError::from(crate::head_chunks::HeadChunksError::Closed)));
+                    }
+                    drop(guard);
+                }
+            }
+
+            // Pass C: resolve fallbacks + load Block chunks + emit `on_event` with ZERO Head locks held.
+            for (series_idx, state) in batch.drain(..) {
+                let chks = match state {
+                    MultiHeadState::Precomputed(c) => c,
+                    MultiHeadState::Ready {
+                        head_chks,
+                        block_chks,
+                    } => combine_head_and_blocks(head_chks, &block_chks)?,
+                    MultiHeadState::NeedsRead {
+                        ref_id,
+                        entry,
+                        snap,
+                        block_chks,
+                        ..
+                    } => {
+                        let hc = match head {
+                            Some(h) => h.series_final_chunks_from_snapshot_with_tx_isolation(
+                                entry.as_deref(),
+                                ref_id,
+                                snap,
+                                tx_iso,
+                            )?,
+                            None => Vec::new(),
+                        };
+                        combine_head_and_blocks(hc, &block_chks)?
+                    }
+                    MultiHeadState::Retry {
+                        ref_id,
+                        entry,
+                        snap,
+                        block_chks,
+                    } => {
+                        let hc = match head {
+                            Some(h) => match snap {
+                                Some(s) => h.series_final_chunks_from_snapshot_with_tx_isolation(
+                                    entry.as_deref(),
+                                    ref_id,
+                                    s,
+                                    tx_iso,
+                                )?,
+                                None => h.series_final_chunks_only_with_tx_isolation(
+                                    ref_id, mint, maxt, head_iso, tx_iso,
+                                )?,
+                            },
+                            None => Vec::new(),
+                        };
+                        combine_head_and_blocks(hc, &block_chks)?
+                    }
+                };
                 if !on_event(LazyStreamEvent::SeriesChunks(series_idx, chks))? {
                     return Ok(());
                 }
@@ -2769,6 +3015,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn sort_lazy_entries(entries: &mut [LazySeriesEntry]) {
     sort_by_labels(entries, LazySeriesEntry::entry_labels);
 }
@@ -3841,54 +4088,185 @@ mod wave4_tests {
                 )
                 .unwrap();
 
-                // Path B: reference filter closure path
+                // Path B: completely independent non-lazy `select()` oracle filtered by stable_hash
                 let cq_b = make_cq();
-                let prep_b = cq_b.prepare_select(&matchers).unwrap();
-                let pred = move |l: &Labels| l.stable_hash() % shard_count == shard_idx;
+                let all_selected = cq_b.select(true, &matchers).unwrap();
                 let mut b_series: Vec<(Labels, u32)> = Vec::new();
                 let mut b_chunks: ChunkDump = Vec::new();
-                cq_b.stream_prepared_chunks_lazy(
-                    prep_b,
-                    &matchers,
-                    true,
-                    Some(&pred),
-                    |ev| {
-                        match ev {
-                            LazyStreamEvent::Series(l, cnt) => b_series.push((l.clone(), cnt)),
-                            LazyStreamEvent::SeriesEnd => {}
-                            LazyStreamEvent::SeriesChunks(i, chks) => {
-                                b_chunks.push((
-                                    i,
-                                    chks.into_iter()
-                                        .map(|c| {
-                                            (
-                                                c.min_time,
-                                                c.max_time,
-                                                c.chunk.unwrap().as_bytes().to_vec(),
-                                            )
-                                        })
-                                        .collect(),
-                                ));
-                            }
-                        }
-                        Ok(true)
-                    },
-                )
-                .unwrap();
+                for cs in all_selected {
+                    if cs.labels.stable_hash() % shard_count != shard_idx {
+                        continue;
+                    }
+                    let idx = b_series.len();
+                    b_series.push((cs.labels, cs.chunks.len() as u32));
+                    b_chunks.push((
+                        idx,
+                        cs.chunks
+                            .into_iter()
+                            .map(|c| {
+                                (
+                                    c.min_time,
+                                    c.max_time,
+                                    c.chunk.unwrap().as_bytes().to_vec(),
+                                )
+                            })
+                            .collect(),
+                    ));
+                }
 
                 assert_eq!(
                     a_series, b_series,
-                    "series mismatch unordered={unordered} shard={shard_idx}"
+                    "series mismatch vs select() oracle unordered={unordered} shard={shard_idx}"
                 );
                 assert_eq!(
                     a_chunks, b_chunks,
-                    "chunks mismatch unordered={unordered} shard={shard_idx}"
+                    "chunks mismatch vs select() oracle unordered={unordered} shard={shard_idx}"
                 );
                 total_series_seen += a_series.len();
             }
             assert_eq!(total_series_seen, 120);
         }
 
+        // Invalid shard parameters must return InvalidShard error, never panic on modulo by zero.
+        let cq_bad = db.chunk_querier(0, 4 * block_ms);
+        let prep_bad = cq_bad.prepare_select(&matchers).unwrap();
+        assert!(matches!(
+            cq_bad.stream_prepared_chunks_lazy_with_shard(
+                prep_bad,
+                &matchers,
+                true,
+                Some((0, 0)),
+                None,
+                |_| Ok(true),
+            ),
+            Err(QuerierError::InvalidShard { idx: 0, count: 0 })
+        ));
+        let prep_bad2 = cq_bad.prepare_select(&matchers).unwrap();
+        assert!(matches!(
+            cq_bad.stream_prepared_chunks_lazy_with_shard(
+                prep_bad2,
+                &matchers,
+                true,
+                Some((8, 8)),
+                None,
+                |_| Ok(true),
+            ),
+            Err(QuerierError::InvalidShard { idx: 8, count: 8 })
+        ));
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn lazy_phase2_batching_has_no_deadlock_with_append_refresh_or_slow_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrd};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = crate::db::TsdbOptions::default();
+        opts.head.max_head_chunk_file_size = 64 * 1024;
+        let db = Arc::new(crate::db::Tsdb::open(dir.path(), opts).unwrap());
+
+        // Create 80 series with mmapped chunks so Phase 2 takes the chunk_reader path.
+        for s in 0..80usize {
+            let pod = format!("p-{s:03}");
+            let pairs = [("__name__", "dl_metric"), ("pod", pod.as_str())];
+            let mut app = db.appender();
+            for k in 0..130i64 {
+                app.append_float(None, &pairs, 1_000 + k * 1_000, k as f64)
+                    .unwrap();
+            }
+            app.commit().unwrap();
+        }
+        db.head().mmap_head_chunks().unwrap();
+
+        // 1. Slow `on_event` callback must NOT block a concurrent `chunk_reader.write()`
+        //    (verifies `chunk_reader.read()` is dropped before `on_event` runs).
+        let (cb_entered_tx, cb_entered_rx) = std::sync::mpsc::channel();
+        let (cb_release_tx, cb_release_rx) = std::sync::mpsc::channel();
+        let db_q = Arc::clone(&db);
+        let q_handle = std::thread::spawn(move || {
+            let matchers = [LabelMatcher::new(MatchType::Equal, "__name__", "dl_metric").unwrap()];
+            let cq = db_q.chunk_querier(0, 500_000);
+            let prep = cq.prepare_select(&matchers).unwrap();
+            let mut signaled = false;
+            cq.stream_prepared_chunks_lazy_with_shard(
+                prep,
+                &matchers,
+                true,
+                None,
+                None,
+                |ev| {
+                    if matches!(ev, LazyStreamEvent::SeriesChunks(_, _)) && !signaled {
+                        signaled = true;
+                        let _ = cb_entered_tx.send(());
+                        let _ = cb_release_rx.recv();
+                    }
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        });
+        cb_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("query must reach on_event(SeriesChunks)");
+        // While on_event is parked, sealing/refreshing chunks_head (which acquires chunk_reader.write())
+        // must complete promptly without stalling behind the slow query callback!
+        let db_r = Arc::clone(&db);
+        let (refreshed_tx, refreshed_rx) = std::sync::mpsc::channel();
+        let r_handle = std::thread::spawn(move || {
+            db_r.head().acquire_chunk_reader_write_for_test();
+            let _ = refreshed_tx.send(());
+        });
+        refreshed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("chunk_reader.write() must NOT stall while on_event is blocked");
+        let _ = cb_release_tx.send(());
+        q_handle.join().unwrap();
+        r_handle.join().unwrap();
+
+        // 2. Concurrent stress: QueryStream + duplicate appends + chunk_reader refreshes.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_a = Arc::clone(&stop);
+        let db_a = Arc::clone(&db);
+        let t_append = std::thread::spawn(move || {
+            let mut iter = 0i64;
+            while !stop_a.load(AtomicOrd::Relaxed) {
+                let mut app = db_a.appender();
+                for s in 0..80usize {
+                    let pod = format!("p-{s:03}");
+                    let pairs = [("__name__", "dl_metric"), ("pod", pod.as_str())];
+                    let _ = app.append_float(None, &pairs, 1_000 + 129 * 1_000, iter as f64);
+                }
+                let _ = app.commit();
+                iter += 1;
+            }
+        });
+        let stop_w = Arc::clone(&stop);
+        let db_w = Arc::clone(&db);
+        let t_refresh = std::thread::spawn(move || {
+            while !stop_w.load(AtomicOrd::Relaxed) {
+                db_w.head().acquire_chunk_reader_write_for_test();
+                std::thread::yield_now();
+            }
+        });
+        let matchers = [LabelMatcher::new(MatchType::Equal, "__name__", "dl_metric").unwrap()];
+        for _ in 0..25 {
+            let cq = db.chunk_querier(0, 500_000);
+            let prep = cq.prepare_select(&matchers).unwrap();
+            let mut count = 0usize;
+            cq.stream_prepared_chunks_lazy_with_shard(prep, &matchers, true, None, None, |ev| {
+                if matches!(ev, LazyStreamEvent::SeriesChunks(_, _)) {
+                    count += 1;
+                }
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(count, 80);
+        }
+        stop.store(true, AtomicOrd::Relaxed);
+        t_append.join().unwrap();
+        t_refresh.join().unwrap();
         db.close().unwrap();
     }
 }

@@ -180,6 +180,11 @@ impl PreCommitNotifier for IngesterStorageAdapter {
     }
 }
 
+#[inline]
+fn checked_arena_u32(val: usize) -> Option<u32> {
+    u32::try_from(val).ok()
+}
+
 #[derive(Clone, Copy)]
 struct ShardSeriesItem {
     record_offset: i64,
@@ -937,6 +942,7 @@ impl IngesterShardedBatchConsumer {
                     let mut rec_metadata: Vec<BorrowedMetadata<'_>> = Vec::new();
                     let mut rec_first_shard: Option<usize> = None;
                     let mut rec_series_count = 0usize;
+                    let mut arena_overflow = false;
                     // Exemplars are always unmarshalled and retained during decode, matching Go:
                     // only the distributor sets `SkipUnmarshalingExemplars`, and
                     // `max_global_exemplars_per_user > 0` is checked at exemplar append time.
@@ -993,6 +999,35 @@ impl IngesterShardedBatchConsumer {
                                 }
                                 exemplars_arena.append(&mut tmp_ex);
                             }
+                            let Some((
+                                lbs,
+                                lbl,
+                                rlbs,
+                                rlbl,
+                                ss,
+                                sl,
+                                hs,
+                                hl,
+                                es,
+                                el,
+                            )) = (|| {
+                                Some((
+                                    checked_arena_u32(label_bytes_start)?,
+                                    checked_arena_u32(label_bytes_len)?,
+                                    checked_arena_u32(raw_label_bytes_start)?,
+                                    checked_arena_u32(raw_label_bytes_len)?,
+                                    checked_arena_u32(ts.samples_range.start)?,
+                                    checked_arena_u32(ts.samples_range.end - ts.samples_range.start)?,
+                                    checked_arena_u32(hist_start)?,
+                                    checked_arena_u32(hist_len)?,
+                                    checked_arena_u32(ex_start)?,
+                                    checked_arena_u32(ex_len)?,
+                                ))
+                            })()
+                            else {
+                                arena_overflow = true;
+                                return;
+                            };
                             rec_first_shard.get_or_insert(shard);
                             shard_buckets[shard].push(ShardSeriesItem {
                                 worker_idx: worker_idx as u16,
@@ -1005,22 +1040,39 @@ impl IngesterShardedBatchConsumer {
                                 labels_sorted_unique: ts.labels_sorted_unique,
                                 bad_utf8: ts.bad_utf8,
                                 prom_hash,
-                                label_bytes_start: label_bytes_start as u32,
-                                label_bytes_len: label_bytes_len as u32,
-                                raw_label_bytes_start: raw_label_bytes_start as u32,
-                                raw_label_bytes_len: raw_label_bytes_len as u32,
-                                samples_start: ts.samples_range.start as u32,
-                                samples_len: (ts.samples_range.end - ts.samples_range.start) as u32,
+                                label_bytes_start: lbs,
+                                label_bytes_len: lbl,
+                                raw_label_bytes_start: rlbs,
+                                raw_label_bytes_len: rlbl,
+                                samples_start: ss,
+                                samples_len: sl,
                                 created_timestamp: ts.created_timestamp,
-                                histograms_start: hist_start as u32,
-                                histograms_len: hist_len as u32,
-                                exemplars_start: ex_start as u32,
-                                exemplars_len: ex_len as u32,
+                                histograms_start: hs,
+                                histograms_len: hl,
+                                exemplars_start: es,
+                                exemplars_len: el,
                                 min_ts,
                             });
                             *total_series += 1;
                         },
                     );
+
+                    if arena_overflow {
+                        error!("ingest batch worker arena exceeded u32::MAX bytes; skipping record");
+                        label_bytes_arena.truncate(label_bytes_base);
+                        samples_arena.truncate(samples_base);
+                        exemplars_arena.truncate(ex_base);
+                        for s_idx in 0..num_shards {
+                            shard_buckets[s_idx].truncate(bucket_bases[s_idx]);
+                            histograms_buckets[s_idx]
+                                .get_mut()
+                                .truncate(hist_bucket_bases[s_idx]);
+                        }
+                        *total_series = total_series_base;
+                        drop(rec_metadata);
+                        wr_scratch.clear();
+                        continue;
+                    }
 
                     match stream_res {
                         Ok(hdr) => {
@@ -1318,6 +1370,23 @@ impl IngesterShardedBatchConsumer {
                         }
                         exemplars_arena.append(&mut tmp_ex);
                     }
+                    let Some((lbs, lbl, rlbs, rlbl, ss, sl, hs, hl, es, el)) = (|| {
+                        Some((
+                            checked_arena_u32(label_bytes_start)?,
+                            checked_arena_u32(label_bytes_len)?,
+                            checked_arena_u32(raw_label_bytes_start)?,
+                            checked_arena_u32(raw_label_bytes_len)?,
+                            checked_arena_u32(samples_start)?,
+                            checked_arena_u32(samples_len)?,
+                            checked_arena_u32(hist_start)?,
+                            checked_arena_u32(hist_len)?,
+                            checked_arena_u32(ex_start)?,
+                            checked_arena_u32(ex_len)?,
+                        ))
+                    })() else {
+                        label_encode_err = Some("worker arena exceeded u32::MAX bytes".to_string());
+                        break;
+                    };
                     rec_first_shard.get_or_insert(shard);
                     shard_buckets[shard].push(ShardSeriesItem {
                         worker_idx: worker_idx as u16,
@@ -1330,17 +1399,17 @@ impl IngesterShardedBatchConsumer {
                         labels_sorted_unique,
                         bad_utf8,
                         prom_hash,
-                        label_bytes_start: label_bytes_start as u32,
-                        label_bytes_len: label_bytes_len as u32,
-                        raw_label_bytes_start: raw_label_bytes_start as u32,
-                        raw_label_bytes_len: raw_label_bytes_len as u32,
-                        samples_start: samples_start as u32,
-                        samples_len: samples_len as u32,
+                        label_bytes_start: lbs,
+                        label_bytes_len: lbl,
+                        raw_label_bytes_start: rlbs,
+                        raw_label_bytes_len: rlbl,
+                        samples_start: ss,
+                        samples_len: sl,
                         created_timestamp: ts.created_timestamp(),
-                        histograms_start: hist_start as u32,
-                        histograms_len: hist_len as u32,
-                        exemplars_start: ex_start as u32,
-                        exemplars_len: ex_len as u32,
+                        histograms_start: hs,
+                        histograms_len: hl,
+                        exemplars_start: es,
+                        exemplars_len: el,
                         min_ts,
                     });
                     *total_series += 1;

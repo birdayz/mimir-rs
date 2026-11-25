@@ -9,8 +9,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::collections::VecDeque;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -459,23 +458,6 @@ pub fn repair_bad_index_version(dir: &Path) -> Result<(), BlockError> {
     Ok(())
 }
 
-const MAX_SHARD_HASH_CACHE_ENTRIES: usize = 8;
-const MAX_SHARD_HASH_CACHE_REFS: usize = 524_288;
-
-struct ShardHashCacheEntry {
-    key: usize,
-    weak: Weak<[u64]>,
-    cell: Arc<Mutex<Option<Arc<[u64]>>>>,
-}
-
-impl std::fmt::Debug for ShardHashCacheEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShardHashCacheEntry")
-            .field("key", &self.key)
-            .finish()
-    }
-}
-
 /// Opened immutable on-disk Prometheus ULID block (`tsdb.Block`).
 #[derive(Debug)]
 pub struct Block {
@@ -488,7 +470,6 @@ pub struct Block {
     delete_mtx: Mutex<()>,
     postings_cache: Arc<PostingsForMatchersCache>,
     postings_cache_source_id: u64,
-    shard_hash_cache: Mutex<VecDeque<ShardHashCacheEntry>>,
     compaction_failed: AtomicBool,
     compaction_deletable: AtomicBool,
     readers: Arc<BlockReaders>,
@@ -547,7 +528,6 @@ impl Block {
             delete_mtx: Mutex::new(()),
             postings_cache,
             postings_cache_source_id: next_postings_cache_source_id(),
-            shard_hash_cache: Mutex::new(VecDeque::new()),
             compaction_failed,
             compaction_deletable,
             readers: Arc::new(BlockReaders::default()),
@@ -669,55 +649,42 @@ impl Block {
         )
     }
 
-    /// Returns cached Prometheus `StableHash` values aligned 1:1 with `refs` when `refs` is
-    /// shared across concurrent sharded queries via `PostingsForMatchersCache`.
-    ///
-    /// Uses singleflight per-entry locking so concurrent shards compute the hashes at most once
-    /// per live cached postings slice, and auto-prunes entries once the postings cache evicts
-    /// `refs` (`Weak::ptr_eq` prevents ABA pointer reuse). Returns `Ok(None)` for unshared or
-    /// oversized slices so callers stream `index.series_stable_hash` without allocating.
-    pub fn shard_hashes_for_postings(
+    /// Evaluates `matchers` against this block's index using its `PostingsForMatchersCache`,
+    /// also returning the cache entry's singleflight `ShardHashSlot` when `concurrent` is true.
+    pub(crate) fn postings_for_matchers_with_shard_slot(
         &self,
-        refs: &Arc<[u64]>,
+        matchers: &[LabelMatcher],
+        concurrent: bool,
+    ) -> Result<(Arc<[u64]>, Option<crate::postings_cache::ShardHashSlot>), PostingsError> {
+        self.postings_cache.get_or_compute_with_shard_slot_for_source(
+            self.postings_cache_source_id,
+            matchers,
+            concurrent,
+            || postings_for_matchers(&self.index, matchers),
+        )
+    }
+
+    /// Computes or returns cached Prometheus `StableHash` values for `refs` stored in the
+    /// `PostingsForMatchersCache` entry's singleflight `slot` (automatically evicted with the
+    /// postings entry). Errors are never cached so corrupt blocks always return `IndexError`.
+    pub(crate) fn resolve_shard_hashes_in_slot(
+        &self,
+        refs: &[u64],
+        slot: Option<&crate::postings_cache::ShardHashSlot>,
     ) -> Result<Option<Arc<[u64]>>, IndexError> {
-        if refs.is_empty()
-            || refs.len() > MAX_SHARD_HASH_CACHE_REFS
-            || Arc::strong_count(refs) <= 1
-        {
+        let Some(slot) = slot else {
             return Ok(None);
-        }
-        let key = Arc::as_ptr(refs) as *const u64 as usize;
-        let cell = {
-            let mut cache = self.shard_hash_cache.lock();
-            cache.retain(|e| e.weak.strong_count() > 0);
-            if let Some(entry) = cache
-                .iter()
-                .find(|e| e.key == key && std::ptr::eq(e.weak.as_ptr(), Arc::as_ptr(refs)))
-            {
-                Arc::clone(&entry.cell)
-            } else {
-                if cache.len() >= MAX_SHARD_HASH_CACHE_ENTRIES {
-                    cache.pop_front();
-                }
-                let cell = Arc::new(Mutex::new(None));
-                cache.push_back(ShardHashCacheEntry {
-                    key,
-                    weak: Arc::downgrade(refs),
-                    cell: Arc::clone(&cell),
-                });
-                cell
-            }
         };
-        let mut guard = cell.lock();
-        if let Some(ref hashes) = *guard {
-            return Ok(Some(Arc::clone(hashes)));
+        let mut guard = slot.lock();
+        if let Some(ref cached) = *guard {
+            return Ok(cached.as_ref().map(Arc::clone));
         }
         let mut hashes = Vec::with_capacity(refs.len());
-        for &r in refs.iter() {
+        for &r in refs {
             hashes.push(self.index.series_stable_hash(r)?);
         }
         let arc: Arc<[u64]> = Arc::from(hashes);
-        *guard = Some(Arc::clone(&arc));
+        *guard = Some(Some(Arc::clone(&arc)));
         Ok(Some(arc))
     }
 
@@ -996,23 +963,26 @@ mod tests {
         )
         .unwrap()];
 
-        // Unshared (strong_count == 1) slice must bypass cache and return None.
-        let unshared: Arc<[u64]> = Arc::from(blk.postings_for_matchers_direct(&matchers).unwrap());
-        assert!(blk.shard_hashes_for_postings(&unshared).unwrap().is_none());
-
-        // Shared slice from PostingsForMatchersCache (concurrent = true): 16 concurrent threads
-        // must all get the exact same Arc<[u64]> matching series_labels().stable_hash().
-        let cached_refs = blk
-            .postings_for_matchers_with_concurrent(&matchers, true)
+        // Uncached / non-concurrent lookup returns no shard-hash slot.
+        let (_direct_refs, no_slot) = blk
+            .postings_for_matchers_with_shard_slot(&matchers, false)
             .unwrap();
-        assert!(Arc::strong_count(&cached_refs) >= 2);
+        assert!(no_slot.is_none());
+
+        // Concurrent lookup from PostingsForMatchersCache shares one singleflight ShardHashSlot
+        // across all 16 threads and drops hashes when the postings cache invalidates the source.
+        let (cached_refs, slot) = blk
+            .postings_for_matchers_with_shard_slot(&matchers, true)
+            .unwrap();
+        let slot = slot.expect("concurrent postings lookup must carry a shard-hash slot");
 
         let mut handles = Vec::new();
         for _ in 0..16 {
             let b = Arc::clone(&blk);
             let r = Arc::clone(&cached_refs);
+            let s = Arc::clone(&slot);
             handles.push(std::thread::spawn(move || {
-                b.shard_hashes_for_postings(&r).unwrap().unwrap()
+                b.resolve_shard_hashes_in_slot(&r, Some(&s)).unwrap().unwrap()
             }));
         }
         let first = handles.remove(0).join().unwrap();
@@ -1025,16 +995,16 @@ mod tests {
             assert!(Arc::ptr_eq(&first, &other));
         }
 
-        // Simulate cache eviction by holding a fresh shared Arc then dropping both clones.
-        {
-            let ephem: Arc<[u64]> = Arc::from(cached_refs.as_ref());
-            let ephem2 = Arc::clone(&ephem);
-            assert!(blk.shard_hashes_for_postings(&ephem).unwrap().is_some());
-            drop(ephem2);
-            drop(ephem);
-        }
-        // Next lookup prunes dead Weak entries.
-        let _ = blk.shard_hashes_for_postings(&cached_refs).unwrap();
-        assert_eq!(blk.shard_hash_cache.lock().len(), 1);
+        // Evicting/invalidating the postings cache drops its reference to the shard-hash slot.
+        let weak_hashes = Arc::downgrade(&first);
+        drop(first);
+        drop(slot);
+        drop(cached_refs);
+        blk.postings_cache.invalidate_source(blk.postings_cache_source_id);
+        blk.postings_cache.remove_source(blk.postings_cache_source_id);
+        assert!(
+            weak_hashes.upgrade().is_none(),
+            "shard hashes must be freed immediately when postings cache entry is removed"
+        );
     }
 }

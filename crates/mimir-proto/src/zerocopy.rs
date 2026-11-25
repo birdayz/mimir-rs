@@ -1818,7 +1818,7 @@ resolved_scratch.lossy_utf8_arena.clear();
             tmp_slices: [b"".as_slice(); 16],
         };
         for (i, &sym) in common_symbols.iter().enumerate() {
-            if sym == "__name__" {
+            if i != 0 && i < resolved.len() && sym == "__name__" {
                 if single_name_sym_idx.is_none() {
                     single_name_sym_idx = Some(i as u32);
                 } else {
@@ -2072,6 +2072,27 @@ fn finish_packed_label_err(
     fallback
 }
 
+/// Cold field-order helper: when a later field (2..6) errors after a deferred packed
+/// field 1 was recorded, check whether field 1's varint stream itself had an earlier error
+/// so Go's wire-order error precedence is preserved with zero hot-path overhead.
+#[cold]
+#[inline(never)]
+fn validate_packed_varints_before_err(
+    input: &[u8],
+    packed: Option<Range<usize>>,
+    later_err: DecodeError,
+) -> DecodeError {
+    if let Some(r) = packed {
+        let mut p = r.start;
+        while p < r.end {
+            if let Err(e) = read_varint_bounded(input, &mut p, r.end) {
+                return e;
+            }
+        }
+    }
+    later_err
+}
+
 struct LabelNameSchemaCache<'a> {
     len: usize,
     idxs: [u32; 16],
@@ -2122,107 +2143,117 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
 
     let mut pos = range.start;
     let end = range.end;
-    while pos < end {
-        let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
-        match field_num {
-            1 => {
-                if wire_type == 0 {
-                    return Err(DecodeError::OddNumberOfLabelRefs);
-                } else if wire_type == 2 {
-                    let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                    if !multi_label_fields && single_packed_labels.is_none() {
-                        single_packed_labels = Some(packed);
-                    } else {
-                        if let Some(first) = single_packed_labels.take() {
-                            let mut p = first.start;
-                            while p < first.end {
-                                let r = read_varint_bounded(input, &mut p, first.end)? as u32;
+    let field_loop_res: Result<(), DecodeError> = (|| {
+        while pos < end {
+            let (field_num, wire_type) = read_key_bounded(input, &mut pos, end)?;
+            match field_num {
+                1 => {
+                    if wire_type == 0 {
+                        return Err(DecodeError::OddNumberOfLabelRefs);
+                    } else if wire_type == 2 {
+                        let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                        if !multi_label_fields && single_packed_labels.is_none() {
+                            single_packed_labels = Some(packed);
+                        } else {
+                            if let Some(first) = single_packed_labels.take() {
+                                let mut p = first.start;
+                                while p < first.end {
+                                    let r = read_varint_bounded(input, &mut p, first.end)? as u32;
+                                    scratch.rw2_label_refs.push(r);
+                                }
+                            }
+                            multi_label_fields = true;
+                            let mut p = packed.start;
+                            while p < packed.end {
+                                let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
                                 scratch.rw2_label_refs.push(r);
                             }
                         }
-                        multi_label_fields = true;
-                        let mut p = packed.start;
-                        while p < packed.end {
-                            let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                            scratch.rw2_label_refs.push(r);
-                        }
+                    } else {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 1,
+                            wire_type,
+                        });
                     }
-                } else {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 1,
-                        wire_type,
-                    });
                 }
-            }
-            2 => {
-                if wire_type != 2 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 2,
-                        wire_type,
-                    });
+                2 => {
+                    if wire_type != 2 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 2,
+                            wire_type,
+                        });
+                    }
+                    let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let sample = decode_sample(input, sub)?;
+                    min_sample_ts = min_sample_ts.min(sample.timestamp_ms);
+                    samples_arena.push(sample);
                 }
-                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                let sample = decode_sample(input, sub)?;
-                min_sample_ts = min_sample_ts.min(sample.timestamp_ms);
-                samples_arena.push(sample);
-            }
-            3 => {
-                if wire_type != 2 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 3,
-                        wire_type,
-                    });
+                3 => {
+                    if wire_type != 2 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 3,
+                            wire_type,
+                        });
+                    }
+                    let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let hist = decode_histogram(input, sub, scratch)?;
+                    scratch.histograms.push(hist);
                 }
-                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                let hist = decode_histogram(input, sub, scratch)?;
-                scratch.histograms.push(hist);
-            }
-            4 => {
-                if wire_type != 2 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 4,
-                        wire_type,
-                    });
+                4 => {
+                    if wire_type != 2 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 4,
+                            wire_type,
+                        });
+                    }
+                    let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    if !opts.skip_unmarshaling_exemplars {
+                        let ex = decode_exemplar_rw2_resolved(
+                            input,
+                            sub,
+                            symbol_offset,
+                            resolved,
+                            scratch,
+                            budget,
+                        )?;
+                        scratch.exemplars.push(ex);
+                    }
                 }
-                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                if !opts.skip_unmarshaling_exemplars {
-                    let ex = decode_exemplar_rw2_resolved(
-                        input,
-                        sub,
-                        symbol_offset,
-                        resolved,
-                        scratch,
-                        budget,
-                    )?;
-                    scratch.exemplars.push(ex);
+                5 => {
+                    if wire_type != 2 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 5,
+                            wire_type,
+                        });
+                    }
+                    let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
+                    let meta_fields = parse_metadata_rw2_fields(input, sub)?;
+                    if meta_fields.0 != 0 || meta_fields.1 != 0 || meta_fields.2 != 0 {
+                        scratch.rw2_deferred_meta.push(meta_fields);
+                    }
                 }
-            }
-            5 => {
-                if wire_type != 2 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 5,
-                        wire_type,
-                    });
+                6 => {
+                    if wire_type != 0 {
+                        return Err(DecodeError::InvalidWireType {
+                            field: 6,
+                            wire_type,
+                        });
+                    }
+                    created_timestamp = read_varint_bounded(input, &mut pos, end)? as i64;
                 }
-                let sub = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                let meta_fields = parse_metadata_rw2_fields(input, sub)?;
-                if meta_fields.0 != 0 || meta_fields.1 != 0 || meta_fields.2 != 0 {
-                    scratch.rw2_deferred_meta.push(meta_fields);
+                _ => {
+                    skip_field_bounded(input, &mut pos, end, wire_type)?;
                 }
-            }
-            6 => {
-                if wire_type != 0 {
-                    return Err(DecodeError::InvalidWireType {
-                        field: 6,
-                        wire_type,
-                    });
-                }
-                created_timestamp = read_varint_bounded(input, &mut pos, end)? as i64;
-            }
-            _ => {
-                skip_field_bounded(input, &mut pos, end, wire_type)?;
             }
         }
+        Ok(())
+    })();
+    if let Err(later_err) = field_loop_res {
+        return Err(validate_packed_varints_before_err(
+            input,
+            single_packed_labels,
+            later_err,
+        ));
     }
 
     if let Some(packed) = single_packed_labels {
@@ -2237,6 +2268,7 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
             let mut p = packed.start;
             let pend = packed.end;
             let mut pending_budget: usize = 0;
+            let mut budget_remaining: usize = budget.limit.saturating_sub(budget.used);
             let resolved_len = resolved.len();
             let cached_len = last_schema.len;
             let mut matched_schema = cached_len > 0;
@@ -2404,11 +2436,12 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
                     if klen < 255 && vlen < 255 {
                         let need = 2 + klen + vlen;
                         pending_budget = pending_budget.saturating_add(need);
-                        if pending_budget >= 4096 {
+                        if pending_budget >= 4096 || pending_budget > budget_remaining {
                             unsafe { label_bytes_arena.set_len(out_len) };
                             if let Err(e) = budget.try_add(pending_budget) {
                                 return Err(finish_packed_label_err(input, p, pend, e));
                             }
+                            budget_remaining = budget.limit.saturating_sub(budget.used);
                             pending_budget = 0;
                         }
                         if out_cap - out_len < need {
@@ -2446,6 +2479,7 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
                         ) {
                             return Err(finish_packed_label_err(input, p, pend, e));
                         }
+                        budget_remaining = budget.limit.saturating_sub(budget.used);
                         out_len = label_bytes_arena.len();
                         out_cap = label_bytes_arena.capacity();
                         out_base = label_bytes_arena.as_mut_ptr();
@@ -7058,6 +7092,63 @@ mod tests {
                 append_stringlabel_pair_proto(&mut expected_raw, k, v).unwrap();
             }
             assert_eq!(got[idx].1, expected_raw, "raw labels mismatch at series {idx}");
+        }
+
+        drop(meta_out);
+
+        // Verify error precedence on single-pass packed path:
+        // (a) [999, 1] (even, invalid name ref) -> InvalidLabelRef(999)
+        let mut even_bad_ts = Vec::new();
+        let mut p_even = Vec::new();
+        push_varint(&mut p_even, 999);
+        push_varint(&mut p_even, 1);
+        push_ld(&mut even_bad_ts, 1, &p_even);
+        let mut wr_even_bad = Vec::new();
+        push_ld(&mut wr_even_bad, 4, b"");
+        push_ld(&mut wr_even_bad, 5, &even_bad_ts);
+        {
+            let mut m = Vec::new();
+            assert_eq!(
+                decode_rw2_stream(
+                    &wr_even_bad,
+                    DecodeOptions::rw2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut lbl_arena,
+                    &mut samp_arena,
+                    &mut m,
+                    |_| {},
+                )
+                .err(),
+                Some(DecodeError::InvalidLabelRef { index: 999, offset: 0 })
+            );
+        }
+
+        // (b) Truncated varint in field 1 followed by invalid wire type on field 2 ->
+        //     must report field 1's UnexpectedEof (preserving Go field-order precedence).
+        let mut bad_f1_f2_ts = Vec::new();
+        push_ld(&mut bad_f1_f2_ts, 1, &[0x80]); // truncated varint in field 1
+        bad_f1_f2_ts.push(2 << 3); // field 2 with wrong wire type 0 (expects 2)
+        bad_f1_f2_ts.push(0x01);
+        let mut wr_f1_f2 = Vec::new();
+        push_ld(&mut wr_f1_f2, 4, b"");
+        push_ld(&mut wr_f1_f2, 5, &bad_f1_f2_ts);
+        {
+            let mut m = Vec::new();
+            assert_eq!(
+                decode_rw2_stream(
+                    &wr_f1_f2,
+                    DecodeOptions::rw2(),
+                    &mut scratch,
+                    &mut resolved,
+                    &mut lbl_arena,
+                    &mut samp_arena,
+                    &mut m,
+                    |_| {},
+                )
+                .err(),
+                Some(DecodeError::UnexpectedEof)
+            );
         }
     }
 }

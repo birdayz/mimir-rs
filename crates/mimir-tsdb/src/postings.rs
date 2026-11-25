@@ -442,8 +442,7 @@ impl MemPostings {
         }
         let next_task = AtomicUsize::new(0);
         let num_tasks = POSTINGS_STRIPES + 1;
-        let workers = std::num::NonZeroUsize::new(mimir_common::cached_available_parallelism())
-            .map_or(4, |n| n.get())
+        let workers = mimir_common::cached_available_parallelism()
             .clamp(2, 16)
             .min(num_tasks);
 
