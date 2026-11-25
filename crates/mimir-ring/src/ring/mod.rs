@@ -628,11 +628,17 @@ impl Ring {
                     || cmp_locked == CompareResult::EqualButStatesAndTimestamps
                 {
                     inner.ring_desc = ring_desc.clone();
-                    if cmp_locked != CompareResult::Equal {
+                    {
                         let tt = &mut inner.token_table;
                         for (id, dst) in tt.instance_ids.iter().zip(tt.instances.iter_mut()) {
                             if let Some(src) = ring_desc.ingesters.get(id) {
-                                *dst = src.clone();
+                                dst.state = src.state;
+                                dst.timestamp = src.timestamp;
+                                dst.read_only = src.read_only;
+                                dst.read_only_updated_timestamp = src.read_only_updated_timestamp;
+                                if dst.versions != src.versions {
+                                    dst.versions = src.versions.clone();
+                                }
                             }
                         }
                     }
@@ -1380,6 +1386,15 @@ impl Ring {
                 }
             }
         }
+        {
+            let tt = &mut c_inner.token_table;
+            for (id, dst) in tt.instance_ids.iter().zip(tt.instances.iter_mut()) {
+                if let Some(src) = inner.ring_desc.ingesters.get(id) {
+                    dst.state = src.state;
+                    dst.timestamp = src.timestamp;
+                }
+            }
+        }
         drop(c_inner);
         Some(cached)
     }
@@ -1831,5 +1846,88 @@ mod new_ring_tests {
         )
         .unwrap();
         assert_eq!(named_ring.into_service().service_name(), "ingester ring client");
+    }
+
+    #[test]
+    fn cached_shuffle_shard_subring_sees_heartbeat_state_and_versions_updates() {
+        use crate::ring::replication_strategy::WRITE;
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let t1 = t0 + Duration::from_secs(120); // past 60s heartbeat_timeout
+        let t0_sec = system_time_to_unix_secs(t0);
+        let t1_sec = system_time_to_unix_secs(t1);
+
+        let mut desc = Desc::default();
+        for i in 0..6u32 {
+            let zone = format!("zone-{}", ['a', 'b', 'c'][(i % 3) as usize]);
+            let id = format!("ing-{i}");
+            let mut toks = Vec::new();
+            for j in 0..16u32 {
+                toks.push(i.wrapping_mul(100_000_003).wrapping_add(j.wrapping_mul(268_435_459)));
+            }
+            toks.sort_unstable();
+            desc.ingesters.insert(
+                id.clone(),
+                InstanceDesc {
+                    id,
+                    addr: format!("10.0.0.{}:9095", i + 1),
+                    timestamp: t0_sec,
+                    state: InstanceState::Active as i32,
+                    tokens: toks,
+                    zone,
+                    registered_timestamp: t0_sec - 300,
+                    versions: HashMap::from([(1u64, 1u64)]),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let ring = Ring::with_optional_store_and_strategy(
+            RingSettings {
+                heartbeat_timeout: Duration::from_secs(60),
+                replication_factor: 3,
+                zone_awareness_enabled: true,
+                excluded_zones: Vec::new(),
+                subring_cache_disabled: false,
+            },
+            "ingester",
+            "ring",
+            None,
+            Arc::new(DefaultReplicationStrategy),
+            None,
+        )
+        .unwrap();
+        ring.update_ring_state(desc.clone());
+
+        // Populate shuffle_shard cache at t0.
+        let sub0 = ring.shuffle_shard("tenant-a", 3);
+        let rs0 = sub0.get_at(42, WRITE, 3, t0).unwrap();
+        assert_eq!(rs0.instances.len(), 3);
+
+        // Refresh heartbeats to t1 (past heartbeat_timeout relative to t0) and transition one
+        // sharded instance to LEAVING -> EqualButStatesAndTimestamps fast path on parent.
+        let mut desc_t1 = desc.clone();
+        let leaving_id = rs0.instances[0].id.clone();
+        for (id, inst) in desc_t1.ingesters.iter_mut() {
+            inst.timestamp = t1_sec;
+            if id == &leaving_id {
+                inst.state = InstanceState::Leaving as i32;
+            }
+        }
+        ring.update_ring_state(desc_t1.clone());
+
+        // Cached subring must refresh token_table.instances with both fresh heartbeat and LEAVING state.
+        let sub1 = ring.shuffle_shard("tenant-a", 3);
+        let rs1 = sub1.get_at(42, WRITE, 3, t1).unwrap();
+        assert_eq!(rs1.instances.len(), 2, "LEAVING replica must be filtered out while 2 healthy survive");
+        assert!(rs1.instances.iter().all(|i| i.timestamp == t1_sec && i.id != leaving_id));
+
+        // Verify CompareResult::Equal with changed versions also updates parent token_table.instances.
+        let mut desc_v2 = desc_t1;
+        for inst in desc_v2.ingesters.values_mut() {
+            inst.versions.insert(1u64, 2u64);
+        }
+        ring.update_ring_state(desc_v2);
+        let rs_parent = ring.get_at(42, WRITE, 3, t1).unwrap();
+        assert!(rs_parent.instances.iter().all(|i| i.versions.get(&1) == Some(&2)));
     }
 }

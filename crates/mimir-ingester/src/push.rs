@@ -2424,7 +2424,15 @@ impl Ingester {
                         if ingest_created_ts && created_ts < h_ts {
                             let ct_res = if is_float {
                                 let Some(fh_ref) = fh_opt.as_ref() else {
-                                    continue;
+                                    debug_assert!(false, "missing converted float histogram");
+                                    hard_err = Some((
+                                        orig_idx,
+                                        IngesterError::Internal {
+                                            message: "missing converted float histogram".to_string(),
+                                        }
+                                        .with_user(user_id, 0),
+                                    ));
+                                    break;
                                 };
                                 let zero_fh = FloatHistogram {
                                     counter_reset_hint: CounterResetHint::CounterReset,
@@ -2444,7 +2452,15 @@ impl Ingester {
                                 )
                             } else {
                                 let Some(ih_ref) = ih_opt.as_ref() else {
-                                    continue;
+                                    debug_assert!(false, "missing converted int histogram");
+                                    hard_err = Some((
+                                        orig_idx,
+                                        IngesterError::Internal {
+                                            message: "missing converted int histogram".to_string(),
+                                        }
+                                        .with_user(user_id, 0),
+                                    ));
+                                    break;
                                 };
                                 let zero_ih = Histogram {
                                     counter_reset_hint: CounterResetHint::CounterReset,
@@ -2496,7 +2512,15 @@ impl Ingester {
                             && !(ex_count > 0 && max_exemplars > 0);
                         let res = if is_float {
                             let Some(fh) = fh_opt.take() else {
-                                continue;
+                                debug_assert!(false, "missing converted float histogram");
+                                hard_err = Some((
+                                    orig_idx,
+                                    IngesterError::Internal {
+                                        message: "missing converted float histogram".to_string(),
+                                    }
+                                    .with_user(user_id, 0),
+                                ));
+                                break;
                             };
                             if take_entry {
                                 app.append_float_histogram_with_entry_prehashed_encoded_take(
@@ -2521,7 +2545,15 @@ impl Ingester {
                             }
                         } else {
                             let Some(ih) = ih_opt.take() else {
-                                continue;
+                                debug_assert!(false, "missing converted int histogram");
+                                hard_err = Some((
+                                    orig_idx,
+                                    IngesterError::Internal {
+                                        message: "missing converted int histogram".to_string(),
+                                    }
+                                    .with_user(user_id, 0),
+                                ));
+                                break;
                             };
                             if take_entry {
                                 app.append_histogram_with_entry_prehashed_encoded_take(
@@ -3278,7 +3310,11 @@ impl Ingester {
                     if ingest_created_ts && created_ts < h_ts {
                         let ct_res = if is_float {
                             let Some(fh_ref) = fh_opt.as_ref() else {
-                                continue;
+                                debug_assert!(false, "missing converted float histogram");
+                                return Err(IngesterError::Internal {
+                                    message: "missing converted float histogram".to_string(),
+                                }
+                                .with_user(user_id, 0));
                             };
                             let zero_fh = FloatHistogram {
                                 counter_reset_hint: CounterResetHint::CounterReset,
@@ -3298,7 +3334,11 @@ impl Ingester {
                             )
                         } else {
                             let Some(ih_ref) = ih_opt.as_ref() else {
-                                continue;
+                                debug_assert!(false, "missing converted int histogram");
+                                return Err(IngesterError::Internal {
+                                    message: "missing converted int histogram".to_string(),
+                                }
+                                .with_user(user_id, 0));
                             };
                             let zero_ih = Histogram {
                                 counter_reset_hint: CounterResetHint::CounterReset,
@@ -3349,7 +3389,11 @@ impl Ingester {
                         && !(ex_count > 0 && max_exemplars > 0);
                     let res = if is_float {
                         let Some(fh) = fh_opt.take() else {
-                            continue;
+                            debug_assert!(false, "missing converted float histogram");
+                            return Err(IngesterError::Internal {
+                                message: "missing converted float histogram".to_string(),
+                            }
+                            .with_user(user_id, 0));
                         };
                         if take_entry {
                             app.append_float_histogram_with_entry_prehashed_encoded_take(
@@ -3374,7 +3418,11 @@ impl Ingester {
                         }
                     } else {
                         let Some(ih) = ih_opt.take() else {
-                            continue;
+                            debug_assert!(false, "missing converted int histogram");
+                            return Err(IngesterError::Internal {
+                                message: "missing converted int histogram".to_string(),
+                            }
+                            .with_user(user_id, 0));
                         };
                         if take_entry {
                             app.append_histogram_with_entry_prehashed_encoded_take(

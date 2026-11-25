@@ -2623,4 +2623,94 @@ mod consumer_tests {
             ]
         );
     }
+
+    #[test]
+    fn bad_utf8_v1_record_after_valid_record_in_single_worker_arena_does_not_panic() {
+        use bytes::Bytes;
+        use mimir_storage::ingest::version::{RecordSerializer, RecordVersion};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mimir_config::IngesterConfig::default();
+        cfg.ring.instance_id = "ing-0".to_string();
+        let mut blocks_cfg = mimir_config::BlocksStorageConfig::default();
+        blocks_cfg.tsdb.dir = tmp.path().to_string_lossy().into_owned();
+        let ing = Ingester::new(
+            cfg,
+            blocks_cfg,
+            mimir_config::IngestStorageConfig::default(),
+            mimir_config::Overrides::new(mimir_config::LimitsConfig::default()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ing.set_state_for_test(State::Running);
+
+        let kcfg = KafkaConfig {
+            ingestion_concurrency_max: 4,
+            ..KafkaConfig::default()
+        };
+        let consumer =
+            IngesterShardedBatchConsumer::new(Arc::clone(&ing), kcfg, PusherConsumerMetrics::new(None));
+        let ser = RecordSerializer::new(RecordVersion::V1);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let mk_rec = |offset: i64, wr: &cortexpb::WriteRequest| {
+            let (mut recs, _) = ser.to_records("ingest", 0, "t-utf8", wr, 1_048_576).unwrap();
+            let r = recs.pop().unwrap();
+            FetchedRecord {
+                offset,
+                timestamp_ms: ts,
+                key: r.key,
+                value: r.value,
+                headers: r.headers,
+            }
+        };
+
+        let wr_good1 = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair::from_strs("__name__", "good_before")],
+                samples: vec![cortexpb::Sample { value: 1.0, timestamp_ms: ts }],
+                ..Default::default()
+            }],
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        };
+        let wr_bad = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![
+                    cortexpb::LabelPair::from_strs("__name__", "bad_utf8"),
+                    cortexpb::LabelPair {
+                        name: Bytes::from_static(b"k"),
+                        value: Bytes::from_static(&[0xff, 0xfe]),
+                    },
+                ],
+                samples: vec![cortexpb::Sample { value: 2.0, timestamp_ms: ts }],
+                ..Default::default()
+            }],
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        };
+        let wr_good2 = cortexpb::WriteRequest {
+            timeseries: vec![cortexpb::TimeSeries {
+                labels: vec![cortexpb::LabelPair::from_strs("__name__", "good_after")],
+                samples: vec![cortexpb::Sample { value: 3.0, timestamp_ms: ts }],
+                ..Default::default()
+            }],
+            source: cortexpb::write_request::SourceEnum::Api as i32,
+            ..Default::default()
+        };
+
+        // Small (< 32 KiB) 3-record batch runs on 1 decode worker so wr_bad sits at label_bytes_start > 0.
+        let batch = vec![mk_rec(1, &wr_good1), mk_rec(2, &wr_bad), mk_rec(3, &wr_good2)];
+        consumer.consume_records_sync(&batch).unwrap();
+        let db = ing.get_tsdb("t-utf8").unwrap();
+        assert_eq!(db.db.head().num_series(), 2);
+    }
 }

@@ -235,7 +235,7 @@ impl BlockChunksWriter {
             self.cut()?;
         }
 
-        let mut len_buf = [0u8; 10];
+        let mut len_buf = [0u8; 11];
         let last_batch_idx = batches.len() - 1;
         for (bi, range) in batches.into_iter().enumerate() {
             for chk in &mut chunks[range] {

@@ -1247,13 +1247,13 @@ impl SeriesState {
         out_chunks: &mut Vec<ChunkMeta>,
     ) {
         for mc in self.mmapped() {
-            if mc.overlaps_closed_interval(mint, maxt_inclusive) {
+            if mc.num_samples > 0 && mc.overlaps_closed_interval(mint, maxt_inclusive) {
                 pending_mmapped.push((slot, *mc));
             }
         }
         if let Some(ref c) = self.cold {
             for hc in &c.extra_head_chunks {
-                if hc.min_time <= maxt_inclusive && mint <= hc.max_time {
+                if hc.chunk.num_samples() > 0 && hc.min_time <= maxt_inclusive && mint <= hc.max_time {
                     out_chunks.push(ChunkMeta {
                         ref_id: 0,
                         min_time: hc.min_time,
@@ -1264,7 +1264,7 @@ impl SeriesState {
             }
         }
         let enc = self.active_encoding();
-        if enc != Encoding::None {
+        if enc != Encoding::None && self.active_chunk_num_samples() > 0 {
             let hc_min = self.active_min_time;
             let hc_max = self.active_max_time();
             if hc_min <= maxt_inclusive && mint <= hc_max {
@@ -9180,8 +9180,22 @@ impl Head {
     fn seal_active_chunks_head_for_compaction(&self) {
         let mut wg = self.chunk_writer.lock();
         if let Some(ref mut writer) = *wg {
-            if matches!(writer.seal_active_file_if_at_least(1024 * 1024), Ok(true)) {
-                let _ = self.refresh_chunk_reader_with_active(None);
+            match writer.seal_active_file_if_at_least(1024 * 1024) {
+                Ok(true) => {
+                    if let Err(err) = self.refresh_chunk_reader_with_active(None) {
+                        tracing::warn!(
+                            err = %err,
+                            "failed to refresh chunk_reader after sealing active chunks_head segment; falling back to active_file reads"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        err = %err,
+                        "failed to seal active chunks_head segment before compaction"
+                    );
+                }
             }
         }
     }
@@ -9242,6 +9256,7 @@ impl Head {
         out: &mut [(Vec<ChunkMeta>, Vec<Interval>)],
     ) -> Result<(), HeadError> {
         let mut pending_mmapped: Vec<(usize, MmappedChunk)> = Vec::with_capacity(entries.len() * 2);
+        let mut head_counts: SmallVec<[usize; 256]> = SmallVec::with_capacity(entries.len());
         let has_tombs = self.tombstones.has_any();
 
         for (slot, entry) in entries.iter().enumerate() {
@@ -9252,6 +9267,7 @@ impl Head {
             {
                 let st = entry.inner.lock();
                 if entry.is_gced() {
+                    head_counts.push(0);
                     continue;
                 }
                 st.collect_in_order_chunks_no_iso_into(
@@ -9262,6 +9278,7 @@ impl Head {
                     out_chunks,
                 );
             }
+            head_counts.push(out_chunks.len());
             if has_tombs {
                 self.tombstones.get_into(entry.ref_id, out_tombs);
             }
@@ -9283,6 +9300,14 @@ impl Head {
                     max_time: mc.max_time,
                     chunk: Some(enc),
                 });
+            }
+            // Restore chronological [mmapped..., extra_head_chunks..., active_chunk] order so
+            // `trim_and_merge_chunks` hits its zero-alloc sorted fast path even when a series
+            // spans both mmapped and in-memory head chunks.
+            for (slot, &hc) in head_counts.iter().enumerate() {
+                if hc > 0 && out[slot].0.len() > hc {
+                    out[slot].0.rotate_left(hc);
+                }
             }
         }
         Ok(())
@@ -16087,7 +16112,7 @@ impl<'a> HeadAppender<'a> {
                 .map_or(0, |e| e.ref_id));
         }
 
-        let entry = if let Some(e) = series_entry {
+        let entry = if let Some(e) = series_entry.filter(|e| !e.is_gced()) {
             Arc::clone(e)
         } else if let Some(r) = series_ref {
             match self.head.series.get_by_id(r) {
@@ -17212,7 +17237,7 @@ impl<'a> HeadAppender<'a> {
                     raw_buf.clear();
                     let need = slice.len() * 14 + 17;
                     if raw_buf.capacity() < need {
-                        raw_buf.reserve(need - raw_buf.capacity());
+                        raw_buf.reserve(need);
                     }
                     let b = std::mem::take(&mut raw_buf);
                     raw_buf = enc.samples_iter(

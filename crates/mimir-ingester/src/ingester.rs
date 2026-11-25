@@ -1415,7 +1415,7 @@ impl Ingester {
             let errs: Mutex<Vec<String>> = Mutex::new(Vec::new());
             let workers = concurrency.min(users.len());
             let pool = self.pre_commit_pool.get_or_init(|| {
-                let pool_threads = concurrency.clamp(1, 32).saturating_sub(1);
+                let pool_threads = concurrency.clamp(1, 256).saturating_sub(1);
                 ScopedWorkerPool::new("ingester-fsync", pool_threads)
             });
             pool.scoped_execute(workers, |_| loop {

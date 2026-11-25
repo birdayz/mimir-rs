@@ -2905,19 +2905,21 @@ pub enum DenseRefFilter<'a> {
         words: Vec<u64>,
     },
     SortedBorrowed(&'a [u64]),
-    SortedOwned(Vec<u64>),
 }
 
 impl<'a> DenseRefFilter<'a> {
     const MAX_BITSET_SPAN: u64 = 4_000_000;
 
-    /// Constructs a filter over a sorted slice of eligible series refs.
+    /// Constructs a filter over a sorted slice of eligible series refs, using an L1-friendly
+    /// bitset only when the ref span is bounded AND dense enough to amortize bitset allocation.
     pub fn from_sorted_refs(eligible: &'a [u64]) -> Self {
         let (Some(&min), Some(&max)) = (eligible.first(), eligible.last()) else {
             return Self::Empty;
         };
         let span = max.saturating_sub(min);
-        if span <= Self::MAX_BITSET_SPAN {
+        let dense_enough = eligible.len() >= 64
+            || span <= (eligible.len() as u64).saturating_mul(64);
+        if span <= Self::MAX_BITSET_SPAN && dense_enough {
             let num_words = (span as usize / 64) + 1;
             let mut words = vec![0u64; num_words];
             for &r in eligible {
@@ -2935,57 +2937,6 @@ impl<'a> DenseRefFilter<'a> {
         }
     }
 
-    /// Constructs a filter over the subset of sorted eligible refs that pass keep(r).
-    pub fn from_sorted_refs_filtered(
-        eligible: &'a [u64],
-        mut keep: impl FnMut(u64) -> bool,
-    ) -> Self {
-        let (Some(&raw_min), Some(&raw_max)) = (eligible.first(), eligible.last()) else {
-            return Self::Empty;
-        };
-        let span = raw_max.saturating_sub(raw_min);
-        if span <= Self::MAX_BITSET_SPAN {
-            let num_words = (span as usize / 64) + 1;
-            let mut words = vec![0u64; num_words];
-            let mut min = u64::MAX;
-            let mut max = 0u64;
-            let mut any = false;
-            for &r in eligible {
-                if keep(r) {
-                    let bit = (r - raw_min) as usize;
-                    words[bit >> 6] |= 1u64 << (bit & 63);
-                    if !any {
-                        min = r;
-                        any = true;
-                    }
-                    max = r;
-                }
-            }
-            if !any {
-                Self::Empty
-            } else {
-                Self::BitSet {
-                    base: raw_min,
-                    min,
-                    max,
-                    words,
-                }
-            }
-        } else {
-            let mut filtered = Vec::with_capacity(eligible.len());
-            for &r in eligible {
-                if keep(r) {
-                    filtered.push(r);
-                }
-            }
-            if filtered.is_empty() {
-                Self::Empty
-            } else {
-                Self::SortedOwned(filtered)
-            }
-        }
-    }
-
     #[inline]
     pub fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
@@ -2996,7 +2947,6 @@ impl<'a> DenseRefFilter<'a> {
         match self {
             Self::Empty => false,
             Self::SortedBorrowed(eligible) => intersect_sorted_any(small, large, eligible),
-            Self::SortedOwned(eligible) => intersect_sorted_any(small, large, eligible),
             Self::BitSet {
                 base,
                 min,

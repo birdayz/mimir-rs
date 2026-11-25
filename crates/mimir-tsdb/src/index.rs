@@ -249,6 +249,11 @@ pub struct IndexWriter {
     /// `(name_start, name_end, name_idx, count_slot, val_start, val_end, val_idx)`.
     /// Exploits lexicographical series ordering to skip ~85% of symbol hash lookups in `add_series`.
     prev_label_cache: Vec<(usize, usize, u32, usize, usize, usize, u32)>,
+    /// Reusable scratch staging buffer for `add_series` so a mid-loop `UnknownSymbol` or I/O
+    /// error never leaves `prev_label_cache` or `label_name_counts` partially mutated.
+    next_label_cache: Vec<(usize, usize, u32, usize, usize, usize, u32)>,
+    /// Set if `close_inner` fails so `Drop` does not retry writing partial postings.
+    close_failed: bool,
     /// All series posting IDs (`series_pos / 16`) collected during `add_series` (eliminates pass-0 mmap scan).
     all_series_ids: Vec<u32>,
     last_series: Option<Labels>,
@@ -313,6 +318,8 @@ impl IndexWriter {
             label_name_counts: Vec::with_capacity(32),
             label_name_slots: hashbrown::HashMap::with_capacity(32),
             prev_label_cache: Vec::with_capacity(16),
+            next_label_cache: Vec::with_capacity(16),
+            close_failed: false,
             all_series_ids: Vec::new(),
             last_series: None,
             last_series_ref: 0,
@@ -404,6 +411,7 @@ impl IndexWriter {
                 self.label_name_counts = Vec::new();
                 self.label_name_slots = hashbrown::HashMap::new();
                 self.prev_label_cache = Vec::new();
+                self.next_label_cache = Vec::new();
                 self.all_series_ids = Vec::new();
                 self.toc.postings = self.pos;
                 self.write_postings()?;
@@ -522,11 +530,9 @@ impl IndexWriter {
             last_maxt = c.max_time;
         }
 
-        self.add_padding(SERIES_BYTE_ALIGN)?;
-        debug_assert_eq!(self.pos % (SERIES_BYTE_ALIGN as u64), 0);
-        let series_id = u32::try_from(self.pos / (SERIES_BYTE_ALIGN as u64))
-            .map_err(|_| IndexError::IndexExceeds64GiB(self.pos))?;
-
+        // Resolve all label symbol IDs into `self.next_label_cache` BEFORE mutating
+        // `self.prev_label_cache`, `self.label_name_counts`, `self.all_series_ids`, or
+        // writing any padding/bytes, so an `UnknownSymbol` error leaves writer state intact.
         self.buf2.reset();
         self.buf2.put_uvarint(labels.len());
 
@@ -536,7 +542,7 @@ impl IndexWriter {
             .last_series
             .as_ref()
             .map_or(&[], |prev| prev.as_bytes());
-        let mut next_cache_len = 0usize;
+        self.next_label_cache.clear();
 
         for (pair_idx, (name, value)) in labels.iter().enumerate() {
             let nb = name.as_bytes();
@@ -551,25 +557,17 @@ impl IndexWriter {
                 Some((pn_s, pn_e, pn_idx, p_slot, _, _, _))
                     if prev_bytes.get(pn_s..pn_e) == Some(nb) =>
                 {
-                    self.label_name_counts[p_slot].1 += 1;
                     (pn_idx, p_slot)
                 }
                 _ => {
                     let nid = self
                         .lookup_symbol(name)
                         .ok_or_else(|| IndexError::UnknownSymbol(name.to_string()))?;
-                    let slot = match self.label_name_slots.get(&nid) {
-                        Some(&s) => {
-                            self.label_name_counts[s].1 += 1;
-                            s
-                        }
-                        None => {
-                            let s = self.label_name_counts.len();
-                            self.label_name_counts.push((nid, 1));
-                            self.label_name_slots.insert(nid, s);
-                            s
-                        }
-                    };
+                    let slot = self
+                        .label_name_slots
+                        .get(&nid)
+                        .copied()
+                        .unwrap_or(usize::MAX);
                     (nid, slot)
                 }
             };
@@ -584,18 +582,11 @@ impl IndexWriter {
                     .ok_or_else(|| IndexError::UnknownSymbol(value.to_string()))?,
             };
 
-            let entry = (n_start, n_end, name_idx, count_slot, v_start, v_end, val_idx);
-            if next_cache_len < self.prev_label_cache.len() {
-                self.prev_label_cache[next_cache_len] = entry;
-            } else {
-                self.prev_label_cache.push(entry);
-            }
-            next_cache_len += 1;
-
+            self.next_label_cache
+                .push((n_start, n_end, name_idx, count_slot, v_start, v_end, val_idx));
             self.buf2.put_uvarint32(name_idx);
             self.buf2.put_uvarint32(val_idx);
         }
-        self.prev_label_cache.truncate(next_cache_len);
 
         self.buf2.put_uvarint(chunks.len());
         if let Some(c0) = chunks.first() {
@@ -622,8 +613,31 @@ impl IndexWriter {
         self.buf1.put_uvarint(self.buf2.len());
         self.buf2.put_crc32c();
 
+        self.add_padding(SERIES_BYTE_ALIGN)?;
+        debug_assert_eq!(self.pos % (SERIES_BYTE_ALIGN as u64), 0);
+        let series_id = u32::try_from(self.pos / (SERIES_BYTE_ALIGN as u64))
+            .map_err(|_| IndexError::IndexExceeds64GiB(self.pos))?;
+
         write_main_slice(&mut self.f, &mut self.pos, self.buf1.as_slice())?;
         write_main_slice(&mut self.f, &mut self.pos, self.buf2.as_slice())?;
+
+        // Commit label counts and swap adjacent-series cache only after all writes succeed.
+        for entry in &mut self.next_label_cache {
+            let slot = if entry.3 != usize::MAX {
+                self.label_name_counts[entry.3].1 += 1;
+                entry.3
+            } else if let Some(&s) = self.label_name_slots.get(&entry.2) {
+                self.label_name_counts[s].1 += 1;
+                s
+            } else {
+                let s = self.label_name_counts.len();
+                self.label_name_counts.push((entry.2, 1));
+                self.label_name_slots.insert(entry.2, s);
+                s
+            };
+            entry.3 = slot;
+        }
+        std::mem::swap(&mut self.prev_label_cache, &mut self.next_label_cache);
         self.all_series_ids.push(series_id);
 
         self.last_series = Some(labels.clone());
@@ -921,19 +935,25 @@ impl IndexWriter {
         if self.stage == WriterStage::Done {
             return Ok(());
         }
-        self.ensure_stage(WriterStage::Done)?;
-        if let Some(mut f) = self.f.take() {
-            f.flush()?;
-            let file = f.into_inner().map_err(|e| e.into_error())?;
-            file.sync_all()?;
+        let res = (|| -> Result<(), IndexError> {
+            self.ensure_stage(WriterStage::Done)?;
+            if let Some(mut f) = self.f.take() {
+                f.flush()?;
+                let file = f.into_inner().map_err(|e| e.into_error())?;
+                file.sync_all()?;
+            }
+            Ok(())
+        })();
+        if res.is_err() {
+            self.close_failed = true;
         }
-        Ok(())
+        res
     }
 }
 
 impl Drop for IndexWriter {
     fn drop(&mut self) {
-        if self.stage != WriterStage::Done && self.f.is_some() {
+        if !self.close_failed && self.stage != WriterStage::Done && self.f.is_some() {
             let _ = self.close_inner();
         }
         let _ = fs::remove_file(&self.tmp_p_path);
@@ -3158,5 +3178,35 @@ mod tests {
             parse_postings_offset_table_payload(dup_val.as_slice()),
             Err(IndexError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn add_series_unknown_symbol_error_does_not_corrupt_prev_label_cache_or_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_FILENAME);
+        let mut w = IndexWriter::new(&path).unwrap();
+        for sym in ["", "a", "b", "bar", "foo", "goo", "qux"] {
+            w.add_symbol(sym).unwrap();
+        }
+
+        let s1 = Labels::from_pairs([("a", "foo"), ("b", "bar")]);
+        let s2_bad = Labels::from_pairs([("a", "goo"), ("c", "MISSING_SYM")]);
+        let s3 = Labels::from_pairs([("a", "foo"), ("b", "qux")]);
+
+        w.add_series(1, &s1, &[]).unwrap();
+        assert!(matches!(
+            w.add_series(2, &s2_bad, &[]),
+            Err(IndexError::UnknownSymbol(_))
+        ));
+        w.add_series(3, &s3, &[]).unwrap();
+        w.close().unwrap();
+
+        let r = IndexReader::open(&path).unwrap();
+        let sids = r.postings("", &[""]).unwrap();
+        assert_eq!(sids.len(), 2);
+        let (lbl1, _) = r.series(sids[0]).unwrap();
+        let (lbl3, _) = r.series(sids[1]).unwrap();
+        assert_eq!(lbl1, s1);
+        assert_eq!(lbl3, s3, "prev_label_cache must not poison S3 with failed S2 symbol");
     }
 }

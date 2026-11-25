@@ -1037,8 +1037,12 @@ impl HeadChunksReader {
             self.files.remove(&seq);
         }
 
+        // Only drop `self.active_file` early if the file no longer exists on disk; if it was
+        // newly sealed (`active_seq != Some(cur_active_seq)` but still in `paths`), keep
+        // `self.active_file` intact until `map_and_validate_file` succeeds so an `ENOMEM` /
+        // `vm.max_map_count` error never leaves the sealed segment unreadable.
         if let Some((cur_active_seq, _)) = self.active_file {
-            if active_seq != Some(cur_active_seq) || !paths.contains_key(&cur_active_seq) {
+            if !paths.contains_key(&cur_active_seq) {
                 self.active_file = None;
             }
         }
@@ -1065,7 +1069,6 @@ impl HeadChunksReader {
                 if prev_tail_seq == Some(seq) {
                     let disk_len = fs::metadata(&path)?.len() as usize;
                     if disk_len != existing.len() {
-                        self.files.remove(&seq);
                         let mmap = Self::map_and_validate_file(&path)?;
                         self.files.insert(seq, mmap);
                     }
@@ -1075,6 +1078,15 @@ impl HeadChunksReader {
 
             let mmap = Self::map_and_validate_file(&path)?;
             self.files.insert(seq, mmap);
+            if self.active_file.as_ref().is_some_and(|(s, _)| *s == seq) {
+                self.active_file = None;
+            }
+        }
+
+        if let Some((cur_active_seq, _)) = self.active_file {
+            if active_seq != Some(cur_active_seq) {
+                self.active_file = None;
+            }
         }
 
         Ok(())
