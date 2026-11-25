@@ -1679,7 +1679,7 @@ impl TsdbInner {
         }
 
         let workers = to_open.len().min(
-            std::thread::available_parallelism()
+            std::num::NonZeroUsize::new(mimir_common::cached_available_parallelism())
                 .map_or(4, |n| n.get())
                 .clamp(2, 16),
         );

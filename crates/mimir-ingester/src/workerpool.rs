@@ -266,7 +266,7 @@ pub struct Pool {
 /// so 16-vCPU pods are never bottlenecked while unconstrained 24+ core hosts do not spawn
 /// excessive idle worker threads.
 fn default_workers() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16))
+    mimir_common::cached_available_parallelism().clamp(2, 16)
 }
 
 impl Pool {

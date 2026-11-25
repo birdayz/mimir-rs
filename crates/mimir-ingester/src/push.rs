@@ -33,7 +33,7 @@ const CLASSIC_PUSH_SHARD_THRESHOLD: usize = 4096;
 fn classic_push_pool() -> &'static ScopedWorkerPool {
     static POOL: OnceLock<ScopedWorkerPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let hw = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let hw = mimir_common::cached_available_parallelism();
         ScopedWorkerPool::new("classic-push", hw.clamp(2, 8).saturating_sub(1))
     })
 }
@@ -1930,7 +1930,7 @@ impl Ingester {
         min_ts: i64,
         items: &mut [PrehashedSeriesItem<'_>],
     ) -> Result<(), IngesterError> {
-        let hw_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let hw_threads = mimir_common::cached_available_parallelism();
         let max_shards = hw_threads.clamp(2, 8);
         let desired = (items.len() / 128).clamp(2, max_shards);
         let num_shards = 1usize << (usize::BITS - 1 - desired.leading_zeros());

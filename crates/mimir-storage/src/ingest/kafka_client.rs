@@ -87,10 +87,13 @@ struct OutboundFrame {
     track_metrics: bool,
 }
 
-async fn read_kafka_frame_bounded_timed<R: tokio::io::AsyncRead + Unpin>(
+/// Reads a single size-prefixed Kafka response frame into `read_buf` without zero-filling
+/// memory, reclaiming oversized buffer capacity after huge frames (> 2 MiB).
+async fn read_kafka_frame_bounded_timed_into<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
+    read_buf: &mut BytesMut,
     max_frame_bytes: usize,
-) -> Option<(Vec<u8>, Instant, Instant)> {
+) -> Option<(Bytes, Instant, Instant)> {
     let mut len_buf = [0u8; 4];
     if reader.read_exact(&mut len_buf).await.is_err() {
         return None;
@@ -100,24 +103,40 @@ async fn read_kafka_frame_bounded_timed<R: tokio::io::AsyncRead + Unpin>(
     if !(4..=max_frame_bytes).contains(&frame_len) {
         return None;
     }
-    let mut payload = Vec::with_capacity(frame_len.min(KAFKA_FRAME_INITIAL_CAP));
-    let mut filled = 0usize;
-    while filled < frame_len {
-        if filled == payload.len() {
-            let next_len = if payload.is_empty() {
-                frame_len.min(KAFKA_FRAME_INITIAL_CAP)
-            } else {
-                payload.len().saturating_mul(2).min(frame_len)
-            };
-            payload.resize(next_len, 0);
+    read_buf.clear();
+    let init_cap = frame_len.min(KAFKA_FRAME_INITIAL_CAP);
+    if read_buf.capacity() < init_cap {
+        read_buf.reserve(init_cap);
+    }
+    while read_buf.len() < frame_len {
+        let rem = frame_len - read_buf.len();
+        if read_buf.capacity() == read_buf.len() {
+            let grow = read_buf.len().max(4096).min(rem);
+            read_buf.reserve(grow);
         }
-        match reader.read(&mut payload[filled..]).await {
+        let mut limited = reader.take(rem as u64);
+        match limited.read_buf(read_buf).await {
             Ok(0) | Err(_) => return None,
-            Ok(n) => filled += n,
+            Ok(_) => {}
         }
     }
     let done_at = Instant::now();
+    let payload = read_buf.split_to(frame_len).freeze();
+    if read_buf.capacity() > 2 * 1024 * 1024 {
+        *read_buf = BytesMut::with_capacity(64 * 1024);
+    }
     Some((payload, header_at, done_at))
+}
+
+#[cfg(test)]
+async fn read_kafka_frame_bounded_timed<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> Option<(Vec<u8>, Instant, Instant)> {
+    let mut buf = BytesMut::new();
+    read_kafka_frame_bounded_timed_into(reader, &mut buf, max_frame_bytes)
+        .await
+        .map(|(b, h, d)| (b.to_vec(), h, d))
 }
 
 #[cfg(test)]
@@ -446,8 +465,9 @@ impl BrokerConn {
         let disconnect_hook = kprom.clone().map(|k| (k, Arc::clone(&node)));
         let ext_r = extended_metrics.clone();
         let reader_handle = tokio::spawn(async move {
+            let mut read_buf = BytesMut::with_capacity(64 * 1024);
             while let Some((payload, header_at, done_at)) =
-                read_kafka_frame_bounded_timed(&mut reader, MAX_KAFKA_FRAME_BYTES).await
+                read_kafka_frame_bounded_timed_into(&mut reader, &mut read_buf, MAX_KAFKA_FRAME_BYTES).await
             {
                 let frame_len = payload.len();
                 if let Some(ref m) = ext_r {
@@ -477,7 +497,7 @@ impl BrokerConn {
                             pending_drained_r.notify_waiters();
                         }
                         let _ = tx.send(ReadFrame {
-                            payload: Bytes::from(payload),
+                            payload,
                             header_at,
                             done_at,
                         });
@@ -1377,7 +1397,7 @@ impl KafkaClient {
 
     fn get_decode_pool(&self) -> &ScopedWorkerPool {
         self.decode_pool.get_or_init(|| {
-            let hw = std::thread::available_parallelism().map_or(4, |n| n.get());
+            let hw = mimir_common::cached_available_parallelism();
             ScopedWorkerPool::new("kafka-decode", hw.clamp(2, 8).saturating_sub(1))
         })
     }
@@ -3260,7 +3280,9 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
             }
         };
 
-        if all_frames.len() > 1 {
+        const PARALLEL_BATCH_DECODE_MIN_BYTES: usize = 64 * 1024;
+        let total_frame_bytes: usize = all_frames.iter().map(|b| b.len()).sum();
+        if all_frames.len() > 1 && total_frame_bytes >= PARALLEL_BATCH_DECODE_MIN_BYTES {
             let pool = get_pool();
             type BatchDecodeSlot = parking_lot::Mutex<
                 Option<Result<(Vec<FetchedRecord>, FetchBatchMetrics), KafkaClientError>>,
@@ -3294,12 +3316,17 @@ pub(crate) fn decode_fetch_records_with_pool<'a>(
             }
             return Ok((decoded, next_fetch_offset, last_batch_end_offset));
         }
-        if all_frames.len() == 1 {
-            let (decoded, m) = decode_single_batch_slice(
-                all_frames.into_iter().next().unwrap(),
-                fetch_offset,
-            )?;
-            observe(m);
+        if !all_frames.is_empty() {
+            let mut decoded = Vec::new();
+            for frame in all_frames {
+                let (recs, m) = decode_single_batch_slice(frame, fetch_offset)?;
+                observe(m);
+                if decoded.is_empty() {
+                    decoded = recs;
+                } else {
+                    decoded.extend(recs);
+                }
+            }
             return Ok((decoded, next_fetch_offset, last_batch_end_offset));
         }
         return Ok((Vec::new(), next_fetch_offset, last_batch_end_offset));
@@ -3698,8 +3725,9 @@ impl KgoBrokerConn {
         let warnings_r = Arc::clone(&warnings);
         let reader_handle = tokio::spawn(async move {
             let mut saw_any_frame = false;
+            let mut read_buf = BytesMut::with_capacity(64 * 1024);
             while let Some((payload, header_at, done_at)) =
-                read_kafka_frame_bounded_timed(&mut reader, MAX_KAFKA_FRAME_BYTES).await
+                read_kafka_frame_bounded_timed_into(&mut reader, &mut read_buf, MAX_KAFKA_FRAME_BYTES).await
             {
                 saw_any_frame = true;
                 if let Some(ref cb) = *on_read_r.lock() {
@@ -3729,7 +3757,7 @@ impl KgoBrokerConn {
                             pending_drained_r.notify_waiters();
                         }
                         let _ = tx.send(ReadFrame {
-                            payload: Bytes::from(payload),
+                            payload,
                             header_at,
                             done_at,
                         });

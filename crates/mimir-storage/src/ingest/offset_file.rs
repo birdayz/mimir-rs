@@ -5,6 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -38,6 +39,7 @@ struct OffsetFileData {
 pub struct OffsetFile {
     file_path: PathBuf,
     partition_id: i32,
+    dir_created: AtomicBool,
     mu: Mutex<()>,
 }
 
@@ -46,6 +48,7 @@ impl OffsetFile {
         Self {
             file_path: file_path.as_ref().to_path_buf(),
             partition_id,
+            dir_created: AtomicBool::new(false),
             mu: Mutex::new(()),
         }
     }
@@ -108,13 +111,20 @@ impl OffsetFile {
     pub fn write(&self, offset: i64) -> Result<(), OffsetFileError> {
         let _guard = self.mu.lock();
 
-        if let Some(dir) = self.file_path.parent() {
-            if !dir.as_os_str().is_empty() {
-                fs::create_dir_all(dir).map_err(|source| OffsetFileError::CreateDir {
-                    path: dir.display().to_string(),
-                    source,
-                })?;
+        let ensure_dir = || -> Result<(), OffsetFileError> {
+            if let Some(dir) = self.file_path.parent() {
+                if !dir.as_os_str().is_empty() {
+                    fs::create_dir_all(dir).map_err(|source| OffsetFileError::CreateDir {
+                        path: dir.display().to_string(),
+                        source,
+                    })?;
+                }
             }
+            Ok(())
+        };
+
+        if !self.dir_created.load(Ordering::Relaxed) {
+            ensure_dir()?;
         }
 
         let data = OffsetFileData {
@@ -123,7 +133,15 @@ impl OffsetFile {
             offset,
         };
         let json_bytes = serde_json::to_vec(&data)?;
-        atomic_write_file(&self.file_path, &json_bytes)?;
+        if let Err(e) = atomic_write_file(&self.file_path, &json_bytes) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ensure_dir()?;
+                atomic_write_file(&self.file_path, &json_bytes)?;
+            } else {
+                return Err(e.into());
+            }
+        }
+        self.dir_created.store(true, Ordering::Relaxed);
 
         debug!(file = %self.file_path.display(), offset, "wrote offset to file");
         Ok(())
@@ -217,5 +235,20 @@ mod tests {
         let off = f.read().unwrap();
         assert!((0..100).contains(&off));
         assert!(!path.with_extension("offset.tmp").exists());
+    }
+
+    #[test]
+    fn offset_file_recreates_deleted_parent_dir_after_cached_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("nested/sub");
+        let path = sub.join("offset");
+        let f = OffsetFile::new(&path, TEST_PARTITION_ID);
+
+        f.write(10).unwrap();
+        assert_eq!(f.read(), Some(10));
+
+        std::fs::remove_dir_all(&sub).unwrap();
+        f.write(42).unwrap();
+        assert_eq!(f.read(), Some(42));
     }
 }

@@ -77,6 +77,20 @@ static ALLOCATOR_PURGE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::ne
 static JEMALLOC_STATS_HOOK: std::sync::OnceLock<fn() -> Option<JemallocStats>> =
     std::sync::OnceLock::new();
 static ALLOCATOR_PURGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CACHED_PARALLELISM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Returns `std::thread::available_parallelism()` (defaulting to `4`) cached once per process.
+///
+/// On Linux cgroup v2, every uncached call to `std::thread::available_parallelism()` executes
+/// `sched_getaffinity` plus `openat`/`read`/`statx`/`close` across `/proc/self/cgroup` and every
+/// ancestor `/sys/fs/cgroup/.../cpu.max` (~30 syscalls per call). Caching eliminates hot-path
+/// kernel `sys` CPU overhead.
+#[inline]
+pub fn cached_available_parallelism() -> usize {
+    *CACHED_PARALLELISM.get_or_init(|| {
+        std::thread::available_parallelism().map_or(4, |n| n.get())
+    })
+}
 static NANOS_SLAB_MAPPED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static NANOS_SLAB_PAGES: AtomicUsize = AtomicUsize::new(0);
 static NANOS_SLAB_RECLAIMED_PAGES_TOTAL: AtomicU64 = AtomicU64::new(0);

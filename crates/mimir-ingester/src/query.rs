@@ -980,12 +980,6 @@ impl Ingester {
                                 }
                             },
                         };
-                        let shard_pred = shard.map(|(shard_idx, shard_count)| {
-                            move |lbls: &Labels| labels_stable_hash(lbls) % shard_count == shard_idx
-                        });
-                        let filter_ref: Option<&dyn Fn(&Labels) -> bool> =
-                            shard_pred.as_ref().map(|f| f as &dyn Fn(&Labels) -> bool);
-
                         let mut num_series = 0usize;
                         let mut num_samples = 0usize;
                         let mut series_batch: Vec<ingesterpb::QueryStreamSeries> =
@@ -995,11 +989,12 @@ impl Ingester {
                         let mut batch_bytes = 0usize;
                         let mut receiver_closed = false;
 
-                        let res = cq_b.stream_prepared_chunks_lazy(
+                        let res = cq_b.stream_prepared_chunks_lazy_with_shard(
                             prepared,
                             &matchers,
                             true,
-                            filter_ref,
+                            shard,
+                            None,
                             |ev| match ev {
                                 LazyStreamEvent::Series(labels, chunk_count) => {
                                     num_series += 1;
@@ -1394,12 +1389,6 @@ impl Ingester {
                                 }
                             },
                         };
-                        let shard_pred = shard.map(|(shard_idx, shard_count)| {
-                            move |lbls: &Labels| labels_stable_hash(lbls) % shard_count == shard_idx
-                        });
-                        let filter_ref: Option<&dyn Fn(&Labels) -> bool> =
-                            shard_pred.as_ref().map(|f| f as &dyn Fn(&Labels) -> bool);
-
                         let mut num_series = 0usize;
                         let mut num_samples = 0usize;
                         let mut builder = QueryStreamBatchBuilder::with_capacity(64 * 1024);
@@ -1407,11 +1396,12 @@ impl Ingester {
                         let mut chunks_in_batch = 0usize;
                         let mut receiver_closed = false;
 
-                        let res = cq_b.stream_prepared_chunks_lazy(
+                        let res = cq_b.stream_prepared_chunks_lazy_with_shard(
                             prepared,
                             &matchers,
                             true,
-                            filter_ref,
+                            shard,
+                            None,
                             |ev| match ev {
                                 LazyStreamEvent::Series(labels, chunk_count) => {
                                     num_series += 1;
@@ -4271,15 +4261,9 @@ fn create_user_stats(
 
 /// Ported from `prometheus/model/labels/sharding.go:StableHash`, the per-series shard hash
 /// (`memSeries.shardHash`) used by the TSDB head `ShardedPostings`.
+#[inline]
 fn labels_stable_hash(lbls: &Labels) -> u64 {
-    let mut h = xxhash_rust::xxh64::Xxh64::new(0);
-    for (name, value) in lbls.iter() {
-        h.update(name.as_bytes());
-        h.update(&[0xff]);
-        h.update(value.as_bytes());
-        h.update(&[0xff]);
-    }
-    h.digest()
+    lbls.stable_hash()
 }
 
 #[allow(dead_code)]

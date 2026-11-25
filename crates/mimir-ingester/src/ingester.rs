@@ -995,7 +995,7 @@ impl Ingester {
         let effective_wal_concurrency = if wal_replay_concurrency > 0 {
             wal_replay_concurrency
         } else {
-            std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 8))
+            mimir_common::cached_available_parallelism().clamp(1, 8)
         };
 
         let bucket_guard = self.bucket.read();

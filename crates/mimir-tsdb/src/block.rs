@@ -9,7 +9,8 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -458,6 +459,23 @@ pub fn repair_bad_index_version(dir: &Path) -> Result<(), BlockError> {
     Ok(())
 }
 
+const MAX_SHARD_HASH_CACHE_ENTRIES: usize = 8;
+const MAX_SHARD_HASH_CACHE_REFS: usize = 524_288;
+
+struct ShardHashCacheEntry {
+    key: usize,
+    weak: Weak<[u64]>,
+    cell: Arc<Mutex<Option<Arc<[u64]>>>>,
+}
+
+impl std::fmt::Debug for ShardHashCacheEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardHashCacheEntry")
+            .field("key", &self.key)
+            .finish()
+    }
+}
+
 /// Opened immutable on-disk Prometheus ULID block (`tsdb.Block`).
 #[derive(Debug)]
 pub struct Block {
@@ -470,6 +488,7 @@ pub struct Block {
     delete_mtx: Mutex<()>,
     postings_cache: Arc<PostingsForMatchersCache>,
     postings_cache_source_id: u64,
+    shard_hash_cache: Mutex<VecDeque<ShardHashCacheEntry>>,
     compaction_failed: AtomicBool,
     compaction_deletable: AtomicBool,
     readers: Arc<BlockReaders>,
@@ -528,6 +547,7 @@ impl Block {
             delete_mtx: Mutex::new(()),
             postings_cache,
             postings_cache_source_id: next_postings_cache_source_id(),
+            shard_hash_cache: Mutex::new(VecDeque::new()),
             compaction_failed,
             compaction_deletable,
             readers: Arc::new(BlockReaders::default()),
@@ -647,6 +667,58 @@ impl Block {
             concurrent,
             || postings_for_matchers(&self.index, matchers),
         )
+    }
+
+    /// Returns cached Prometheus `StableHash` values aligned 1:1 with `refs` when `refs` is
+    /// shared across concurrent sharded queries via `PostingsForMatchersCache`.
+    ///
+    /// Uses singleflight per-entry locking so concurrent shards compute the hashes at most once
+    /// per live cached postings slice, and auto-prunes entries once the postings cache evicts
+    /// `refs` (`Weak::ptr_eq` prevents ABA pointer reuse). Returns `Ok(None)` for unshared or
+    /// oversized slices so callers stream `index.series_stable_hash` without allocating.
+    pub fn shard_hashes_for_postings(
+        &self,
+        refs: &Arc<[u64]>,
+    ) -> Result<Option<Arc<[u64]>>, IndexError> {
+        if refs.is_empty()
+            || refs.len() > MAX_SHARD_HASH_CACHE_REFS
+            || Arc::strong_count(refs) <= 1
+        {
+            return Ok(None);
+        }
+        let key = Arc::as_ptr(refs) as *const u64 as usize;
+        let cell = {
+            let mut cache = self.shard_hash_cache.lock();
+            cache.retain(|e| e.weak.strong_count() > 0);
+            if let Some(entry) = cache
+                .iter()
+                .find(|e| e.key == key && std::ptr::eq(e.weak.as_ptr(), Arc::as_ptr(refs)))
+            {
+                Arc::clone(&entry.cell)
+            } else {
+                if cache.len() >= MAX_SHARD_HASH_CACHE_ENTRIES {
+                    cache.pop_front();
+                }
+                let cell = Arc::new(Mutex::new(None));
+                cache.push_back(ShardHashCacheEntry {
+                    key,
+                    weak: Arc::downgrade(refs),
+                    cell: Arc::clone(&cell),
+                });
+                cell
+            }
+        };
+        let mut guard = cell.lock();
+        if let Some(ref hashes) = *guard {
+            return Ok(Some(Arc::clone(hashes)));
+        }
+        let mut hashes = Vec::with_capacity(refs.len());
+        for &r in refs.iter() {
+            hashes.push(self.index.series_stable_hash(r)?);
+        }
+        let arc: Arc<[u64]> = Arc::from(hashes);
+        *guard = Some(Arc::clone(&arc));
+        Ok(Some(arc))
     }
 
     /// Evaluates `matchers` directly against this block's index, bypassing `PostingsForMatchersCache`.
@@ -897,5 +969,72 @@ mod tests {
         assert!(disk_meta.compaction.failed, "Block::delete must preserve compaction.failed");
         assert!(disk_meta.compaction.deletable, "Block::delete must preserve compaction.deletable");
         assert!(disk_meta.stats.num_tombstones > 0);
+    }
+
+    #[test]
+    fn shard_hashes_for_postings_singleflight_and_prunes_after_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = {
+            let db = crate::db::Tsdb::open(dir.path(), crate::db::TsdbOptions::default()).unwrap();
+            let mut app = db.appender();
+            for i in 0..64 {
+                let pod = format!("p-{i:03}");
+                app.append_float(None, &[("__name__", "shard_metric"), ("pod", pod.as_str())], 1_000, i as f64)
+                    .unwrap();
+            }
+            app.commit().unwrap();
+            let uid = db.compact_head_all().unwrap().unwrap();
+            db.close().unwrap();
+            uid
+        };
+        let bdir = dir.path().join(uid.to_string());
+        let blk = Arc::new(Block::open(&bdir).unwrap());
+        let matchers = [LabelMatcher::new(
+            crate::matcher::MatchType::Equal,
+            "__name__",
+            "shard_metric",
+        )
+        .unwrap()];
+
+        // Unshared (strong_count == 1) slice must bypass cache and return None.
+        let unshared: Arc<[u64]> = Arc::from(blk.postings_for_matchers_direct(&matchers).unwrap());
+        assert!(blk.shard_hashes_for_postings(&unshared).unwrap().is_none());
+
+        // Shared slice from PostingsForMatchersCache (concurrent = true): 16 concurrent threads
+        // must all get the exact same Arc<[u64]> matching series_labels().stable_hash().
+        let cached_refs = blk
+            .postings_for_matchers_with_concurrent(&matchers, true)
+            .unwrap();
+        assert!(Arc::strong_count(&cached_refs) >= 2);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let b = Arc::clone(&blk);
+            let r = Arc::clone(&cached_refs);
+            handles.push(std::thread::spawn(move || {
+                b.shard_hashes_for_postings(&r).unwrap().unwrap()
+            }));
+        }
+        let first = handles.remove(0).join().unwrap();
+        assert_eq!(first.len(), cached_refs.len());
+        for (ref_id, &h) in cached_refs.iter().zip(first.iter()) {
+            assert_eq!(h, blk.index().series_labels(*ref_id).unwrap().stable_hash());
+        }
+        for handle in handles {
+            let other = handle.join().unwrap();
+            assert!(Arc::ptr_eq(&first, &other));
+        }
+
+        // Simulate cache eviction by holding a fresh shared Arc then dropping both clones.
+        {
+            let ephem: Arc<[u64]> = Arc::from(cached_refs.as_ref());
+            let ephem2 = Arc::clone(&ephem);
+            assert!(blk.shard_hashes_for_postings(&ephem).unwrap().is_some());
+            drop(ephem2);
+            drop(ephem);
+        }
+        // Next lookup prunes dead Weak entries.
+        let _ = blk.shard_hashes_for_postings(&cached_refs).unwrap();
+        assert_eq!(blk.shard_hash_cache.lock().len(), 1);
     }
 }

@@ -1009,12 +1009,18 @@ impl SeriesHashCache {
 }
 
 /// Memory-mapped or byte-slice reader for Prometheus TSDB Index v1/v2/v3 files.
+/// Upper bound on symbol count for building a direct `Vec<u32>` offset table (<= 2 MiB).
+const MAX_DIRECT_SYMBOL_OFFSETS: usize = 524_288;
+
 #[derive(Debug)]
 pub struct IndexReader {
     mmap: IndexData,
     version: u8,
     toc: IndexToc,
     symbol_offsets: Vec<usize>,
+    /// Direct O(1) `symbol_id -> mmap byte offset` table for v2/v3 indexes up to 4 GiB and
+    /// `MAX_DIRECT_SYMBOL_OFFSETS` symbols; empty when falling back to `SYMBOL_FACTOR = 32`.
+    direct_symbol_offsets: Vec<u32>,
     num_symbols: usize,
     name_cache: HashMap<u32, (u32, u32)>,
     postings_index: Vec<Box<[PostingOffsetEntry]>>,
@@ -1048,7 +1054,8 @@ impl IndexReader {
         }
 
         let toc = IndexToc::parse(&mmap)?;
-        let (symbol_offsets, num_symbols) = parse_symbols_index(&mmap, toc.symbols as usize)?;
+        let (symbol_offsets, direct_symbol_offsets, num_symbols) =
+            parse_symbols_index(&mmap, toc.symbols as usize, version)?;
         let postings_table_off = usize::try_from(toc.postings_table)
             .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
         let postings_payload_start = postings_table_off
@@ -1092,6 +1099,7 @@ impl IndexReader {
             version,
             toc,
             symbol_offsets,
+            direct_symbol_offsets,
             num_symbols,
             name_cache,
             postings_index,
@@ -1149,23 +1157,29 @@ impl IndexReader {
             let mut dec = Decbuf::new(slice);
             return Ok(dec.uvarint_str()?);
         }
-        if (o as usize) >= self.num_symbols {
+        let idx = o as usize;
+        if idx >= self.num_symbols {
             return Err(IndexError::UnknownSymbolOffset(o));
         }
-        let mut off = self.symbol_offsets[(o as usize) / SYMBOL_FACTOR];
-        let skip = (o as usize) % SYMBOL_FACTOR;
         let mmap = &self.mmap;
-        for _ in 0..skip {
-            let b0 = mmap[off];
-            if b0 < 0x80 {
-                off += 1 + (b0 as usize);
-            } else {
-                let mut dec = Decbuf::new(&mmap[off..]);
-                let len = dec.uvarint()?;
-                let hdr = (mmap.len() - off) - dec.len();
-                off += hdr + len;
+        let off = if let Some(&direct_off) = self.direct_symbol_offsets.get(idx) {
+            direct_off as usize
+        } else {
+            let mut off = self.symbol_offsets[idx / SYMBOL_FACTOR];
+            let skip = idx % SYMBOL_FACTOR;
+            for _ in 0..skip {
+                let b0 = mmap[off];
+                if b0 < 0x80 {
+                    off += 1 + (b0 as usize);
+                } else {
+                    let mut dec = Decbuf::new(&mmap[off..]);
+                    let len = dec.uvarint()?;
+                    let hdr = (mmap.len() - off) - dec.len();
+                    off += hdr + len;
+                }
             }
-        }
+            off
+        };
         let b0 = mmap[off];
         let (len, str_off) = if b0 < 0x80 {
             (b0 as usize, off + 1)
@@ -1266,12 +1280,17 @@ impl IndexReader {
         let mut pos = 0usize;
         let mut heap_buf: Option<Vec<u8>> = None;
 
+        let use_direct = !self.direct_symbol_offsets.is_empty();
         for _ in 0..num_labels {
             let lno = dec.uvarint32()?;
             let lvo = dec.uvarint32()?;
-            let ln = match self.name_cache.get(&lno) {
-                Some(&(off, len)) => self.mmap_str(off, len),
-                None => self.lookup_symbol(lno)?,
+            let ln = if use_direct {
+                self.lookup_symbol(lno)?
+            } else {
+                match self.name_cache.get(&lno) {
+                    Some(&(off, len)) => self.mmap_str(off, len),
+                    None => self.lookup_symbol(lno)?,
+                }
             };
             let lv = self.lookup_symbol(lvo)?;
             if ln.len() >= (1 << 24) || lv.len() >= (1 << 24) {
@@ -1370,6 +1389,60 @@ impl IndexReader {
         let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
         let mut dec = Decbuf::new(payload);
         self.decode_series_labels(&mut dec)
+    }
+
+    /// Computes Prometheus `labels.Labels.StableHash()` directly from the index entry at `ref_id`
+    /// with full CRC32C verification and zero heap allocations (skipping `Labels` construction and
+    /// `ChunkMeta` decoding).
+    pub fn series_stable_hash(&self, ref_id: u64) -> Result<u64, IndexError> {
+        let offset = self.series_offset(ref_id)?;
+        let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
+        let mut dec = Decbuf::new(payload);
+        let num_labels = dec.uvarint()?;
+        let mut stack_buf = [0u8; 1024];
+        let mut pos = 0usize;
+        let mut hasher: Option<xxhash_rust::xxh64::Xxh64> = None;
+        let use_direct = !self.direct_symbol_offsets.is_empty();
+
+        for _ in 0..num_labels {
+            let lno = dec.uvarint32()?;
+            let lvo = dec.uvarint32()?;
+            let ln = if use_direct {
+                self.lookup_symbol(lno)?
+            } else {
+                match self.name_cache.get(&lno) {
+                    Some(&(off, len)) => self.mmap_str(off, len),
+                    None => self.lookup_symbol(lno)?,
+                }
+            };
+            let lv = self.lookup_symbol(lvo)?;
+            let nb = ln.as_bytes();
+            let vb = lv.as_bytes();
+            if hasher.is_none() && pos + nb.len() + vb.len() + 2 >= stack_buf.len() {
+                let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+                h.update(&stack_buf[..pos]);
+                hasher = Some(h);
+            }
+            if let Some(ref mut h) = hasher {
+                h.update(nb);
+                h.update(&[0xff]);
+                h.update(vb);
+                h.update(&[0xff]);
+            } else {
+                stack_buf[pos..pos + nb.len()].copy_from_slice(nb);
+                pos += nb.len();
+                stack_buf[pos] = 0xff;
+                pos += 1;
+                stack_buf[pos..pos + vb.len()].copy_from_slice(vb);
+                pos += vb.len();
+                stack_buf[pos] = 0xff;
+                pos += 1;
+            }
+        }
+        Ok(match hasher {
+            Some(h) => h.digest(),
+            None => xxhash_rust::xxh64::xxh64(&stack_buf[..pos], 0),
+        })
     }
 
     /// Decodes a raw postings list at `postings_off`.
@@ -2044,7 +2117,7 @@ pub struct Symbols {
 
 impl Symbols {
     pub fn new(bytes: Bytes, version: u8, off: usize) -> Result<Self, IndexError> {
-        let (offsets, seen) = parse_symbols_index(&bytes, off)?;
+        let (offsets, _direct, seen) = parse_symbols_index(&bytes, off, INDEX_FORMAT_V2)?;
         Ok(Self {
             bytes,
             version,
@@ -2248,7 +2321,11 @@ fn write_stringlabel_slice(dst: &mut [u8; 512], mut pos: usize, bytes: &[u8]) ->
     pos + len
 }
 
-fn parse_symbols_index(buf: &[u8], off: usize) -> Result<(Vec<usize>, usize), IndexError> {
+fn parse_symbols_index(
+    buf: &[u8],
+    off: usize,
+    version: u8,
+) -> Result<(Vec<usize>, Vec<u32>, usize), IndexError> {
     let payload = checked_decbuf_at(buf, off)?;
     let mut dec = Decbuf::new(payload);
     let cnt = dec.be32()? as usize;
@@ -2257,9 +2334,21 @@ fn parse_symbols_index(buf: &[u8], off: usize) -> Result<(Vec<usize>, usize), In
 
     let cap = (1 + cnt / SYMBOL_FACTOR).min(1 + dec.len() / SYMBOL_FACTOR);
     let mut offsets = Vec::with_capacity(cap);
+    let build_direct = version != INDEX_FORMAT_V1
+        && buf.len() <= u32::MAX as usize
+        && cnt <= MAX_DIRECT_SYMBOL_OFFSETS;
+    let mut direct_offsets = if build_direct {
+        Vec::with_capacity(cnt.min(dec.len()))
+    } else {
+        Vec::new()
+    };
     for seen in 0..cnt {
+        let sym_pos = base_pos + orig_len - dec.len();
         if seen % SYMBOL_FACTOR == 0 {
-            offsets.push(base_pos + orig_len - dec.len());
+            offsets.push(sym_pos);
+        }
+        if build_direct {
+            direct_offsets.push(sym_pos as u32);
         }
         // Validate UTF-8 and bounds once at IndexReader::open so lookup_symbol can skip UTF-8 checks.
         let sym = dec.uvarint_str()?;
@@ -2271,7 +2360,7 @@ fn parse_symbols_index(buf: &[u8], off: usize) -> Result<(Vec<usize>, usize), In
             )));
         }
     }
-    Ok((offsets, cnt))
+    Ok((offsets, direct_offsets, cnt))
 }
 
 fn reverse_lookup_symbol(
@@ -2660,7 +2749,7 @@ mod tests {
         sym_buf.extend_from_slice(&4u32.to_be_bytes());
         sym_buf.extend_from_slice(&payload);
         sym_buf.extend_from_slice(&crc.to_be_bytes());
-        assert!(parse_symbols_index(&sym_buf, 0).is_err());
+        assert!(parse_symbols_index(&sym_buf, 0, INDEX_FORMAT_V2).is_err());
 
         // 3) Corrupt IndexReader file on disk with invalid TOC / huge symbol count fails cleanly.
         let dir = tempfile::tempdir().unwrap();
@@ -3208,5 +3297,75 @@ mod tests {
         let (lbl3, _) = r.series(sids[1]).unwrap();
         assert_eq!(lbl1, s1);
         assert_eq!(lbl3, s3, "prev_label_cache must not poison S3 with failed S2 symbol");
+    }
+
+    #[test]
+    fn series_stable_hash_matches_labels_stable_hash_and_detects_crc_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        let long_val = "v".repeat(1200);
+        let mut syms = vec![
+            "".to_string(),
+            "__name__".to_string(),
+            "a".to_string(),
+            "big".to_string(),
+            "env".to_string(),
+            "m".to_string(),
+            "prod".to_string(),
+            long_val.clone(),
+        ];
+        for i in 0..80 {
+            syms.push(format!("pod-{i:03}"));
+        }
+        syms.sort();
+        syms.dedup();
+
+        let mut w = IndexWriter::new(&path).unwrap();
+        for s in &syms {
+            w.add_symbol(s).unwrap();
+        }
+        let mut series = Vec::new();
+        for i in 0..80 {
+            let lbls = if i == 0 {
+                Labels::from_pairs([("__name__", "m"), ("big", &long_val), ("env", "prod")])
+            } else {
+                Labels::from_pairs([("__name__", "m"), ("a", &format!("pod-{i:03}")), ("env", "prod")])
+            };
+            series.push(lbls);
+        }
+        series.sort();
+        for (idx, lbls) in series.iter().enumerate() {
+            w.add_series(idx as u64 + 1, lbls, &[]).unwrap();
+        }
+        w.close().unwrap();
+
+        let r = IndexReader::open(&path).unwrap();
+        assert!(
+            !r.direct_symbol_offsets.is_empty(),
+            "direct O(1) symbol offset table should be populated for v2 index"
+        );
+        let sids = r.postings("", &[""]).unwrap();
+        assert_eq!(sids.len(), series.len());
+        for (sid, expected_lbls) in sids.iter().zip(series.iter()) {
+            assert_eq!(
+                r.series_stable_hash(*sid).unwrap(),
+                expected_lbls.stable_hash(),
+                "series_stable_hash must match Labels::stable_hash bit-for-bit (including >1KiB fallback)"
+            );
+            assert_eq!(r.series_labels(*sid).unwrap(), *expected_lbls);
+        }
+
+        // Flip a byte inside the first series entry payload and verify CRC32C ChecksumMismatch.
+        let mut raw = std::fs::read(&path).unwrap();
+        let off = (sids[0] as usize) * SERIES_BYTE_ALIGN;
+        raw[off + 2] ^= 0xff;
+        let corrupt = IndexReader::from_bytes(Bytes::from(raw)).unwrap();
+        assert!(
+            matches!(
+                corrupt.series_stable_hash(sids[0]),
+                Err(IndexError::ChecksumMismatch { .. })
+            ),
+            "series_stable_hash must preserve exact CRC32C corruption detection"
+        );
     }
 }

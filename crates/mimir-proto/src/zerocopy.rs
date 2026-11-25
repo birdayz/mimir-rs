@@ -1807,6 +1807,26 @@ resolved_scratch.lossy_utf8_arena.clear();
 
         let mut seen_first_symbol = false;
         let mut emitted_any_series = false;
+        let mut all_symbols_valid_utf8 = true;
+        let mut single_name_sym_idx: Option<u32> = None;
+        let mut multiple_name_syms = false;
+        let mut last_schema = LabelNameSchemaCache {
+            len: 0,
+            idxs: [0u32; 16],
+            slices: [b"".as_slice(); 16],
+            tmp_idxs: [0u32; 16],
+            tmp_slices: [b"".as_slice(); 16],
+        };
+        for (i, &sym) in common_symbols.iter().enumerate() {
+            if sym == "__name__" {
+                if single_name_sym_idx.is_none() {
+                    single_name_sym_idx = Some(i as u32);
+                } else {
+                    multiple_name_syms = true;
+                    single_name_sym_idx = None;
+                }
+            }
+        }
 
         let mut pos = 0usize;
         let len = input.len();
@@ -1872,7 +1892,20 @@ resolved_scratch.lossy_utf8_arena.clear();
                     }
                     seen_first_symbol = true;
                     let valid_utf8 = is_valid_utf8_fast(sym_bytes);
+                    if !valid_utf8 {
+                        all_symbols_valid_utf8 = false;
+                    } else if sym_bytes == b"__name__" && !multiple_name_syms {
+                        if single_name_sym_idx.is_none() {
+                            single_name_sym_idx = Some(resolved.len() as u32);
+                        } else {
+                            multiple_name_syms = true;
+                            single_name_sym_idx = None;
+                        }
+                    }
                     resolved.push(Some((sym_bytes, valid_utf8)));
+                    if emitted_any_series {
+                        last_schema.len = 0;
+                    }
                 }
                 5 => {
                     if wire_type != 2 {
@@ -1895,6 +1928,10 @@ resolved_scratch.lossy_utf8_arena.clear();
                         rw2_offset,
                         common_symbols,
                         resolved,
+                        all_symbols_valid_utf8,
+                        single_name_sym_idx,
+                        multiple_name_syms,
+                        &mut last_schema,
                         lossy_utf8_arena,
                         lossy_map,
                         pending_meta,
@@ -2011,6 +2048,38 @@ resolved_scratch.lossy_utf8_arena.clear();
     })
 }
 
+/// Cold error-precedence helper for the single-pass packed `labels_refs` fast path:
+/// matches Go's two-pass semantics where varint decode errors and `OddNumberOfLabelRefs`
+/// take precedence over `InvalidLabelRef` or arena-budget errors.
+#[cold]
+#[inline(never)]
+fn finish_packed_label_err(
+    input: &[u8],
+    mut p: usize,
+    pend: usize,
+    fallback: DecodeError,
+) -> DecodeError {
+    let mut rem_count = 0usize;
+    while p < pend {
+        if let Err(e) = read_varint_bounded(input, &mut p, pend) {
+            return e;
+        }
+        rem_count += 1;
+    }
+    if !rem_count.is_multiple_of(2) {
+        return DecodeError::OddNumberOfLabelRefs;
+    }
+    fallback
+}
+
+struct LabelNameSchemaCache<'a> {
+    len: usize,
+    idxs: [u32; 16],
+    slices: [&'a [u8]; 16],
+    tmp_idxs: [u32; 16],
+    tmp_slices: [&'a [u8]; 16],
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_timeseries_rw2_stream<'v, 'a>(
     input: &'a [u8],
@@ -2018,6 +2087,10 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
     symbol_offset: u32,
     common_symbols: &'a [&'a str],
     resolved: &[Option<(&'a [u8], bool)>],
+    all_symbols_valid_utf8: bool,
+    single_name_sym_idx: Option<u32>,
+    multiple_name_syms: bool,
+    last_schema: &mut LabelNameSchemaCache<'a>,
     lossy_utf8_arena: &mut Vec<u8>,
     lossy_map: &mut HashMap<u32, (u32, u32)>,
     pending_meta: &mut Vec<PendingStreamMeta>,
@@ -2044,6 +2117,8 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
 
     scratch.rw2_label_refs.clear();
     scratch.rw2_deferred_meta.clear();
+    let mut single_packed_labels: Option<Range<usize>> = None;
+    let mut multi_label_fields = false;
 
     let mut pos = range.start;
     let end = range.end;
@@ -2055,10 +2130,22 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
                     return Err(DecodeError::OddNumberOfLabelRefs);
                 } else if wire_type == 2 {
                     let packed = read_length_delimited_range_bounded(input, &mut pos, end)?;
-                    let mut p = packed.start;
-                    while p < packed.end {
-                        let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
-                        scratch.rw2_label_refs.push(r);
+                    if !multi_label_fields && single_packed_labels.is_none() {
+                        single_packed_labels = Some(packed);
+                    } else {
+                        if let Some(first) = single_packed_labels.take() {
+                            let mut p = first.start;
+                            while p < first.end {
+                                let r = read_varint_bounded(input, &mut p, first.end)? as u32;
+                                scratch.rw2_label_refs.push(r);
+                            }
+                        }
+                        multi_label_fields = true;
+                        let mut p = packed.start;
+                        while p < packed.end {
+                            let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                            scratch.rw2_label_refs.push(r);
+                        }
                     }
                 } else {
                     return Err(DecodeError::InvalidWireType {
@@ -2138,53 +2225,312 @@ fn decode_timeseries_rw2_stream<'v, 'a>(
         }
     }
 
-    if !scratch.rw2_label_refs.len().is_multiple_of(2) {
-        return Err(DecodeError::OddNumberOfLabelRefs);
-    }
+    if let Some(packed) = single_packed_labels {
+        if all_symbols_valid_utf8 {
+            // Fast single-pass packed `labels_refs` decode directly from `input[packed]`:
+            // - inline 1/2-byte varint decoding without Result enum construction
+            // - schema cache (`last_name_idxs`/`last_name_slices`) skipping label-name lookups
+            //   and `pn >= k_bytes` byte comparisons when consecutive series share label names
+            // - register-hoisted `out_ptr`/`out_end` updating `label_bytes_arena.set_len` once
+            let est_bytes = packed.len().saturating_mul(16).clamp(64, 65536);
+            label_bytes_arena.reserve(est_bytes);
+            let mut p = packed.start;
+            let pend = packed.end;
+            let mut pending_budget: usize = 0;
+            let resolved_len = resolved.len();
+            let cached_len = last_schema.len;
+            let mut matched_schema = cached_len > 0;
+            let mut pair_idx = 0usize;
+            let mut new_schema_len = 0usize;
+            let mut track_new_schema = !matched_schema;
 
-    label_bytes_arena.reserve(
-        scratch
-            .rw2_label_refs
-            .len()
-            .saturating_mul(16)
-            .clamp(64, 65536),
-    );
-    for &pair in scratch.rw2_label_refs.as_chunks::<2>().0 {
-        let name_idx = pair[0];
-        let val_idx = pair[1];
-        let (k_bytes, k_utf8) = lookup_resolved(resolved, name_idx).ok_or(
-            DecodeError::InvalidLabelRef {
-                index: name_idx,
-                offset: symbol_offset,
-            },
-        )?;
-        let (v_bytes, v_utf8) = lookup_resolved(resolved, val_idx).ok_or(
-            DecodeError::InvalidLabelRef {
-                index: val_idx,
-                offset: symbol_offset,
-            },
-        )?;
-        if k_bytes == b"__name__" {
-            metric_name_sym_idx = Some(val_idx);
-        }
-        if !k_utf8 || !v_utf8 {
-            bad_utf8 = true;
-        } else if !bad_utf8 {
-            if let Some(pn) = prev_name {
-                if pn >= k_bytes {
-                    labels_sorted_unique = false;
+            let mut out_len = label_bytes_arena.len();
+            let mut out_cap = label_bytes_arena.capacity();
+            let mut out_base = label_bytes_arena.as_mut_ptr();
+
+            let bytes_ptr = input.as_ptr();
+            while p < pend {
+                // Inline 1-byte / 2-byte varint decode for `name_idx`.
+                // SAFETY: `p < pend <= input.len()`.
+                let name_idx: u32 = unsafe {
+                    let b0 = *bytes_ptr.add(p);
+                    if b0 < 0x80 {
+                        p += 1;
+                        b0 as u32
+                    } else if p + 1 < pend {
+                        let b1 = *bytes_ptr.add(p + 1);
+                        if b1 < 0x80 {
+                            p += 2;
+                            ((b0 & 0x7f) as u32) | ((b1 as u32) << 7)
+                        } else {
+                            read_varint_bounded_slow(input, &mut p, pend)? as u32
+                        }
+                    } else {
+                        read_varint_bounded_slow(input, &mut p, pend)? as u32
+                    }
+                };
+                if p >= pend {
+                    // SAFETY: `out_len <= out_cap` and bytes up to `out_len` were initialized.
+                    unsafe { label_bytes_arena.set_len(out_len) };
+                    return Err(DecodeError::OddNumberOfLabelRefs);
+                }
+                // Inline 1-byte / 2-byte varint decode for `val_idx`.
+                // SAFETY: `p < pend <= input.len()`.
+                let val_idx: u32 = unsafe {
+                    let b0 = *bytes_ptr.add(p);
+                    if b0 < 0x80 {
+                        p += 1;
+                        b0 as u32
+                    } else if p + 1 < pend {
+                        let b1 = *bytes_ptr.add(p + 1);
+                        if b1 < 0x80 {
+                            p += 2;
+                            ((b0 & 0x7f) as u32) | ((b1 as u32) << 7)
+                        } else {
+                            read_varint_bounded_slow(input, &mut p, pend)? as u32
+                        }
+                    } else {
+                        read_varint_bounded_slow(input, &mut p, pend)? as u32
+                    }
+                };
+
+                let k_bytes: &'a [u8] = if matched_schema && pair_idx < cached_len && last_schema.idxs[pair_idx] == name_idx {
+                    last_schema.slices[pair_idx]
+                } else {
+                    if matched_schema {
+                        matched_schema = false;
+                        if pair_idx > 0 {
+                            prev_name = Some(last_schema.slices[pair_idx - 1]);
+                            if pair_idx <= 16 {
+                                last_schema.tmp_idxs[..pair_idx].copy_from_slice(&last_schema.idxs[..pair_idx]);
+                                last_schema.tmp_slices[..pair_idx].copy_from_slice(&last_schema.slices[..pair_idx]);
+                                new_schema_len = pair_idx;
+                                track_new_schema = true;
+                            }
+                        } else {
+                            track_new_schema = true;
+                        }
+                    }
+                    let kb = if name_idx == 0 {
+                        b"".as_slice()
+                    } else if (name_idx as usize) < resolved_len {
+                        match resolved[name_idx as usize] {
+                            Some((b, _)) => b,
+                            None => {
+                                unsafe { label_bytes_arena.set_len(out_len) };
+                                return Err(finish_packed_label_err(
+                                    input,
+                                    p,
+                                    pend,
+                                    DecodeError::InvalidLabelRef {
+                                        index: name_idx,
+                                        offset: symbol_offset,
+                                    },
+                                ));
+                            }
+                        }
+                    } else {
+                        unsafe { label_bytes_arena.set_len(out_len) };
+                        return Err(finish_packed_label_err(
+                            input,
+                            p,
+                            pend,
+                            DecodeError::InvalidLabelRef {
+                                index: name_idx,
+                                offset: symbol_offset,
+                            },
+                        ));
+                    };
+                    if let Some(pn) = prev_name {
+                        if pn >= kb {
+                            labels_sorted_unique = false;
+                            track_new_schema = false;
+                        }
+                    }
+                    prev_name = Some(kb);
+                    if track_new_schema {
+                        if new_schema_len < 16 {
+                            last_schema.tmp_idxs[new_schema_len] = name_idx;
+                            last_schema.tmp_slices[new_schema_len] = kb;
+                            new_schema_len += 1;
+                        } else {
+                            track_new_schema = false;
+                        }
+                    }
+                    kb
+                };
+                pair_idx += 1;
+
+                let v_bytes: &'a [u8] = if val_idx == 0 {
+                    b"".as_slice()
+                } else if (val_idx as usize) < resolved_len {
+                    match resolved[val_idx as usize] {
+                        Some((b, _)) => b,
+                        None => {
+                            unsafe { label_bytes_arena.set_len(out_len) };
+                            return Err(finish_packed_label_err(
+                                input,
+                                p,
+                                pend,
+                                DecodeError::InvalidLabelRef {
+                                    index: val_idx,
+                                    offset: symbol_offset,
+                                },
+                            ));
+                        }
+                    }
+                } else {
+                    unsafe { label_bytes_arena.set_len(out_len) };
+                    return Err(finish_packed_label_err(
+                        input,
+                        p,
+                        pend,
+                        DecodeError::InvalidLabelRef {
+                            index: val_idx,
+                            offset: symbol_offset,
+                        },
+                    ));
+                };
+                if let Some(ni) = single_name_sym_idx {
+                    if name_idx == ni {
+                        metric_name_sym_idx = Some(val_idx);
+                    }
+                } else if multiple_name_syms && k_bytes == b"__name__" {
+                    metric_name_sym_idx = Some(val_idx);
+                }
+                let vlen = v_bytes.len();
+                if vlen != 0 {
+                    let klen = k_bytes.len();
+                    if klen < 255 && vlen < 255 {
+                        let need = 2 + klen + vlen;
+                        pending_budget = pending_budget.saturating_add(need);
+                        if pending_budget >= 4096 {
+                            unsafe { label_bytes_arena.set_len(out_len) };
+                            if let Err(e) = budget.try_add(pending_budget) {
+                                return Err(finish_packed_label_err(input, p, pend, e));
+                            }
+                            pending_budget = 0;
+                        }
+                        if out_cap - out_len < need {
+                            unsafe { label_bytes_arena.set_len(out_len) };
+                            label_bytes_arena.reserve(need.max(128));
+                            out_cap = label_bytes_arena.capacity();
+                            out_base = label_bytes_arena.as_mut_ptr();
+                        }
+                        // SAFETY: `out_len + need <= out_cap` and `klen < 255 && vlen < 255`.
+                        unsafe {
+                            let ptr = out_base.add(out_len);
+                            *ptr = klen as u8;
+                            std::ptr::copy_nonoverlapping(k_bytes.as_ptr(), ptr.add(1), klen);
+                            *ptr.add(1 + klen) = vlen as u8;
+                            std::ptr::copy_nonoverlapping(
+                                v_bytes.as_ptr(),
+                                ptr.add(2 + klen),
+                                vlen,
+                            );
+                        }
+                        out_len += need;
+                    } else {
+                        unsafe { label_bytes_arena.set_len(out_len) };
+                        if pending_budget > 0 {
+                            if let Err(e) = budget.try_add(pending_budget) {
+                                return Err(finish_packed_label_err(input, p, pend, e));
+                            }
+                            pending_budget = 0;
+                        }
+                        if let Err(e) = append_stringlabel_pair_proto_budgeted(
+                            label_bytes_arena,
+                            k_bytes,
+                            v_bytes,
+                            budget,
+                        ) {
+                            return Err(finish_packed_label_err(input, p, pend, e));
+                        }
+                        out_len = label_bytes_arena.len();
+                        out_cap = label_bytes_arena.capacity();
+                        out_base = label_bytes_arena.as_mut_ptr();
+                    }
+                } else {
+                    dropped_empty = true;
                 }
             }
-            prev_name = Some(k_bytes);
-            if !v_bytes.is_empty() {
-                append_stringlabel_pair_proto_budgeted(
-                    label_bytes_arena,
-                    k_bytes,
-                    v_bytes,
-                    budget,
-                )?;
-            } else {
-                dropped_empty = true;
+            // SAFETY: all bytes up to `out_len` were initialized above and `out_len <= out_cap`.
+            unsafe { label_bytes_arena.set_len(out_len) };
+            if pending_budget > 0 {
+                budget.try_add(pending_budget)?;
+            }
+            if track_new_schema && labels_sorted_unique && new_schema_len > 0 {
+                last_schema.len = new_schema_len;
+                std::mem::swap(&mut last_schema.idxs, &mut last_schema.tmp_idxs);
+                std::mem::swap(&mut last_schema.slices, &mut last_schema.tmp_slices);
+            }
+            if dropped_empty {
+                // Rare path: populate `scratch.rw2_label_refs` so `append_raw_rw2_labels_from_refs`
+                // below preserves exact raw-label semantics.
+                let mut p = packed.start;
+                while p < packed.end {
+                    let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                    scratch.rw2_label_refs.push(r);
+                }
+            }
+        } else {
+            let mut p = packed.start;
+            while p < packed.end {
+                let r = read_varint_bounded(input, &mut p, packed.end)? as u32;
+                scratch.rw2_label_refs.push(r);
+            }
+        }
+    }
+
+    if !scratch.rw2_label_refs.is_empty() && !dropped_empty {
+        if !scratch.rw2_label_refs.len().is_multiple_of(2) {
+            return Err(DecodeError::OddNumberOfLabelRefs);
+        }
+
+        label_bytes_arena.reserve(
+            scratch
+                .rw2_label_refs
+                .len()
+                .saturating_mul(16)
+                .clamp(64, 65536),
+        );
+        for &pair in scratch.rw2_label_refs.as_chunks::<2>().0 {
+            let name_idx = pair[0];
+            let val_idx = pair[1];
+            let (k_bytes, k_utf8) = lookup_resolved(resolved, name_idx).ok_or(
+                DecodeError::InvalidLabelRef {
+                    index: name_idx,
+                    offset: symbol_offset,
+                },
+            )?;
+            let (v_bytes, v_utf8) = lookup_resolved(resolved, val_idx).ok_or(
+                DecodeError::InvalidLabelRef {
+                    index: val_idx,
+                    offset: symbol_offset,
+                },
+            )?;
+            if k_bytes == b"__name__" {
+                metric_name_sym_idx = Some(val_idx);
+            }
+            if !k_utf8 || !v_utf8 {
+                bad_utf8 = true;
+            } else if !bad_utf8 {
+                if let Some(pn) = prev_name {
+                    if pn >= k_bytes {
+                        labels_sorted_unique = false;
+                    }
+                }
+                prev_name = Some(k_bytes);
+                if !v_bytes.is_empty() {
+                    append_stringlabel_pair_proto_budgeted(
+                        label_bytes_arena,
+                        k_bytes,
+                        v_bytes,
+                        budget,
+                    )?;
+                } else {
+                    dropped_empty = true;
+                }
             }
         }
     }
@@ -3793,6 +4139,37 @@ fn resolve_symbol_ref(
 
 #[inline(always)]
 fn read_key_bounded(input: &[u8], pos: &mut usize, end: usize) -> Result<(u32, u8), DecodeError> {
+    let p = *pos;
+    if p < end {
+        let b0 = input[p];
+        if b0 < 0x80 {
+            *pos = p + 1;
+            let field_num = (b0 >> 3) as u32;
+            let wire_type = b0 & 0x7;
+            if field_num != 0 && wire_type != 4 && wire_type <= 5 {
+                return Ok((field_num, wire_type));
+            }
+            return read_key_bounded_err(field_num, wire_type);
+        }
+    }
+    read_key_bounded_slow(input, pos, end)
+}
+
+#[cold]
+#[inline(never)]
+fn read_key_bounded_err(field_num: u32, wire_type: u8) -> Result<(u32, u8), DecodeError> {
+    if wire_type == 4 || wire_type > 5 {
+        return Err(DecodeError::InvalidWireType {
+            field: field_num,
+            wire_type,
+        });
+    }
+    Err(DecodeError::InvalidFieldNumber(field_num))
+}
+
+#[cold]
+#[inline(never)]
+fn read_key_bounded_slow(input: &[u8], pos: &mut usize, end: usize) -> Result<(u32, u8), DecodeError> {
     let wire = read_varint_bounded(input, pos, end)?;
     let raw_field_num = wire >> 3;
     let field_num = raw_field_num as u32;
@@ -6568,5 +6945,119 @@ mod tests {
             let _ = idx;
         }
         assert_eq!(decoded_series, 10);
+    }
+
+    #[test]
+    fn decode_rw2_stream_schema_cache_handles_schema_switch_late_symbols_and_empty_values() {
+        fn push_varint(buf: &mut Vec<u8>, mut v: u64) {
+            while v >= 0x80 {
+                buf.push((v as u8 & 0x7f) | 0x80);
+                v >>= 7;
+            }
+            buf.push(v as u8);
+        }
+        fn push_ld(buf: &mut Vec<u8>, field: u32, payload: &[u8]) {
+            push_varint(buf, ((field as u64) << 3) | 2);
+            push_varint(buf, payload.len() as u64);
+            buf.extend_from_slice(payload);
+        }
+        fn build_ts(label_refs: &[u32], ts: i64, val: f64) -> Vec<u8> {
+            let mut packed = Vec::new();
+            for &r in label_refs {
+                push_varint(&mut packed, r as u64);
+            }
+            let mut sample = Vec::new();
+            sample.push(0x09);
+            sample.extend_from_slice(&val.to_le_bytes());
+            sample.push(0x10);
+            push_varint(&mut sample, ts as u64);
+            let mut out = Vec::new();
+            push_ld(&mut out, 1, &packed);
+            push_ld(&mut out, 2, &sample);
+            out
+        }
+
+        let mut raw = Vec::new();
+        let base = V2_RECORD_SYMBOL_OFFSET;
+        let mut syms: Vec<String> = vec![
+            "".into(),
+            "m1".into(),
+            "app".into(),
+            "a1".into(),
+            "a2".into(),
+            "z_lbl".into(),
+            "zv".into(),
+        ];
+        for i in 0..18 {
+            syms.push(format!("k{i:02}"));
+        }
+        syms.push("v".into());
+        for s in &syms {
+            push_ld(&mut raw, 4, s.as_bytes());
+        }
+        let name_idx = V2_COMMON_SYMBOLS_LIST
+            .iter()
+            .position(|&s| s == "__name__")
+            .unwrap() as u32;
+
+        // S0 & S1: same schema (__name__, app, z_lbl)
+        push_ld(&mut raw, 5, &build_ts(&[name_idx, base + 1, base + 2, base + 3, base + 5, base + 6], 1000, 1.0));
+        push_ld(&mut raw, 5, &build_ts(&[name_idx, base + 1, base + 2, base + 4, base + 5, base + 6], 1000, 2.0));
+        // S2: >16 labels schema switch
+        let mut wide_refs = vec![name_idx, base + 1];
+        for i in 0..18u32 {
+            wide_refs.push(base + 7 + i);
+            wide_refs.push(base + 25);
+        }
+        push_ld(&mut raw, 5, &build_ts(&wide_refs, 1000, 3.0));
+        // S3: empty value (ref 0 = "") -> dropped_empty slow path
+        push_ld(&mut raw, 5, &build_ts(&[name_idx, base + 1, base + 2, 0, base + 5, base + 6], 1000, 4.0));
+        // S4: unsorted names (z_lbl before app)
+        push_ld(&mut raw, 5, &build_ts(&[name_idx, base + 1, base + 5, base + 6, base + 2, base + 3], 1000, 5.0));
+        // Late field 4 symbol + S5 referencing it
+        push_ld(&mut raw, 4, b"late_val");
+        push_ld(&mut raw, 5, &build_ts(&[name_idx, base + 1, base + 2, base + 26], 1000, 6.0));
+
+        let mut scratch = WriteRequestScratch::new();
+        let mut resolved = Rw2ResolvedScratch::new();
+        let mut lbl_arena = Vec::new();
+        let mut samp_arena = Vec::new();
+        let mut meta_out = Vec::new();
+        let mut got: Vec<(Vec<u8>, Vec<u8>, bool)> = Vec::new();
+
+        decode_rw2_stream(
+            &raw,
+            DecodeOptions::kafka_v2(),
+            &mut scratch,
+            &mut resolved,
+            &mut lbl_arena,
+            &mut samp_arena,
+            &mut meta_out,
+            |s| {
+                got.push((
+                    s.encoded_labels.to_vec(),
+                    s.raw_encoded_labels.to_vec(),
+                    s.labels_sorted_unique,
+                ));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(got.len(), 6);
+        assert!(got[0].2 && got[1].2 && got[2].2 && got[3].2 && !got[4].2 && got[5].2);
+        assert_ne!(got[3].0, got[3].1);
+        assert!(got[3].0.len() < got[3].1.len());
+
+        let mut ref_scratch = WriteRequestScratch::new();
+        let ref_wr = decode_write_request(&raw, DecodeOptions::kafka_v2(), &mut ref_scratch).unwrap();
+        assert_eq!(ref_wr.timeseries_len(), 6);
+        for (idx, ts) in ref_wr.timeseries().enumerate() {
+            let pairs: Vec<(&[u8], &[u8])> = ts.labels().map(|l| (l.name, l.value)).collect();
+            let mut expected_raw = Vec::new();
+            for (k, v) in &pairs {
+                append_stringlabel_pair_proto(&mut expected_raw, k, v).unwrap();
+            }
+            assert_eq!(got[idx].1, expected_raw, "raw labels mismatch at series {idx}");
+        }
     }
 }

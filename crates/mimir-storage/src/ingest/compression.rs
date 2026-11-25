@@ -194,6 +194,99 @@ thread_local! {
         RefCell::new(snap::raw::Decoder::new());
     static SNAPPY_ENCODER: RefCell<snap::raw::Encoder> =
         RefCell::new(snap::raw::Encoder::new());
+    static ZSTD_DCTX: RefCell<zstd::zstd_safe::DCtx<'static>> = RefCell::new({
+        let mut dctx = zstd::zstd_safe::DCtx::create();
+        let _ = dctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(23));
+        dctx
+    });
+}
+
+fn zstd_decompress_stream_into(
+    raw: &[u8],
+    max_bytes: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let start_len = out.len();
+    let max_total = start_len.saturating_add(max_bytes);
+    if let Ok(Some(sz)) = zstd::zstd_safe::get_frame_content_size(raw) {
+        if sz > max_bytes as u64 {
+            return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
+        }
+        let target = (sz as usize).min(INITIAL_DECOMPRESS_CAP).min(max_bytes);
+        out.reserve(target);
+    }
+    if raw.is_empty() {
+        return Ok(());
+    }
+    ZSTD_DCTX.with(|cell| -> Result<()> {
+        let mut dctx = cell.borrow_mut();
+        dctx.reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(|code| anyhow::anyhow!("zstd reset: {}", zstd::zstd_safe::get_error_name(code)))?;
+        let mut in_buf = zstd::zstd_safe::InBuffer::around(raw);
+        let mut last_ret: usize = 0;
+        while in_buf.pos < raw.len() || last_ret != 0 {
+            let cur_written = out.len() - start_len;
+            if cur_written >= max_bytes {
+                // Probe 1 byte to check if more output remains (exact DecompressedSizeExceeded check).
+                let mut probe = [0u8; 1];
+                let mut probe_out = zstd::zstd_safe::OutBuffer::around(&mut probe);
+                last_ret = dctx
+                    .decompress_stream(&mut probe_out, &mut in_buf)
+                    .map_err(|code| {
+                        anyhow::anyhow!(
+                            "zstd decompress record batch: {}",
+                            zstd::zstd_safe::get_error_name(code)
+                        )
+                    })?;
+                if probe_out.pos() > 0 {
+                    return Err(
+                        CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into(),
+                    );
+                }
+                if in_buf.pos >= raw.len() && last_ret == 0 {
+                    break;
+                }
+                if probe_out.pos() == 0 && last_ret > 0 {
+                    // Input still has buffered frame bytes with output remaining or trailing checksum.
+                    continue;
+                }
+            }
+            let remaining_cap = max_total - out.len();
+            let chunk_cap = remaining_cap.clamp(1, 64 * 1024);
+            out.reserve(chunk_cap);
+            let old_len = out.len();
+            let spare_len = (out.capacity() - old_len).min(remaining_cap);
+            // SAFETY: `OutBuffer::around_pos` writes only into `spare_len` bytes of `out`'s
+            // spare capacity and returns the exact number of initialized bytes written.
+            let written = unsafe {
+                let slice = std::slice::from_raw_parts_mut(
+                    out.as_mut_ptr().add(old_len),
+                    spare_len,
+                );
+                let mut out_buf = zstd::zstd_safe::OutBuffer::around(slice);
+                let before_in = in_buf.pos;
+                last_ret = dctx
+                    .decompress_stream(&mut out_buf, &mut in_buf)
+                    .map_err(|code| {
+                        anyhow::anyhow!(
+                            "zstd decompress record batch: {}",
+                            zstd::zstd_safe::get_error_name(code)
+                        )
+                    })?;
+                let w = out_buf.pos();
+                out.set_len(old_len + w);
+                if w == 0 && in_buf.pos == before_in && last_ret != 0 {
+                    bail!("zstd decompress record batch: truncated input frame");
+                }
+                w
+            };
+            let _ = written;
+        }
+        if last_ret != 0 {
+            bail!("zstd decompress record batch: truncated input frame");
+        }
+        Ok(())
+    })
 }
 
 /// Max theoretical expansion ratio for valid Snappy blocks (3-byte copy tag -> 64 bytes < 22x).
@@ -228,22 +321,13 @@ fn snappy_raw_decompress_into(src: &[u8], max_bytes: usize, out: &mut Vec<u8>) -
 }
 
 fn decompress_zstd(raw: &[u8], max_bytes: usize) -> Result<Bytes> {
-    if let Ok(Some(sz)) = zstd::zstd_safe::get_frame_content_size(raw) {
-        if sz > max_bytes as u64 {
-            return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
-        }
-    }
-    let mut decoder = zstd::stream::read::Decoder::new(raw).context("zstd decompress record batch")?;
-    decoder
-        .window_log_max(23)
-        .context("zstd configure window_log_max")?;
     let cap = raw
         .len()
         .saturating_mul(4)
         .min(INITIAL_DECOMPRESS_CAP)
         .min(max_bytes);
     let mut out = Vec::with_capacity(cap);
-    read_bounded(decoder, max_bytes, &mut out, "zstd")?;
+    zstd_decompress_stream_into(raw, max_bytes, &mut out)?;
     Ok(Bytes::from(out))
 }
 
@@ -486,15 +570,7 @@ fn decompress_into(
         KafkaCompression::Lz4 => {
             read_bounded(FrameDecoder::new(src), max_bytes, out, "lz4")
         }
-        KafkaCompression::Zstd => {
-            if let Ok(Some(sz)) = zstd::zstd_safe::get_frame_content_size(src) {
-                if sz > max_bytes as u64 {
-                    return Err(CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into());
-                }
-            }
-            let decoder = zstd::stream::read::Decoder::new(src).context("zstd decompress")?;
-            read_bounded(decoder, max_bytes, out, "zstd")
-        }
+        KafkaCompression::Zstd => zstd_decompress_stream_into(src, max_bytes, out),
     }
 }
 
@@ -708,5 +784,37 @@ mod tests {
             err.downcast_ref::<CompressionError>(),
             Some(&CompressionError::DecompressedSizeExceeded { limit: 10 })
         );
+    }
+
+    #[test]
+    fn zstd_dctx_reuse_preserves_window_log_limit_max_bytes_and_multiframe() {
+        let f1 = zstd::bulk::compress(b"first-frame-payload-", 1).unwrap();
+        let f2 = zstd::bulk::compress(b"second-frame-payload!", 1).unwrap();
+        let mut combined = Vec::with_capacity(f1.len() + f2.len());
+        combined.extend_from_slice(&f1);
+        combined.extend_from_slice(&f2);
+
+        for _ in 0..5 {
+            let mut b = Bytes::from(combined.clone());
+            let out = decompress_record_batch(&mut b, Compression::Zstd).unwrap();
+            assert_eq!(out.as_ref(), b"first-frame-payload-second-frame-payload!");
+        }
+
+        let exact_len = b"first-frame-payload-second-frame-payload!".len();
+        let mut b_ok = Bytes::from(combined.clone());
+        let ok = decompress_record_batch_with_limit(&mut b_ok, Compression::Zstd, exact_len).unwrap();
+        assert_eq!(ok.len(), exact_len);
+
+        let mut b_err = Bytes::from(combined);
+        let err = decompress_record_batch_with_limit(&mut b_err, Compression::Zstd, exact_len - 1)
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CompressionError>(),
+            Some(&CompressionError::DecompressedSizeExceeded { limit: exact_len - 1 })
+        );
+
+        let mut b_after = Bytes::from(f1);
+        let after = decompress_record_batch(&mut b_after, Compression::Zstd).unwrap();
+        assert_eq!(after.as_ref(), b"first-frame-payload-");
     }
 }

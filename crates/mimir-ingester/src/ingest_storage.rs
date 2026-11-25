@@ -4,7 +4,7 @@
 //! - github.com/grafana/mimir/pkg/ingester/ingester.go (ingest_storage init)
 //! - github.com/grafana/mimir/pkg/storage/ingest/util.go (IngesterPartitionID)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -182,28 +182,28 @@ impl PreCommitNotifier for IngesterStorageAdapter {
 
 #[derive(Clone, Copy)]
 struct ShardSeriesItem {
-    worker_idx: u16,
-    rec_seq: u32,
     record_offset: i64,
+    prom_hash: u64,
+    created_timestamp: i64,
+    min_ts: i64,
+    rec_seq: u32,
     tenant_idx: u32,
     trace_id_idx: u32,
     source: i32,
+    label_bytes_start: u32,
+    label_bytes_len: u32,
+    raw_label_bytes_start: u32,
+    raw_label_bytes_len: u32,
+    samples_start: u32,
+    samples_len: u32,
+    histograms_start: u32,
+    histograms_len: u32,
+    exemplars_start: u32,
+    exemplars_len: u32,
+    worker_idx: u16,
     skip_label_validation: bool,
     labels_sorted_unique: bool,
     bad_utf8: bool,
-    prom_hash: u64,
-    label_bytes_start: usize,
-    label_bytes_len: usize,
-    raw_label_bytes_start: usize,
-    raw_label_bytes_len: usize,
-    samples_start: usize,
-    samples_len: usize,
-    created_timestamp: i64,
-    histograms_start: usize,
-    histograms_len: usize,
-    exemplars_start: usize,
-    exemplars_len: usize,
-    min_ts: i64,
 }
 
 /// Metric metadata entry stashed during Phase A; strings live in `MetadataStash::bytes`.
@@ -526,7 +526,7 @@ impl IngesterShardedBatchConsumer {
             sampler,
             None,
         ));
-        let hw_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let hw_threads = mimir_common::cached_available_parallelism();
         let max_shards = if kafka_cfg.ingestion_concurrency_max <= 0 {
             1
         } else {
@@ -711,7 +711,7 @@ impl IngesterShardedBatchConsumer {
             }
         };
 
-        let hw_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let hw_threads = mimir_common::cached_available_parallelism();
         let total_payload_bytes: usize = tenant_bytes.iter().sum();
         let num_workers = if records.len() <= 1 || total_payload_bytes < 32 * 1024 {
             1
@@ -843,7 +843,12 @@ impl IngesterShardedBatchConsumer {
                     continue;
                 }
 
-                let rec_trace_idx = if rec.headers.is_empty() {
+                let rec_trace_idx = if rec.headers.is_empty()
+                    || !rec
+                        .headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
+                {
                     u32::MAX
                 } else {
                     let extracted = mimir_common::tracing::extract_from_headers(
@@ -1000,17 +1005,17 @@ impl IngesterShardedBatchConsumer {
                                 labels_sorted_unique: ts.labels_sorted_unique,
                                 bad_utf8: ts.bad_utf8,
                                 prom_hash,
-                                label_bytes_start,
-                                label_bytes_len,
-                                raw_label_bytes_start,
-                                raw_label_bytes_len,
-                                samples_start: ts.samples_range.start,
-                                samples_len: ts.samples_range.end - ts.samples_range.start,
+                                label_bytes_start: label_bytes_start as u32,
+                                label_bytes_len: label_bytes_len as u32,
+                                raw_label_bytes_start: raw_label_bytes_start as u32,
+                                raw_label_bytes_len: raw_label_bytes_len as u32,
+                                samples_start: ts.samples_range.start as u32,
+                                samples_len: (ts.samples_range.end - ts.samples_range.start) as u32,
                                 created_timestamp: ts.created_timestamp,
-                                histograms_start: hist_start,
-                                histograms_len: hist_len,
-                                exemplars_start: ex_start,
-                                exemplars_len: ex_len,
+                                histograms_start: hist_start as u32,
+                                histograms_len: hist_len as u32,
+                                exemplars_start: ex_start as u32,
+                                exemplars_len: ex_len as u32,
                                 min_ts,
                             });
                             *total_series += 1;
@@ -1325,17 +1330,17 @@ impl IngesterShardedBatchConsumer {
                         labels_sorted_unique,
                         bad_utf8,
                         prom_hash,
-                        label_bytes_start,
-                        label_bytes_len,
-                        raw_label_bytes_start,
-                        raw_label_bytes_len,
-                        samples_start,
-                        samples_len,
+                        label_bytes_start: label_bytes_start as u32,
+                        label_bytes_len: label_bytes_len as u32,
+                        raw_label_bytes_start: raw_label_bytes_start as u32,
+                        raw_label_bytes_len: raw_label_bytes_len as u32,
+                        samples_start: samples_start as u32,
+                        samples_len: samples_len as u32,
                         created_timestamp: ts.created_timestamp(),
-                        histograms_start: hist_start,
-                        histograms_len: hist_len,
-                        exemplars_start: ex_start,
-                        exemplars_len: ex_len,
+                        histograms_start: hist_start as u32,
+                        histograms_len: hist_len as u32,
+                        exemplars_start: ex_start as u32,
+                        exemplars_len: ex_len as u32,
                         min_ts,
                     });
                     *total_series += 1;
@@ -1436,10 +1441,16 @@ impl IngesterShardedBatchConsumer {
         }
 
         let _parallel_metrics_guard = if !is_sequential {
-            let mut pushers: HashSet<(u32, i32)> = HashSet::new();
-            for a in &pool_guard.arenas {
-                for &p in &a.decoded_pushers {
-                    pushers.insert(p);
+            let mut pushers: SmallVec<[(u32, i32); 16]> = SmallVec::new();
+            if pool_guard.arenas.len() == 1 {
+                pushers.extend_from_slice(&pool_guard.arenas[0].decoded_pushers);
+            } else {
+                for a in &pool_guard.arenas {
+                    for &p in &a.decoded_pushers {
+                        if !pushers.contains(&p) {
+                            pushers.push(p);
+                        }
+                    }
                 }
             }
             let bytes_per_sample = self
@@ -1534,26 +1545,82 @@ impl IngesterShardedBatchConsumer {
         let tenants_ref: &[String] = &tenants;
         let tenant_ids_ref: &[String] = &tenant_ids;
 
+        let n_tenants = tenants_ref.len();
         let run_shard = |shard_idx: usize| -> Result<(), String> {
-            let mut items_for_shard: Vec<ShardSeriesItem> = Vec::new();
-            let mut metas_for_shard: Vec<ShardMetadataItem> = Vec::new();
-            for arena in arenas_ref {
-                let b = &arena.shard_buckets[shard_idx];
-                if !b.is_empty() {
-                    items_for_shard.extend_from_slice(b);
+            // Stagger tenant flush order per shard in parallel mode so concurrent shards
+            // hit different tenants' WAL/series locks instead of convoying on tenant 0 first.
+            let rot_tenant = |t_idx: u32| -> u32 {
+                if n_tenants <= 1 {
+                    t_idx
+                } else {
+                    ((t_idx as usize + shard_idx) % n_tenants) as u32
                 }
-                if let Some(mb) = arena.metadata.buckets.get(shard_idx) {
-                    metas_for_shard.extend_from_slice(mb);
+            };
+            let mut owned_items: Vec<ShardSeriesItem> = Vec::new();
+            let items_for_shard: &[ShardSeriesItem] = if arenas_ref.len() == 1 {
+                let b = &arenas_ref[0].shard_buckets[shard_idx];
+                if is_sequential
+                    || b.len() <= 1
+                    || b.windows(2).all(|w| {
+                        (rot_tenant(w[0].tenant_idx), norm_source_i32(w[0].source))
+                            <= (rot_tenant(w[1].tenant_idx), norm_source_i32(w[1].source))
+                    })
+                {
+                    b.as_slice()
+                } else {
+                    owned_items.extend_from_slice(b);
+                    owned_items
+                        .sort_by_key(|it| (rot_tenant(it.tenant_idx), norm_source_i32(it.source)));
+                    owned_items.as_slice()
                 }
-            }
+            } else {
+                for arena in arenas_ref {
+                    let b = &arena.shard_buckets[shard_idx];
+                    if !b.is_empty() {
+                        owned_items.extend_from_slice(b);
+                    }
+                }
+                if !is_sequential {
+                    owned_items
+                        .sort_by_key(|it| (rot_tenant(it.tenant_idx), norm_source_i32(it.source)));
+                }
+                owned_items.as_slice()
+            };
+
+            let mut owned_metas: Vec<ShardMetadataItem> = Vec::new();
+            let metas_for_shard: &[ShardMetadataItem] = if arenas_ref.len() == 1 {
+                let mb = arenas_ref[0]
+                    .metadata
+                    .buckets
+                    .get(shard_idx)
+                    .map_or(&[][..], Vec::as_slice);
+                if is_sequential
+                    || mb.len() <= 1
+                    || mb.windows(2).all(|w| {
+                        (rot_tenant(w[0].tenant_idx), w[0].source as i32)
+                            <= (rot_tenant(w[1].tenant_idx), w[1].source as i32)
+                    })
+                {
+                    mb
+                } else {
+                    owned_metas.extend_from_slice(mb);
+                    owned_metas.sort_by_key(|it| (rot_tenant(it.tenant_idx), it.source as i32));
+                    owned_metas.as_slice()
+                }
+            } else {
+                for arena in arenas_ref {
+                    if let Some(mb) = arena.metadata.buckets.get(shard_idx) {
+                        owned_metas.extend_from_slice(mb);
+                    }
+                }
+                if !is_sequential {
+                    owned_metas.sort_by_key(|it| (rot_tenant(it.tenant_idx), it.source as i32));
+                }
+                owned_metas.as_slice()
+            };
+
             if items_for_shard.is_empty() && metas_for_shard.is_empty() {
                 return Ok(());
-            }
-
-
-            if !is_sequential {
-                items_for_shard.sort_by_key(|it| (it.tenant_idx, norm_source_i32(it.source)));
-                metas_for_shard.sort_by_key(|it| (it.tenant_idx, it.source as i32));
             }
 
             // One flush == one Go `Pusher.PushToStorageAndReleaseRequest` call: the series
@@ -1664,7 +1731,7 @@ impl IngesterShardedBatchConsumer {
                 if is_sequential {
                     (it.rec_seq, 0)
                 } else {
-                    (it.tenant_idx, it.source as i32)
+                    (rot_tenant(it.tenant_idx), it.source as i32)
                 }
             };
             // End (exclusive) of the run of metadata items for `key` starting at `pos`.
@@ -1727,14 +1794,15 @@ impl IngesterShardedBatchConsumer {
                 batch_hists.clear();
                 let mut total_hists = 0usize;
                 for it in run_slice {
-                    total_hists += it.histograms_len;
+                    total_hists += it.histograms_len as usize;
                 }
                 if total_hists > 0 {
                     batch_hists.reserve(total_hists);
                     for it in run_slice {
-                        if it.histograms_len > 0 {
-                            let src = &mut arena_hists[it.worker_idx as usize]
-                                [it.histograms_start..it.histograms_start + it.histograms_len];
+                        let hlen = it.histograms_len as usize;
+                        if hlen > 0 {
+                            let hstart = it.histograms_start as usize;
+                            let src = &mut arena_hists[it.worker_idx as usize][hstart..hstart + hlen];
                             for h in src.iter_mut() {
                                 batch_hists.push(std::mem::take(h));
                             }
@@ -1745,26 +1813,32 @@ impl IngesterShardedBatchConsumer {
                 let mut batch: Vec<PrehashedSeriesItem<'_>> = Vec::with_capacity(run_slice.len());
                 for item in run_slice {
                     let wa = &arenas_ref[item.worker_idx as usize];
-                    let encoded_labels =
-                        wa.label_bytes_slice(item.label_bytes_start, item.label_bytes_len);
-                    let raw_encoded_labels =
-                        wa.label_bytes_slice(item.raw_label_bytes_start, item.raw_label_bytes_len);
-                    let s_start = item.samples_start;
-                    let s_end = s_start + item.samples_len;
+                    let encoded_labels = wa.label_bytes_slice(
+                        item.label_bytes_start as usize,
+                        item.label_bytes_len as usize,
+                    );
+                    let raw_encoded_labels = wa.label_bytes_slice(
+                        item.raw_label_bytes_start as usize,
+                        item.raw_label_bytes_len as usize,
+                    );
+                    let s_start = item.samples_start as usize;
+                    let s_end = s_start + item.samples_len as usize;
                     let samples = &wa.samples_arena[s_start..s_end];
 
-                    let histograms = if item.histograms_len == 0 {
+                    let hlen = item.histograms_len as usize;
+                    let histograms = if hlen == 0 {
                         &mut [][..]
                     } else {
-                        let (h_slice, rest) = hist_rest.split_at_mut(item.histograms_len);
+                        let (h_slice, rest) = hist_rest.split_at_mut(hlen);
                         hist_rest = rest;
                         h_slice
                     };
-                    let exemplars = if item.exemplars_len == 0 {
+                    let elen = item.exemplars_len as usize;
+                    let exemplars = if elen == 0 {
                         &[][..]
                     } else {
-                        let e_start = item.exemplars_start;
-                        &wa.exemplars_arena[e_start..e_start + item.exemplars_len]
+                        let e_start = item.exemplars_start as usize;
+                        &wa.exemplars_arena[e_start..e_start + elen]
                     };
 
                     batch.push(PrehashedSeriesItem {
@@ -1807,7 +1881,7 @@ impl IngesterShardedBatchConsumer {
                     let cur_key = if is_sequential {
                         (cur_rec_seq, 0)
                     } else {
-                        (cur_tenant_idx, norm_cur_src)
+                        (rot_tenant(cur_tenant_idx), norm_cur_src)
                     };
                     flush_metadata_only_before(cur_key, &mut meta_pos)?;
                     let meta_end = meta_run_end(meta_pos, cur_key);
@@ -1840,7 +1914,7 @@ impl IngesterShardedBatchConsumer {
             let cur_key = if is_sequential {
                 (cur_rec_seq, 0)
             } else {
-                (cur_tenant_idx, norm_cur_src)
+                (rot_tenant(cur_tenant_idx), norm_cur_src)
             };
             flush_metadata_only_before(cur_key, &mut meta_pos)?;
             let meta_end = meta_run_end(meta_pos, cur_key);

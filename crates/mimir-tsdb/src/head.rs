@@ -767,6 +767,12 @@ impl SeriesEntry {
         }
     }
 
+    /// Returns Prometheus `labels.Labels.StableHash()` for this series.
+    #[inline]
+    pub fn stable_hash(&self) -> u64 {
+        self.labels.stable_hash()
+    }
+
     #[doc(hidden)]
     pub fn new_for_test(ref_id: u64, hash: u64, labels: Labels) -> Self {
         Self::new(ref_id, hash, labels, 0)
@@ -2769,6 +2775,53 @@ impl PagedById {
         }
     }
 
+    /// Computes `Labels::stable_hash()` for `ref_id` under the stripe lock without cloning `Arc`.
+    unsafe fn stable_hash_under_stripe_lock(&self, ref_id: u64) -> Option<u64> {
+        let (top, dir, offset) = Self::split_id(ref_id);
+        let dir_ptr = self.dirs[top].load(Ordering::Acquire);
+        if dir_ptr.is_null() {
+            return None;
+        }
+        let page_ptr = unsafe { (*dir_ptr).pages[dir].load(Ordering::Acquire) };
+        if page_ptr.is_null() {
+            return None;
+        }
+        unsafe {
+            (*(*page_ptr).slots[offset].get())
+                .as_ref()
+                .map(|e| e.labels.stable_hash())
+        }
+    }
+
+    /// Returns `None` if no series exists for `ref_id`, `Some(None)` if the series exists but
+    /// does not belong to `(shard_idx, shard_count)` (avoiding `Arc` refcount churn across
+    /// concurrent sharded readers), or `Some(Some(entry))` if it matches.
+    unsafe fn get_if_shard_under_stripe_lock(
+        &self,
+        ref_id: u64,
+        shard_idx: u64,
+        shard_count: u64,
+    ) -> Option<Option<Arc<SeriesEntry>>> {
+        let (top, dir, offset) = Self::split_id(ref_id);
+        let dir_ptr = self.dirs[top].load(Ordering::Acquire);
+        if dir_ptr.is_null() {
+            return None;
+        }
+        let page_ptr = unsafe { (*dir_ptr).pages[dir].load(Ordering::Acquire) };
+        if page_ptr.is_null() {
+            return None;
+        }
+        unsafe {
+            (*(*page_ptr).slots[offset].get()).as_ref().map(|e| {
+                if e.stable_hash() % shard_count == shard_idx {
+                    Some(Arc::clone(e))
+                } else {
+                    None
+                }
+            })
+        }
+    }
+
     unsafe fn insert_under_stripe_lock(&self, ref_id: u64, entry: Arc<SeriesEntry>) {
         let (top, dir, offset) = Self::split_id(ref_id);
         let mut dir_ptr = self.dirs[top].load(Ordering::Acquire);
@@ -3030,6 +3083,40 @@ impl StripeSeries {
             return unsafe { self.by_id_pages.get_under_stripe_lock(ref_id) };
         }
         stripe.get_overflow(ref_id).cloned()
+    }
+
+    fn stable_hash_for_id(&self, ref_id: u64) -> Option<u64> {
+        let idx = self.stripe_idx(ref_id);
+        let stripe = self.stripes[idx].read();
+        if ref_id < MAX_PAGED_SERIES_ID {
+            // SAFETY: `stripe` read guard prevents concurrent slot mutation and page reclamation.
+            return unsafe { self.by_id_pages.stable_hash_under_stripe_lock(ref_id) };
+        }
+        stripe.get_overflow(ref_id).map(|e| e.labels.stable_hash())
+    }
+
+    fn get_by_id_if_shard(
+        &self,
+        ref_id: u64,
+        shard_idx: u64,
+        shard_count: u64,
+    ) -> Option<Option<Arc<SeriesEntry>>> {
+        let idx = self.stripe_idx(ref_id);
+        let stripe = self.stripes[idx].read();
+        if ref_id < MAX_PAGED_SERIES_ID {
+            // SAFETY: `stripe` read guard prevents concurrent slot mutation and page reclamation.
+            return unsafe {
+                self.by_id_pages
+                    .get_if_shard_under_stripe_lock(ref_id, shard_idx, shard_count)
+            };
+        }
+        stripe.get_overflow(ref_id).map(|e| {
+            if e.stable_hash() % shard_count == shard_idx {
+                Some(Arc::clone(e))
+            } else {
+                None
+            }
+        })
     }
 
     #[inline]
@@ -4109,6 +4196,14 @@ impl HeadMetrics {
 }
 
 /// Striped in-memory TSDB Head backed by WAL, WBL, and mmap `chunks_head`.
+type HeadShardHashCell = Arc<Mutex<Option<Option<Arc<[u64]>>>>>;
+
+struct HeadShardHashEntry {
+    key: usize,
+    weak: std::sync::Weak<[u64]>,
+    cell: HeadShardHashCell,
+}
+
 pub struct Head {
     dir: PathBuf,
     chunks_dir: PathBuf,
@@ -4123,6 +4218,7 @@ pub struct Head {
     postings: MemPostings,
     postings_cache: Arc<PostingsForMatchersCache>,
     postings_cache_source_id: u64,
+    shard_hash_cache: Mutex<VecDeque<HeadShardHashEntry>>,
     tombstones: MemTombstones,
     exemplars: CircularExemplarStorage,
     metadata: UserMetricsMetadata,
@@ -4560,6 +4656,7 @@ impl Head {
                 .clone()
                 .unwrap_or_else(|| Arc::new(PostingsForMatchersCache::new(opts.postings_cache.clone()))),
             postings_cache_source_id: next_postings_cache_source_id(),
+            shard_hash_cache: Mutex::new(VecDeque::new()),
             tombstones: MemTombstones::new(),
             exemplars: CircularExemplarStorage::new_with_registry(
                 if opts.enable_exemplar_storage {
@@ -4749,6 +4846,7 @@ impl Head {
             postings: MemPostings::new_unordered(),
             postings_cache: Arc::new(PostingsForMatchersCache::new(opts.postings_cache.clone())),
             postings_cache_source_id: next_postings_cache_source_id(),
+            shard_hash_cache: Mutex::new(VecDeque::new()),
             tombstones: MemTombstones::new(),
             exemplars: CircularExemplarStorage::new_with_registry(0, 0, None),
             metadata: UserMetricsMetadata::new(),
@@ -6195,7 +6293,7 @@ impl Head {
         const WAL_DECODE_BATCH_BYTES: usize = 512 * 1024;
         const WAL_SERIES_PARALLEL_BATCH_MAX: usize = 16_384;
 
-        let max_threads = std::thread::available_parallelism()
+        let max_threads = std::num::NonZeroUsize::new(mimir_common::cached_available_parallelism())
             .map_or(8, |n| n.get())
             .clamp(2, 32);
         let workers = self.opts.wal_replay_concurrency.min(max_threads).max(2);
@@ -11551,6 +11649,62 @@ impl Head {
 
     /// Evaluates label matchers against `MemPostings` (backed by `PostingsForMatchersCache`),
     /// passing `concurrent` (Go `sharded` / `hints.ShardCount > 0`).
+    /// Returns cached Prometheus `StableHash` values aligned 1:1 with `refs` when `refs` is
+    /// shared across concurrent sharded queries via `PostingsForMatchersCache`.
+    ///
+    /// Keeps `SeriesEntry` compact (`<= 176B`) while eliminating repeated stripe-lock +
+    /// `stable_hash` work on shards 2..N. Returns `None` if `refs` is unshared, oversized, or
+    /// contains any already-GC'd ref so callers fall back to `get_by_id_if_shard`.
+    pub fn shard_hashes_for_postings(&self, refs: &Arc<[u64]>) -> Option<Arc<[u64]>> {
+        const MAX_HEAD_SHARD_HASH_CACHE_ENTRIES: usize = 8;
+        const MAX_HEAD_SHARD_HASH_CACHE_REFS: usize = 524_288;
+        if refs.is_empty()
+            || refs.len() > MAX_HEAD_SHARD_HASH_CACHE_REFS
+            || Arc::strong_count(refs) <= 1
+        {
+            return None;
+        }
+        let key = Arc::as_ptr(refs) as *const u64 as usize;
+        let cell = {
+            let mut cache = self.shard_hash_cache.lock();
+            cache.retain(|e| e.weak.strong_count() > 0);
+            if let Some(entry) = cache
+                .iter()
+                .find(|e| e.key == key && std::ptr::eq(e.weak.as_ptr(), Arc::as_ptr(refs)))
+            {
+                Arc::clone(&entry.cell)
+            } else {
+                if cache.len() >= MAX_HEAD_SHARD_HASH_CACHE_ENTRIES {
+                    cache.pop_front();
+                }
+                let cell = Arc::new(Mutex::new(None));
+                cache.push_back(HeadShardHashEntry {
+                    key,
+                    weak: Arc::downgrade(refs),
+                    cell: Arc::clone(&cell),
+                });
+                cell
+            }
+        };
+        let mut guard = cell.lock();
+        if let Some(ref cached) = *guard {
+            return cached.as_ref().map(Arc::clone);
+        }
+        let mut hashes = Vec::with_capacity(refs.len());
+        for &r in refs.iter() {
+            match self.series.stable_hash_for_id(r) {
+                Some(h) => hashes.push(h),
+                None => {
+                    *guard = Some(None);
+                    return None;
+                }
+            }
+        }
+        let arc: Arc<[u64]> = Arc::from(hashes);
+        *guard = Some(Some(Arc::clone(&arc)));
+        Some(arc)
+    }
+
     pub fn postings_for_matchers_with_concurrent(
         &self,
         matchers: &[LabelMatcher],
@@ -12249,6 +12403,145 @@ impl Head {
         self.series_final_chunks_from_snapshot_with_tx_isolation(entry_opt, ref_id, snapshot, None)
     }
 
+    /// Acquires a shared `HeadChunksReader` read guard for batching Phase 2 chunk reads across
+    /// multiple series without re-acquiring the global `RwLock` per series.
+    #[inline]
+    pub(crate) fn read_chunk_reader_guard(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, Option<HeadChunksReader>> {
+        self.chunk_reader.read()
+    }
+
+    /// Like `series_final_chunks_from_snapshot_with_tx_isolation`, using a pre-acquired
+    /// `HeadChunksReader` reference when available; if concurrent segment rotation removed a file
+    /// from the borrowed reader, returns `Ok(None)` so the caller can drop the guard and fall back
+    /// to the retry loop.
+    pub(crate) fn try_series_final_chunks_from_snapshot_with_reader(
+        &self,
+        entry_opt: Option<&SeriesEntry>,
+        ref_id: u64,
+        snapshot: &HeadChunkSnapshot,
+        tx_iso: Option<&IsolationStateInfo>,
+        reader: &HeadChunksReader,
+    ) -> Result<Option<Vec<ChunkMeta>>, HeadError> {
+        let min_times = match snapshot {
+            HeadChunkSnapshot::Precomputed(_) => return Ok(None),
+            HeadChunkSnapshot::InOrderByMinTime(min_times) => min_times,
+        };
+        if min_times.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if self.is_closed() {
+            return Err(HeadChunksError::Closed.into());
+        }
+        let looked_up;
+        let entry = match entry_opt {
+            Some(e) => e,
+            None => {
+                let Some(e) = self.series.get_by_id(ref_id) else {
+                    self.metrics.chunk_reads_of_removed_series.inc();
+                    return Ok(Some(Vec::new()));
+                };
+                looked_up = e;
+                &looked_up
+            }
+        };
+        let effective_tx_iso = tx_iso.filter(|_| !self.iso.is_disabled());
+        let (mmapped_in_order, head_chks) = {
+            let st = entry.inner.lock();
+            if entry.is_gced() {
+                self.metrics.chunk_reads_of_removed_series.inc();
+                return Ok(Some(Vec::new()));
+            }
+            if let Some(iso_info) = effective_tx_iso {
+                let (mm, hc) = if let Some(s) = self.txs_stripe(ref_id) {
+                    let map = s.lock();
+                    st.collect_in_order_chunks_for_tx_iso(
+                        map.get(&ref_id),
+                        i64::MIN,
+                        i64::MAX,
+                        Some(iso_info),
+                    )?
+                } else {
+                    st.collect_in_order_chunks_for_tx_iso(
+                        None,
+                        i64::MIN,
+                        i64::MAX,
+                        Some(iso_info),
+                    )?
+                };
+                let mm_filt: Vec<(u64, MmappedChunk, Option<usize>)> = mm
+                    .into_iter()
+                    .filter(|(_, mc, _)| min_times.contains(&mc.min_time))
+                    .collect();
+                let hc_filt: Vec<ChunkMeta> = hc
+                    .into_iter()
+                    .filter(|c| min_times.contains(&c.min_time))
+                    .collect();
+                (mm_filt, hc_filt)
+            } else {
+                let mut pos = 0u64;
+                let mut mmapped_in_order = Vec::new();
+                for mc in st.mmapped() {
+                    if min_times.contains(&mc.min_time) {
+                        mmapped_in_order.push((pos, *mc, None));
+                        pos += 1;
+                    }
+                }
+                let mut head_chks = Vec::new();
+                st.for_each_head_chunk_cloned(|hc_chunk, hc_min, hc_max| {
+                    if min_times.contains(&hc_min) {
+                        head_chks.push(ChunkMeta {
+                            ref_id: pos,
+                            min_time: hc_min,
+                            max_time: hc_max,
+                            chunk: Some(hc_chunk),
+                        });
+                        pos += 1;
+                    }
+                });
+                (mmapped_in_order, head_chks)
+            }
+        };
+
+        if mmapped_in_order.is_empty() {
+            return Ok(Some(head_chks));
+        }
+
+        let mut chks = Vec::with_capacity(mmapped_in_order.len() + head_chks.len());
+        for (sort_ref, mc, trim) in mmapped_in_order {
+            match reader.chunk(mc.ref_id) {
+                Ok(enc) => {
+                    if let Some(stop_after) = trim {
+                        if let Some((sliced, s_min, s_max)) =
+                            crate::compact::slice_chunk_prefix(&enc, stop_after)?
+                        {
+                            chks.push(ChunkMeta {
+                                ref_id: sort_ref,
+                                min_time: s_min,
+                                max_time: s_max,
+                                chunk: Some(sliced),
+                            });
+                        }
+                    } else {
+                        chks.push(ChunkMeta {
+                            ref_id: sort_ref,
+                            min_time: mc.min_time,
+                            max_time: mc.max_time,
+                            chunk: Some(enc),
+                        });
+                    }
+                }
+                Err(_) if !reader.has_file(mc.ref_id.unpack().0 as usize) => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        chks.extend(head_chks);
+        Ok(Some(chks))
+    }
+
     pub fn series_final_chunks_from_snapshot_with_tx_isolation(
         &self,
         entry_opt: Option<&SeriesEntry>,
@@ -12438,7 +12731,9 @@ impl Head {
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
     ) -> Result<Option<(Arc<SeriesEntry>, u32, HeadChunkSnapshot)>, HeadError> {
-        self.series_lazy_chunk_count_with_snapshot_inner(ref_id, mint, maxt, filter, None, None)
+        self.series_lazy_chunk_count_with_snapshot_inner(
+            ref_id, mint, maxt, None, filter, None, None,
+        )
     }
 
     pub fn series_lazy_chunk_count_with_snapshot_and_isolation(
@@ -12449,7 +12744,15 @@ impl Head {
         filter: Option<&dyn Fn(&Labels) -> bool>,
         iso: &HeadReadIsolation,
     ) -> Result<Option<(Arc<SeriesEntry>, u32, HeadChunkSnapshot)>, HeadError> {
-        self.series_lazy_chunk_count_with_snapshot_inner(ref_id, mint, maxt, filter, Some(iso), None)
+        self.series_lazy_chunk_count_with_snapshot_inner(
+            ref_id,
+            mint,
+            maxt,
+            None,
+            filter,
+            Some(iso),
+            None,
+        )
     }
 
     pub fn series_lazy_chunk_count_with_snapshot_and_tx_isolation(
@@ -12461,14 +12764,34 @@ impl Head {
         iso: Option<&HeadReadIsolation>,
         tx_iso: Option<&IsolationStateInfo>,
     ) -> Result<Option<(Arc<SeriesEntry>, u32, HeadChunkSnapshot)>, HeadError> {
-        self.series_lazy_chunk_count_with_snapshot_inner(ref_id, mint, maxt, filter, iso, tx_iso)
+        self.series_lazy_chunk_count_with_snapshot_inner(
+            ref_id, mint, maxt, None, filter, iso, tx_iso,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn series_lazy_chunk_count_with_snapshot_and_shard(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        shard: Option<(u64, u64)>,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+        iso: Option<&HeadReadIsolation>,
+        tx_iso: Option<&IsolationStateInfo>,
+    ) -> Result<Option<(Arc<SeriesEntry>, u32, HeadChunkSnapshot)>, HeadError> {
+        self.series_lazy_chunk_count_with_snapshot_inner(
+            ref_id, mint, maxt, shard, filter, iso, tx_iso,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn series_lazy_chunk_count_with_snapshot_inner(
         &self,
         ref_id: u64,
         mint: i64,
         maxt: i64,
+        shard: Option<(u64, u64)>,
         filter: Option<&dyn Fn(&Labels) -> bool>,
         iso: Option<&HeadReadIsolation>,
         tx_iso: Option<&IsolationStateInfo>,
@@ -12476,14 +12799,30 @@ impl Head {
         if self.is_closed() {
             return Err(HeadChunksError::Closed.into());
         }
-        let Some(entry) = self.series.get_by_id(ref_id) else {
-            if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
-                self.metrics.chunk_reads_of_removed_series.inc();
-            } else {
-                // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
-                self.metrics.series_not_found.inc();
+        let entry = if let Some((shard_idx, shard_count)) = shard {
+            match self.series.get_by_id_if_shard(ref_id, shard_idx, shard_count) {
+                None => {
+                    if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                        self.metrics.chunk_reads_of_removed_series.inc();
+                    } else {
+                        self.metrics.series_not_found.inc();
+                    }
+                    return Ok(None);
+                }
+                Some(None) => return Ok(None),
+                Some(Some(e)) => e,
             }
-            return Ok(None);
+        } else {
+            let Some(e) = self.series.get_by_id(ref_id) else {
+                if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                    self.metrics.chunk_reads_of_removed_series.inc();
+                } else {
+                    // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
+                    self.metrics.series_not_found.inc();
+                }
+                return Ok(None);
+            };
+            e
         };
         if let Some(pred) = filter {
             if !pred(&entry.labels) {
@@ -12594,7 +12933,10 @@ impl Head {
         maxt: i64,
         filter: Option<&dyn Fn(&Labels) -> bool>,
     ) -> Result<SeriesChunkMetasWithSnapshot, HeadError> {
-        self.series_chunk_metas_no_bytes_with_snapshot_inner(ref_id, mint, maxt, filter, None, None)
+        self.series_chunk_metas_no_bytes_with_snapshot_inner(
+            ref_id, mint, maxt, None, filter, None, None,
+        )
+        .map(|opt| opt.map(|(_e, lbls, ivs, snap)| (lbls, ivs, snap)))
     }
 
     pub fn series_chunk_metas_no_bytes_with_snapshot_and_isolation(
@@ -12605,7 +12947,16 @@ impl Head {
         filter: Option<&dyn Fn(&Labels) -> bool>,
         iso: &HeadReadIsolation,
     ) -> Result<SeriesChunkMetasWithSnapshot, HeadError> {
-        self.series_chunk_metas_no_bytes_with_snapshot_inner(ref_id, mint, maxt, filter, Some(iso), None)
+        self.series_chunk_metas_no_bytes_with_snapshot_inner(
+            ref_id,
+            mint,
+            maxt,
+            None,
+            filter,
+            Some(iso),
+            None,
+        )
+        .map(|opt| opt.map(|(_e, lbls, ivs, snap)| (lbls, ivs, snap)))
     }
 
     pub fn series_chunk_metas_no_bytes_with_snapshot_and_tx_isolation(
@@ -12617,29 +12968,66 @@ impl Head {
         iso: Option<&HeadReadIsolation>,
         tx_iso: Option<&IsolationStateInfo>,
     ) -> Result<SeriesChunkMetasWithSnapshot, HeadError> {
-        self.series_chunk_metas_no_bytes_with_snapshot_inner(ref_id, mint, maxt, filter, iso, tx_iso)
+        self.series_chunk_metas_no_bytes_with_snapshot_inner(
+            ref_id, mint, maxt, None, filter, iso, tx_iso,
+        )
+        .map(|opt| opt.map(|(_e, lbls, ivs, snap)| (lbls, ivs, snap)))
     }
 
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn series_chunk_metas_no_bytes_with_entry_snapshot_and_shard(
+        &self,
+        ref_id: u64,
+        mint: i64,
+        maxt: i64,
+        shard: Option<(u64, u64)>,
+        filter: Option<&dyn Fn(&Labels) -> bool>,
+        iso: Option<&HeadReadIsolation>,
+        tx_iso: Option<&IsolationStateInfo>,
+    ) -> Result<Option<(Arc<SeriesEntry>, Labels, SmallVec<[(i64, i64); 4]>, HeadChunkSnapshot)>, HeadError> {
+        self.series_chunk_metas_no_bytes_with_snapshot_inner(
+            ref_id, mint, maxt, shard, filter, iso, tx_iso,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn series_chunk_metas_no_bytes_with_snapshot_inner(
         &self,
         ref_id: u64,
         mint: i64,
         maxt: i64,
+        shard: Option<(u64, u64)>,
         filter: Option<&dyn Fn(&Labels) -> bool>,
         iso: Option<&HeadReadIsolation>,
         tx_iso: Option<&IsolationStateInfo>,
-    ) -> Result<SeriesChunkMetasWithSnapshot, HeadError> {
+    ) -> Result<Option<(Arc<SeriesEntry>, Labels, SmallVec<[(i64, i64); 4]>, HeadChunkSnapshot)>, HeadError> {
         if self.is_closed() {
             return Err(HeadChunksError::Closed.into());
         }
-        let Some(entry) = self.series.get_by_id(ref_id) else {
-            if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
-                self.metrics.chunk_reads_of_removed_series.inc();
-            } else {
-                // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
-                self.metrics.series_not_found.inc();
+        let entry = if let Some((shard_idx, shard_count)) = shard {
+            match self.series.get_by_id_if_shard(ref_id, shard_idx, shard_count) {
+                None => {
+                    if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                        self.metrics.chunk_reads_of_removed_series.inc();
+                    } else {
+                        self.metrics.series_not_found.inc();
+                    }
+                    return Ok(None);
+                }
+                Some(None) => return Ok(None),
+                Some(Some(e)) => e,
             }
-            return Ok(None);
+        } else {
+            let Some(e) = self.series.get_by_id(ref_id) else {
+                if iso.is_some_and(|i| i.evicting_contains(ref_id)) {
+                    self.metrics.chunk_reads_of_removed_series.inc();
+                } else {
+                    // Go `headIndexReader.Series`: `seriesNotFound.Inc()`.
+                    self.metrics.series_not_found.inc();
+                }
+                return Ok(None);
+            };
+            e
         };
         if let Some(pred) = filter {
             if !pred(&entry.labels) {
@@ -12698,8 +13086,10 @@ impl Head {
                 return Ok(None);
             }
             let min_times: SmallVec<[i64; 4]> = intervals.iter().map(|&(mn, _)| mn).collect();
+            let labels = entry.labels.clone();
             return Ok(Some((
-                entry.labels.clone(),
+                entry,
+                labels,
                 intervals,
                 HeadChunkSnapshot::InOrderByMinTime(min_times),
             )));
@@ -12709,7 +13099,7 @@ impl Head {
         };
         let ivs: SmallVec<[(i64, i64); 4]> =
             chks.iter().map(|c| (c.min_time, c.max_time)).collect();
-        Ok(Some((labels, ivs, HeadChunkSnapshot::Precomputed(chks))))
+        Ok(Some((entry, labels, ivs, HeadChunkSnapshot::Precomputed(chks))))
     }
 
     /// Returns `(labels, chunk_intervals, needs_chunk_load_for_count)` for `ref_id` in `[mint, maxt]`
@@ -20372,6 +20762,7 @@ mod tests {
                     .clone()
                     .unwrap_or_else(|| Arc::new(PostingsForMatchersCache::new(opts.postings_cache.clone()))),
                 postings_cache_source_id: next_postings_cache_source_id(),
+            shard_hash_cache: Mutex::new(VecDeque::new()),
                 tombstones: MemTombstones::new(),
                 exemplars: CircularExemplarStorage::new_with_registry(0, 0, None),
                 metadata: UserMetricsMetadata::new(),

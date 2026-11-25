@@ -1048,7 +1048,12 @@ impl<'a> Iterator for StringLabelsIter<'a> {
         };
         let nend = nstart.checked_add(nlen)?;
         let name_bytes = data.get(nstart..nend)?;
-        let name = std::str::from_utf8(name_bytes).ok()?;
+        let name = if name_bytes.is_ascii() {
+            // SAFETY: ASCII is valid UTF-8.
+            unsafe { std::str::from_utf8_unchecked(name_bytes) }
+        } else {
+            std::str::from_utf8(name_bytes).ok()?
+        };
 
         let b1 = *data.get(nend)?;
         let (vlen, vstart) = if b1 < 255 {
@@ -1058,7 +1063,12 @@ impl<'a> Iterator for StringLabelsIter<'a> {
         };
         let vend = vstart.checked_add(vlen)?;
         let val_bytes = data.get(vstart..vend)?;
-        let value = std::str::from_utf8(val_bytes).ok()?;
+        let value = if val_bytes.is_ascii() {
+            // SAFETY: ASCII is valid UTF-8.
+            unsafe { std::str::from_utf8_unchecked(val_bytes) }
+        } else {
+            std::str::from_utf8(val_bytes).ok()?
+        };
 
         self.pos = vend;
         Some((name, value))
