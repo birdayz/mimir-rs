@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use std::ops::Deref;
@@ -121,6 +121,96 @@ enum WriterStage {
     Done,
 }
 
+#[inline]
+fn fast_hash_bytes(bytes: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(bytes)
+}
+
+#[inline]
+fn symbol_bytes<'a>(arena: &'a [u8], offsets: &[usize], idx: u32) -> &'a [u8] {
+    let i = idx as usize;
+    &arena[offsets[i]..offsets[i + 1]]
+}
+
+#[inline]
+fn symbol_str<'a>(arena: &'a [u8], offsets: &[usize], idx: u32) -> &'a str {
+    let raw = symbol_bytes(arena, offsets, idx);
+    std::str::from_utf8(raw).unwrap_or("")
+}
+
+fn write_main_slice(
+    f_opt: &mut Option<BufWriter<File>>,
+    pos: &mut u64,
+    bytes: &[u8],
+) -> Result<(), IndexError> {
+    let f = f_opt
+        .as_mut()
+        .ok_or(IndexError::InvalidStage("writer closed"))?;
+    f.write_all(bytes)?;
+    *pos += bytes.len() as u64;
+    if *pos > 16 * u64::from(u32::MAX) {
+        return Err(IndexError::IndexExceeds64GiB(*pos));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_posting_entry(
+    fp_opt: &mut Option<BufWriter<File>>,
+    fp_pos: &mut u64,
+    fpo_opt: &mut Option<BufWriter<File>>,
+    fpo_pos: &mut u64,
+    cnt_po: &mut u32,
+    buf1: &mut Encbuf,
+    name: &str,
+    value: &str,
+    offs: &[u32],
+) -> Result<(), IndexError> {
+    let fp = fp_opt
+        .as_mut()
+        .ok_or(IndexError::InvalidStage("postings writer closed"))?;
+    // Align postings entry to 4 bytes.
+    let rem = (*fp_pos as usize) % 4;
+    if rem != 0 {
+        let pad = 4 - rem;
+        let zeros = [0u8; 4];
+        fp.write_all(&zeros[..pad])?;
+        *fp_pos += pad as u64;
+    }
+
+    // Write offset table entry to temporary fpo.
+    buf1.reset();
+    buf1.put_uvarint(2);
+    buf1.put_uvarint_str(name);
+    buf1.put_uvarint_str(value);
+    buf1.put_uvarint64(*fp_pos);
+    {
+        let fpo = fpo_opt
+            .as_mut()
+            .ok_or(IndexError::InvalidStage("postings offset writer closed"))?;
+        fpo.write_all(buf1.as_slice())?;
+        *fpo_pos += buf1.len() as u64;
+    }
+    *cnt_po += 1;
+
+    // Encode raw postings: <4B BE len><4B BE count><count * 4B BE off><4B BE crc32c>
+    let count_u32 =
+        u32::try_from(offs.len()).map_err(|_| IndexError::PostingSizeTooLarge(offs.len()))?;
+    buf1.reset();
+    buf1.put_be32(count_u32);
+    for &off in offs {
+        buf1.put_be32(off);
+    }
+    let body_len =
+        u32::try_from(buf1.len()).map_err(|_| IndexError::PostingSizeTooLarge(buf1.len()))?;
+    buf1.put_crc32c();
+
+    fp.write_all(&body_len.to_be_bytes())?;
+    fp.write_all(buf1.as_slice())?;
+    *fp_pos += 4 + buf1.len() as u64;
+    Ok(())
+}
+
 /// Bit-exact Prometheus Index v2 writer (`index.Writer`).
 pub struct IndexWriter {
     path: PathBuf,
@@ -142,11 +232,30 @@ pub struct IndexWriter {
     postings_start: u64,
 
     num_symbols: u32,
-    last_symbol: String,
-    symbols: Vec<String>,
-    symbol_index: HashMap<String, u32>,
+    symbols_body_crc: u32,
+    symbols_body_len: usize,
+    /// Flat contiguous UTF-8 byte arena for all symbols (zero per-symbol `String` allocs).
+    symbols_arena: Vec<u8>,
+    /// `symbol_offsets.len() == num_symbols + 1`; symbol `i` is `symbols_arena[off[i]..off[i+1]]`.
+    symbol_offsets: Vec<usize>,
+    /// Fast raw hash table mapping symbol bytes -> symbol `u32` ID with zero duplicate `String`s.
+    symbol_table: hashbrown::HashTable<u32>,
 
-    label_names: BTreeMap<String, u64>,
+    /// Counts of series per label name symbol ID: `(name_sid, count)` indexed by dense slot.
+    label_name_counts: Vec<(u32, u64)>,
+    /// Maps `name_sid -> slot` in `label_name_counts`.
+    label_name_slots: hashbrown::HashMap<u32, usize>,
+    /// Adjacent-series label cache referencing `last_series.as_bytes()` slices:
+    /// `(name_start, name_end, name_idx, count_slot, val_start, val_end, val_idx)`.
+    /// Exploits lexicographical series ordering to skip ~85% of symbol hash lookups in `add_series`.
+    prev_label_cache: Vec<(usize, usize, u32, usize, usize, usize, u32)>,
+    /// Reusable scratch staging buffer for `add_series` so a mid-loop `UnknownSymbol` or I/O
+    /// error never leaves `prev_label_cache` or `label_name_counts` partially mutated.
+    next_label_cache: Vec<(usize, usize, u32, usize, usize, usize, u32)>,
+    /// Set if `close_inner` fails so `Drop` does not retry writing partial postings.
+    close_failed: bool,
+    /// All series posting IDs (`series_pos / 16`) collected during `add_series` (eliminates pass-0 mmap scan).
+    all_series_ids: Vec<u32>,
     last_series: Option<Labels>,
     last_series_ref: u64,
     last_chunk_ref: u64,
@@ -201,10 +310,17 @@ impl IndexWriter {
             stage: WriterStage::None,
             postings_start: 0,
             num_symbols: 0,
-            last_symbol: String::new(),
-            symbols: Vec::new(),
-            symbol_index: HashMap::with_capacity(256),
-            label_names: BTreeMap::new(),
+            symbols_body_crc: 0,
+            symbols_body_len: 0,
+            symbols_arena: Vec::with_capacity(4096),
+            symbol_offsets: vec![0],
+            symbol_table: hashbrown::HashTable::with_capacity(256),
+            label_name_counts: Vec::with_capacity(32),
+            label_name_slots: hashbrown::HashMap::with_capacity(32),
+            prev_label_cache: Vec::with_capacity(16),
+            next_label_cache: Vec::with_capacity(16),
+            close_failed: false,
+            all_series_ids: Vec::new(),
             last_series: None,
             last_series_ref: 0,
             last_chunk_ref: 0,
@@ -256,8 +372,7 @@ impl IndexWriter {
         self.buf1.reset();
         self.buf1.put_be32(MAGIC_INDEX);
         self.buf1.put_byte(INDEX_FORMAT_V2);
-        let bytes = self.buf1.as_slice().to_vec();
-        self.write_main(&bytes)
+        write_main_slice(&mut self.f, &mut self.pos, self.buf1.as_slice())
     }
 
     fn ensure_stage(&mut self, target: WriterStage) -> Result<(), IndexError> {
@@ -290,9 +405,14 @@ impl IndexWriter {
                 self.last_series = None;
                 self.toc.label_indices = self.pos;
                 self.write_postings_to_tmp_files()?;
-                self.symbols = Vec::new();
-                self.symbol_index = HashMap::new();
-                self.label_names.clear();
+                self.symbols_arena = Vec::new();
+                self.symbol_offsets = Vec::new();
+                self.symbol_table = hashbrown::HashTable::new();
+                self.label_name_counts = Vec::new();
+                self.label_name_slots = hashbrown::HashMap::new();
+                self.prev_label_cache = Vec::new();
+                self.next_label_cache = Vec::new();
+                self.all_series_ids = Vec::new();
                 self.toc.postings = self.pos;
                 self.write_postings()?;
                 self.toc.label_indices_table = self.pos;
@@ -309,47 +429,56 @@ impl IndexWriter {
     /// Registers a symbol in strictly ascending lexicographical order.
     pub fn add_symbol(&mut self, sym: &str) -> Result<(), IndexError> {
         self.ensure_stage(WriterStage::Symbols)?;
-        if self.num_symbols != 0 && sym <= self.last_symbol.as_str() {
-            return Err(IndexError::OutOfOrderSymbol(sym.to_string()));
+        if self.num_symbols != 0 {
+            let last_bytes = symbol_bytes(&self.symbols_arena, &self.symbol_offsets, self.num_symbols - 1);
+            if sym.as_bytes() <= last_bytes {
+                return Err(IndexError::OutOfOrderSymbol(sym.to_string()));
+            }
         }
         let idx = self.num_symbols;
-        self.last_symbol.clear();
-        self.last_symbol.push_str(sym);
-        self.symbols.push(sym.to_string());
-        self.symbol_index.insert(sym.to_string(), idx);
+        let sym_bytes = sym.as_bytes();
+        self.symbols_arena.extend_from_slice(sym_bytes);
+        self.symbol_offsets.push(self.symbols_arena.len());
+        let h = fast_hash_bytes(sym_bytes);
+        let arena = &self.symbols_arena;
+        let offsets = &self.symbol_offsets;
+        self.symbol_table.insert_unique(h, idx, |&existing_id| {
+            fast_hash_bytes(symbol_bytes(arena, offsets, existing_id))
+        });
         self.num_symbols += 1;
 
         self.buf1.reset();
         self.buf1.put_uvarint_str(sym);
-        let bytes = self.buf1.as_slice().to_vec();
-        self.write_main(&bytes)
+        let slice = self.buf1.as_slice();
+        self.symbols_body_crc = crc32c::crc32c_append(self.symbols_body_crc, slice);
+        self.symbols_body_len += slice.len();
+        write_main_slice(&mut self.f, &mut self.pos, slice)
+    }
+
+    #[inline]
+    fn lookup_symbol(&self, sym: &str) -> Option<u32> {
+        let target = sym.as_bytes();
+        let h = fast_hash_bytes(target);
+        let arena = &self.symbols_arena;
+        let offsets = &self.symbol_offsets;
+        self.symbol_table
+            .find(h, |&id| symbol_bytes(arena, offsets, id) == target)
+            .copied()
     }
 
     fn finish_symbols(&mut self) -> Result<(), IndexError> {
         let sym_table_len = self.pos - self.toc.symbols - 4;
         let sym_table_size = u32::try_from(sym_table_len)
             .map_err(|_| IndexError::SymbolTableTooLarge(sym_table_len))?;
-        self.buf1.reset();
-        self.buf1.put_be32(sym_table_size);
-        self.buf1.put_be32(self.num_symbols);
-        let hdr = self.buf1.as_slice().to_vec();
+        let mut hdr = [0u8; 8];
+        hdr[..4].copy_from_slice(&sym_table_size.to_be_bytes());
+        hdr[4..8].copy_from_slice(&self.num_symbols.to_be_bytes());
         self.write_main_at(&hdr, self.toc.symbols)?;
 
-        // Compute CRC32C over [toc.symbols + 4 .. self.pos] (4B numSymbols + all uvarintStr symbols).
-        let hash_pos = self.pos;
-        let f = self
-            .f
-            .as_mut()
-            .ok_or(IndexError::InvalidStage("writer closed"))?;
-        f.flush()?;
-        let raw_file = f.get_mut();
-        raw_file.seek(SeekFrom::Start(self.toc.symbols + 4))?;
-        let len = (hash_pos - (self.toc.symbols + 4)) as usize;
-        let mut tmp = vec![0u8; len];
-        raw_file.read_exact(&mut tmp)?;
-        raw_file.seek(SeekFrom::End(0))?;
-
-        let crc = crc32c::crc32c(&tmp);
+        // Compute CRC32C over [toc.symbols + 4 .. self.pos] (4B numSymbols + all uvarintStr symbols)
+        // by combining the 4-byte header CRC with the incrementally accumulated body CRC (zero disk read-back).
+        let hdr_crc = crc32c::crc32c(&hdr[4..8]);
+        let crc = crc32c::crc32c_combine(hdr_crc, self.symbols_body_crc, self.symbols_body_len);
         self.write_main(&crc.to_be_bytes())
     }
 
@@ -401,22 +530,60 @@ impl IndexWriter {
             last_maxt = c.max_time;
         }
 
-        self.add_padding(SERIES_BYTE_ALIGN)?;
-        debug_assert_eq!(self.pos % (SERIES_BYTE_ALIGN as u64), 0);
-
+        // Resolve all label symbol IDs into `self.next_label_cache` BEFORE mutating
+        // `self.prev_label_cache`, `self.label_name_counts`, `self.all_series_ids`, or
+        // writing any padding/bytes, so an `UnknownSymbol` error leaves writer state intact.
         self.buf2.reset();
         self.buf2.put_uvarint(labels.len());
 
-        for (name, value) in labels.iter() {
-            let name_idx = *self
-                .symbol_index
-                .get(name)
-                .ok_or_else(|| IndexError::UnknownSymbol(name.to_string()))?;
-            let val_idx = *self
-                .symbol_index
-                .get(value)
-                .ok_or_else(|| IndexError::UnknownSymbol(value.to_string()))?;
-            *self.label_names.entry(name.to_string()).or_insert(0) += 1;
+        let cur_bytes = labels.as_bytes();
+        let cur_base = cur_bytes.as_ptr() as usize;
+        let prev_bytes: &[u8] = self
+            .last_series
+            .as_ref()
+            .map_or(&[], |prev| prev.as_bytes());
+        self.next_label_cache.clear();
+
+        for (pair_idx, (name, value)) in labels.iter().enumerate() {
+            let nb = name.as_bytes();
+            let vb = value.as_bytes();
+            let n_start = (nb.as_ptr() as usize) - cur_base;
+            let n_end = n_start + nb.len();
+            let v_start = (vb.as_ptr() as usize) - cur_base;
+            let v_end = v_start + vb.len();
+
+            let cached = self.prev_label_cache.get(pair_idx).copied();
+            let (name_idx, count_slot) = match cached {
+                Some((pn_s, pn_e, pn_idx, p_slot, _, _, _))
+                    if prev_bytes.get(pn_s..pn_e) == Some(nb) =>
+                {
+                    (pn_idx, p_slot)
+                }
+                _ => {
+                    let nid = self
+                        .lookup_symbol(name)
+                        .ok_or_else(|| IndexError::UnknownSymbol(name.to_string()))?;
+                    let slot = self
+                        .label_name_slots
+                        .get(&nid)
+                        .copied()
+                        .unwrap_or(usize::MAX);
+                    (nid, slot)
+                }
+            };
+            let val_idx = match cached {
+                Some((_, _, _, _, pv_s, pv_e, pv_idx))
+                    if prev_bytes.get(pv_s..pv_e) == Some(vb) =>
+                {
+                    pv_idx
+                }
+                _ => self
+                    .lookup_symbol(value)
+                    .ok_or_else(|| IndexError::UnknownSymbol(value.to_string()))?,
+            };
+
+            self.next_label_cache
+                .push((n_start, n_end, name_idx, count_slot, v_start, v_end, val_idx));
             self.buf2.put_uvarint32(name_idx);
             self.buf2.put_uvarint32(val_idx);
         }
@@ -446,10 +613,32 @@ impl IndexWriter {
         self.buf1.put_uvarint(self.buf2.len());
         self.buf2.put_crc32c();
 
-        let len_bytes = self.buf1.as_slice().to_vec();
-        let body_bytes = self.buf2.as_slice().to_vec();
-        self.write_main(&len_bytes)?;
-        self.write_main(&body_bytes)?;
+        self.add_padding(SERIES_BYTE_ALIGN)?;
+        debug_assert_eq!(self.pos % (SERIES_BYTE_ALIGN as u64), 0);
+        let series_id = u32::try_from(self.pos / (SERIES_BYTE_ALIGN as u64))
+            .map_err(|_| IndexError::IndexExceeds64GiB(self.pos))?;
+
+        write_main_slice(&mut self.f, &mut self.pos, self.buf1.as_slice())?;
+        write_main_slice(&mut self.f, &mut self.pos, self.buf2.as_slice())?;
+
+        // Commit label counts and swap adjacent-series cache only after all writes succeed.
+        for entry in &mut self.next_label_cache {
+            let slot = if entry.3 != usize::MAX {
+                self.label_name_counts[entry.3].1 += 1;
+                entry.3
+            } else if let Some(&s) = self.label_name_slots.get(&entry.2) {
+                self.label_name_counts[s].1 += 1;
+                s
+            } else {
+                let s = self.label_name_counts.len();
+                self.label_name_counts.push((entry.2, 1));
+                self.label_name_slots.insert(entry.2, s);
+                s
+            };
+            entry.3 = slot;
+        }
+        std::mem::swap(&mut self.prev_label_cache, &mut self.next_label_cache);
+        self.all_series_ids.push(series_id);
 
         self.last_series = Some(labels.clone());
         self.last_series_ref = ref_id;
@@ -464,154 +653,196 @@ impl IndexWriter {
             .ok_or(IndexError::InvalidStage("writer closed"))?;
         f.flush()?;
 
+        // Release hash table before allocating posting sort buffers (symbols_arena + symbol_offsets remain).
+        self.symbol_table = hashbrown::HashTable::new();
+
+        // 1. Write all-postings ("", "") directly from series IDs recorded during `add_series`
+        //    (eliminating a full pass-0 mmap scan of the series region).
+        let all_offsets = std::mem::take(&mut self.all_series_ids);
+        let max_postings = all_offsets.len() as u64;
+        write_posting_entry(
+            &mut self.fp,
+            &mut self.fp_pos,
+            &mut self.fpo,
+            &mut self.fpo_pos,
+            &mut self.cnt_po,
+            &mut self.buf1,
+            "",
+            "",
+            &all_offsets,
+        )?;
+        drop(all_offsets);
+
+        if self.label_name_counts.is_empty() {
+            return Ok(());
+        }
+
         let file_for_mmap = File::open(&self.path)?;
         // SAFETY: only reading up to `self.toc.label_indices` which is already flushed.
         let mmap = unsafe { MmapOptions::new().map(&file_for_mmap)? };
         let series_region = &mmap[..self.toc.label_indices as usize];
 
-        // 1. Collect all series offsets (series_id = start_pos / 16) for ("", "").
-        let mut all_offsets = Vec::new();
-        let mut cur = self.toc.series as usize;
-        while cur < series_region.len() {
-            while cur < series_region.len() && series_region[cur] == 0 {
-                cur += 1;
-            }
-            if cur >= series_region.len() {
-                break;
-            }
-            if !cur.is_multiple_of(SERIES_BYTE_ALIGN) {
-                return Err(IndexError::Corrupt(format!(
-                    "series not 16-byte aligned at {cur}"
-                )));
-            }
-            let sid = u32::try_from(cur / SERIES_BYTE_ALIGN)
-                .map_err(|_| IndexError::IndexExceeds64GiB(cur as u64))?;
-            all_offsets.push(sid);
-            let mut dec = Decbuf::new(&series_region[cur..]);
-            let entry_len = dec.uvarint()?;
-            let consumed = (series_region.len() - cur) - dec.len();
-            cur += consumed + entry_len + 4;
-        }
+        // Symbols were added in strictly ascending lexicographical order, so sorting label name
+        // symbol IDs numerically produces exact ascending lexicographical label-name order.
+        let mut sorted_names: Vec<(u32, u64)> = self.label_name_counts.clone();
+        sorted_names.sort_unstable_by_key(|&(sid, _)| sid);
 
-        self.write_posting("", "", &all_offsets)?;
-        let max_postings = all_offsets.len() as u64;
-
-        // 2. Batch label names and scan series region to populate postings.
-        let names: Vec<String> = self.label_names.keys().cloned().collect();
+        // Batch up to 4x `max_postings` packed (val_sid, series_id) u64 entries per mmap scan
+        // (8 bytes/entry => ~32 MiB at 1M series, cutting mmap scans ~4x vs 1-label batches while
+        // eliminating BTreeMap & millions of tiny Vec<u32> allocations).
+        let batch_limit = max_postings.saturating_mul(4).max(1);
+        let mut offs_buf: Vec<u32> = Vec::new();
         let mut name_idx = 0usize;
-        while name_idx < names.len() {
+
+        while name_idx < sorted_names.len() {
             let mut batch_count = 0u64;
             let batch_start = name_idx;
-            while name_idx < names.len() {
-                let cnt = self.label_names[&names[name_idx]];
-                if cnt + batch_count > max_postings {
-                    if batch_count > 0 {
-                        break;
-                    }
+            while name_idx < sorted_names.len() {
+                let (sid, cnt) = sorted_names[name_idx];
+                if cnt > max_postings {
+                    let name = symbol_str(&self.symbols_arena, &self.symbol_offsets, sid);
                     return Err(IndexError::Corrupt(format!(
-                        "corruption detected when writing postings to index: label {:?} has {cnt} uses, but maxPostings is {max_postings}",
-                        names[name_idx]
+                        "corruption detected when writing postings to index: label {name:?} has {cnt} uses, but maxPostings is {max_postings}"
                     )));
+                }
+                if cnt + batch_count > batch_limit && batch_count > 0 {
+                    break;
                 }
                 batch_count += cnt;
                 name_idx += 1;
             }
 
-            let batch_names = &names[batch_start..name_idx];
-            let mut wanted_name_ids: HashSet<u32> = HashSet::with_capacity(batch_names.len());
-            for name in batch_names {
-                let sid = *self
-                    .symbol_index
-                    .get(name)
-                    .ok_or_else(|| IndexError::UnknownSymbol(name.clone()))?;
-                wanted_name_ids.insert(sid);
-            }
+            let batch = &sorted_names[batch_start..name_idx];
+            let mut batch_packed: Vec<Vec<u64>> = batch
+                .iter()
+                .map(|&(_, cnt)| Vec::with_capacity(cnt as usize))
+                .collect();
 
-            let mut postings: HashMap<u32, BTreeMap<u32, Vec<u32>>> = HashMap::new();
-            let mut cur = self.toc.series as usize;
-            while cur < series_region.len() {
-                while cur < series_region.len() && series_region[cur] == 0 {
-                    cur += 1;
-                }
-                if cur >= series_region.len() {
-                    break;
-                }
-                let series_id = u32::try_from(cur / SERIES_BYTE_ALIGN)
-                    .map_err(|_| IndexError::IndexExceeds64GiB(cur as u64))?;
-                let mut dec = Decbuf::new(&series_region[cur..]);
-                let entry_len = dec.uvarint()?;
-                let header_consumed = (series_region.len() - cur) - dec.len();
-                let body_start_len = dec.len();
-                let num_labels = dec.uvarint()?;
-                for _ in 0..num_labels {
-                    let lno = dec.uvarint32()?;
-                    let lvo = dec.uvarint32()?;
-                    if wanted_name_ids.contains(&lno) {
-                        postings
-                            .entry(lno)
-                            .or_default()
-                            .entry(lvo)
-                            .or_default()
-                            .push(series_id);
+            if batch.len() == 1 {
+                let target_lno = batch[0].0;
+                let dst = &mut batch_packed[0];
+                let mut cur = self.toc.series as usize;
+                while cur < series_region.len() {
+                    while cur < series_region.len() && series_region[cur] == 0 {
+                        cur += 1;
                     }
-                }
-                let _ = body_start_len;
-                cur += header_consumed + entry_len + 4;
-            }
-
-            for name in batch_names {
-                let sid = self.symbol_index[name];
-                if let Some(val_map) = postings.get(&sid) {
-                    for (&val_sid, offs) in val_map {
-                        let val_str = self.symbols[val_sid as usize].clone();
-                        self.write_posting(name, &val_str, offs)?;
+                    if cur >= series_region.len() {
+                        break;
                     }
+                    let series_id = u32::try_from(cur / SERIES_BYTE_ALIGN)
+                        .map_err(|_| IndexError::IndexExceeds64GiB(cur as u64))?;
+                    let mut dec = Decbuf::new(&series_region[cur..]);
+                    let entry_len = dec.uvarint()?;
+                    let header_consumed = (series_region.len() - cur) - dec.len();
+                    let num_labels = dec.uvarint()?;
+                    for _ in 0..num_labels {
+                        let lno = dec.uvarint32()?;
+                        let lvo = dec.uvarint32()?;
+                        if lno == target_lno {
+                            dst.push((u64::from(lvo) << 32) | u64::from(series_id));
+                        }
+                    }
+                    cur += header_consumed + entry_len + 4;
+                }
+            } else if batch.len() <= 8 {
+                let mut target_ids = [u32::MAX; 8];
+                let blen = batch.len();
+                for (slot, &(sid, _)) in batch.iter().enumerate() {
+                    target_ids[slot] = sid;
+                }
+                let mut cur = self.toc.series as usize;
+                while cur < series_region.len() {
+                    while cur < series_region.len() && series_region[cur] == 0 {
+                        cur += 1;
+                    }
+                    if cur >= series_region.len() {
+                        break;
+                    }
+                    let series_id = u32::try_from(cur / SERIES_BYTE_ALIGN)
+                        .map_err(|_| IndexError::IndexExceeds64GiB(cur as u64))?;
+                    let mut dec = Decbuf::new(&series_region[cur..]);
+                    let entry_len = dec.uvarint()?;
+                    let header_consumed = (series_region.len() - cur) - dec.len();
+                    let num_labels = dec.uvarint()?;
+                    for _ in 0..num_labels {
+                        let lno = dec.uvarint32()?;
+                        let lvo = dec.uvarint32()?;
+                        for (slot, &tid) in target_ids[..blen].iter().enumerate() {
+                            if lno == tid {
+                                batch_packed[slot]
+                                    .push((u64::from(lvo) << 32) | u64::from(series_id));
+                                break;
+                            }
+                        }
+                    }
+                    cur += header_consumed + entry_len + 4;
+                }
+            } else {
+                let mut lno_to_slot: hashbrown::HashMap<u32, usize> =
+                    hashbrown::HashMap::with_capacity(batch.len());
+                for (slot, &(sid, _)) in batch.iter().enumerate() {
+                    lno_to_slot.insert(sid, slot);
+                }
+                let mut cur = self.toc.series as usize;
+                while cur < series_region.len() {
+                    while cur < series_region.len() && series_region[cur] == 0 {
+                        cur += 1;
+                    }
+                    if cur >= series_region.len() {
+                        break;
+                    }
+                    let series_id = u32::try_from(cur / SERIES_BYTE_ALIGN)
+                        .map_err(|_| IndexError::IndexExceeds64GiB(cur as u64))?;
+                    let mut dec = Decbuf::new(&series_region[cur..]);
+                    let entry_len = dec.uvarint()?;
+                    let header_consumed = (series_region.len() - cur) - dec.len();
+                    let num_labels = dec.uvarint()?;
+                    for _ in 0..num_labels {
+                        let lno = dec.uvarint32()?;
+                        let lvo = dec.uvarint32()?;
+                        if let Some(&slot) = lno_to_slot.get(&lno) {
+                            batch_packed[slot]
+                                .push((u64::from(lvo) << 32) | u64::from(series_id));
+                        }
+                    }
+                    cur += header_consumed + entry_len + 4;
                 }
             }
-        }
-        Ok(())
-    }
 
-    fn write_posting(&mut self, name: &str, value: &str, offs: &[u32]) -> Result<(), IndexError> {
-        // Align postings entry to 4 bytes.
-        let rem = (self.fp_pos as usize) % 4;
-        if rem != 0 {
-            let pad = 4 - rem;
-            let zeros = [0u8; 4];
-            let fp = self.fp.as_mut().unwrap();
-            fp.write_all(&zeros[..pad])?;
-            self.fp_pos += pad as u64;
+            // Sort each label's packed (val_sid << 32 | series_id) array and stream postings
+            // in exact ascending (label_name, label_value, series_id) order with zero String clones.
+            for (slot, &(name_sid, _)) in batch.iter().enumerate() {
+                let packed = &mut batch_packed[slot];
+                if packed.is_empty() {
+                    continue;
+                }
+                packed.sort_unstable();
+                let name_str = symbol_str(&self.symbols_arena, &self.symbol_offsets, name_sid);
+                let mut i = 0usize;
+                while i < packed.len() {
+                    let val_sid = (packed[i] >> 32) as u32;
+                    offs_buf.clear();
+                    while i < packed.len() && ((packed[i] >> 32) as u32) == val_sid {
+                        offs_buf.push(packed[i] as u32);
+                        i += 1;
+                    }
+                    let val_str = symbol_str(&self.symbols_arena, &self.symbol_offsets, val_sid);
+                    write_posting_entry(
+                        &mut self.fp,
+                        &mut self.fp_pos,
+                        &mut self.fpo,
+                        &mut self.fpo_pos,
+                        &mut self.cnt_po,
+                        &mut self.buf1,
+                        name_str,
+                        val_str,
+                        &offs_buf,
+                    )?;
+                }
+                // Free buffer immediately before moving to next label in batch.
+                *packed = Vec::new();
+            }
         }
-
-        // Write offset table entry to temporary fpo.
-        self.buf1.reset();
-        self.buf1.put_uvarint(2);
-        self.buf1.put_uvarint_str(name);
-        self.buf1.put_uvarint_str(value);
-        self.buf1.put_uvarint64(self.fp_pos);
-        {
-            let fpo = self.fpo.as_mut().unwrap();
-            fpo.write_all(self.buf1.as_slice())?;
-            self.fpo_pos += self.buf1.len() as u64;
-        }
-        self.cnt_po += 1;
-
-        // Encode raw postings: <4B BE len><4B BE count><count * 4B BE off><4B BE crc32c>
-        let count_u32 = u32::try_from(offs.len())
-            .map_err(|_| IndexError::PostingSizeTooLarge(offs.len()))?;
-        self.buf1.reset();
-        self.buf1.put_be32(count_u32);
-        for &off in offs {
-            self.buf1.put_be32(off);
-        }
-        let body_len = u32::try_from(self.buf1.len())
-            .map_err(|_| IndexError::PostingSizeTooLarge(self.buf1.len()))?;
-        self.buf1.put_crc32c();
-
-        let fp = self.fp.as_mut().unwrap();
-        fp.write_all(&body_len.to_be_bytes())?;
-        fp.write_all(self.buf1.as_slice())?;
-        self.fp_pos += 4 + self.buf1.len() as u64;
         Ok(())
     }
 
@@ -666,9 +897,9 @@ impl IndexWriter {
             self.buf1.put_uvarint_str(name);
             self.buf1.put_uvarint_str(value);
             self.buf1.put_uvarint64(off);
-            let slice = self.buf1.as_slice().to_vec();
-            crc = crc32c::crc32c_append(crc, &slice);
-            self.write_main(&slice)?;
+            let slice = self.buf1.as_slice();
+            crc = crc32c::crc32c_append(crc, slice);
+            write_main_slice(&mut self.f, &mut self.pos, slice)?;
             cnt -= 1;
         }
 
@@ -704,19 +935,25 @@ impl IndexWriter {
         if self.stage == WriterStage::Done {
             return Ok(());
         }
-        self.ensure_stage(WriterStage::Done)?;
-        if let Some(mut f) = self.f.take() {
-            f.flush()?;
-            let file = f.into_inner().map_err(|e| e.into_error())?;
-            file.sync_all()?;
+        let res = (|| -> Result<(), IndexError> {
+            self.ensure_stage(WriterStage::Done)?;
+            if let Some(mut f) = self.f.take() {
+                f.flush()?;
+                let file = f.into_inner().map_err(|e| e.into_error())?;
+                file.sync_all()?;
+            }
+            Ok(())
+        })();
+        if res.is_err() {
+            self.close_failed = true;
         }
-        Ok(())
+        res
     }
 }
 
 impl Drop for IndexWriter {
     fn drop(&mut self) {
-        if self.stage != WriterStage::Done && self.f.is_some() {
+        if !self.close_failed && self.stage != WriterStage::Done && self.f.is_some() {
             let _ = self.close_inner();
         }
         let _ = fs::remove_file(&self.tmp_p_path);
@@ -2941,5 +3178,35 @@ mod tests {
             parse_postings_offset_table_payload(dup_val.as_slice()),
             Err(IndexError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn add_series_unknown_symbol_error_does_not_corrupt_prev_label_cache_or_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_FILENAME);
+        let mut w = IndexWriter::new(&path).unwrap();
+        for sym in ["", "a", "b", "bar", "foo", "goo", "qux"] {
+            w.add_symbol(sym).unwrap();
+        }
+
+        let s1 = Labels::from_pairs([("a", "foo"), ("b", "bar")]);
+        let s2_bad = Labels::from_pairs([("a", "goo"), ("c", "MISSING_SYM")]);
+        let s3 = Labels::from_pairs([("a", "foo"), ("b", "qux")]);
+
+        w.add_series(1, &s1, &[]).unwrap();
+        assert!(matches!(
+            w.add_series(2, &s2_bad, &[]),
+            Err(IndexError::UnknownSymbol(_))
+        ));
+        w.add_series(3, &s3, &[]).unwrap();
+        w.close().unwrap();
+
+        let r = IndexReader::open(&path).unwrap();
+        let sids = r.postings("", &[""]).unwrap();
+        assert_eq!(sids.len(), 2);
+        let (lbl1, _) = r.series(sids[0]).unwrap();
+        let (lbl3, _) = r.series(sids[1]).unwrap();
+        assert_eq!(lbl1, s1);
+        assert_eq!(lbl3, s3, "prev_label_cache must not poison S3 with failed S2 symbol");
     }
 }

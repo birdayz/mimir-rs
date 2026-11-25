@@ -24,7 +24,8 @@ use crate::block::{
 use crate::chunkenc::Encoding;
 use crate::compact::{
     compact_blocks_with_float_encoding_and_segment_size_and_metrics, plan_block_compactions,
-    write_block_from_block_with_base, write_head_block_streaming_with_options, CompactError,
+    write_block_from_block_with_base, write_head_block_streaming_entries_with_options,
+    write_head_block_streaming_with_options, CompactError,
     CompactorMetrics,
 };
 use crate::exemplar::{CircularExemplarStorage, ExemplarQueryResult};
@@ -2066,8 +2067,8 @@ impl TsdbInner {
             return Ok(());
         }
         let maxt = maxt_incl.saturating_add(1);
-        let candidates = self.head.collect_compaction_candidates(mint, maxt_incl)?;
-        let _ = write_head_block_streaming_with_options(
+        let candidates = self.head.collect_compaction_candidate_entries(mint, maxt_incl)?;
+        let _ = write_head_block_streaming_entries_with_options(
             dest_dir,
             mint,
             maxt,
@@ -2077,9 +2078,9 @@ impl TsdbInner {
             false,
             self.opts.max_block_chunk_segment_size,
             Some(&self.metrics.compactor),
-            |ref_id, chks, tombs| {
+            |entries, bufs| {
                 self.head
-                    .load_series_in_order_chunks_into(ref_id, mint, maxt_incl, chks, tombs)
+                    .load_entries_batch_in_order_chunks_into(entries, mint, maxt_incl, bufs)
                     .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
             },
         )?;
@@ -2231,9 +2232,9 @@ impl TsdbInner {
         if maxt < mint || maxt_inclusive < mint {
             return Ok(None);
         }
-        let candidates = self.head.collect_compaction_candidates(mint, maxt_inclusive)?;
+        let candidates = self.head.collect_compaction_candidate_entries(mint, maxt_inclusive)?;
         let meta_opt = self.timed_write(|| {
-            write_head_block_streaming_with_options(
+            write_head_block_streaming_entries_with_options(
                 &self.dir,
                 mint,
                 maxt,
@@ -2243,9 +2244,9 @@ impl TsdbInner {
                 false,
                 self.opts.max_block_chunk_segment_size,
                 Some(&self.metrics.compactor),
-                |ref_id, chks, tombs| {
+                |entries, bufs| {
                     self.head
-                        .load_series_in_order_chunks_into(ref_id, mint, maxt_inclusive, chks, tombs)
+                        .load_entries_batch_in_order_chunks_into(entries, mint, maxt_inclusive, bufs)
                         .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
                 },
             )
@@ -2903,8 +2904,8 @@ impl TsdbReadOnly {
             let mint = head.min_time();
             let maxt_incl = head.max_time();
             let maxt = maxt_incl.saturating_add(1);
-            let candidates = head.collect_compaction_candidates(mint, maxt_incl)?;
-            let _ = write_head_block_streaming_with_options(
+            let candidates = head.collect_compaction_candidate_entries(mint, maxt_incl)?;
+            let _ = write_head_block_streaming_entries_with_options(
                 dest_dir.as_ref(),
                 mint,
                 maxt,
@@ -2914,8 +2915,8 @@ impl TsdbReadOnly {
                 false,
                 0,
                 None,
-                |ref_id, chks, tombs| {
-                    head.load_series_in_order_chunks_into(ref_id, mint, maxt_incl, chks, tombs)
+                |entries, bufs| {
+                    head.load_entries_batch_in_order_chunks_into(entries, mint, maxt_incl, bufs)
                         .map_err(|e| CompactError::Io(io::Error::other(e.to_string())))
                 },
             )?;

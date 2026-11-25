@@ -164,6 +164,75 @@ fn replace_host_and_ingester(template: &str, host: &str, ingester: &str) -> Stri
     out
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TokenLookupEntry {
+    instance_idx: u32,
+    zone_idx: u16,
+    zone_empty: bool,
+}
+
+#[derive(Default)]
+struct PreindexedTokenTable {
+    instance_ids: Vec<String>,
+    instances: Vec<InstanceDesc>,
+    token_meta: Vec<TokenLookupEntry>,
+    total_hosts_per_zone: Vec<usize>,
+}
+
+fn build_token_lookup_table(
+    ring_desc: &Desc,
+    ring_tokens: &[u32],
+    ring_instance_by_token: &HashMap<u32, InstanceInfo>,
+    ring_zones: &[String],
+    instances_count_per_zone: &HashMap<String, usize>,
+) -> PreindexedTokenTable {
+    let mut instance_ids = Vec::with_capacity(ring_desc.ingesters.len());
+    let mut instances = Vec::with_capacity(ring_desc.ingesters.len());
+    let mut id_to_idx: HashMap<&str, u32> = HashMap::with_capacity(ring_desc.ingesters.len());
+    for (id, inst) in &ring_desc.ingesters {
+        let idx = u32::try_from(instances.len()).unwrap_or(u32::MAX);
+        id_to_idx.insert(id.as_str(), idx);
+        instance_ids.push(id.clone());
+        instances.push(inst.clone());
+    }
+    let mut zone_to_idx: HashMap<&str, u16> = HashMap::with_capacity(ring_zones.len());
+    let mut total_hosts_per_zone = Vec::with_capacity(ring_zones.len());
+    for (zi, z) in ring_zones.iter().enumerate() {
+        zone_to_idx.insert(z.as_str(), u16::try_from(zi).unwrap_or(u16::MAX));
+        total_hosts_per_zone.push(instances_count_per_zone.get(z).copied().unwrap_or(0));
+    }
+    let mut token_meta = Vec::with_capacity(ring_tokens.len());
+    for &tok in ring_tokens {
+        if let Some(info) = ring_instance_by_token.get(&tok) {
+            let instance_idx = id_to_idx
+                .get(info.instance_id.as_str())
+                .copied()
+                .unwrap_or(u32::MAX);
+            let zone_idx = zone_to_idx
+                .get(info.zone.as_str())
+                .copied()
+                .unwrap_or(u16::MAX);
+            token_meta.push(TokenLookupEntry {
+                instance_idx,
+                zone_idx,
+                zone_empty: info.zone.is_empty(),
+            });
+        } else {
+            token_meta.push(TokenLookupEntry {
+                instance_idx: u32::MAX,
+                zone_idx: u16::MAX,
+                zone_empty: true,
+            });
+        }
+    }
+    PreindexedTokenTable {
+        instance_ids,
+        instances,
+        token_meta,
+        total_hosts_per_zone,
+    }
+}
+
 struct RingInner {
     ring_desc: Desc,
     ring_tokens: Vec<u32>,
@@ -172,6 +241,7 @@ struct RingInner {
     read_only_instances: Option<usize>,
     oldest_read_only_updated_timestamp: Option<i64>,
     ring_instance_by_token: Arc<HashMap<u32, InstanceInfo>>,
+    token_table: PreindexedTokenTable,
     last_topology_change: SystemTime,
     ring_zones: Vec<String>,
     tracked_ring_zones: HashSet<String>,
@@ -356,6 +426,7 @@ impl Ring {
                 read_only_instances: None,
                 oldest_read_only_updated_timestamp: None,
                 ring_instance_by_token: Arc::new(HashMap::new()),
+                token_table: PreindexedTokenTable::default(),
                 last_topology_change: UNIX_EPOCH,
                 ring_zones: Vec::new(),
                 tracked_ring_zones: HashSet::new(),
@@ -391,6 +462,7 @@ impl Ring {
                 read_only_instances: None,
                 oldest_read_only_updated_timestamp: None,
                 ring_instance_by_token: Arc::new(HashMap::new()),
+                token_table: PreindexedTokenTable::default(),
                 last_topology_change: UNIX_EPOCH,
                 ring_zones: Vec::new(),
                 tracked_ring_zones: HashSet::new(),
@@ -429,6 +501,7 @@ impl Ring {
                 read_only_instances: None,
                 oldest_read_only_updated_timestamp: None,
                 ring_instance_by_token: Arc::new(HashMap::new()),
+                token_table: PreindexedTokenTable::default(),
                 last_topology_change: UNIX_EPOCH,
                 ring_zones: Vec::new(),
                 tracked_ring_zones: HashSet::new(),
@@ -555,6 +628,20 @@ impl Ring {
                     || cmp_locked == CompareResult::EqualButStatesAndTimestamps
                 {
                     inner.ring_desc = ring_desc.clone();
+                    {
+                        let tt = &mut inner.token_table;
+                        for (id, dst) in tt.instance_ids.iter().zip(tt.instances.iter_mut()) {
+                            if let Some(src) = ring_desc.ingesters.get(id) {
+                                dst.state = src.state;
+                                dst.timestamp = src.timestamp;
+                                dst.read_only = src.read_only;
+                                dst.read_only_updated_timestamp = src.read_only_updated_timestamp;
+                                if dst.versions != src.versions {
+                                    dst.versions = src.versions.clone();
+                                }
+                            }
+                        }
+                    }
                     updated_metrics = cmp_locked != CompareResult::Equal;
                     resolved = true;
                 }
@@ -609,6 +696,13 @@ impl Ring {
             }
         }
         let (ro_count, ro_oldest) = read_only_instances_and_oldest_updated(&ring_desc);
+        let token_table = build_token_lookup_table(
+            &ring_desc,
+            &ring_tokens,
+            &ring_instance_by_token,
+            &ring_zones,
+            &instances_count_per_zone,
+        );
 
         {
             let mut inner = self.inner.write();
@@ -616,6 +710,7 @@ impl Ring {
             inner.ring_tokens = ring_tokens;
             inner.ring_tokens_by_zone = ring_tokens_by_zone;
             inner.ring_instance_by_token = ring_instance_by_token;
+            inner.token_table = token_table;
             inner.ring_zones = ring_zones.clone();
             for z in &ring_zones {
                 if !inner.tracked_ring_zones.contains(z)
@@ -796,34 +891,42 @@ impl Ring {
     ) -> Result<Vec<InstanceDesc>, RingError> {
         let mut replica_set_size = replication_factor;
         let mut instances = Vec::with_capacity(replica_set_size + 2);
+        let n_tokens = inner.ring_tokens.len();
         let start = search_token(&inner.ring_tokens, key);
-        let max_instances = inner.ring_desc.ingesters.len();
+        let max_instances = inner.token_table.instances.len();
 
-        let mut distinct_hosts: HashSet<&str> = HashSet::with_capacity(replica_set_size + 2);
+        // Track distinct instance indices on the stack for typical RF <= 16 (zero HashSet alloc).
+        let mut seen_inline = [0u32; 16];
+        let mut seen_len = 0usize;
+        let mut seen_overflow: Option<HashSet<u32>> = None;
 
         let num_zones = inner.ring_zones.len();
-        let mut total_hosts_per_zone = vec![0usize; num_zones];
-        let mut examined_hosts_per_zone = vec![0usize; num_zones];
-        let mut found_hosts_per_zone = vec![0usize; num_zones];
+        let total_hosts_per_zone = inner.token_table.total_hosts_per_zone.as_slice();
+        let mut examined_inline = [0usize; 16];
+        let mut found_inline = [0usize; 16];
+        let mut examined_vec = Vec::new();
+        let mut found_vec = Vec::new();
+        let (examined_hosts_per_zone, found_hosts_per_zone): (&mut [usize], &mut [usize]) =
+            if num_zones <= 16 {
+                (&mut examined_inline[..num_zones], &mut found_inline[..num_zones])
+            } else {
+                examined_vec.resize(num_zones, 0);
+                found_vec.resize(num_zones, 0);
+                (examined_vec.as_mut_slice(), found_vec.as_mut_slice())
+            };
         let target_hosts_per_zone = (replication_factor / max_zones.max(1)).max(1);
 
-        if zone_awareness_enabled {
-            for (idx, zone) in inner.ring_zones.iter().enumerate() {
-                total_hosts_per_zone[idx] =
-                    inner.instances_count_per_zone.get(zone).copied().unwrap_or(0);
-            }
-        }
-
+        let token_meta = inner.token_table.token_meta.as_slice();
+        let ring_instances = inner.token_table.instances.as_slice();
         let mut iterations = 0usize;
-        let mut i = start;
-        let n_tokens = inner.ring_tokens.len();
+        let mut i = if start == n_tokens { 0 } else { start };
 
-        while distinct_hosts.len() < max_instances.min(replica_set_size) && iterations < n_tokens {
+        while seen_len < max_instances.min(replica_set_size) && iterations < n_tokens {
             if zone_awareness_enabled
                 && can_stop_looking(
-                    &total_hosts_per_zone,
-                    &found_hosts_per_zone,
-                    &examined_hosts_per_zone,
+                    total_hosts_per_zone,
+                    found_hosts_per_zone,
+                    examined_hosts_per_zone,
                     target_hosts_per_zone,
                 )
             {
@@ -831,28 +934,34 @@ impl Ring {
             }
 
             iterations += 1;
-            let token = inner.ring_tokens[i % n_tokens];
+            let meta = token_meta[i];
             i += 1;
+            if i == n_tokens {
+                i = 0;
+            }
 
-            let info = inner
-                .ring_instance_by_token
-                .get(&token)
-                .ok_or(RingError::InconsistentTokensInfo)?;
+            if meta.instance_idx == u32::MAX {
+                return Err(RingError::InconsistentTokensInfo);
+            }
 
-            if distinct_hosts.contains(info.instance_id.as_str()) {
+            let already_seen = if let Some(ref set) = seen_overflow {
+                set.contains(&meta.instance_idx)
+            } else {
+                seen_inline[..seen_len].contains(&meta.instance_idx)
+            };
+            if already_seen {
                 continue;
             }
 
             let mut zone_index = None;
             if zone_awareness_enabled {
-                let zi = inner
-                    .ring_zones
-                    .iter()
-                    .position(|z| z == &info.zone)
-                    .ok_or(RingError::InconsistentTokensInfo)?;
+                if meta.zone_idx == u16::MAX {
+                    return Err(RingError::InconsistentTokensInfo);
+                }
+                let zi = meta.zone_idx as usize;
                 zone_index = Some(zi);
 
-                if !info.zone.is_empty() {
+                if !meta.zone_empty {
                     if found_hosts_per_zone[zi] >= target_hosts_per_zone {
                         continue;
                     }
@@ -860,17 +969,23 @@ impl Ring {
                 }
             }
 
-            distinct_hosts.insert(info.instance_id.as_str());
-            let instance = inner
-                .ring_desc
-                .ingesters
-                .get(&info.instance_id)
-                .ok_or(RingError::InconsistentTokensInfo)?
-                .clone();
+            if let Some(ref mut set) = seen_overflow {
+                set.insert(meta.instance_idx);
+            } else if seen_len < seen_inline.len() {
+                seen_inline[seen_len] = meta.instance_idx;
+            } else {
+                let mut set = HashSet::with_capacity(replica_set_size + 4);
+                set.extend(seen_inline);
+                set.insert(meta.instance_idx);
+                seen_overflow = Some(set);
+            }
+            seen_len += 1;
+
+            let instance = ring_instances[meta.instance_idx as usize].clone();
 
             if op.should_extend_raw_state(instance.state) {
                 replica_set_size += 1;
-            } else if zone_awareness_enabled && !info.zone.is_empty() {
+            } else if zone_awareness_enabled && !meta.zone_empty {
                 if let Some(zi) = zone_index {
                     found_hosts_per_zone[zi] += 1;
                 }
@@ -1191,6 +1306,13 @@ impl Ring {
         }
 
         let oldest_registered_timestamp = get_oldest_registered_timestamp(&shard_desc);
+        let token_table = build_token_lookup_table(
+            &shard_desc,
+            &shard_tokens,
+            &parent_inner.ring_instance_by_token,
+            &zones,
+            &instances_count_per_zone,
+        );
 
         Arc::new(Ring {
             name: self.name.clone(),
@@ -1206,6 +1328,7 @@ impl Ring {
                 read_only_instances: None,
                 oldest_read_only_updated_timestamp: None,
                 ring_instance_by_token: parent_inner.ring_instance_by_token.clone(),
+                token_table,
                 last_topology_change: parent_inner.last_topology_change,
                 ring_zones: zones,
                 tracked_ring_zones: HashSet::new(),
@@ -1258,6 +1381,15 @@ impl Ring {
         for name in names {
             if let Some(src) = inner.ring_desc.ingesters.get(&name) {
                 if let Some(dst) = c_inner.ring_desc.ingesters.get_mut(&name) {
+                    dst.state = src.state;
+                    dst.timestamp = src.timestamp;
+                }
+            }
+        }
+        {
+            let tt = &mut c_inner.token_table;
+            for (id, dst) in tt.instance_ids.iter().zip(tt.instances.iter_mut()) {
+                if let Some(src) = inner.ring_desc.ingesters.get(id) {
                     dst.state = src.state;
                     dst.timestamp = src.timestamp;
                 }
@@ -1714,5 +1846,88 @@ mod new_ring_tests {
         )
         .unwrap();
         assert_eq!(named_ring.into_service().service_name(), "ingester ring client");
+    }
+
+    #[test]
+    fn cached_shuffle_shard_subring_sees_heartbeat_state_and_versions_updates() {
+        use crate::ring::replication_strategy::WRITE;
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let t1 = t0 + Duration::from_secs(120); // past 60s heartbeat_timeout
+        let t0_sec = system_time_to_unix_secs(t0);
+        let t1_sec = system_time_to_unix_secs(t1);
+
+        let mut desc = Desc::default();
+        for i in 0..6u32 {
+            let zone = format!("zone-{}", ['a', 'b', 'c'][(i % 3) as usize]);
+            let id = format!("ing-{i}");
+            let mut toks = Vec::new();
+            for j in 0..16u32 {
+                toks.push(i.wrapping_mul(100_000_003).wrapping_add(j.wrapping_mul(268_435_459)));
+            }
+            toks.sort_unstable();
+            desc.ingesters.insert(
+                id.clone(),
+                InstanceDesc {
+                    id,
+                    addr: format!("10.0.0.{}:9095", i + 1),
+                    timestamp: t0_sec,
+                    state: InstanceState::Active as i32,
+                    tokens: toks,
+                    zone,
+                    registered_timestamp: t0_sec - 300,
+                    versions: HashMap::from([(1u64, 1u64)]),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let ring = Ring::with_optional_store_and_strategy(
+            RingSettings {
+                heartbeat_timeout: Duration::from_secs(60),
+                replication_factor: 3,
+                zone_awareness_enabled: true,
+                excluded_zones: Vec::new(),
+                subring_cache_disabled: false,
+            },
+            "ingester",
+            "ring",
+            None,
+            Arc::new(DefaultReplicationStrategy),
+            None,
+        )
+        .unwrap();
+        ring.update_ring_state(desc.clone());
+
+        // Populate shuffle_shard cache at t0.
+        let sub0 = ring.shuffle_shard("tenant-a", 3);
+        let rs0 = sub0.get_at(42, WRITE, 3, t0).unwrap();
+        assert_eq!(rs0.instances.len(), 3);
+
+        // Refresh heartbeats to t1 (past heartbeat_timeout relative to t0) and transition one
+        // sharded instance to LEAVING -> EqualButStatesAndTimestamps fast path on parent.
+        let mut desc_t1 = desc.clone();
+        let leaving_id = rs0.instances[0].id.clone();
+        for (id, inst) in desc_t1.ingesters.iter_mut() {
+            inst.timestamp = t1_sec;
+            if id == &leaving_id {
+                inst.state = InstanceState::Leaving as i32;
+            }
+        }
+        ring.update_ring_state(desc_t1.clone());
+
+        // Cached subring must refresh token_table.instances with both fresh heartbeat and LEAVING state.
+        let sub1 = ring.shuffle_shard("tenant-a", 3);
+        let rs1 = sub1.get_at(42, WRITE, 3, t1).unwrap();
+        assert_eq!(rs1.instances.len(), 2, "LEAVING replica must be filtered out while 2 healthy survive");
+        assert!(rs1.instances.iter().all(|i| i.timestamp == t1_sec && i.id != leaving_id));
+
+        // Verify CompareResult::Equal with changed versions also updates parent token_table.instances.
+        let mut desc_v2 = desc_t1;
+        for inst in desc_v2.ingesters.values_mut() {
+            inst.versions.insert(1u64, 2u64);
+        }
+        ring.update_ring_state(desc_v2);
+        let rs_parent = ring.get_at(42, WRITE, 3, t1).unwrap();
+        assert!(rs_parent.instances.iter().all(|i| i.versions.get(&1) == Some(&2)));
     }
 }

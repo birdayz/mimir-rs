@@ -139,6 +139,30 @@ impl ReplicationStrategy for DefaultReplicationStrategy {
         }
         let min_success = (replication_factor / 2) + 1;
 
+        if instances
+            .iter()
+            .all(|inst| inst.is_healthy(op, heartbeat_timeout, now))
+        {
+            if instances.len() < min_success {
+                let msg = if zone_awareness_enabled {
+                    format!(
+                        "at least {} live replicas required across different availability zones, could only find {}",
+                        min_success,
+                        instances.len(),
+                    )
+                } else {
+                    format!(
+                        "at least {} live replicas required, could only find {}",
+                        min_success,
+                        instances.len(),
+                    )
+                };
+                return Err(RingError::TooFewReplicas(msg));
+            }
+            let max_failures = instances.len() - min_success;
+            return Ok((instances, max_failures));
+        }
+
         let mut healthy = Vec::with_capacity(instances.len());
         let mut unhealthy = Vec::new();
         for inst in instances {

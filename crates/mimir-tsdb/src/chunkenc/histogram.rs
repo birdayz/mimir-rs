@@ -186,7 +186,7 @@ impl HistogramChunk {
         t: i64,
         h: &Histogram,
     ) -> Result<AppendHistogramOutcome, ChunkError> {
-        let mut app = match state.take() {
+        let app = match state.take() {
             Some(s) => HistogramAppender { chunk: self, state: s },
             None => self.appender()?,
         };
@@ -692,7 +692,7 @@ impl<'a> HistogramAppender<'a> {
     }
 
     fn append_histogram_with_state(
-        &mut self,
+        mut self,
         prev: Option<&HistogramAppenderState>,
         st: i64,
         t: i64,
@@ -700,10 +700,7 @@ impl<'a> HistogramAppender<'a> {
         append_only: bool,
     ) -> Result<(AppendHistogramOutcome, HistogramAppenderState), ChunkError> {
         let (out, next_state) = self.append_histogram_inner(prev, st, t, h, append_only, true)?;
-        let st_out = match next_state {
-            Some(s) => s,
-            None => self.state.clone(),
-        };
+        let st_out = next_state.unwrap_or(self.state);
         Ok((out, st_out))
     }
 
@@ -854,6 +851,21 @@ pub fn expand_int_spans_and_buckets(
     a_buckets: &[i64],
     b_buckets: &[i64],
 ) -> Option<(Vec<Insert>, Vec<Insert>)> {
+    if a == b && a_buckets.len() == b_buckets.len() {
+        let total_len: usize = a.iter().map(|s| s.length as usize).sum();
+        if total_len == a_buckets.len() {
+            let mut ac = 0i64;
+            let mut bc = 0i64;
+            for (&da, &db) in a_buckets.iter().zip(b_buckets.iter()) {
+                ac = ac.wrapping_add(da);
+                bc = bc.wrapping_add(db);
+                if ac > bc {
+                    return None;
+                }
+            }
+            return Some((Vec::new(), Vec::new()));
+        }
+    }
     let mut ai = BucketIterator::new(a);
     let mut bi = BucketIterator::new(b);
 

@@ -1180,49 +1180,102 @@ impl SeriesState {
         }
 
         let mut head_chks = Vec::with_capacity(self.head_chunks_len());
-        let mut push_hc = |hc_chunk: EncodedChunk, hc_min: i64, hc_max: i64| -> Result<(), HeadError> {
-            let num_s = hc_chunk.num_samples();
-            let stop_after = match use_iso {
-                Some(info) => tx_stop_after_for_chunk(tx_ring, info, total_samples, prev_samples, num_s),
-                None => num_s,
-            };
-            prev_samples += num_s;
-            if hc_min <= maxt_inclusive && mint <= hc_max && stop_after > 0 {
-                if stop_after < num_s {
-                    if let Some((sliced, smint, smaxt)) = slice_chunk_prefix(&hc_chunk, stop_after)? {
-                        if smint <= maxt_inclusive && mint <= smaxt {
-                            head_chks.push(ChunkMeta {
-                                ref_id: in_order_pos,
-                                min_time: smint,
-                                max_time: smaxt,
-                                chunk: Some(sliced),
-                            });
-                            in_order_pos += 1;
-                        }
+        let mut push_hc =
+            |num_s: usize, hc_min: i64, hc_max: i64, mk_chunk: &dyn Fn() -> EncodedChunk| -> Result<(), HeadError> {
+                let stop_after = match use_iso {
+                    Some(info) => {
+                        tx_stop_after_for_chunk(tx_ring, info, total_samples, prev_samples, num_s)
                     }
-                } else {
-                    head_chks.push(ChunkMeta {
-                        ref_id: in_order_pos,
-                        min_time: hc_min,
-                        max_time: hc_max,
-                        chunk: Some(hc_chunk),
-                    });
-                    in_order_pos += 1;
+                    None => num_s,
+                };
+                prev_samples += num_s;
+                if hc_min <= maxt_inclusive && mint <= hc_max && stop_after > 0 {
+                    let hc_chunk = mk_chunk();
+                    if stop_after < num_s {
+                        if let Some((sliced, smint, smaxt)) =
+                            slice_chunk_prefix(&hc_chunk, stop_after)?
+                        {
+                            if smint <= maxt_inclusive && mint <= smaxt {
+                                head_chks.push(ChunkMeta {
+                                    ref_id: in_order_pos,
+                                    min_time: smint,
+                                    max_time: smaxt,
+                                    chunk: Some(sliced),
+                                });
+                                in_order_pos += 1;
+                            }
+                        }
+                    } else {
+                        head_chks.push(ChunkMeta {
+                            ref_id: in_order_pos,
+                            min_time: hc_min,
+                            max_time: hc_max,
+                            chunk: Some(hc_chunk),
+                        });
+                        in_order_pos += 1;
+                    }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
         if let Some(ref c) = self.cold {
             for hc in &c.extra_head_chunks {
-                push_hc(hc.chunk.clone(), hc.min_time, hc.max_time)?;
+                push_hc(hc.chunk.num_samples(), hc.min_time, hc.max_time, &|| {
+                    hc.chunk.clone()
+                })?;
             }
         }
         let enc = self.active_encoding();
         if enc != Encoding::None {
-            let chunk = EncodedChunk::from_bstream(enc, self.active_bstream.clone());
-            push_hc(chunk, self.active_min_time, self.active_max_time())?;
+            push_hc(
+                self.active_chunk_num_samples(),
+                self.active_min_time,
+                self.active_max_time(),
+                &|| EncodedChunk::from_bstream(enc, self.active_bstream.clone()),
+            )?;
         }
         Ok((mmapped_in_order, head_chks))
+    }
+
+    /// Zero-allocation in-order chunk collector for compaction (no tx isolation): pushes overlapping
+    /// mmapped refs directly into `pending_mmapped` and clones ONLY overlapping head chunks into `out_chunks`.
+    fn collect_in_order_chunks_no_iso_into(
+        &self,
+        mint: i64,
+        maxt_inclusive: i64,
+        slot: usize,
+        pending_mmapped: &mut Vec<(usize, MmappedChunk)>,
+        out_chunks: &mut Vec<ChunkMeta>,
+    ) {
+        for mc in self.mmapped() {
+            if mc.num_samples > 0 && mc.overlaps_closed_interval(mint, maxt_inclusive) {
+                pending_mmapped.push((slot, *mc));
+            }
+        }
+        if let Some(ref c) = self.cold {
+            for hc in &c.extra_head_chunks {
+                if hc.chunk.num_samples() > 0 && hc.min_time <= maxt_inclusive && mint <= hc.max_time {
+                    out_chunks.push(ChunkMeta {
+                        ref_id: 0,
+                        min_time: hc.min_time,
+                        max_time: hc.max_time,
+                        chunk: Some(hc.chunk.clone()),
+                    });
+                }
+            }
+        }
+        let enc = self.active_encoding();
+        if enc != Encoding::None && self.active_chunk_num_samples() > 0 {
+            let hc_min = self.active_min_time;
+            let hc_max = self.active_max_time();
+            if hc_min <= maxt_inclusive && mint <= hc_max {
+                out_chunks.push(ChunkMeta {
+                    ref_id: 0,
+                    min_time: hc_min,
+                    max_time: hc_max,
+                    chunk: Some(EncodedChunk::from_bstream(enc, self.active_bstream.clone())),
+                });
+            }
+        }
     }
 }
 
@@ -8088,6 +8141,19 @@ impl Head {
             .visit_all_values_postings_for_name(name, &syms, f);
     }
 
+    /// Visits every value of `name` whose postings pass `pred(small, large)`, resolving the
+    /// symbol string ONLY for values that match `pred`.
+    pub fn visit_matching_values_postings_for_name(
+        &self,
+        name: &str,
+        pred: impl FnMut(&[u32], &[u64]) -> bool,
+        on_match: impl FnMut(&str),
+    ) {
+        let syms = self.symbols.read();
+        self.postings
+            .visit_matching_values_postings_for_name(name, &syms, pred, on_match);
+    }
+
     /// Returns number of postings for `(name, value)`.
     pub fn postings_length(&self, name: &str, value: &str) -> usize {
         let syms = self.symbols.read();
@@ -9106,6 +9172,147 @@ impl Head {
     }
 
     /// Collects lightweight `(ref_id, Labels)` candidates for streaming head compaction over `[mint, maxt_inclusive]`.
+    /// Collects `Arc<SeriesEntry>` compaction candidates overlapping `[mint, maxt_inclusive]`
+    /// directly without cloning `Labels` or forcing per-series `series.get_by_id` hash lookups.
+    /// Seals the active `chunks_head` segment file if it has >= 1 MiB written and refreshes
+    /// `chunk_reader` so compaction reads those chunks from zero-copy `Mmap` instead of per-chunk
+    /// `pread()` syscalls. Lock order: `chunk_writer` -> `chunk_reader`.
+    fn seal_active_chunks_head_for_compaction(&self) {
+        let mut wg = self.chunk_writer.lock();
+        if let Some(ref mut writer) = *wg {
+            match writer.seal_active_file_if_at_least(1024 * 1024) {
+                Ok(true) => {
+                    if let Err(err) = self.refresh_chunk_reader_with_active(None) {
+                        tracing::warn!(
+                            err = %err,
+                            "failed to refresh chunk_reader after sealing active chunks_head segment; falling back to active_file reads"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        err = %err,
+                        "failed to seal active chunks_head segment before compaction"
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn collect_compaction_candidate_entries(
+        &self,
+        mint: i64,
+        maxt_inclusive: i64,
+    ) -> Result<Vec<Arc<SeriesEntry>>, HeadError> {
+        self.seal_active_chunks_head_for_compaction();
+        let has_tombs = self.tombstones.has_any();
+        let mut tombs_buf = Vec::new();
+        let mut stripe_buf: Vec<Arc<SeriesEntry>> = Vec::with_capacity(256);
+        let mut out = Vec::with_capacity(self.num_series() as usize);
+
+        for stripe in &self.series.stripes {
+            stripe_buf.clear();
+            StripeSeries::collect_stripe_into(stripe, &mut stripe_buf);
+            for entry in stripe_buf.drain(..) {
+                let has_overlap = {
+                    let st = entry.inner.lock();
+                    if !has_tombs {
+                        st.mmapped()
+                            .iter()
+                            .any(|mc| mc.overlaps_closed_interval(mint, maxt_inclusive))
+                            || st.any_head_chunk_bounds(|hc_min, hc_max| {
+                                hc_min <= maxt_inclusive && mint <= hc_max
+                            })
+                    } else {
+                        self.tombstones.get_into(entry.ref_id, &mut tombs_buf);
+                        st.mmapped().iter().any(|mc| {
+                            mc.overlaps_closed_interval(mint, maxt_inclusive)
+                                && !is_completely_deleted(&tombs_buf, mc.min_time, mc.max_time)
+                        }) || st.any_head_chunk_bounds(|hc_min, hc_max| {
+                            hc_min <= maxt_inclusive
+                                && mint <= hc_max
+                                && !is_completely_deleted(&tombs_buf, hc_min, hc_max)
+                        })
+                    }
+                };
+                if has_overlap {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-loads in-order chunks overlapping `[mint, maxt_inclusive]` and tombstones for a slice
+    /// of pre-resolved `SeriesEntry` handles, acquiring `self.chunk_reader.read()` at most ONCE per
+    /// batch (after dropping all `entry.inner` locks to preserve strict lock ordering) and avoiding
+    /// per-series `series.get_by_id` stripe locks & hash lookups.
+    pub fn load_entries_batch_in_order_chunks_into(
+        &self,
+        entries: &[Arc<SeriesEntry>],
+        mint: i64,
+        maxt_inclusive: i64,
+        out: &mut [(Vec<ChunkMeta>, Vec<Interval>)],
+    ) -> Result<(), HeadError> {
+        let mut pending_mmapped: Vec<(usize, MmappedChunk)> = Vec::with_capacity(entries.len() * 2);
+        let mut head_counts: SmallVec<[usize; 256]> = SmallVec::with_capacity(entries.len());
+        let has_tombs = self.tombstones.has_any();
+
+        for (slot, entry) in entries.iter().enumerate() {
+            let (out_chunks, out_tombs) = &mut out[slot];
+            out_chunks.clear();
+            out_tombs.clear();
+
+            {
+                let st = entry.inner.lock();
+                if entry.is_gced() {
+                    head_counts.push(0);
+                    continue;
+                }
+                st.collect_in_order_chunks_no_iso_into(
+                    mint,
+                    maxt_inclusive,
+                    slot,
+                    &mut pending_mmapped,
+                    out_chunks,
+                );
+            }
+            head_counts.push(out_chunks.len());
+            if has_tombs {
+                self.tombstones.get_into(entry.ref_id, out_tombs);
+            }
+        }
+
+        if !pending_mmapped.is_empty() {
+            if self.is_closed() {
+                return Err(HeadChunksError::Closed.into());
+            }
+            let chunk_reader_guard = self.chunk_reader.read();
+            let Some(r) = chunk_reader_guard.as_ref() else {
+                return Err(HeadChunksError::Closed.into());
+            };
+            for (slot, mc) in pending_mmapped {
+                let enc = r.chunk(mc.ref_id)?;
+                out[slot].0.push(ChunkMeta {
+                    ref_id: mc.ref_id.as_u64(),
+                    min_time: mc.min_time,
+                    max_time: mc.max_time,
+                    chunk: Some(enc),
+                });
+            }
+            // Restore chronological [mmapped..., extra_head_chunks..., active_chunk] order so
+            // `trim_and_merge_chunks` hits its zero-alloc sorted fast path even when a series
+            // spans both mmapped and in-memory head chunks.
+            for (slot, &hc) in head_counts.iter().enumerate() {
+                if hc > 0 && out[slot].0.len() > hc {
+                    out[slot].0.rotate_left(hc);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn collect_compaction_candidates(
         &self,
         mint: i64,
@@ -13522,7 +13729,9 @@ impl<'a> CommitContext<'a> {
             ref_id: ph.entry.ref_id,
             bound: self.cleanup_append_ids_below,
         };
-        let check = {
+        let check = if ph.t >= min_valid_time && ph.t > state.max_time() {
+            Ok((false, false))
+        } else if state.needs_chunk_reader_for_t(ph.t) {
             let cr_guard = self.head.chunk_reader.read();
             state.appendable_histogram(
                 ph.t,
@@ -13531,6 +13740,15 @@ impl<'a> CommitContext<'a> {
                 min_valid_time,
                 ooo_time_window,
                 cr_guard.as_ref(),
+            )
+        } else {
+            state.appendable_histogram(
+                ph.t,
+                &ph.h,
+                head_maxt,
+                min_valid_time,
+                ooo_time_window,
+                None,
             )
         };
         let (is_ooo, is_dup) = match check {
@@ -13640,7 +13858,9 @@ impl<'a> CommitContext<'a> {
             ref_id: pfh.entry.ref_id,
             bound: self.cleanup_append_ids_below,
         };
-        let check = {
+        let check = if pfh.t >= min_valid_time && pfh.t > state.max_time() {
+            Ok((false, false))
+        } else if state.needs_chunk_reader_for_t(pfh.t) {
             let cr_guard = self.head.chunk_reader.read();
             state.appendable_float_histogram(
                 pfh.t,
@@ -13649,6 +13869,15 @@ impl<'a> CommitContext<'a> {
                 min_valid_time,
                 ooo_time_window,
                 cr_guard.as_ref(),
+            )
+        } else {
+            state.appendable_float_histogram(
+                pfh.t,
+                &pfh.fh,
+                head_maxt,
+                min_valid_time,
+                ooo_time_window,
+                None,
             )
         };
         let (is_ooo, is_dup) = match check {
@@ -14324,6 +14553,18 @@ impl<'a> HeadAppender<'a> {
         self.floats.last().map(|pf| &*pf.entry)
     }
 
+    /// Returns a reference to the `SeriesEntry` of the most recently appended integer histogram.
+    #[inline]
+    pub fn last_histogram_entry(&self) -> Option<&SeriesEntry> {
+        self.histograms.last().map(|ph| &*ph.entry)
+    }
+
+    /// Returns a reference to the `SeriesEntry` of the most recently appended float histogram.
+    #[inline]
+    pub fn last_float_histogram_entry(&self) -> Option<&SeriesEntry> {
+        self.float_histograms.last().map(|pfh| &*pfh.entry)
+    }
+
     /// Appends a float sample using a cached `Option<Arc<SeriesEntry>>` and optional precomputed Prometheus hash
     /// (for already-sorted, unique, non-empty `pairs`).
     #[allow(clippy::too_many_arguments)]
@@ -14584,6 +14825,7 @@ impl<'a> HeadAppender<'a> {
                             self.ooo_time_window,
                             reject_ooo,
                         )
+                        .map(Result::ok)
                     }
                     BatchSampleType::FloatHistogram
                     | BatchSampleType::CustomBucketFloatHistogram => {
@@ -14601,6 +14843,7 @@ impl<'a> HeadAppender<'a> {
                             self.ooo_time_window,
                             reject_ooo,
                         )
+                        .map(Result::ok)
                     }
                 };
             }
@@ -14996,6 +15239,7 @@ impl<'a> HeadAppender<'a> {
                             self.ooo_time_window,
                             false,
                         )
+                        .map(Result::ok)
                     }
                     BatchSampleType::FloatHistogram
                     | BatchSampleType::CustomBucketFloatHistogram => {
@@ -15013,6 +15257,7 @@ impl<'a> HeadAppender<'a> {
                             self.ooo_time_window,
                             false,
                         )
+                        .map(Result::ok)
                     }
                 }?;
                 return res.ok_or(HeadError::UnknownSeriesRef(series_ref));
@@ -15113,13 +15358,136 @@ impl<'a> HeadAppender<'a> {
         self.append_histogram_inner(series_ref, pairs, st, t, h, true)
     }
 
+    /// Appends an integer native histogram sample using a cached `Option<Arc<SeriesEntry>>`,
+    /// precomputed Prometheus hash, and pre-encoded `stringlabels` bytes (zero label decode on hit,
+    /// zero `Histogram` clone).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_histogram_with_entry_prehashed_encoded(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        h: Histogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_histogram_with_entry_prehashed_encoded_inner(
+            series_entry,
+            false,
+            prehashed,
+            encoded_labels,
+            st,
+            t,
+            h,
+            reject_ooo,
+        )
+    }
+
+    /// Same as [`Self::append_histogram_with_entry_prehashed_encoded`], moving `series_entry`
+    /// into `self.histograms` on success to avoid a second `Arc::clone`/`Arc::drop` pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_histogram_with_entry_prehashed_encoded_take(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        h: Histogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_histogram_with_entry_prehashed_encoded_inner(
+            series_entry,
+            true,
+            prehashed,
+            encoded_labels,
+            st,
+            t,
+            h,
+            reject_ooo,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_histogram_with_entry_prehashed_encoded_inner(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        take_entry: bool,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        mut h: Histogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        if self.closed {
+            return Err(HeadError::AppenderClosed);
+        }
+        let orig_st = st;
+        let st = self.zero_or_st(st);
+        if !self.head.initialized() {
+            self.head.init_time(t);
+            self.min_valid_time = self.head.appendable_min_valid_time();
+            self.head_maxt = self.head.max_time();
+        }
+        h.validate().map_err(HeadError::HistogramValidation)?;
+        if self.ooo_time_window == 0 && t < self.min_valid_time {
+            self.head
+                .metrics
+                .out_of_bound_samples
+                .with_label_values(&["histogram"])
+                .inc();
+            return Err(HeadError::OutOfBounds);
+        }
+
+        let mut did_zero = false;
+        loop {
+            let entry = match series_entry.take() {
+                Some(e) => {
+                    if !take_entry {
+                        *series_entry = Some(Arc::clone(&e));
+                    }
+                    e
+                }
+                None => {
+                    let e = self.resolve_encoded_labels_prehashed(prehashed, encoded_labels)?;
+                    if !take_entry {
+                        *series_entry = Some(Arc::clone(&e));
+                    }
+                    e
+                }
+            };
+            if !did_zero && self.head.enable_st_as_zero_sample() && orig_st != 0 {
+                did_zero = true;
+                self.best_effort_append_st_zero_hist(Arc::clone(&entry), orig_st, t, &h);
+            }
+            match self.append_histogram_with_resolved_entry(
+                series_entry,
+                take_entry,
+                entry,
+                st,
+                t,
+                h,
+                self.ooo_time_window,
+                reject_ooo,
+            )? {
+                Ok(ref_id) => return Ok(ref_id),
+                Err(returned_h) => {
+                    h = returned_h;
+                    *series_entry = None;
+                }
+            }
+        }
+    }
+
     fn append_histogram_inner(
         &mut self,
         series_ref: Option<u64>,
         pairs: &[(&str, &str)],
         st: i64,
         t: i64,
-        h: Histogram,
+        mut h: Histogram,
         reject_ooo: bool,
     ) -> Result<u64, HeadError> {
         if self.closed {
@@ -15151,19 +15519,22 @@ impl<'a> HeadAppender<'a> {
                 self.best_effort_append_st_zero_hist(Arc::clone(&e), orig_st, t, &h);
             }
             let mut opt = None;
-            if let Some(ref_id) = self.append_histogram_with_resolved_entry(
+            match self.append_histogram_with_resolved_entry(
                 &mut opt,
                 false,
                 e,
                 st,
                 t,
-                h.clone(),
+                h,
                 self.ooo_time_window,
                 reject_ooo,
             )? {
-                return Ok(ref_id);
+                Ok(ref_id) => return Ok(ref_id),
+                Err(returned_h) => {
+                    h = returned_h;
+                    cur_ref = None;
+                }
             }
-            cur_ref = None;
         }
     }
 
@@ -15178,23 +15549,54 @@ impl<'a> HeadAppender<'a> {
         h: Histogram,
         ooo_time_window: i64,
         reject_ooo: bool,
-    ) -> Result<Option<u64>, HeadError> {
-        if !entry.try_inc_pending_commit() {
-            return Ok(None);
-        }
-        if entry.is_gced() {
-            entry.pending_commits.fetch_sub(1, Ordering::Release);
-            return Ok(None);
-        }
-
+    ) -> Result<Result<u64, Histogram>, HeadError> {
         let ref_id = entry.ref_id;
+
+        // Lock-free single-lock fast path mirroring floats: claim `pending_commits` 0 -> 1
+        // and check `t > in_order_max_time`, skipping `entry.inner.lock()` on warm in-order appends.
+        let claimed = if t >= self.min_valid_time
+            && entry
+                .pending_commits
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            if entry.is_gced() {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
+                return Ok(Err(h));
+            }
+            let max_t = entry.in_order_max_time.load(Ordering::Acquire);
+            if t > max_t {
+                let ht = BatchSampleType::from_hist(&h);
+                self.record_hist_in_batch(ref_id, ht);
+                self.histograms.push(PendingHist {
+                    entry,
+                    st,
+                    t,
+                    h,
+                });
+                return Ok(Ok(ref_id));
+            }
+            true
+        } else {
+            false
+        };
+
+        if !claimed {
+            if !entry.try_inc_pending_commit() {
+                return Ok(Err(h));
+            }
+            if entry.is_gced() {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
+                return Ok(Err(h));
+            }
+        }
         {
             // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
             let state = entry.inner.lock();
             if entry.is_gced() {
                 drop(state);
                 entry.pending_commits.fetch_sub(1, Ordering::Release);
-                return Ok(None);
+                return Ok(Err(h));
             }
             let res = if state.needs_chunk_reader_for_t(t) {
                 let cr_guard = self.head.chunk_reader.read();
@@ -15254,7 +15656,7 @@ impl<'a> HeadAppender<'a> {
                 if take_entry {
                     *series_entry = Some(entry);
                 }
-                return Ok(Some(ref_id));
+                return Ok(Ok(ref_id));
             }
             let _ = is_ooo;
         }
@@ -15266,7 +15668,7 @@ impl<'a> HeadAppender<'a> {
             t,
             h,
         });
-        Ok(Some(ref_id))
+        Ok(Ok(ref_id))
     }
 
     /// Appends a float native histogram sample.
@@ -15303,13 +15705,136 @@ impl<'a> HeadAppender<'a> {
         self.append_float_histogram_inner(series_ref, pairs, st, t, fh, true)
     }
 
+    /// Appends a float native histogram sample using a cached `Option<Arc<SeriesEntry>>`,
+    /// precomputed Prometheus hash, and pre-encoded `stringlabels` bytes (zero label decode on hit,
+    /// zero `FloatHistogram` clone).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_float_histogram_with_entry_prehashed_encoded(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        fh: FloatHistogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_float_histogram_with_entry_prehashed_encoded_inner(
+            series_entry,
+            false,
+            prehashed,
+            encoded_labels,
+            st,
+            t,
+            fh,
+            reject_ooo,
+        )
+    }
+
+    /// Same as [`Self::append_float_histogram_with_entry_prehashed_encoded`], moving `series_entry`
+    /// into `self.float_histograms` on success to avoid a second `Arc::clone`/`Arc::drop` pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_float_histogram_with_entry_prehashed_encoded_take(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        fh: FloatHistogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        self.append_float_histogram_with_entry_prehashed_encoded_inner(
+            series_entry,
+            true,
+            prehashed,
+            encoded_labels,
+            st,
+            t,
+            fh,
+            reject_ooo,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_float_histogram_with_entry_prehashed_encoded_inner(
+        &mut self,
+        series_entry: &mut Option<Arc<SeriesEntry>>,
+        take_entry: bool,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        st: i64,
+        t: i64,
+        mut fh: FloatHistogram,
+        reject_ooo: bool,
+    ) -> Result<u64, HeadError> {
+        if self.closed {
+            return Err(HeadError::AppenderClosed);
+        }
+        let orig_st = st;
+        let st = self.zero_or_st(st);
+        if !self.head.initialized() {
+            self.head.init_time(t);
+            self.min_valid_time = self.head.appendable_min_valid_time();
+            self.head_maxt = self.head.max_time();
+        }
+        fh.validate().map_err(HeadError::HistogramValidation)?;
+        if self.ooo_time_window == 0 && t < self.min_valid_time {
+            self.head
+                .metrics
+                .out_of_bound_samples
+                .with_label_values(&["histogram"])
+                .inc();
+            return Err(HeadError::OutOfBounds);
+        }
+
+        let mut did_zero = false;
+        loop {
+            let entry = match series_entry.take() {
+                Some(e) => {
+                    if !take_entry {
+                        *series_entry = Some(Arc::clone(&e));
+                    }
+                    e
+                }
+                None => {
+                    let e = self.resolve_encoded_labels_prehashed(prehashed, encoded_labels)?;
+                    if !take_entry {
+                        *series_entry = Some(Arc::clone(&e));
+                    }
+                    e
+                }
+            };
+            if !did_zero && self.head.enable_st_as_zero_sample() && orig_st != 0 {
+                did_zero = true;
+                self.best_effort_append_st_zero_fhist(Arc::clone(&entry), orig_st, t, &fh);
+            }
+            match self.append_float_histogram_with_resolved_entry(
+                series_entry,
+                take_entry,
+                entry,
+                st,
+                t,
+                fh,
+                self.ooo_time_window,
+                reject_ooo,
+            )? {
+                Ok(ref_id) => return Ok(ref_id),
+                Err(returned_fh) => {
+                    fh = returned_fh;
+                    *series_entry = None;
+                }
+            }
+        }
+    }
+
     fn append_float_histogram_inner(
         &mut self,
         series_ref: Option<u64>,
         pairs: &[(&str, &str)],
         st: i64,
         t: i64,
-        fh: FloatHistogram,
+        mut fh: FloatHistogram,
         reject_ooo: bool,
     ) -> Result<u64, HeadError> {
         if self.closed {
@@ -15341,19 +15866,22 @@ impl<'a> HeadAppender<'a> {
                 self.best_effort_append_st_zero_fhist(Arc::clone(&e), orig_st, t, &fh);
             }
             let mut opt = None;
-            if let Some(ref_id) = self.append_float_histogram_with_resolved_entry(
+            match self.append_float_histogram_with_resolved_entry(
                 &mut opt,
                 false,
                 e,
                 st,
                 t,
-                fh.clone(),
+                fh,
                 self.ooo_time_window,
                 reject_ooo,
             )? {
-                return Ok(ref_id);
+                Ok(ref_id) => return Ok(ref_id),
+                Err(returned_fh) => {
+                    fh = returned_fh;
+                    cur_ref = None;
+                }
             }
-            cur_ref = None;
         }
     }
 
@@ -15368,23 +15896,54 @@ impl<'a> HeadAppender<'a> {
         fh: FloatHistogram,
         ooo_time_window: i64,
         reject_ooo: bool,
-    ) -> Result<Option<u64>, HeadError> {
-        if !entry.try_inc_pending_commit() {
-            return Ok(None);
-        }
-        if entry.is_gced() {
-            entry.pending_commits.fetch_sub(1, Ordering::Release);
-            return Ok(None);
-        }
-
+    ) -> Result<Result<u64, FloatHistogram>, HeadError> {
         let ref_id = entry.ref_id;
+
+        // Lock-free single-lock fast path mirroring floats: claim `pending_commits` 0 -> 1
+        // and check `t > in_order_max_time`, skipping `entry.inner.lock()` on warm in-order appends.
+        let claimed = if t >= self.min_valid_time
+            && entry
+                .pending_commits
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            if entry.is_gced() {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
+                return Ok(Err(fh));
+            }
+            let max_t = entry.in_order_max_time.load(Ordering::Acquire);
+            if t > max_t {
+                let ht = BatchSampleType::from_float_hist(&fh);
+                self.record_hist_in_batch(ref_id, ht);
+                self.float_histograms.push(PendingFloatHist {
+                    entry,
+                    st,
+                    t,
+                    fh,
+                });
+                return Ok(Ok(ref_id));
+            }
+            true
+        } else {
+            false
+        };
+
+        if !claimed {
+            if !entry.try_inc_pending_commit() {
+                return Ok(Err(fh));
+            }
+            if entry.is_gced() {
+                entry.pending_commits.fetch_sub(1, Ordering::Release);
+                return Ok(Err(fh));
+            }
+        }
         {
             // Lock order: entry.inner BEFORE chunk_reader.read() (C2).
             let state = entry.inner.lock();
             if entry.is_gced() {
                 drop(state);
                 entry.pending_commits.fetch_sub(1, Ordering::Release);
-                return Ok(None);
+                return Ok(Err(fh));
             }
             let res = if state.needs_chunk_reader_for_t(t) {
                 let cr_guard = self.head.chunk_reader.read();
@@ -15444,7 +16003,7 @@ impl<'a> HeadAppender<'a> {
                 if take_entry {
                     *series_entry = Some(entry);
                 }
-                return Ok(Some(ref_id));
+                return Ok(Ok(ref_id));
             }
             let _ = is_ooo;
         }
@@ -15456,7 +16015,7 @@ impl<'a> HeadAppender<'a> {
             t,
             fh,
         });
-        Ok(Some(ref_id))
+        Ok(Ok(ref_id))
     }
 
     /// Appends an exemplar for `series_ref` (or `pairs` if `series_ref` is `None`).
@@ -15494,6 +16053,81 @@ impl<'a> HeadAppender<'a> {
             }
         } else {
             lookup_by_pairs().ok_or(HeadError::UnknownSeriesRef(0))?
+        };
+        if entry.is_gced() {
+            return Err(HeadError::UnknownSeriesRef(entry.ref_id));
+        }
+
+        let cleaned = Exemplar {
+            labels: exemplar.labels.without_empty(),
+            ..exemplar
+        };
+        match self.head.exemplars.validate_exemplar(&entry.labels, &cleaned) {
+            Ok(()) => {}
+            Err(ExemplarError::DuplicateExemplar | ExemplarError::Disabled) => {
+                return Ok(entry.ref_id);
+            }
+            Err(e) => return Err(HeadError::Exemplar(e)),
+        }
+
+        let ref_id = entry.ref_id;
+        {
+            let mut st = entry.inner.lock();
+            if entry.is_gced() {
+                return Err(HeadError::UnknownSeriesRef(ref_id));
+            }
+            st.update_last_exemplar_ts(cleaned.timestamp_ms);
+        }
+        self.exemplars.push(PendingExemplar {
+            entry,
+            exemplar: cleaned,
+        });
+        Ok(ref_id)
+    }
+
+    /// Appends an exemplar using a cached `Option<Arc<SeriesEntry>>` (or prehashed encoded labels),
+    /// avoiding label pair decoding and `get_by_id` stripe lookup on the common hit path.
+    pub fn append_exemplar_with_entry_encoded(
+        &mut self,
+        series_entry: Option<&Arc<SeriesEntry>>,
+        series_ref: Option<u64>,
+        prehashed: u64,
+        encoded_labels: &[u8],
+        exemplar: Exemplar,
+    ) -> Result<u64, HeadError> {
+        if self.closed {
+            return Err(HeadError::AppenderClosed);
+        }
+        if !self.head.opts.enable_exemplar_storage || self.head.exemplars.capacity() == 0 {
+            if let Some(e) = series_entry {
+                return Ok(e.ref_id);
+            }
+            if let Some(r) = series_ref {
+                return Ok(r);
+            }
+            return Ok(self
+                .head
+                .series
+                .get_by_encoded_labels(prehashed, encoded_labels)
+                .map_or(0, |e| e.ref_id));
+        }
+
+        let entry = if let Some(e) = series_entry.filter(|e| !e.is_gced()) {
+            Arc::clone(e)
+        } else if let Some(r) = series_ref {
+            match self.head.series.get_by_id(r) {
+                Some(e) => e,
+                None => self
+                    .head
+                    .series
+                    .get_by_encoded_labels(prehashed, encoded_labels)
+                    .ok_or(HeadError::UnknownSeriesRef(r))?,
+            }
+        } else {
+            self.head
+                .series
+                .get_by_encoded_labels(prehashed, encoded_labels)
+                .ok_or(HeadError::UnknownSeriesRef(0))?
         };
         if entry.is_gced() {
             return Err(HeadError::UnknownSeriesRef(entry.ref_id));
@@ -16537,151 +17171,176 @@ impl<'a> HeadAppender<'a> {
             return Ok(());
         }
 
-        let series_rec = if !self.series_refs.is_empty() {
-            Some(enc.series(&self.series_refs, Vec::new()))
-        } else {
-            None
+        // Encode and compress all records OUTSIDE `head.wal.lock()` reusing `self.wal_buf`
+        // and `self.wal_comp_buf` with zero per-record heap allocations and zero histogram/exemplar/metadata clones.
+        let mut raw_buf = std::mem::take(&mut self.wal_buf);
+        let mut comp_buf = std::mem::take(&mut self.wal_comp_buf);
+        let mut cb_buf = Vec::new();
+        raw_buf.clear();
+        comp_buf.clear();
+
+        let pack_record = |raw: &[u8],
+                           out: &mut Vec<u8>|
+         -> Result<(usize, usize, bool, usize), HeadError> {
+            let start = out.len();
+            let is_comp = crate::wlog::compress_wal_record_append(raw, wal_compression, out)?;
+            Ok((start, out.len(), is_comp, raw.len()))
         };
 
-        let mut recs: Vec<Vec<u8>> = Vec::new();
-        if !self.metadata.is_empty() {
-            let metas: Vec<RefMetadata> = self
-                .metadata
-                .iter()
-                .map(|m| RefMetadata {
-                    ref_id: m.entry.ref_id,
-                    metric_type: m.metric_type as u8,
-                    unit: m.unit.clone(),
-                    help: m.help.clone(),
-                })
-                .collect();
-            recs.push(enc.metadata(&metas, Vec::new()));
-        }
-        let total_batches = self.batch_boundaries.len() + 1;
-        let mut f_start = 0usize;
-        let mut h_start = 0usize;
-        let mut fh_start = 0usize;
+        let mut series_span: Option<(usize, usize, bool, usize)> = None;
+        let mut rec_spans: SmallVec<[(usize, usize, bool, usize); 8]> = SmallVec::new();
 
-        for batch_idx in 0..total_batches {
-            let (f_end, h_end, fh_end) = if batch_idx < self.batch_boundaries.len() {
-                let b = self.batch_boundaries[batch_idx];
-                (b.floats_end, b.hists_end, b.fhists_end)
-            } else {
-                (
-                    self.floats.len(),
-                    self.histograms.len(),
-                    self.float_histograms.len(),
-                )
-            };
+        let encode_res: Result<(), HeadError> = (|| {
+            if !self.series_refs.is_empty() {
+                raw_buf.clear();
+                let b = std::mem::take(&mut raw_buf);
+                raw_buf = enc.series(&self.series_refs, b);
+                series_span = Some(pack_record(&raw_buf, &mut comp_buf)?);
+            }
 
-            if f_start < f_end {
-                let slice = &self.floats[f_start..f_end];
-                recs.push(enc.samples_iter(
-                    slice.iter().map(|f| RefSample {
-                        ref_id: f.entry.ref_id,
-                        st: f.st,
-                        t: f.t,
-                        v: f.v,
+            if !self.metadata.is_empty() {
+                raw_buf.clear();
+                let b = std::mem::take(&mut raw_buf);
+                raw_buf = enc.metadata_iter(
+                    self.metadata.iter().map(|m| {
+                        (
+                            m.entry.ref_id,
+                            m.metric_type as u8,
+                            m.unit.as_str(),
+                            m.help.as_str(),
+                        )
                     }),
-                    Vec::with_capacity(slice.len() * 14 + 17),
-                ));
-            }
-            if h_start < h_end {
-                let hists: Vec<RefHistogramSample> = self.histograms[h_start..h_end]
-                    .iter()
-                    .map(|h| RefHistogramSample {
-                        ref_id: h.entry.ref_id,
-                        st: h.st,
-                        t: h.t,
-                        h: h.h.clone(),
-                    })
-                    .collect();
-                let (r, cb) = enc.histogram_samples(&hists, Vec::new());
-                if !r.is_empty() {
-                    recs.push(r);
-                }
-                if !cb.is_empty() {
-                    recs.push(enc.custom_buckets_histogram_samples(&cb, Vec::new()));
-                }
-            }
-            if fh_start < fh_end {
-                let fhists: Vec<RefFloatHistogramSample> = self.float_histograms[fh_start..fh_end]
-                    .iter()
-                    .map(|fh| RefFloatHistogramSample {
-                        ref_id: fh.entry.ref_id,
-                        st: fh.st,
-                        t: fh.t,
-                        fh: fh.fh.clone(),
-                    })
-                    .collect();
-                let (r, cb) = enc.float_histogram_samples(&fhists, Vec::new());
-                if !r.is_empty() {
-                    recs.push(r);
-                }
-                if !cb.is_empty() {
-                    recs.push(enc.custom_buckets_float_histogram_samples(&cb, Vec::new()));
-                }
+                    b,
+                );
+                rec_spans.push(pack_record(&raw_buf, &mut comp_buf)?);
             }
 
-            f_start = f_end;
-            h_start = h_end;
-            fh_start = fh_end;
-        }
-        if !self.exemplars.is_empty() {
-            let exs: Vec<RefExemplar> = self
-                .exemplars
-                .iter()
-                .map(|e| RefExemplar {
-                    ref_id: e.entry.ref_id,
-                    t: e.exemplar.timestamp_ms,
-                    v: e.exemplar.value,
-                    labels: e.exemplar.labels.clone(),
-                })
-                .collect();
-            recs.push(enc.exemplars(&exs, Vec::new()));
-        }
+            let total_batches = self.batch_boundaries.len() + 1;
+            let mut f_start = 0usize;
+            let mut h_start = 0usize;
+            let mut fh_start = 0usize;
 
-        let prepared_series = match series_rec {
-            Some(r) => {
-                let ulen = r.len();
-                let mut comp_buf = Vec::new();
-                if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
-                    Some((comp_buf, true, ulen))
+            for batch_idx in 0..total_batches {
+                let (f_end, h_end, fh_end) = if batch_idx < self.batch_boundaries.len() {
+                    let b = self.batch_boundaries[batch_idx];
+                    (b.floats_end, b.hists_end, b.fhists_end)
                 } else {
-                    Some((r, false, ulen))
-                }
-            }
-            None => None,
-        };
+                    (
+                        self.floats.len(),
+                        self.histograms.len(),
+                        self.float_histograms.len(),
+                    )
+                };
 
-        let mut prepared: Vec<(Vec<u8>, bool, usize)> = Vec::with_capacity(recs.len());
-        for r in recs {
-            let ulen = r.len();
-            let mut comp_buf = Vec::new();
-            if crate::wlog::compress_wal_record(&r, wal_compression, &mut comp_buf)? {
-                prepared.push((comp_buf, true, ulen));
-            } else {
-                prepared.push((r, false, ulen));
-            }
-        }
+                if f_start < f_end {
+                    let slice = &self.floats[f_start..f_end];
+                    raw_buf.clear();
+                    let need = slice.len() * 14 + 17;
+                    if raw_buf.capacity() < need {
+                        raw_buf.reserve(need);
+                    }
+                    let b = std::mem::take(&mut raw_buf);
+                    raw_buf = enc.samples_iter(
+                        slice.iter().map(|f| RefSample {
+                            ref_id: f.entry.ref_id,
+                            st: f.st,
+                            t: f.t,
+                            v: f.v,
+                        }),
+                        b,
+                    );
+                    rec_spans.push(pack_record(&raw_buf, &mut comp_buf)?);
+                }
+                if h_start < h_end {
+                    raw_buf.clear();
+                    cb_buf.clear();
+                    let rb = std::mem::take(&mut raw_buf);
+                    let cb = std::mem::take(&mut cb_buf);
+                    let (r, c) = enc.histogram_samples_iter(
+                        self.histograms[h_start..h_end]
+                            .iter()
+                            .map(|h| (h.entry.ref_id, h.st, h.t, &h.h)),
+                        rb,
+                        cb,
+                    );
+                    raw_buf = r;
+                    cb_buf = c;
+                    if !raw_buf.is_empty() {
+                        rec_spans.push(pack_record(&raw_buf, &mut comp_buf)?);
+                    }
+                    if !cb_buf.is_empty() {
+                        rec_spans.push(pack_record(&cb_buf, &mut comp_buf)?);
+                    }
+                }
+                if fh_start < fh_end {
+                    raw_buf.clear();
+                    cb_buf.clear();
+                    let rb = std::mem::take(&mut raw_buf);
+                    let cb = std::mem::take(&mut cb_buf);
+                    let (r, c) = enc.float_histogram_samples_iter(
+                        self.float_histograms[fh_start..fh_end]
+                            .iter()
+                            .map(|fh| (fh.entry.ref_id, fh.st, fh.t, &fh.fh)),
+                        rb,
+                        cb,
+                    );
+                    raw_buf = r;
+                    cb_buf = c;
+                    if !raw_buf.is_empty() {
+                        rec_spans.push(pack_record(&raw_buf, &mut comp_buf)?);
+                    }
+                    if !cb_buf.is_empty() {
+                        rec_spans.push(pack_record(&cb_buf, &mut comp_buf)?);
+                    }
+                }
 
-        if prepared_series.is_some() || !prepared.is_empty() {
-            let mut wal_guard = self.head.wal.lock();
-            if let Some(ref mut wal) = *wal_guard {
-                if let Some((ref b, c, ulen)) = prepared_series {
-                    wal.log_precompressed_with_lens(&[(b.as_slice(), c, ulen)])?;
-                    self.series_refs.clear();
-                }
-                if !prepared.is_empty() {
-                    let slices: Vec<(&[u8], bool, usize)> = prepared
-                        .iter()
-                        .map(|(b, c, u)| (b.as_slice(), *c, *u))
-                        .collect();
-                    wal.log_precompressed_with_lens(&slices)?;
+                f_start = f_end;
+                h_start = h_end;
+                fh_start = fh_end;
+            }
+
+            if !self.exemplars.is_empty() {
+                raw_buf.clear();
+                let b = std::mem::take(&mut raw_buf);
+                raw_buf = enc.exemplars_iter(
+                    self.exemplars.iter().map(|e| {
+                        (
+                            e.entry.ref_id,
+                            e.exemplar.timestamp_ms,
+                            e.exemplar.value,
+                            &e.exemplar.labels,
+                        )
+                    }),
+                    b,
+                );
+                rec_spans.push(pack_record(&raw_buf, &mut comp_buf)?);
+            }
+            Ok(())
+        })();
+
+        let write_res: Result<(), HeadError> = encode_res.and_then(|()| {
+            if series_span.is_some() || !rec_spans.is_empty() {
+                let mut wal_guard = self.head.wal.lock();
+                if let Some(ref mut wal) = *wal_guard {
+                    if let Some((start, end, comp, ulen)) = series_span {
+                        wal.log_precompressed_with_lens(&[(&comp_buf[start..end], comp, ulen)])?;
+                        self.series_refs.clear();
+                    }
+                    if !rec_spans.is_empty() {
+                        let slices: SmallVec<[(&[u8], bool, usize); 8]> = rec_spans
+                            .iter()
+                            .map(|&(s, e, c, u)| (&comp_buf[s..e], c, u))
+                            .collect();
+                        wal.log_precompressed_with_lens(&slices)?;
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        });
+
+        self.wal_buf = raw_buf;
+        self.wal_comp_buf = comp_buf;
+        write_res
     }
 
     fn prepare_wal_payloads(&mut self) -> Result<PreparedWalPayloads, HeadError> {
@@ -16731,17 +17390,17 @@ impl<'a> HeadAppender<'a> {
 
         let mut recs: Vec<Vec<u8>> = Vec::new();
         if !self.metadata.is_empty() {
-            let metas: Vec<RefMetadata> = self
-                .metadata
-                .iter()
-                .map(|m| RefMetadata {
-                    ref_id: m.entry.ref_id,
-                    metric_type: m.metric_type as u8,
-                    unit: m.unit.clone(),
-                    help: m.help.clone(),
-                })
-                .collect();
-            recs.push(enc.metadata(&metas, Vec::new()));
+            recs.push(enc.metadata_iter(
+                self.metadata.iter().map(|m| {
+                    (
+                        m.entry.ref_id,
+                        m.metric_type as u8,
+                        m.unit.as_str(),
+                        m.help.as_str(),
+                    )
+                }),
+                Vec::new(),
+            ));
         }
         let total_batches = self.batch_boundaries.len() + 1;
         let mut f_start = 0usize;
@@ -16773,39 +17432,33 @@ impl<'a> HeadAppender<'a> {
                 ));
             }
             if h_start < h_end {
-                let hists: Vec<RefHistogramSample> = self.histograms[h_start..h_end]
-                    .iter()
-                    .map(|h| RefHistogramSample {
-                        ref_id: h.entry.ref_id,
-                        st: h.st,
-                        t: h.t,
-                        h: h.h.clone(),
-                    })
-                    .collect();
-                let (r, cb) = enc.histogram_samples(&hists, Vec::new());
+                let (r, cb) = enc.histogram_samples_iter(
+                    self.histograms[h_start..h_end]
+                        .iter()
+                        .map(|h| (h.entry.ref_id, h.st, h.t, &h.h)),
+                    Vec::new(),
+                    Vec::new(),
+                );
                 if !r.is_empty() {
                     recs.push(r);
                 }
                 if !cb.is_empty() {
-                    recs.push(enc.custom_buckets_histogram_samples(&cb, Vec::new()));
+                    recs.push(cb);
                 }
             }
             if fh_start < fh_end {
-                let fhists: Vec<RefFloatHistogramSample> = self.float_histograms[fh_start..fh_end]
-                    .iter()
-                    .map(|fh| RefFloatHistogramSample {
-                        ref_id: fh.entry.ref_id,
-                        st: fh.st,
-                        t: fh.t,
-                        fh: fh.fh.clone(),
-                    })
-                    .collect();
-                let (r, cb) = enc.float_histogram_samples(&fhists, Vec::new());
+                let (r, cb) = enc.float_histogram_samples_iter(
+                    self.float_histograms[fh_start..fh_end]
+                        .iter()
+                        .map(|fh| (fh.entry.ref_id, fh.st, fh.t, &fh.fh)),
+                    Vec::new(),
+                    Vec::new(),
+                );
                 if !r.is_empty() {
                     recs.push(r);
                 }
                 if !cb.is_empty() {
-                    recs.push(enc.custom_buckets_float_histogram_samples(&cb, Vec::new()));
+                    recs.push(cb);
                 }
             }
 
@@ -16814,17 +17467,17 @@ impl<'a> HeadAppender<'a> {
             fh_start = fh_end;
         }
         if !self.exemplars.is_empty() {
-            let exs: Vec<RefExemplar> = self
-                .exemplars
-                .iter()
-                .map(|e| RefExemplar {
-                    ref_id: e.entry.ref_id,
-                    t: e.exemplar.timestamp_ms,
-                    v: e.exemplar.value,
-                    labels: e.exemplar.labels.clone(),
-                })
-                .collect();
-            recs.push(enc.exemplars(&exs, Vec::new()));
+            recs.push(enc.exemplars_iter(
+                self.exemplars.iter().map(|e| {
+                    (
+                        e.entry.ref_id,
+                        e.exemplar.timestamp_ms,
+                        e.exemplar.value,
+                        &e.exemplar.labels,
+                    )
+                }),
+                Vec::new(),
+            ));
         }
 
         let prepared_series = match series_rec {

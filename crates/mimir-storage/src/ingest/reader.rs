@@ -146,6 +146,16 @@ pub trait RecordBatchConsumer: Send + Sync + 'static {
         &self,
         records: Vec<FetchedRecord>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+
+    /// Zero-clone entry point accepting an `Arc<[FetchedRecord]>` shared across retry attempts.
+    /// Consumers that only read `&[FetchedRecord]` should override this to avoid cloning records
+    /// and their header `Vec<(String, Bytes)>` on every Kafka fetch.
+    fn consume_shared(
+        &self,
+        records: Arc<[FetchedRecord]>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        self.consume(records.to_vec())
+    }
 }
 
 /// Synchronous zero-copy record handler invoked per decoded record with a reusable `WriteRequestScratch`.
@@ -2203,15 +2213,27 @@ impl FetchLoop {
         self.update_highest_consumed_timestamp_before_consumption(&fetches);
         let num_records = all.len();
         drop(all);
-        self.consume_fetches(&fetches, cancel)
+        let mut spans: Vec<(i32, i64, usize, usize)> = Vec::with_capacity(fetches.len());
+        let mut flat: Vec<FetchedRecord> = Vec::with_capacity(num_records);
+        for f in fetches {
+            let start = flat.len();
+            flat.extend(f.records);
+            spans.push((f.partition, f.high_watermark, start, flat.len()));
+        }
+        let shared_records: Arc<[FetchedRecord]> = Arc::from(flat);
+        self.consume_shared_records(&shared_records, cancel)
             .await
             .map_err(|e| match e {
                 ReaderError::Canceled | ReaderError::WaitTargetLagDeadlineExceeded => e,
                 other => ReaderError::Startup(format!("consume {num_records} records: {other}")),
             })?;
-        self.enqueue_commit(&fetches);
-        self.notify_last_consumed_offset(&fetches);
-        self.update_highest_consumed_timestamp_after_consumption(&fetches, phase);
+        self.enqueue_commit_spans(&spans, &shared_records);
+        self.notify_last_consumed_offset_spans(&spans, &shared_records);
+        self.update_highest_consumed_timestamp_after_consumption_spans(
+            &spans,
+            &shared_records,
+            phase,
+        );
         Ok(())
     }
 
@@ -2261,7 +2283,12 @@ impl FetchLoop {
     }
 
     /// `updateHighestConsumedTimestampAfterConsumption`.
-    fn update_highest_consumed_timestamp_after_consumption(&self, fetches: &[FetchResult], phase: &str) {
+    fn update_highest_consumed_timestamp_after_consumption_spans(
+        &self,
+        spans: &[(i32, i64, usize, usize)],
+        records: &[FetchedRecord],
+        phase: &str,
+    ) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2271,43 +2298,39 @@ impl FetchLoop {
             .receive_and_consume_delay
             .with_label_values(&[phase]);
         let mut highest = UNSET_TS_MS;
-        for f in fetches {
-            if f.partition != self.partition_id || f.records.is_empty() {
+        for &(partition, high_watermark, start, end) in spans {
+            let slice = &records[start..end];
+            if partition != self.partition_id || slice.is_empty() {
                 continue;
             }
-            for r in &f.records {
+            for r in slice {
                 observer.observe(elapsed_secs_from_ms(now_ms, r.timestamp_ms));
                 highest = highest.max(r.timestamp_ms);
             }
-            let last = f.records.last().expect("non-empty");
-            if last.offset + 1 >= f.high_watermark {
-                self.highest_ts.store(UNSET_TS_MS, Ordering::SeqCst);
-            } else {
-                self.highest_ts.store(highest, Ordering::SeqCst);
+            if let Some(last) = slice.last() {
+                if last.offset + 1 >= high_watermark {
+                    self.highest_ts.store(UNSET_TS_MS, Ordering::SeqCst);
+                } else {
+                    self.highest_ts.store(highest, Ordering::SeqCst);
+                }
             }
         }
     }
 
     /// `consumeFetches`: retries forever (250ms..2s backoff) until canceled. An in-flight
-    /// consumption is never interrupted.
-    async fn consume_fetches(
+    /// consumption is never interrupted. Shares `Arc<[FetchedRecord]>` across retries with zero
+    /// record/header cloning.
+    async fn consume_shared_records(
         &self,
-        fetches: &[FetchResult],
+        records: &Arc<[FetchedRecord]>,
         cancel: &Cancel,
     ) -> Result<(), ReaderError> {
-        let num: usize = fetches.iter().map(|f| f.records.len()).sum();
-        if num == 0 {
+        if records.is_empty() {
             return Ok(());
         }
-        let collect = || -> Vec<FetchedRecord> {
-            fetches
-                .iter()
-                .flat_map(|f| f.records.iter().cloned())
-                .collect()
-        };
         let mut min_offset = i64::MAX;
         let mut max_offset = 0i64;
-        for r in fetches.iter().flat_map(|f| f.records.iter()) {
+        for r in records.iter() {
             min_offset = min_offset.min(r.offset);
             max_offset = max_offset.max(r.offset);
         }
@@ -2319,9 +2342,7 @@ impl FetchLoop {
             max_retries: 0,
         });
         let res = loop {
-            // The records are rebuilt from the fetches for every attempt (the consumer takes
-            // ownership); an in-flight attempt is never interrupted by cancellation.
-            match self.consumer.consume(collect()).await {
+            match self.consumer.consume_shared(Arc::clone(records)).await {
                 Ok(()) => break Ok(()),
                 Err(err) => {
                     error!(
@@ -2350,17 +2371,22 @@ impl FetchLoop {
     }
 
     /// `enqueueCommit`.
-    fn enqueue_commit(&self, fetches: &[FetchResult]) {
+    fn enqueue_commit_spans(
+        &self,
+        spans: &[(i32, i64, usize, usize)],
+        records: &[FetchedRecord],
+    ) {
         let mut last = None;
-        for f in fetches {
-            if f.records.is_empty() {
+        for &(partition, _hwm, start, end) in spans {
+            let slice = &records[start..end];
+            if slice.is_empty() {
                 continue;
             }
-            if f.partition != self.partition_id {
-                error!(partition = f.partition, expected_partition = self.partition_id, "asked to commit wrong partition");
+            if partition != self.partition_id {
+                error!(partition = partition, expected_partition = self.partition_id, "asked to commit wrong partition");
                 continue;
             }
-            last = f.records.last().map(|r| r.offset);
+            last = slice.last().map(|r| r.offset);
         }
         if let Some(o) = last {
             self.committer.enqueue_offset(o);
@@ -2368,12 +2394,16 @@ impl FetchLoop {
     }
 
     /// `notifyLastConsumedOffset`.
-    fn notify_last_consumed_offset(&self, fetches: &[FetchResult]) {
-        for f in fetches {
-            if f.partition != self.partition_id {
+    fn notify_last_consumed_offset_spans(
+        &self,
+        spans: &[(i32, i64, usize, usize)],
+        records: &[FetchedRecord],
+    ) {
+        for &(partition, _hwm, start, end) in spans {
+            if partition != self.partition_id {
                 continue;
             }
-            let Some(rec) = f.records.last() else {
+            let Some(rec) = records[start..end].last() else {
                 continue;
             };
             self.offset_watcher.notify(rec.offset);

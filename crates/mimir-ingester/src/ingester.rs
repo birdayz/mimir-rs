@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -19,6 +19,7 @@ use mimir_common::services::{
     State,
 };
 use mimir_common::shutdownmarker;
+use mimir_common::thread_pool::ScopedWorkerPool;
 use mimir_common::usagestats;
 use mimir_config::{
     BlocksStorageConfig, CompartmentsConfig, IngestStorageConfig, IngesterConfig, InstanceLimits,
@@ -159,6 +160,9 @@ pub struct Ingester {
     utilization_limiter_svc: Option<Arc<crate::utilization::UtilizationBasedLimiter>>,
     /// Shared tenant-fair compute worker pool (Go: `computeWorkerPool`, name `ingester-compute`).
     pub compute_worker_pool: Arc<crate::workerpool::Pool>,
+    /// Persistent lazily-initialized scoped worker pool for parallel WAL/WBL fsyncs in
+    /// `notify_pre_commit`, eliminating per-commit OS thread creation/teardown (`std::thread::scope`).
+    pre_commit_pool: OnceLock<ScopedWorkerPool>,
 
     pub tsdbs: DashMap<String, Arc<UserTsdb>>,
     pub users_metadata: DashMap<String, Arc<TenantMetadataStore>>,
@@ -515,6 +519,7 @@ impl Ingester {
             ),
             utilization_limiter_svc,
             compute_worker_pool,
+            pre_commit_pool: OnceLock::new(),
             tsdbs: DashMap::new(),
             users_metadata: DashMap::new(),
             tsdb_create_mtx: Mutex::new(()),
@@ -1409,19 +1414,19 @@ impl Ingester {
             let next_idx = std::sync::atomic::AtomicUsize::new(0);
             let errs: Mutex<Vec<String>> = Mutex::new(Vec::new());
             let workers = concurrency.min(users.len());
-            std::thread::scope(|s| {
-                for _ in 0..workers {
-                    s.spawn(|| loop {
-                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                        let Some(user_id) = users.get(idx) else {
-                            break;
-                        };
-                        if let Some(db) = self.get_tsdb(user_id) {
-                            if let Err(e) = sync_user(user_id, &db) {
-                                errs.lock().push(e);
-                            }
-                        }
-                    });
+            let pool = self.pre_commit_pool.get_or_init(|| {
+                let pool_threads = concurrency.clamp(1, 256).saturating_sub(1);
+                ScopedWorkerPool::new("ingester-fsync", pool_threads)
+            });
+            pool.scoped_execute(workers, |_| loop {
+                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                let Some(user_id) = users.get(idx) else {
+                    break;
+                };
+                if let Some(db) = self.get_tsdb(user_id) {
+                    if let Err(e) = sync_user(user_id, &db) {
+                        errs.lock().push(e);
+                    }
                 }
             });
             errs.into_inner()

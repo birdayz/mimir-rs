@@ -1442,6 +1442,217 @@ impl RecordEncoder {
         }
         buf.into_vec()
     }
+
+    /// Zero-clone metadata encoder taking borrowed (ref_id, metric_type, unit, help) tuples.
+    pub fn metadata_iter<'a, I>(&self, metadata: I, b: Vec<u8>) -> Vec<u8>
+    where
+        I: IntoIterator<Item = (u64, u8, &'a str, &'a str)>,
+    {
+        let mut buf = Encbuf { buf: b };
+        buf.put_byte(RecordType::Metadata as u8);
+        for (ref_id, metric_type, unit, help) in metadata {
+            buf.put_uvarint64(ref_id);
+            buf.put_byte(metric_type);
+            buf.put_uvarint(2);
+            buf.put_uvarint_str(UNIT_META_NAME);
+            buf.put_uvarint_str(unit);
+            buf.put_uvarint_str(HELP_META_NAME);
+            buf.put_uvarint_str(help);
+        }
+        buf.into_vec()
+    }
+
+    /// Zero-clone exemplars encoder taking borrowed (ref_id, t, v, &Labels) tuples.
+    pub fn exemplars_iter<'a, I>(&self, exemplars: I, b: Vec<u8>) -> Vec<u8>
+    where
+        I: IntoIterator<Item = (u64, i64, f64, &'a Labels)>,
+    {
+        let mut buf = Encbuf { buf: b };
+        buf.put_byte(RecordType::Exemplars as u8);
+        let mut iter = exemplars.into_iter();
+        let Some((first_ref, first_t, first_v, first_labels)) = iter.next() else {
+            return buf.into_vec();
+        };
+        buf.put_be64(first_ref);
+        buf.put_be64_i64(first_t);
+        buf.put_varint64(0);
+        buf.put_varint64(0);
+        buf.put_be_f64(first_v);
+        encode_labels(&mut buf, first_labels);
+        for (ref_id, t, v, labels) in iter {
+            buf.put_varint64((ref_id as i64).wrapping_sub(first_ref as i64));
+            buf.put_varint64(t.wrapping_sub(first_t));
+            buf.put_be_f64(v);
+            encode_labels(&mut buf, labels);
+        }
+        buf.into_vec()
+    }
+
+    /// Zero-clone integer histogram encoder writing directly into (normal_b, custom_b) without
+    /// cloning any Histogram or allocating intermediate Vec<RefHistogramSample> buffers.
+    ///
+    /// Byte-for-byte identical to histogram_samples + custom_buckets_histogram_samples.
+    pub fn histogram_samples_iter<'a, I>(
+        &self,
+        histograms: I,
+        normal_b: Vec<u8>,
+        custom_b: Vec<u8>,
+    ) -> (Vec<u8>, Vec<u8>)
+    where
+        I: IntoIterator<Item = (u64, i64, i64, &'a Histogram)>,
+    {
+        let mut iter = histograms.into_iter();
+        if self.enable_st_storage {
+            let mut buf = Encbuf { buf: normal_b };
+            buf.put_byte(RecordType::HistogramSamplesV2 as u8);
+            let Some((first_ref, first_st, first_t, first_h)) = iter.next() else {
+                return (buf.into_vec(), custom_b);
+            };
+            buf.put_varint64(first_ref as i64);
+            buf.put_varint64(first_t);
+            buf.put_varint64(first_st);
+            encode_histogram(&mut buf, first_h);
+            let mut prev_ref = first_ref;
+            let mut prev_st = first_st;
+            for (ref_id, st, t, h) in iter {
+                buf.put_varint64((ref_id as i64).wrapping_sub(prev_ref as i64));
+                buf.put_varint64(t.wrapping_sub(first_t));
+                write_st_marker(&mut buf, st, first_st, prev_st);
+                encode_histogram(&mut buf, h);
+                prev_ref = ref_id;
+                prev_st = st;
+            }
+            return (buf.into_vec(), custom_b);
+        }
+
+        let start_len = normal_b.len();
+        let mut normal = Encbuf { buf: normal_b };
+        normal.put_byte(RecordType::HistogramSamples as u8);
+        let Some((first_ref, _first_st, first_t, first_h)) = iter.next() else {
+            return (normal.into_vec(), custom_b);
+        };
+        normal.put_be64(first_ref);
+        normal.put_be64_i64(first_t);
+
+        let mut custom = Encbuf { buf: custom_b };
+        let mut cb_base: Option<(u64, i64)> = None;
+        let mut normal_count = 0usize;
+
+        let mut encode_one = |ref_id: u64, t: i64, h: &Histogram| {
+            if h.uses_custom_buckets() {
+                let (cb_ref, cb_t) = match cb_base {
+                    Some(b) => b,
+                    None => {
+                        custom.put_byte(RecordType::CustomBucketsHistogramSamples as u8);
+                        custom.put_be64(ref_id);
+                        custom.put_be64_i64(t);
+                        cb_base = Some((ref_id, t));
+                        (ref_id, t)
+                    }
+                };
+                custom.put_varint64((ref_id as i64).wrapping_sub(cb_ref as i64));
+                custom.put_varint64(t.wrapping_sub(cb_t));
+                encode_histogram(&mut custom, h);
+            } else {
+                normal.put_varint64((ref_id as i64).wrapping_sub(first_ref as i64));
+                normal.put_varint64(t.wrapping_sub(first_t));
+                encode_histogram(&mut normal, h);
+                normal_count += 1;
+            }
+        };
+
+        encode_one(first_ref, first_t, first_h);
+        for (ref_id, _st, t, h) in iter {
+            encode_one(ref_id, t, h);
+        }
+        if normal_count == 0 {
+            normal.buf.truncate(start_len);
+        }
+        (normal.into_vec(), custom.into_vec())
+    }
+
+    /// Zero-clone float histogram encoder writing directly into (normal_b, custom_b) without
+    /// cloning any FloatHistogram or allocating intermediate Vec<RefFloatHistogramSample> buffers.
+    ///
+    /// Byte-for-byte identical to float_histogram_samples + custom_buckets_float_histogram_samples.
+    pub fn float_histogram_samples_iter<'a, I>(
+        &self,
+        histograms: I,
+        normal_b: Vec<u8>,
+        custom_b: Vec<u8>,
+    ) -> (Vec<u8>, Vec<u8>)
+    where
+        I: IntoIterator<Item = (u64, i64, i64, &'a FloatHistogram)>,
+    {
+        let mut iter = histograms.into_iter();
+        if self.enable_st_storage {
+            let mut buf = Encbuf { buf: normal_b };
+            buf.put_byte(RecordType::FloatHistogramSamplesV2 as u8);
+            let Some((first_ref, first_st, first_t, first_fh)) = iter.next() else {
+                return (buf.into_vec(), custom_b);
+            };
+            buf.put_varint64(first_ref as i64);
+            buf.put_varint64(first_t);
+            buf.put_varint64(first_st);
+            encode_float_histogram(&mut buf, first_fh);
+            let mut prev_ref = first_ref;
+            let mut prev_st = first_st;
+            for (ref_id, st, t, fh) in iter {
+                buf.put_varint64((ref_id as i64).wrapping_sub(prev_ref as i64));
+                buf.put_varint64(t.wrapping_sub(first_t));
+                write_st_marker(&mut buf, st, first_st, prev_st);
+                encode_float_histogram(&mut buf, fh);
+                prev_ref = ref_id;
+                prev_st = st;
+            }
+            return (buf.into_vec(), custom_b);
+        }
+
+        let start_len = normal_b.len();
+        let mut normal = Encbuf { buf: normal_b };
+        normal.put_byte(RecordType::FloatHistogramSamples as u8);
+        let Some((first_ref, _first_st, first_t, first_fh)) = iter.next() else {
+            return (normal.into_vec(), custom_b);
+        };
+        normal.put_be64(first_ref);
+        normal.put_be64_i64(first_t);
+
+        let mut custom = Encbuf { buf: custom_b };
+        let mut cb_base: Option<(u64, i64)> = None;
+        let mut normal_count = 0usize;
+
+        let mut encode_one = |ref_id: u64, t: i64, fh: &FloatHistogram| {
+            if fh.uses_custom_buckets() {
+                let (cb_ref, cb_t) = match cb_base {
+                    Some(b) => b,
+                    None => {
+                        custom.put_byte(RecordType::CustomBucketsFloatHistogramSamples as u8);
+                        custom.put_be64(ref_id);
+                        custom.put_be64_i64(t);
+                        cb_base = Some((ref_id, t));
+                        (ref_id, t)
+                    }
+                };
+                custom.put_varint64((ref_id as i64).wrapping_sub(cb_ref as i64));
+                custom.put_varint64(t.wrapping_sub(cb_t));
+                encode_float_histogram(&mut custom, fh);
+            } else {
+                normal.put_varint64((ref_id as i64).wrapping_sub(first_ref as i64));
+                normal.put_varint64(t.wrapping_sub(first_t));
+                encode_float_histogram(&mut normal, fh);
+                normal_count += 1;
+            }
+        };
+
+        encode_one(first_ref, first_t, first_fh);
+        for (ref_id, _st, t, fh) in iter {
+            encode_one(ref_id, t, fh);
+        }
+        if normal_count == 0 {
+            normal.buf.truncate(start_len);
+        }
+        (normal.into_vec(), custom.into_vec())
+    }
 }
 
 #[cfg(test)]
@@ -1741,5 +1952,155 @@ mod tests {
         buf2.put_uvarint_bytes(&invalid_6mib);
         let mut dec2 = Decbuf::new(buf2.as_slice());
         assert_eq!(decode_labels(&mut dec2), Err(EncodingError::InvalidSize));
+    }
+
+    #[test]
+    fn zero_clone_iter_encoders_match_slice_encoders_byte_for_byte() {
+        let mk_hist = |schema: i32, custom: Vec<f64>| Histogram {
+            counter_reset_hint: CounterResetHint::NotCounterReset,
+            schema,
+            zero_threshold: 0.001,
+            zero_count: 5,
+            count: 25,
+            sum: 42.5,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 2 }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![3, -1],
+            negative_buckets: Vec::new(),
+            custom_values: custom,
+        };
+        let mk_fhist = |schema: i32, custom: Vec<f64>| FloatHistogram {
+            counter_reset_hint: CounterResetHint::NotCounterReset,
+            schema,
+            zero_threshold: 0.001,
+            zero_count: 5.5,
+            count: 25.5,
+            sum: 42.5,
+            positive_spans: vec![HistogramSpan { offset: 0, length: 2 }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![3.5, 2.0],
+            negative_buckets: Vec::new(),
+            custom_values: custom,
+        };
+
+        let normal_h = mk_hist(0, Vec::new());
+        let custom_h = mk_hist(-53, vec![0.1, 0.5, 1.0]);
+        let normal_fh = mk_fhist(0, Vec::new());
+        let custom_fh = mk_fhist(-53, vec![0.1, 0.5, 1.0]);
+
+        for enable_st in [false, true] {
+            let enc = RecordEncoder::new(enable_st);
+
+            // 1. Metadata
+            let metas = vec![
+                RefMetadata { ref_id: 1, metric_type: 1, unit: "s".into(), help: "dur".into() },
+                RefMetadata { ref_id: 9, metric_type: 2, unit: "".into(), help: "cnt".into() },
+            ];
+            assert_eq!(
+                enc.metadata(&metas, Vec::new()),
+                enc.metadata_iter(
+                    metas.iter().map(|m| (m.ref_id, m.metric_type, m.unit.as_str(), m.help.as_str())),
+                    Vec::new()
+                )
+            );
+
+            // 2. Exemplars
+            let exs = vec![
+                RefExemplar {
+                    ref_id: 10,
+                    t: 1000,
+                    v: 1.5,
+                    labels: Labels::from_pairs([("trace_id", "abc")]),
+                },
+                RefExemplar {
+                    ref_id: 12,
+                    t: 2000,
+                    v: 2.5,
+                    labels: Labels::from_pairs([("trace_id", "def")]),
+                },
+            ];
+            assert_eq!(
+                enc.exemplars(&exs, Vec::new()),
+                enc.exemplars_iter(
+                    exs.iter().map(|e| (e.ref_id, e.t, e.v, &e.labels)),
+                    Vec::new()
+                )
+            );
+            assert_eq!(
+                enc.exemplars(&[], Vec::new()),
+                enc.exemplars_iter(std::iter::empty(), Vec::new())
+            );
+
+            // 3. Histograms: empty, normal-only, custom-only, custom-first mixed, normal-first mixed
+            let cases: Vec<Vec<RefHistogramSample>> = vec![
+                vec![],
+                vec![
+                    RefHistogramSample { ref_id: 1, st: 900, t: 1000, h: normal_h.clone() },
+                    RefHistogramSample { ref_id: 3, st: 900, t: 2000, h: normal_h.clone() },
+                ],
+                vec![
+                    RefHistogramSample { ref_id: 2, st: 800, t: 1000, h: custom_h.clone() },
+                    RefHistogramSample { ref_id: 5, st: 850, t: 2000, h: custom_h.clone() },
+                ],
+                vec![
+                    RefHistogramSample { ref_id: 2, st: 800, t: 1000, h: custom_h.clone() },
+                    RefHistogramSample { ref_id: 4, st: 850, t: 1500, h: normal_h.clone() },
+                    RefHistogramSample { ref_id: 7, st: 900, t: 2000, h: custom_h.clone() },
+                ],
+                vec![
+                    RefHistogramSample { ref_id: 2, st: 800, t: 1000, h: normal_h.clone() },
+                    RefHistogramSample { ref_id: 4, st: 850, t: 1500, h: custom_h.clone() },
+                    RefHistogramSample { ref_id: 7, st: 900, t: 2000, h: normal_h.clone() },
+                ],
+            ];
+            for case in &cases {
+                let (exp_n, exp_cb_refs) = enc.histogram_samples(case, Vec::new());
+                let exp_cb = if exp_cb_refs.is_empty() {
+                    Vec::new()
+                } else {
+                    enc.custom_buckets_histogram_samples(&exp_cb_refs, Vec::new())
+                };
+                let (got_n, got_cb) = enc.histogram_samples_iter(
+                    case.iter().map(|x| (x.ref_id, x.st, x.t, &x.h)),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                assert_eq!(got_n, exp_n, "int hist normal mismatch (enable_st={enable_st})");
+                assert_eq!(got_cb, exp_cb, "int hist custom mismatch (enable_st={enable_st})");
+            }
+
+            // 4. Float histograms: all same shapes
+            let fcases: Vec<Vec<RefFloatHistogramSample>> = vec![
+                vec![],
+                vec![
+                    RefFloatHistogramSample { ref_id: 1, st: 900, t: 1000, fh: normal_fh.clone() },
+                    RefFloatHistogramSample { ref_id: 3, st: 900, t: 2000, fh: normal_fh.clone() },
+                ],
+                vec![
+                    RefFloatHistogramSample { ref_id: 2, st: 800, t: 1000, fh: custom_fh.clone() },
+                    RefFloatHistogramSample { ref_id: 5, st: 850, t: 2000, fh: custom_fh.clone() },
+                ],
+                vec![
+                    RefFloatHistogramSample { ref_id: 2, st: 800, t: 1000, fh: custom_fh.clone() },
+                    RefFloatHistogramSample { ref_id: 4, st: 850, t: 1500, fh: normal_fh.clone() },
+                    RefFloatHistogramSample { ref_id: 7, st: 900, t: 2000, fh: custom_fh.clone() },
+                ],
+            ];
+            for case in &fcases {
+                let (exp_n, exp_cb_refs) = enc.float_histogram_samples(case, Vec::new());
+                let exp_cb = if exp_cb_refs.is_empty() {
+                    Vec::new()
+                } else {
+                    enc.custom_buckets_float_histogram_samples(&exp_cb_refs, Vec::new())
+                };
+                let (got_n, got_cb) = enc.float_histogram_samples_iter(
+                    case.iter().map(|x| (x.ref_id, x.st, x.t, &x.fh)),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                assert_eq!(got_n, exp_n, "float hist normal mismatch (enable_st={enable_st})");
+                assert_eq!(got_cb, exp_cb, "float hist custom mismatch (enable_st={enable_st})");
+            }
+        }
     }
 }

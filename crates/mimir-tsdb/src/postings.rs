@@ -992,6 +992,53 @@ impl MemPostings {
         }
     }
 
+    /// Visits every value of name whose postings pass pred(small, large), resolving the
+    /// symbol string via symbols.resolve(val_id) ONLY for matching values.
+    pub fn visit_matching_values_postings_for_name(
+        &self,
+        name: &str,
+        symbols: &SymbolTable,
+        mut pred: impl FnMut(&[u32], &[u64]) -> bool,
+        mut on_match: impl FnMut(&str),
+    ) {
+        if !self.ordered.load(AtomicOrdering::Acquire) {
+            self.ensure_order();
+        }
+        let Some(name_id) = symbols.get(name) else {
+            return;
+        };
+        if name_id == ALL_POSTINGS_KEY.0 {
+            return;
+        }
+        let stripe = self.stripes[Self::stripe_idx(name_id)].read();
+        let Some(vm) = stripe.m.get(&name_id) else {
+            return;
+        };
+        if stripe.overflow.is_empty() {
+            for (&val_id, small) in vm {
+                if pred(small.as_slice(), &[]) {
+                    on_match(symbols.resolve(val_id));
+                }
+            }
+            return;
+        }
+        for (&val_id, small) in vm {
+            let large = stripe
+                .overflow
+                .get(&(name_id, val_id))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if pred(small.as_slice(), large) {
+                on_match(symbols.resolve(val_id));
+            }
+        }
+        for (&(nid, vid), large) in &stripe.overflow {
+            if nid == name_id && !vm.contains_key(&vid) && pred(&[], large.as_slice()) {
+                on_match(symbols.resolve(vid));
+            }
+        }
+    }
+
     /// Evaluates `matchers` directly on `MemPostings` `&[u32]` posting slices (widening to
     /// `Vec<u64>` only once for the final result), avoiding intermediate `Vec<u64>` allocations.
     pub fn postings_for_matchers(
@@ -2844,6 +2891,117 @@ pub fn intersect_sorted_u64_any(large: &[u64], eligible: &[u64]) -> bool {
 #[inline]
 pub fn intersect_sorted_any(small: &[u32], large: &[u64], eligible: &[u64]) -> bool {
     intersect_sorted_u32_u64_any(small, eligible) || intersect_sorted_u64_any(large, eligible)
+}
+
+/// Fast membership filter over a sorted slice of eligible series refs, using an L1-friendly dense
+/// bitset when the ref range fits within 500 KiB (max - min <= 4_000_000) and falling back to
+/// sorted binary/merge intersection otherwise.
+pub enum DenseRefFilter<'a> {
+    Empty,
+    BitSet {
+        base: u64,
+        min: u64,
+        max: u64,
+        words: Vec<u64>,
+    },
+    SortedBorrowed(&'a [u64]),
+}
+
+impl<'a> DenseRefFilter<'a> {
+    const MAX_BITSET_SPAN: u64 = 4_000_000;
+
+    /// Constructs a filter over a sorted slice of eligible series refs, using an L1-friendly
+    /// bitset only when the ref span is bounded AND dense enough to amortize bitset allocation.
+    pub fn from_sorted_refs(eligible: &'a [u64]) -> Self {
+        let (Some(&min), Some(&max)) = (eligible.first(), eligible.last()) else {
+            return Self::Empty;
+        };
+        let span = max.saturating_sub(min);
+        let dense_enough = eligible.len() >= 64
+            || span <= (eligible.len() as u64).saturating_mul(64);
+        if span <= Self::MAX_BITSET_SPAN && dense_enough {
+            let num_words = (span as usize / 64) + 1;
+            let mut words = vec![0u64; num_words];
+            for &r in eligible {
+                let bit = (r - min) as usize;
+                words[bit >> 6] |= 1u64 << (bit & 63);
+            }
+            Self::BitSet {
+                base: min,
+                min,
+                max,
+                words,
+            }
+        } else {
+            Self::SortedBorrowed(eligible)
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[inline]
+    pub fn matches_any(&self, small: &[u32], large: &[u64]) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::SortedBorrowed(eligible) => intersect_sorted_any(small, large, eligible),
+            Self::BitSet {
+                base,
+                min,
+                max,
+                words,
+            } => {
+                if !small.is_empty() {
+                    let s_min = small[0] as u64;
+                    let s_max = small[small.len() - 1] as u64;
+                    if s_max >= *min && s_min <= *max {
+                        let start = if small.len() > 64 && s_min < *min {
+                            small.partition_point(|&x| (x as u64) < *min)
+                        } else {
+                            0
+                        };
+                        for &r32 in &small[start..] {
+                            let r = r32 as u64;
+                            if r > *max {
+                                break;
+                            }
+                            if r >= *min {
+                                let bit = (r - *base) as usize;
+                                if (words[bit >> 6] >> (bit & 63)) & 1 != 0 {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !large.is_empty() {
+                    let l_min = large[0];
+                    let l_max = large[large.len() - 1];
+                    if l_max >= *min && l_min <= *max {
+                        let start = if large.len() > 64 && l_min < *min {
+                            large.partition_point(|&x| x < *min)
+                        } else {
+                            0
+                        };
+                        for &r in &large[start..] {
+                            if r > *max {
+                                break;
+                            }
+                            if r >= *min {
+                                let bit = (r - *base) as usize;
+                                if (words[bit >> 6] >> (bit & 63)) & 1 != 0 {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
 }
 
 /// Borrowed view pairing [`MemPostings`] with a [`SymbolTable`] to implement [`PostingsSource`].

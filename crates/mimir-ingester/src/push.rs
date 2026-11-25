@@ -425,7 +425,7 @@ pub struct PrehashedSeriesItem<'a> {
     pub prom_hash: u64,
     pub labels_sorted_unique: bool,
     pub bad_utf8: bool,
-    pub histograms: &'a [ConvertedHistogram],
+    pub histograms: &'a mut [ConvertedHistogram],
     pub exemplars: &'a [ConvertedExemplarResult],
 }
 
@@ -1293,7 +1293,6 @@ impl Ingester {
             prom_hash: u64,
             labels_sorted_unique: bool,
             bad_utf8: bool,
-            hist_start: usize,
             hist_len: usize,
             ex_start: usize,
             ex_len: usize,
@@ -1393,7 +1392,6 @@ impl Ingester {
                     }
                     min_ts = min_ts.min(series.min_sample_ts);
 
-                    let hist_start = histograms_arena.len();
                     let mut hist_len = 0usize;
                     for h in series.histograms() {
                         let conv = convert_borrowed_histogram(&h);
@@ -1434,7 +1432,6 @@ impl Ingester {
                         prom_hash: series.prom_hash,
                         labels_sorted_unique: series.labels_sorted_unique,
                         bad_utf8: series.bad_utf8,
-                        hist_start,
                         hist_len,
                         ex_start,
                         ex_len,
@@ -1468,6 +1465,7 @@ impl Ingester {
             let _skip_label_count_validation = header.skip_label_count_validation;
 
             let mut items: Vec<PrehashedSeriesItem<'_>> = Vec::with_capacity(ts_len);
+            let mut hist_rest: &mut [ConvertedHistogram] = histograms_arena.as_mut_slice();
             for m in series_metas.iter() {
                 let l_start = m.label_start;
                 let encoded_labels = if m.bad_utf8 {
@@ -1484,10 +1482,11 @@ impl Ingester {
                 let s_start = m.sample_start;
                 let samples = &samples_arena[s_start..s_start + m.sample_len];
                 let histograms = if m.hist_len == 0 {
-                    &[][..]
+                    &mut [][..]
                 } else {
-                    let h_start = m.hist_start;
-                    &histograms_arena[h_start..h_start + m.hist_len]
+                    let (h_slice, rest) = hist_rest.split_at_mut(m.hist_len);
+                    hist_rest = rest;
+                    h_slice
                 };
                 let exemplars = if m.ex_len == 0 {
                     &[][..]
@@ -1521,9 +1520,9 @@ impl Ingester {
                     .get_instance_limits()
                     .is_some_and(|il| il.max_series > 0)
             {
-                self.ingest_prehashed_classic_sharded(user_id, source, min_ts, &items)
+                self.ingest_prehashed_classic_sharded(user_id, source, min_ts, &mut items)
             } else {
-                self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, &items)
+                self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, &mut items)
             }
         })
     }
@@ -1883,7 +1882,7 @@ impl Ingester {
         user_id: &str,
         source: cortexpb::write_request::SourceEnum,
         min_ts: i64,
-        items: &[PrehashedSeriesItem<'_>],
+        items: &mut [PrehashedSeriesItem<'_>],
         metadata: &[BorrowedMetadata<'_>],
         sampled_trace_id: Option<&str>,
     ) -> Result<(), IngesterError> {
@@ -1929,7 +1928,7 @@ impl Ingester {
         user_id: &str,
         source: cortexpb::write_request::SourceEnum,
         min_ts: i64,
-        items: &[PrehashedSeriesItem<'_>],
+        items: &mut [PrehashedSeriesItem<'_>],
     ) -> Result<(), IngesterError> {
         let hw_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let max_shards = hw_threads.clamp(2, 8);
@@ -1939,25 +1938,14 @@ impl Ingester {
             return self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, items);
         }
         let shard_mask = num_shards - 1;
-
-        struct ShardItemRef<'a, 'b> {
-            orig_idx: usize,
-            item: &'b PrehashedSeriesItem<'a>,
+        let mut seen_shards = 0u16;
+        for item in items.iter() {
+            seen_shards |= 1u16 << ((item.prom_hash as usize) & shard_mask);
+            if seen_shards.count_ones() > 1 {
+                break;
+            }
         }
-
-        let mut buckets: SmallVec<[Vec<ShardItemRef<'_, '_>>; 8]> = (0..num_shards)
-            .map(|_| Vec::with_capacity((items.len() / num_shards) + 8))
-            .collect();
-        for (idx, item) in items.iter().enumerate() {
-            let shard = (item.prom_hash as usize) & shard_mask;
-            buckets[shard].push(ShardItemRef {
-                orig_idx: idx,
-                item,
-            });
-        }
-        let active_shards: SmallVec<[Vec<ShardItemRef<'_, '_>>; 8]> =
-            buckets.into_iter().filter(|b| !b.is_empty()).collect();
-        if active_shards.len() <= 1 {
+        if seen_shards.count_ones() <= 1 {
             return self.ingest_prehashed_shard_batch_inner(user_id, source, min_ts, items);
         }
 
@@ -2033,7 +2021,7 @@ impl Ingester {
                     && item.samples.iter().all(|s| s.timestamp_ms < min_append_time)
                     && item.histograms.iter().all(|h| h.0 < min_append_time);
                 if !oob_skip {
-                    for (h_ts, is_float, ih_opt, fh_opt, _) in item.histograms {
+                    for (h_ts, is_float, ih_opt, fh_opt, _) in item.histograms.iter() {
                         let h_ts = *h_ts;
                         if h_ts > max_timestamp_ms || h_ts < min_timestamp_ms {
                             continue;
@@ -2092,12 +2080,32 @@ impl Ingester {
         type PreparedShardSlot<'a, 'b> =
             Mutex<Option<Result<PreparedShard<'a, 'b>, (usize, IngesterError)>>>;
 
+        struct ShardItemRef<'a, 'b> {
+            orig_idx: usize,
+            item: &'b mut PrehashedSeriesItem<'a>,
+        }
+        let mut buckets: SmallVec<[Vec<ShardItemRef<'_, '_>>; 8]> = (0..num_shards)
+            .map(|_| Vec::with_capacity((items.len() / num_shards) + 8))
+            .collect();
+        for (idx, item) in items.iter_mut().enumerate() {
+            let shard = (item.prom_hash as usize) & shard_mask;
+            buckets[shard].push(ShardItemRef {
+                orig_idx: idx,
+                item,
+            });
+        }
+        let active_shards: SmallVec<[Mutex<Vec<ShardItemRef<'_, '_>>>; 8]> = buckets
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .map(Mutex::new)
+            .collect();
         let shard_slots: SmallVec<[PreparedShardSlot<'_, '_>; 8]> =
             (0..active_shards.len()).map(|_| Mutex::new(None)).collect();
 
         let pool = classic_push_pool();
         pool.scoped_execute(active_shards.len(), |s_idx| {
-            let shard_items = &active_shards[s_idx];
+            let mut shard_items_guard = active_shards[s_idx].lock();
+            let shard_items = shard_items_guard.as_mut_slice();
             let mut app = db.db.appender_with_capacity(shard_items.len());
             let mut stats = PushStats::default();
             let mut first_partial: Option<(usize, IngesterError, Option<SampleKind>)> = None;
@@ -2113,7 +2121,7 @@ impl Ingester {
                 head.resolve_prehashed_encoded_batch(
                     shard_items,
                     |si| {
-                        let item = si.item;
+                        let item = &*si.item;
                         if item.bad_utf8
                             || !item.labels_sorted_unique
                             || item.encoded_labels.is_empty()
@@ -2145,9 +2153,9 @@ impl Ingester {
             };
 
             let mut hard_err: Option<(usize, IngesterError)> = None;
-            for (local_idx, si) in shard_items.iter().enumerate() {
+            for (local_idx, si) in shard_items.iter_mut().enumerate() {
                 let orig_idx = si.orig_idx;
-                let item = si.item;
+                let item = &mut *si.item;
                 if let Some(ref g) = resolved_guard {
                     if let Some(Some(ref next_entry)) = g.vec.get(local_idx + 4) {
                         let next_ptr = Arc::as_ptr(next_entry);
@@ -2389,18 +2397,12 @@ impl Ingester {
 
                 let mut num_native_hist_buckets: i64 = -1;
                 let ex_count = item.exemplars.len();
-                let lazy_pairs: SmallVec<[(&str, &str); 24]> = if (native_histograms_enabled
-                    && hist_count > 0)
-                    || (ex_count > 0 && max_exemplars > 0)
-                {
-                    iter_stringlabels(encoded_labels).collect()
-                } else {
-                    SmallVec::new()
-                };
 
                 if native_histograms_enabled && hist_count > 0 {
-                    let pairs = lazy_pairs.as_slice();
-                    for (h_ts, is_float, ih_opt, fh_opt, _bucket_count) in item.histograms.iter() {
+                    let h_total = item.histograms.len();
+                    for (h_idx, (h_ts, is_float, ih_opt, fh_opt, _bucket_count)) in
+                        item.histograms.iter_mut().enumerate()
+                    {
                         let h_ts = *h_ts;
                         let is_float = *is_float;
 
@@ -2421,7 +2423,17 @@ impl Ingester {
 
                         if ingest_created_ts && created_ts < h_ts {
                             let ct_res = if is_float {
-                                let fh_ref = fh_opt.as_ref().expect("float histogram");
+                                let Some(fh_ref) = fh_opt.as_ref() else {
+                                    debug_assert!(false, "missing converted float histogram");
+                                    hard_err = Some((
+                                        orig_idx,
+                                        IngesterError::Internal {
+                                            message: "missing converted float histogram".to_string(),
+                                        }
+                                        .with_user(user_id, 0),
+                                    ));
+                                    break;
+                                };
                                 let zero_fh = FloatHistogram {
                                     counter_reset_hint: CounterResetHint::CounterReset,
                                     schema: fh_ref.schema,
@@ -2429,11 +2441,27 @@ impl Ingester {
                                     custom_values: fh_ref.custom_values.clone(),
                                     ..FloatHistogram::default()
                                 };
-                                app.append_float_histogram_reject_ooo(
-                                    series_ref, pairs, created_ts, zero_fh,
+                                app.append_float_histogram_with_entry_prehashed_encoded(
+                                    &mut series_entry,
+                                    item.prom_hash,
+                                    encoded_labels,
+                                    0,
+                                    created_ts,
+                                    zero_fh,
+                                    true,
                                 )
                             } else {
-                                let ih_ref = ih_opt.as_ref().expect("int histogram");
+                                let Some(ih_ref) = ih_opt.as_ref() else {
+                                    debug_assert!(false, "missing converted int histogram");
+                                    hard_err = Some((
+                                        orig_idx,
+                                        IngesterError::Internal {
+                                            message: "missing converted int histogram".to_string(),
+                                        }
+                                        .with_user(user_id, 0),
+                                    ));
+                                    break;
+                                };
                                 let zero_ih = Histogram {
                                     counter_reset_hint: CounterResetHint::CounterReset,
                                     schema: ih_ref.schema,
@@ -2441,8 +2469,14 @@ impl Ingester {
                                     custom_values: ih_ref.custom_values.clone(),
                                     ..Histogram::default()
                                 };
-                                app.append_histogram_reject_ooo(
-                                    series_ref, pairs, created_ts, zero_ih,
+                                app.append_histogram_with_entry_prehashed_encoded(
+                                    &mut series_entry,
+                                    item.prom_hash,
+                                    encoded_labels,
+                                    0,
+                                    created_ts,
+                                    zero_ih,
+                                    true,
                                 )
                             };
                             match ct_res {
@@ -2473,22 +2507,75 @@ impl Ingester {
                             created_ts = 0;
                         }
 
+                        let take_entry = h_idx + 1 == h_total
+                            && !active_series_enabled
+                            && !(ex_count > 0 && max_exemplars > 0);
                         let res = if is_float {
-                            app.append_float_histogram(
-                                series_ref,
-                                pairs,
-                                0,
-                                h_ts,
-                                fh_opt.as_ref().expect("float histogram").clone(),
-                            )
+                            let Some(fh) = fh_opt.take() else {
+                                debug_assert!(false, "missing converted float histogram");
+                                hard_err = Some((
+                                    orig_idx,
+                                    IngesterError::Internal {
+                                        message: "missing converted float histogram".to_string(),
+                                    }
+                                    .with_user(user_id, 0),
+                                ));
+                                break;
+                            };
+                            if take_entry {
+                                app.append_float_histogram_with_entry_prehashed_encoded_take(
+                                    &mut series_entry,
+                                    item.prom_hash,
+                                    encoded_labels,
+                                    0,
+                                    h_ts,
+                                    fh,
+                                    false,
+                                )
+                            } else {
+                                app.append_float_histogram_with_entry_prehashed_encoded(
+                                    &mut series_entry,
+                                    item.prom_hash,
+                                    encoded_labels,
+                                    0,
+                                    h_ts,
+                                    fh,
+                                    false,
+                                )
+                            }
                         } else {
-                            app.append_histogram(
-                                series_ref,
-                                pairs,
-                                0,
-                                h_ts,
-                                ih_opt.as_ref().expect("int histogram").clone(),
-                            )
+                            let Some(ih) = ih_opt.take() else {
+                                debug_assert!(false, "missing converted int histogram");
+                                hard_err = Some((
+                                    orig_idx,
+                                    IngesterError::Internal {
+                                        message: "missing converted int histogram".to_string(),
+                                    }
+                                    .with_user(user_id, 0),
+                                ));
+                                break;
+                            };
+                            if take_entry {
+                                app.append_histogram_with_entry_prehashed_encoded_take(
+                                    &mut series_entry,
+                                    item.prom_hash,
+                                    encoded_labels,
+                                    0,
+                                    h_ts,
+                                    ih,
+                                    false,
+                                )
+                            } else {
+                                app.append_histogram_with_entry_prehashed_encoded(
+                                    &mut series_entry,
+                                    item.prom_hash,
+                                    encoded_labels,
+                                    0,
+                                    h_ts,
+                                    ih,
+                                    false,
+                                )
+                            }
                         };
 
                         match res {
@@ -2526,7 +2613,11 @@ impl Ingester {
 
                 if active_series_enabled && stats.succeeded_samples > prev_succeeded {
                     if let Some(ref_id) = series_ref {
-                        let entry = series_entry;
+                        let entry = if ex_count > 0 && max_exemplars > 0 {
+                            series_entry.clone()
+                        } else {
+                            series_entry.take()
+                        };
                         active_updates.push(ActiveUpdate {
                             entry,
                             encoded_labels,
@@ -2566,7 +2657,6 @@ impl Ingester {
                         }
                         stats.failed_exemplars += ex_count;
                     } else {
-                        let pairs = lazy_pairs.as_slice();
                         let mut out_of_order_exemplars = 0usize;
                         for ex_res in item.exemplars {
                             let (ex_ts, ex_val, ex_labels, ex_str) = match ex_res {
@@ -2637,7 +2727,13 @@ impl Ingester {
                                 continue;
                             }
                             let exemplar = Exemplar::new(ex_labels.clone(), *ex_val, ex_ts);
-                            match app.append_exemplar(series_ref, pairs, exemplar) {
+                            match app.append_exemplar_with_entry_encoded(
+                                series_entry.as_ref(),
+                                series_ref,
+                                item.prom_hash,
+                                encoded_labels,
+                                exemplar,
+                            ) {
                                 Ok(_) => stats.succeeded_exemplars += 1,
                                 Err(HeadError::Exemplar(ExemplarError::OutOfOrderExemplar)) => {
                                     stats.failed_exemplars += 1;
@@ -2700,7 +2796,9 @@ impl Ingester {
             }
         });
 
-        let mut prepared: Vec<PreparedShard<'_, '_>> = Vec::with_capacity(active_shards.len());
+        let active_shard_count = active_shards.len();
+        drop(active_shards);
+        let mut prepared: Vec<PreparedShard<'_, '_>> = Vec::with_capacity(active_shard_count);
         let mut first_hard_err: Option<(usize, IngesterError)> = None;
         for slot in shard_slots {
             match slot.into_inner() {
@@ -2848,7 +2946,7 @@ impl Ingester {
         user_id: &str,
         source: cortexpb::write_request::SourceEnum,
         min_ts: i64,
-        items: &[PrehashedSeriesItem<'_>],
+        items: &mut [PrehashedSeriesItem<'_>],
     ) -> Result<(), IngesterError> {
         let db = self.get_or_create_tsdb(user_id).map_err(|e| {
             let wrapped = e.with_user(user_id, 0);
@@ -2870,7 +2968,7 @@ impl Ingester {
         db: &Arc<crate::user_tsdb::UserTsdb>,
         lock_guard: crate::user_tsdb::AppendLockGuard<'a>,
         source: cortexpb::write_request::SourceEnum,
-        items: &[PrehashedSeriesItem<'_>],
+        items: &mut [PrehashedSeriesItem<'_>],
     ) -> Result<(), IngesterError> {
         let start_append = SystemTime::now();
         let start_append_ms = start_append
@@ -2946,7 +3044,7 @@ impl Ingester {
             None
         };
 
-        for (idx, item) in items.iter().enumerate() {
+        for (idx, item) in items.iter_mut().enumerate() {
             if let Some(ref g) = resolved_guard {
                 if let Some(Some(ref next_entry)) = g.vec.get(idx + 4) {
                     let next_ptr = Arc::as_ptr(next_entry);
@@ -3185,17 +3283,12 @@ impl Ingester {
 
             let mut num_native_hist_buckets: i64 = -1;
             let ex_count = item.exemplars.len();
-            let lazy_pairs: SmallVec<[(&str, &str); 24]> =
-                if (native_histograms_enabled && hist_count > 0) || (ex_count > 0 && max_exemplars > 0)
-                {
-                    iter_stringlabels(encoded_labels).collect()
-                } else {
-                    SmallVec::new()
-                };
 
             if native_histograms_enabled && hist_count > 0 {
-                let pairs = lazy_pairs.as_slice();
-                for (h_ts, is_float, ih_opt, fh_opt, _bucket_count) in item.histograms.iter() {
+                let h_total = item.histograms.len();
+                for (h_idx, (h_ts, is_float, ih_opt, fh_opt, _bucket_count)) in
+                    item.histograms.iter_mut().enumerate()
+                {
                     let h_ts = *h_ts;
                     let is_float = *is_float;
 
@@ -3216,7 +3309,13 @@ impl Ingester {
 
                     if ingest_created_ts && created_ts < h_ts {
                         let ct_res = if is_float {
-                            let fh_ref = fh_opt.as_ref().expect("float histogram");
+                            let Some(fh_ref) = fh_opt.as_ref() else {
+                                debug_assert!(false, "missing converted float histogram");
+                                return Err(IngesterError::Internal {
+                                    message: "missing converted float histogram".to_string(),
+                                }
+                                .with_user(user_id, 0));
+                            };
                             let zero_fh = FloatHistogram {
                                 counter_reset_hint: CounterResetHint::CounterReset,
                                 schema: fh_ref.schema,
@@ -3224,11 +3323,23 @@ impl Ingester {
                                 custom_values: fh_ref.custom_values.clone(),
                                 ..FloatHistogram::default()
                             };
-                            app.append_float_histogram_reject_ooo(
-                                series_ref, pairs, created_ts, zero_fh,
+                            app.append_float_histogram_with_entry_prehashed_encoded(
+                                &mut series_entry,
+                                item.prom_hash,
+                                encoded_labels,
+                                0,
+                                created_ts,
+                                zero_fh,
+                                true,
                             )
                         } else {
-                            let ih_ref = ih_opt.as_ref().expect("int histogram");
+                            let Some(ih_ref) = ih_opt.as_ref() else {
+                                debug_assert!(false, "missing converted int histogram");
+                                return Err(IngesterError::Internal {
+                                    message: "missing converted int histogram".to_string(),
+                                }
+                                .with_user(user_id, 0));
+                            };
                             let zero_ih = Histogram {
                                 counter_reset_hint: CounterResetHint::CounterReset,
                                 schema: ih_ref.schema,
@@ -3236,8 +3347,14 @@ impl Ingester {
                                 custom_values: ih_ref.custom_values.clone(),
                                 ..Histogram::default()
                             };
-                            app.append_histogram_reject_ooo(
-                                series_ref, pairs, created_ts, zero_ih,
+                            app.append_histogram_with_entry_prehashed_encoded(
+                                &mut series_entry,
+                                item.prom_hash,
+                                encoded_labels,
+                                0,
+                                created_ts,
+                                zero_ih,
+                                true,
                             )
                         };
                         match ct_res {
@@ -3268,22 +3385,66 @@ impl Ingester {
                         created_ts = 0;
                     }
 
+                    let take_entry = h_idx + 1 == h_total
+                        && !(ex_count > 0 && max_exemplars > 0);
                     let res = if is_float {
-                        app.append_float_histogram(
-                            series_ref,
-                            pairs,
-                            0,
-                            h_ts,
-                            fh_opt.as_ref().expect("float histogram").clone(),
-                        )
+                        let Some(fh) = fh_opt.take() else {
+                            debug_assert!(false, "missing converted float histogram");
+                            return Err(IngesterError::Internal {
+                                message: "missing converted float histogram".to_string(),
+                            }
+                            .with_user(user_id, 0));
+                        };
+                        if take_entry {
+                            app.append_float_histogram_with_entry_prehashed_encoded_take(
+                                &mut series_entry,
+                                item.prom_hash,
+                                encoded_labels,
+                                0,
+                                h_ts,
+                                fh,
+                                false,
+                            )
+                        } else {
+                            app.append_float_histogram_with_entry_prehashed_encoded(
+                                &mut series_entry,
+                                item.prom_hash,
+                                encoded_labels,
+                                0,
+                                h_ts,
+                                fh,
+                                false,
+                            )
+                        }
                     } else {
-                        app.append_histogram(
-                            series_ref,
-                            pairs,
-                            0,
-                            h_ts,
-                            ih_opt.as_ref().expect("int histogram").clone(),
-                        )
+                        let Some(ih) = ih_opt.take() else {
+                            debug_assert!(false, "missing converted int histogram");
+                            return Err(IngesterError::Internal {
+                                message: "missing converted int histogram".to_string(),
+                            }
+                            .with_user(user_id, 0));
+                        };
+                        if take_entry {
+                            app.append_histogram_with_entry_prehashed_encoded_take(
+                                &mut series_entry,
+                                item.prom_hash,
+                                encoded_labels,
+                                0,
+                                h_ts,
+                                ih,
+                                false,
+                            )
+                        } else {
+                            app.append_histogram_with_entry_prehashed_encoded(
+                                &mut series_entry,
+                                item.prom_hash,
+                                encoded_labels,
+                                0,
+                                h_ts,
+                                ih,
+                                false,
+                            )
+                        }
                     };
 
                     match res {
@@ -3319,7 +3480,9 @@ impl Ingester {
                 if let Some(ref_id) = series_ref {
                     let entry_ref = series_entry
                         .as_deref()
-                        .or_else(|| app.last_float_entry().filter(|e| e.ref_id == ref_id));
+                        .or_else(|| app.last_float_entry().filter(|e| e.ref_id == ref_id))
+                        .or_else(|| app.last_histogram_entry().filter(|e| e.ref_id == ref_id))
+                        .or_else(|| app.last_float_histogram_entry().filter(|e| e.ref_id == ref_id));
                     db.active_series.update_series_with_entry_encoded(
                         entry_ref,
                         encoded_labels,
@@ -3361,7 +3524,6 @@ impl Ingester {
                     }
                     stats.failed_exemplars += ex_count;
                 } else {
-                    let pairs = lazy_pairs.as_slice();
                     let mut out_of_order_exemplars = 0usize;
                     for ex_res in item.exemplars {
                         let (ex_ts, ex_val, ex_labels, ex_str) = match ex_res {
@@ -3432,7 +3594,13 @@ impl Ingester {
                             continue;
                         }
                         let exemplar = Exemplar::new(ex_labels.clone(), *ex_val, ex_ts);
-                        match app.append_exemplar(series_ref, pairs, exemplar) {
+                        match app.append_exemplar_with_entry_encoded(
+                            series_entry.as_ref(),
+                            series_ref,
+                            item.prom_hash,
+                            encoded_labels,
+                            exemplar,
+                        ) {
                             Ok(_) => stats.succeeded_exemplars += 1,
                             Err(HeadError::Exemplar(ExemplarError::OutOfOrderExemplar)) => {
                                 stats.failed_exemplars += 1;
@@ -5860,7 +6028,7 @@ mod wave3_tests {
                 "t-empty-unavail",
                 cortexpb::write_request::SourceEnum::Api,
                 i64::MAX,
-                &[],
+                &mut [],
                 &[],
                 None,
             )
@@ -5876,7 +6044,7 @@ mod wave3_tests {
             "t-empty-ok",
             cortexpb::write_request::SourceEnum::Api,
             i64::MAX,
-            &[],
+            &mut [],
             &[],
             None,
         )

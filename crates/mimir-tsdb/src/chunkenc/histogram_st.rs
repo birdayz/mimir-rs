@@ -189,7 +189,7 @@ impl HistogramStChunk {
         t: i64,
         h: &Histogram,
     ) -> Result<AppendHistogramStOutcome, ChunkError> {
-        let mut app = match cached.take() {
+        let app = match cached.take() {
             Some((state, st_enc)) => HistogramStAppender {
                 chunk: self,
                 state,
@@ -316,7 +316,7 @@ impl<'a> HistogramStAppender<'a> {
     }
 
     fn append_histogram_with_state(
-        &mut self,
+        mut self,
         prev: Option<&HistogramAppenderState>,
         st: i64,
         t: i64,
@@ -324,10 +324,7 @@ impl<'a> HistogramStAppender<'a> {
         append_only: bool,
     ) -> Result<(AppendHistogramStOutcome, (HistogramAppenderState, StEncoder)), ChunkError> {
         let (out, next_cached) = self.append_histogram_inner(prev, st, t, h, append_only, true)?;
-        let cached = match next_cached {
-            Some(c) => c,
-            None => (self.state.clone(), self.st_enc.clone()),
-        };
+        let cached = next_cached.unwrap_or((self.state, self.st_enc));
         Ok((out, cached))
     }
 
