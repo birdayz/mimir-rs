@@ -649,6 +649,45 @@ impl Block {
         )
     }
 
+    /// Evaluates `matchers` against this block's index using its `PostingsForMatchersCache`,
+    /// also returning the cache entry's singleflight `ShardHashSlot` when `concurrent` is true.
+    pub(crate) fn postings_for_matchers_with_shard_slot(
+        &self,
+        matchers: &[LabelMatcher],
+        concurrent: bool,
+    ) -> Result<(Arc<[u64]>, Option<crate::postings_cache::ShardHashSlot>), PostingsError> {
+        self.postings_cache.get_or_compute_with_shard_slot_for_source(
+            self.postings_cache_source_id,
+            matchers,
+            concurrent,
+            || postings_for_matchers(&self.index, matchers),
+        )
+    }
+
+    /// Computes or returns cached Prometheus `StableHash` values for `refs` stored in the
+    /// `PostingsForMatchersCache` entry's singleflight `slot` (automatically evicted with the
+    /// postings entry). Errors are never cached so corrupt blocks always return `IndexError`.
+    pub(crate) fn resolve_shard_hashes_in_slot(
+        &self,
+        refs: &[u64],
+        slot: Option<&crate::postings_cache::ShardHashSlot>,
+    ) -> Result<Option<Arc<[u64]>>, IndexError> {
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        let mut guard = slot.lock();
+        if let Some(ref cached) = *guard {
+            return Ok(cached.as_ref().map(Arc::clone));
+        }
+        let mut hashes = Vec::with_capacity(refs.len());
+        for &r in refs {
+            hashes.push(self.index.series_stable_hash(r)?);
+        }
+        let arc: Arc<[u64]> = Arc::from(hashes);
+        *guard = Some(Some(Arc::clone(&arc)));
+        Ok(Some(arc))
+    }
+
     /// Evaluates `matchers` directly against this block's index, bypassing `PostingsForMatchersCache`.
     pub fn postings_for_matchers_direct(
         &self,
@@ -897,5 +936,75 @@ mod tests {
         assert!(disk_meta.compaction.failed, "Block::delete must preserve compaction.failed");
         assert!(disk_meta.compaction.deletable, "Block::delete must preserve compaction.deletable");
         assert!(disk_meta.stats.num_tombstones > 0);
+    }
+
+    #[test]
+    fn shard_hashes_for_postings_singleflight_and_prunes_after_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = {
+            let db = crate::db::Tsdb::open(dir.path(), crate::db::TsdbOptions::default()).unwrap();
+            let mut app = db.appender();
+            for i in 0..64 {
+                let pod = format!("p-{i:03}");
+                app.append_float(None, &[("__name__", "shard_metric"), ("pod", pod.as_str())], 1_000, i as f64)
+                    .unwrap();
+            }
+            app.commit().unwrap();
+            let uid = db.compact_head_all().unwrap().unwrap();
+            db.close().unwrap();
+            uid
+        };
+        let bdir = dir.path().join(uid.to_string());
+        let blk = Arc::new(Block::open(&bdir).unwrap());
+        let matchers = [LabelMatcher::new(
+            crate::matcher::MatchType::Equal,
+            "__name__",
+            "shard_metric",
+        )
+        .unwrap()];
+
+        // Uncached / non-concurrent lookup returns no shard-hash slot.
+        let (_direct_refs, no_slot) = blk
+            .postings_for_matchers_with_shard_slot(&matchers, false)
+            .unwrap();
+        assert!(no_slot.is_none());
+
+        // Concurrent lookup from PostingsForMatchersCache shares one singleflight ShardHashSlot
+        // across all 16 threads and drops hashes when the postings cache invalidates the source.
+        let (cached_refs, slot) = blk
+            .postings_for_matchers_with_shard_slot(&matchers, true)
+            .unwrap();
+        let slot = slot.expect("concurrent postings lookup must carry a shard-hash slot");
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let b = Arc::clone(&blk);
+            let r = Arc::clone(&cached_refs);
+            let s = Arc::clone(&slot);
+            handles.push(std::thread::spawn(move || {
+                b.resolve_shard_hashes_in_slot(&r, Some(&s)).unwrap().unwrap()
+            }));
+        }
+        let first = handles.remove(0).join().unwrap();
+        assert_eq!(first.len(), cached_refs.len());
+        for (ref_id, &h) in cached_refs.iter().zip(first.iter()) {
+            assert_eq!(h, blk.index().series_labels(*ref_id).unwrap().stable_hash());
+        }
+        for handle in handles {
+            let other = handle.join().unwrap();
+            assert!(Arc::ptr_eq(&first, &other));
+        }
+
+        // Evicting/invalidating the postings cache drops its reference to the shard-hash slot.
+        let weak_hashes = Arc::downgrade(&first);
+        drop(first);
+        drop(slot);
+        drop(cached_refs);
+        blk.postings_cache.invalidate_source(blk.postings_cache_source_id);
+        blk.postings_cache.remove_source(blk.postings_cache_source_id);
+        assert!(
+            weak_hashes.upgrade().is_none(),
+            "shard hashes must be freed immediately when postings cache entry is removed"
+        );
     }
 }

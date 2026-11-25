@@ -48,8 +48,8 @@ pub enum CompressionType {
 pub type WlogCompression = CompressionType;
 
 thread_local! {
-    static TLS_SNAPPY_ENCODER: RefCell<snap::raw::Encoder> =
-        RefCell::new(snap::raw::Encoder::new());
+    static TLS_SNAPPY_ENCODER: RefCell<(snap::raw::Encoder, Vec<u8>)> =
+        RefCell::new((snap::raw::Encoder::new(), Vec::new()));
     static TLS_ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
         const { RefCell::new(None) };
 }
@@ -72,18 +72,36 @@ pub fn compress_wal_record(
         CompressionType::None => unreachable!(),
         CompressionType::Snappy => {
             let max_len = snap::raw::max_compress_len(rec.len());
-            if out.len() < max_len {
-                out.resize(max_len, 0);
-            }
-            let n = TLS_SNAPPY_ENCODER.with(|cell| {
-                if let Ok(mut enc) = cell.try_borrow_mut() {
-                    enc.compress(rec, &mut out[..max_len])
-                } else {
-                    snap::raw::Encoder::new().compress(rec, &mut out[..max_len])
-                }
-            })
-            .map_err(|e| WlogError::Compression(e.to_string()))?;
-            out.truncate(n);
+            out.clear();
+            let is_smaller = TLS_SNAPPY_ENCODER
+                .with(|cell| -> Result<bool, WlogError> {
+                    if let Ok(mut guard) = cell.try_borrow_mut() {
+                        let (enc, scratch) = &mut *guard;
+                        if scratch.len() < max_len {
+                            scratch.resize(max_len, 0);
+                        }
+                        let n = enc
+                            .compress(rec, &mut scratch[..max_len])
+                            .map_err(|e| WlogError::Compression(e.to_string()))?;
+                        let smaller = n < rec.len();
+                        if smaller {
+                            out.extend_from_slice(&scratch[..n]);
+                        }
+                        if scratch.len() > 4 * 1024 * 1024 {
+                            scratch.truncate(256 * 1024);
+                            scratch.shrink_to_fit();
+                        }
+                        Ok(smaller)
+                    } else {
+                        out.resize(max_len, 0);
+                        let n = snap::raw::Encoder::new()
+                            .compress(rec, &mut out[..max_len])
+                            .map_err(|e| WlogError::Compression(e.to_string()))?;
+                        out.truncate(n);
+                        Ok(n < rec.len())
+                    }
+                })?;
+            return Ok(is_smaller);
         }
         CompressionType::Zstd => {
             let bound = zstd::zstd_safe::compress_bound(rec.len());
@@ -135,24 +153,42 @@ pub fn compress_wal_record_append(
         CompressionType::None => unreachable!(),
         CompressionType::Snappy => {
             let max_len = snap::raw::max_compress_len(rec.len());
-            out.resize(base + max_len, 0);
-            let n = TLS_SNAPPY_ENCODER
-                .with(|cell| {
-                    if let Ok(mut enc) = cell.try_borrow_mut() {
-                        enc.compress(rec, &mut out[base..base + max_len])
-                    } else {
-                        snap::raw::Encoder::new().compress(rec, &mut out[base..base + max_len])
+            TLS_SNAPPY_ENCODER.with(|cell| -> Result<bool, WlogError> {
+                if let Ok(mut guard) = cell.try_borrow_mut() {
+                    let (enc, scratch) = &mut *guard;
+                    if scratch.len() < max_len {
+                        scratch.resize(max_len, 0);
                     }
-                })
-                .map_err(|e| WlogError::Compression(e.to_string()))?;
-            if n < rec.len() {
-                out.truncate(base + n);
-                Ok(true)
-            } else {
-                out.truncate(base);
-                out.extend_from_slice(rec);
-                Ok(false)
-            }
+                    let n = enc
+                        .compress(rec, &mut scratch[..max_len])
+                        .map_err(|e| WlogError::Compression(e.to_string()))?;
+                    let res = if n < rec.len() {
+                        out.extend_from_slice(&scratch[..n]);
+                        true
+                    } else {
+                        out.extend_from_slice(rec);
+                        false
+                    };
+                    if scratch.len() > 4 * 1024 * 1024 {
+                        scratch.truncate(256 * 1024);
+                        scratch.shrink_to_fit();
+                    }
+                    Ok(res)
+                } else {
+                    out.resize(base + max_len, 0);
+                    let n = snap::raw::Encoder::new()
+                        .compress(rec, &mut out[base..base + max_len])
+                        .map_err(|e| WlogError::Compression(e.to_string()))?;
+                    if n < rec.len() {
+                        out.truncate(base + n);
+                        Ok(true)
+                    } else {
+                        out.truncate(base);
+                        out.extend_from_slice(rec);
+                        Ok(false)
+                    }
+                }
+            })
         }
         CompressionType::Zstd => {
             let bound = zstd::zstd_safe::compress_bound(rec.len());
@@ -336,6 +372,7 @@ pub struct WlogWriter {
     rollback_page_buf: Vec<u8>,
     fault_hook: Option<WriteFaultHook>,
     metrics: Option<crate::metrics::WlogMetrics>,
+    cached_bytes_saved: Option<prometheus::Counter>,
     metrics_reg: Option<(prometheus::Registry, String)>,
 }
 
@@ -380,6 +417,7 @@ impl WlogWriter {
             rollback_page_buf: Vec::new(),
             fault_hook: None,
             metrics: None,
+            cached_bytes_saved: None,
             metrics_reg: None,
         })
     }
@@ -493,6 +531,7 @@ impl WlogWriter {
             metrics.current_segment.set(seg.index as f64);
         }
         self.metrics = Some(metrics);
+        self.cached_bytes_saved = None;
     }
 
     fn set_current_segment_metric(&self, index: usize) {
@@ -704,7 +743,7 @@ impl WlogWriter {
     }
 
     fn record_compression_savings(
-        &self,
+        &mut self,
         uncomp_len: usize,
         payload_len: usize,
         compressed: bool,
@@ -714,15 +753,19 @@ impl WlogWriter {
             CompressionType::Snappy => "snappy",
             CompressionType::Zstd => "zstd",
         };
+        let saved = if compressed {
+            uncomp_len.saturating_sub(payload_len)
+        } else {
+            0
+        };
+        if let Some(ref c) = self.cached_bytes_saved {
+            c.inc_by(saved as f64);
+            return;
+        }
         if let Some(m) = self.metrics.as_ref() {
-            let saved = if compressed {
-                uncomp_len.saturating_sub(payload_len)
-            } else {
-                0
-            };
-            m.record_bytes_saved
-                .with_label_values(&[comp_label])
-                .inc_by(saved as f64);
+            let c = m.record_bytes_saved.with_label_values(&[comp_label]);
+            c.inc_by(saved as f64);
+            self.cached_bytes_saved = Some(c);
         }
     }
 

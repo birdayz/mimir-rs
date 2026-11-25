@@ -1009,12 +1009,20 @@ impl SeriesHashCache {
 }
 
 /// Memory-mapped or byte-slice reader for Prometheus TSDB Index v1/v2/v3 files.
+/// Upper bound on symbol count for lazily building a direct `Box<[u32]>` offset table (<= 512 KiB).
+const MAX_DIRECT_SYMBOL_OFFSETS: usize = 131_072;
+
+/// Memory-mapped Prometheus TSDB block index reader (format v1/v2/v3).
 #[derive(Debug)]
 pub struct IndexReader {
     mmap: IndexData,
     version: u8,
     toc: IndexToc,
     symbol_offsets: Vec<usize>,
+    /// Lazily populated O(1) `symbol_id -> mmap byte offset` table for queried v2/v3 indexes
+    /// up to 4 GiB and `MAX_DIRECT_SYMBOL_OFFSETS` symbols (0 B until first query).
+    direct_symbol_offsets: std::sync::OnceLock<Box<[u32]>>,
+    can_build_direct_symbols: bool,
     num_symbols: usize,
     name_cache: HashMap<u32, (u32, u32)>,
     postings_index: Vec<Box<[PostingOffsetEntry]>>,
@@ -1049,6 +1057,10 @@ impl IndexReader {
 
         let toc = IndexToc::parse(&mmap)?;
         let (symbol_offsets, num_symbols) = parse_symbols_index(&mmap, toc.symbols as usize)?;
+        let can_build_direct_symbols = version != INDEX_FORMAT_V1
+            && num_symbols > 0
+            && mmap.len() <= u32::MAX as usize
+            && num_symbols <= MAX_DIRECT_SYMBOL_OFFSETS;
         let postings_table_off = usize::try_from(toc.postings_table)
             .map_err(|_| IndexError::Encoding(EncodingError::InvalidSize))?;
         let postings_payload_start = postings_table_off
@@ -1066,7 +1078,11 @@ impl IndexReader {
             (Vec::new(), postings_v1, name_cache)
         } else {
             let postings_index = parse_postings_offset_table(&mmap, postings_table_off)?;
-            let mut name_cache = HashMap::with_capacity(postings_index.len());
+            let mut name_cache = if can_build_direct_symbols {
+                HashMap::new()
+            } else {
+                HashMap::with_capacity(postings_index.len())
+            };
             for entries in &postings_index {
                 let Some(first) = entries.first() else {
                     continue;
@@ -1081,8 +1097,12 @@ impl IndexReader {
                 );
                 // SAFETY: `parse_postings_offset_table` validated UTF-8 and slice bounds on `mmap`.
                 let name = unsafe { std::str::from_utf8_unchecked(&mmap[start..end]) };
-                let sid = reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name, version)?;
-                name_cache.insert(sid, (first.name_off, first.name_len));
+                // Always verify postings label names exist in the symbol table (matches Go `index.go:1162`).
+                let sid =
+                    reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name, version)?;
+                if !can_build_direct_symbols {
+                    name_cache.insert(sid, (first.name_off, first.name_len));
+                }
             }
             (postings_index, BTreeMap::new(), name_cache)
         };
@@ -1092,6 +1112,8 @@ impl IndexReader {
             version,
             toc,
             symbol_offsets,
+            direct_symbol_offsets: std::sync::OnceLock::new(),
+            can_build_direct_symbols,
             num_symbols,
             name_cache,
             postings_index,
@@ -1149,23 +1171,29 @@ impl IndexReader {
             let mut dec = Decbuf::new(slice);
             return Ok(dec.uvarint_str()?);
         }
-        if (o as usize) >= self.num_symbols {
+        let idx = o as usize;
+        if idx >= self.num_symbols {
             return Err(IndexError::UnknownSymbolOffset(o));
         }
-        let mut off = self.symbol_offsets[(o as usize) / SYMBOL_FACTOR];
-        let skip = (o as usize) % SYMBOL_FACTOR;
         let mmap = &self.mmap;
-        for _ in 0..skip {
-            let b0 = mmap[off];
-            if b0 < 0x80 {
-                off += 1 + (b0 as usize);
-            } else {
-                let mut dec = Decbuf::new(&mmap[off..]);
-                let len = dec.uvarint()?;
-                let hdr = (mmap.len() - off) - dec.len();
-                off += hdr + len;
+        let off = if let Some(direct) = self.get_direct_symbol_offsets() {
+            direct[idx] as usize
+        } else {
+            let mut off = self.symbol_offsets[idx / SYMBOL_FACTOR];
+            let skip = idx % SYMBOL_FACTOR;
+            for _ in 0..skip {
+                let b0 = mmap[off];
+                if b0 < 0x80 {
+                    off += 1 + (b0 as usize);
+                } else {
+                    let mut dec = Decbuf::new(&mmap[off..]);
+                    let len = dec.uvarint()?;
+                    let hdr = (mmap.len() - off) - dec.len();
+                    off += hdr + len;
+                }
             }
-        }
+            off
+        };
         let b0 = mmap[off];
         let (len, str_off) = if b0 < 0x80 {
             (b0 as usize, off + 1)
@@ -1177,6 +1205,31 @@ impl IndexReader {
         };
         // SAFETY: `parse_symbols_index` validates bounds and UTF-8 for every symbol on open.
         Ok(unsafe { std::str::from_utf8_unchecked(&mmap[str_off..str_off + len]) })
+    }
+
+    #[inline]
+    fn get_direct_symbol_offsets(&self) -> Option<&[u32]> {
+        if !self.can_build_direct_symbols {
+            return None;
+        }
+        Some(self.direct_symbol_offsets.get_or_init(|| {
+            let mut out = Vec::with_capacity(self.num_symbols);
+            let mmap = &self.mmap;
+            let mut off = self.symbol_offsets[0];
+            for _ in 0..self.num_symbols {
+                out.push(off as u32);
+                let b0 = mmap[off];
+                if b0 < 0x80 {
+                    off += 1 + (b0 as usize);
+                } else {
+                    let mut dec = Decbuf::new(&mmap[off..]);
+                    let len = dec.uvarint().unwrap_or(0);
+                    let hdr = (mmap.len() - off) - dec.len();
+                    off += hdr + len;
+                }
+            }
+            out.into_boxed_slice()
+        }))
     }
 
     /// Returns all symbols in ascending lexicographical order.
@@ -1266,12 +1319,17 @@ impl IndexReader {
         let mut pos = 0usize;
         let mut heap_buf: Option<Vec<u8>> = None;
 
+        let use_direct = self.can_build_direct_symbols;
         for _ in 0..num_labels {
             let lno = dec.uvarint32()?;
             let lvo = dec.uvarint32()?;
-            let ln = match self.name_cache.get(&lno) {
-                Some(&(off, len)) => self.mmap_str(off, len),
-                None => self.lookup_symbol(lno)?,
+            let ln = if use_direct {
+                self.lookup_symbol(lno)?
+            } else {
+                match self.name_cache.get(&lno) {
+                    Some(&(off, len)) => self.mmap_str(off, len),
+                    None => self.lookup_symbol(lno)?,
+                }
             };
             let lv = self.lookup_symbol(lvo)?;
             if ln.len() >= (1 << 24) || lv.len() >= (1 << 24) {
@@ -1370,6 +1428,60 @@ impl IndexReader {
         let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
         let mut dec = Decbuf::new(payload);
         self.decode_series_labels(&mut dec)
+    }
+
+    /// Computes Prometheus `labels.Labels.StableHash()` directly from the index entry at `ref_id`
+    /// with full CRC32C verification and zero heap allocations (skipping `Labels` construction and
+    /// `ChunkMeta` decoding).
+    pub fn series_stable_hash(&self, ref_id: u64) -> Result<u64, IndexError> {
+        let offset = self.series_offset(ref_id)?;
+        let payload = checked_uvarint_decbuf_at(&self.mmap, offset)?;
+        let mut dec = Decbuf::new(payload);
+        let num_labels = dec.uvarint()?;
+        let mut stack_buf = [0u8; 1024];
+        let mut pos = 0usize;
+        let mut hasher: Option<xxhash_rust::xxh64::Xxh64> = None;
+        let use_direct = self.can_build_direct_symbols;
+
+        for _ in 0..num_labels {
+            let lno = dec.uvarint32()?;
+            let lvo = dec.uvarint32()?;
+            let ln = if use_direct {
+                self.lookup_symbol(lno)?
+            } else {
+                match self.name_cache.get(&lno) {
+                    Some(&(off, len)) => self.mmap_str(off, len),
+                    None => self.lookup_symbol(lno)?,
+                }
+            };
+            let lv = self.lookup_symbol(lvo)?;
+            let nb = ln.as_bytes();
+            let vb = lv.as_bytes();
+            if hasher.is_none() && pos + nb.len() + vb.len() + 2 >= stack_buf.len() {
+                let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+                h.update(&stack_buf[..pos]);
+                hasher = Some(h);
+            }
+            if let Some(ref mut h) = hasher {
+                h.update(nb);
+                h.update(&[0xff]);
+                h.update(vb);
+                h.update(&[0xff]);
+            } else {
+                stack_buf[pos..pos + nb.len()].copy_from_slice(nb);
+                pos += nb.len();
+                stack_buf[pos] = 0xff;
+                pos += 1;
+                stack_buf[pos..pos + vb.len()].copy_from_slice(vb);
+                pos += vb.len();
+                stack_buf[pos] = 0xff;
+                pos += 1;
+            }
+        }
+        Ok(match hasher {
+            Some(h) => h.digest(),
+            None => xxhash_rust::xxh64::xxh64(&stack_buf[..pos], 0),
+        })
     }
 
     /// Decodes a raw postings list at `postings_off`.
@@ -3208,5 +3320,79 @@ mod tests {
         let (lbl3, _) = r.series(sids[1]).unwrap();
         assert_eq!(lbl1, s1);
         assert_eq!(lbl3, s3, "prev_label_cache must not poison S3 with failed S2 symbol");
+    }
+
+    #[test]
+    fn series_stable_hash_matches_labels_stable_hash_and_detects_crc_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        let long_val = "v".repeat(1200);
+        let mut syms = vec![
+            "".to_string(),
+            "__name__".to_string(),
+            "a".to_string(),
+            "big".to_string(),
+            "env".to_string(),
+            "m".to_string(),
+            "prod".to_string(),
+            long_val.clone(),
+        ];
+        for i in 0..80 {
+            syms.push(format!("pod-{i:03}"));
+        }
+        syms.sort();
+        syms.dedup();
+
+        let mut w = IndexWriter::new(&path).unwrap();
+        for s in &syms {
+            w.add_symbol(s).unwrap();
+        }
+        let mut series = Vec::new();
+        for i in 0..80 {
+            let lbls = if i == 0 {
+                Labels::from_pairs([("__name__", "m"), ("big", &long_val), ("env", "prod")])
+            } else {
+                Labels::from_pairs([("__name__", "m"), ("a", &format!("pod-{i:03}")), ("env", "prod")])
+            };
+            series.push(lbls);
+        }
+        series.sort();
+        for (idx, lbls) in series.iter().enumerate() {
+            w.add_series(idx as u64 + 1, lbls, &[]).unwrap();
+        }
+        w.close().unwrap();
+
+        let r = IndexReader::open(&path).unwrap();
+        assert!(
+            r.direct_symbol_offsets.get().is_none(),
+            "direct O(1) symbol offset table must remain lazy (0 B) until first query"
+        );
+        let sids = r.postings("", &[""]).unwrap();
+        assert_eq!(sids.len(), series.len());
+        for (sid, expected_lbls) in sids.iter().zip(series.iter()) {
+            assert_eq!(
+                r.series_stable_hash(*sid).unwrap(),
+                expected_lbls.stable_hash(),
+                "series_stable_hash must match Labels::stable_hash bit-for-bit (including >1KiB fallback)"
+            );
+            assert_eq!(r.series_labels(*sid).unwrap(), *expected_lbls);
+        }
+        assert!(
+            r.direct_symbol_offsets.get().is_some(),
+            "direct O(1) symbol offset table should be lazily populated on first query"
+        );
+
+        // Flip a byte inside the first series entry payload and verify CRC32C ChecksumMismatch.
+        let mut raw = std::fs::read(&path).unwrap();
+        let off = (sids[0] as usize) * SERIES_BYTE_ALIGN;
+        raw[off + 2] ^= 0xff;
+        let corrupt = IndexReader::from_bytes(Bytes::from(raw)).unwrap();
+        assert!(
+            matches!(
+                corrupt.series_stable_hash(sids[0]),
+                Err(IndexError::ChecksumMismatch { .. })
+            ),
+            "series_stable_hash must preserve exact CRC32C corruption detection"
+        );
     }
 }

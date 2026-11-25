@@ -1678,11 +1678,9 @@ impl TsdbInner {
             return Ok((blocks, corrupted));
         }
 
-        let workers = to_open.len().min(
-            std::thread::available_parallelism()
-                .map_or(4, |n| n.get())
-                .clamp(2, 16),
-        );
+        let workers = to_open
+            .len()
+            .min(mimir_common::cached_available_parallelism().clamp(2, 16));
         let next_idx = std::sync::atomic::AtomicUsize::new(0);
         let results: Mutex<Vec<(Ulid, Result<Arc<Block>, BlockError>)>> =
             Mutex::new(Vec::with_capacity(to_open.len()));

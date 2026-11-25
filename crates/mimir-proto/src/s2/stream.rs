@@ -41,9 +41,10 @@ pub struct WriterOptions {
 
 impl Default for WriterOptions {
     fn default() -> Self {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        static CACHED_CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let cpus = *CACHED_CPUS.get_or_init(|| {
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        });
         Self {
             block_size: DEFAULT_BLOCK_SIZE,
             level: WriterLevel::Fast,
