@@ -228,6 +228,7 @@ fn zstd_decompress_stream_into(
             .map_err(|code| anyhow::anyhow!("zstd reset: {}", zstd::zstd_safe::get_error_name(code)))?;
         let mut in_buf = zstd::zstd_safe::InBuffer::around(raw);
         let mut last_ret: usize = 0;
+        let mut peak_written: usize = 0;
         let res = (|| -> Result<()> {
             while in_buf.pos < raw.len() || last_ret != 0 {
                 let cur_written = out.len() - start_len;
@@ -277,7 +278,9 @@ fn zstd_decompress_stream_into(
                         )
                     })?;
                 let written = out.len() - old_len;
-                if out.len() - start_len > max_bytes {
+                let total_written = out.len() - start_len;
+                peak_written = peak_written.max(total_written);
+                if total_written > max_bytes {
                     out.truncate(start_len);
                     return Err(
                         CompressionError::DecompressedSizeExceeded { limit: max_bytes }.into(),
@@ -294,7 +297,7 @@ fn zstd_decompress_stream_into(
         })();
         // Release unusually large decompression windows (> 1 MiB output) so threads never pin
         // an 8 MiB window buffer permanently after a single oversized batch.
-        if out.len().saturating_sub(start_len) > ZSTD_DCTX_RESET_OUTPUT_THRESHOLD {
+        if peak_written > ZSTD_DCTX_RESET_OUTPUT_THRESHOLD {
             *dctx = create_zstd_dctx();
         }
         res

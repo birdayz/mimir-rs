@@ -25,6 +25,7 @@ mod sync_impl {
 #[cfg(miri)]
 #[allow(dead_code)]
 mod sync_impl {
+    #[derive(Debug)]
     pub struct Mutex<T>(std::sync::Mutex<T>);
 
     impl<T> Mutex<T> {

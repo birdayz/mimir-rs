@@ -1188,6 +1188,7 @@ impl<'a> TsdbQuerier<'a> {
                     };
                     let cached_head_hashes = if shard.is_some() {
                         h.resolve_shard_hashes_in_slot(&refs, prepared.head_shard_hashes.as_ref())
+                            .filter(|hashes| hashes.len() == refs.len())
                     } else {
                         None
                     };
@@ -1473,6 +1474,7 @@ impl<'a> TsdbQuerier<'a> {
             };
             let cached_head_hashes = if shard.is_some() {
                 h.resolve_shard_hashes_in_slot(&refs, prepared.head_shard_hashes.as_ref())
+                    .filter(|hashes| hashes.len() == refs.len())
             } else {
                 None
             };
@@ -1537,6 +1539,7 @@ impl<'a> TsdbQuerier<'a> {
             let cached_shard_hashes = if shard.is_some() {
                 let slot = prepared.block_shard_hashes.get(b_idx).and_then(|s| s.as_ref());
                 blk.resolve_shard_hashes_in_slot(refs, slot)?
+                    .filter(|hashes| hashes.len() == refs.len())
             } else {
                 None
             };

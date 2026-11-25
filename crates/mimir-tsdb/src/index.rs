@@ -1078,30 +1078,32 @@ impl IndexReader {
             (Vec::new(), postings_v1, name_cache)
         } else {
             let postings_index = parse_postings_offset_table(&mmap, postings_table_off)?;
-            let name_cache = if can_build_direct_symbols {
+            let mut name_cache = if can_build_direct_symbols {
                 HashMap::new()
             } else {
-                let mut nc = HashMap::with_capacity(postings_index.len());
-                for entries in &postings_index {
-                    let Some(first) = entries.first() else {
-                        continue;
-                    };
-                    if first.name_len == 0 {
-                        continue;
-                    }
-                    let (start, end) = resolve_posting_str_range(
-                        postings_payload_start,
-                        first.name_off,
-                        first.name_len,
-                    );
-                    // SAFETY: `parse_postings_offset_table` validated UTF-8 and slice bounds on `mmap`.
-                    let name = unsafe { std::str::from_utf8_unchecked(&mmap[start..end]) };
-                    let sid =
-                        reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name, version)?;
-                    nc.insert(sid, (first.name_off, first.name_len));
-                }
-                nc
+                HashMap::with_capacity(postings_index.len())
             };
+            for entries in &postings_index {
+                let Some(first) = entries.first() else {
+                    continue;
+                };
+                if first.name_len == 0 {
+                    continue;
+                }
+                let (start, end) = resolve_posting_str_range(
+                    postings_payload_start,
+                    first.name_off,
+                    first.name_len,
+                );
+                // SAFETY: `parse_postings_offset_table` validated UTF-8 and slice bounds on `mmap`.
+                let name = unsafe { std::str::from_utf8_unchecked(&mmap[start..end]) };
+                // Always verify postings label names exist in the symbol table (matches Go `index.go:1162`).
+                let sid =
+                    reverse_lookup_symbol(&mmap, &symbol_offsets, num_symbols, name, version)?;
+                if !can_build_direct_symbols {
+                    name_cache.insert(sid, (first.name_off, first.name_len));
+                }
+            }
             (postings_index, BTreeMap::new(), name_cache)
         };
 
