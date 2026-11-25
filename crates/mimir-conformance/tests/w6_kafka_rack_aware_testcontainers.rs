@@ -247,13 +247,18 @@ impl Drop for ProcessGuard {
 // ---------------------------------------------------------------------------------------------
 
 fn redpanda_yaml(node: usize, names: &[String], ports: &[u16]) -> String {
-    let mut y = format!(
-        "redpanda:\n  data_directory: /var/lib/redpanda/data\n  node_id: {node}\n  rack: {rack}\n  empty_seed_starts_cluster: false\n  seed_servers:\n",
-        rack = RACKS[node]
-    );
-    for n in names {
-        let _ = writeln!(y, "    - host: {{address: {n}, port: 33145}}");
-    }
+    let mut y = if node == 0 {
+        format!(
+            "redpanda:\n  data_directory: /var/lib/redpanda/data\n  node_id: 0\n  rack: {rack}\n  empty_seed_starts_cluster: true\n  seed_servers: []\n",
+            rack = RACKS[node]
+        )
+    } else {
+        format!(
+            "redpanda:\n  data_directory: /var/lib/redpanda/data\n  node_id: {node}\n  rack: {rack}\n  empty_seed_starts_cluster: false\n  seed_servers:\n    - host: {{address: {seed}, port: 33145}}\n",
+            rack = RACKS[node],
+            seed = names[0]
+        )
+    };
     let _ = write!(
         y,
         "  rpc_server: {{address: 0.0.0.0, port: 33145}}\n  advertised_rpc_api: {{address: {name}, port: 33145}}\n  admin: [{{address: 0.0.0.0, port: 9644}}]\n  developer_mode: true\n  kafka_api:\n    - {{name: external, address: 0.0.0.0, port: {port}}}\n  advertised_kafka_api:\n    - {{name: external, address: 127.0.0.1, port: {port}}}\n",
@@ -269,6 +274,29 @@ struct RackCluster {
 }
 
 impl RackCluster {
+    fn build_node_request(
+        node: usize,
+        network: &str,
+        names: &[String],
+        ports: &[u16],
+    ) -> testcontainers::ContainerRequest<GenericImage> {
+        GenericImage::new(REDPANDA_IMAGE, REDPANDA_TAG)
+            .with_entrypoint("/bin/sh")
+            .with_cmd([
+                "-c",
+                "cp /config/redpanda.yaml /etc/redpanda/redpanda.yaml && exec rpk redpanda start --mode dev-container --smp 1 --memory 512M --reserve-memory 0M --default-log-level=warn",
+            ])
+            .with_label(CONTAINER_LABEL.0, CONTAINER_LABEL.1)
+            .with_network(network.to_string())
+            .with_container_name(names[node].clone())
+            .with_startup_timeout(Duration::from_secs(180))
+            .with_copy_to(
+                CopyTargetOptions::new("/config/redpanda.yaml").with_mode(0o644),
+                redpanda_yaml(node, names, ports).into_bytes(),
+            )
+            .with_mapped_port(ports[node], ContainerPort::Tcp(ports[node]))
+    }
+
     async fn start() -> Result<Self> {
         let suffix = format!(
             "{}-{}",
@@ -282,39 +310,88 @@ impl RackCluster {
         let names: Vec<String> = (0..3).map(|n| format!("rp{n}-{suffix}")).collect();
         let ports = free_tcp_ports(3);
 
-        let mut starts = Vec::new();
-        for node in 0..3 {
-            let req = GenericImage::new(REDPANDA_IMAGE, REDPANDA_TAG)
-                .with_entrypoint("/bin/sh")
-                .with_cmd([
-                    "-c",
-                    "cp /config/redpanda.yaml /etc/redpanda/redpanda.yaml && exec rpk redpanda start --mode dev-container --smp 1 --memory 1G --reserve-memory 0M --default-log-level=warn",
-                ])
-                .with_label(CONTAINER_LABEL.0, CONTAINER_LABEL.1)
-                .with_network(network.clone())
-                .with_container_name(names[node].clone())
-                .with_startup_timeout(Duration::from_secs(180))
-                .with_copy_to(
-                    CopyTargetOptions::new("/config/redpanda.yaml").with_mode(0o644),
-                    redpanda_yaml(node, &names, &ports).into_bytes(),
-                )
-                .with_mapped_port(ports[node], ContainerPort::Tcp(ports[node]));
-            starts.push(req.start());
+        let node0 = Self::build_node_request(0, &network, &names, &ports)
+            .start()
+            .await
+            .context("starting Redpanda seed node 0 via testcontainers (is Docker running?)")?;
+        let mut c = Self {
+            nodes: vec![node0],
+            ports: ports.clone(),
+        };
+        c.wait_seed_ready().await?;
+
+        let starts = (1..3).map(|node| Self::build_node_request(node, &network, &names, &ports).start());
+        for (idx, r) in futures::future::join_all(starts).await.into_iter().enumerate() {
+            c.nodes.push(
+                r.with_context(|| format!("starting Redpanda node {} via testcontainers", idx + 1))?,
+            );
         }
-        let mut nodes = Vec::new();
-        for r in futures::future::join_all(starts).await {
-            nodes.push(r.context("starting Redpanda via testcontainers (is Docker running?)")?);
-        }
-        let c = Self { nodes, ports };
-        c.wait_healthy().await?;
+        c.wait_all_brokers_ready().await?;
         c.rpk(0, &["cluster", "config", "set", "enable_rack_awareness", "true"])
             .await?;
         Ok(c)
     }
 
-    async fn wait_healthy(&self) -> Result<()> {
+    async fn wait_seed_ready(&self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if matches!(self.nodes[0].is_running().await, Ok(false)) {
+                let logs = self.dump_logs().await;
+                bail!("Redpanda seed node 0 exited during startup:\n{logs}");
+            }
+            let out = tokio::time::timeout(
+                Duration::from_secs(15),
+                self.rpk(0, &["cluster", "info"]),
+            )
+            .await;
+            if let Ok(Ok(text)) = &out {
+                if text.contains("BROKERS") {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                let logs = self.dump_logs().await;
+                bail!("Redpanda seed node 0 admin/Kafka API never became ready: {out:?}\n{logs}");
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_all_brokers_ready(&self) -> Result<()> {
+        let _ = self
+            .rpk(
+                0,
+                &["cluster", "config", "set", "storage_space_alert_free_threshold_percent", "0"],
+            )
+            .await;
+        self.wait_nodes_healthy(&["0", "1", "2"]).await
+    }
+
+    async fn dump_logs(&self) -> String {
+        let mut s = String::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            let running = n.is_running().await.ok();
+            let out = n.stdout_to_vec().await.unwrap_or_default();
+            let err = n.stderr_to_vec().await.unwrap_or_default();
+            let _ = writeln!(
+                s,
+                "--- node {i} (running={running:?}) ---\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err),
+            );
+        }
+        s
+    }
+
+    async fn wait_nodes_healthy(&self, expected: &[&str]) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
+            for (i, n) in self.nodes.iter().enumerate() {
+                if matches!(n.is_running().await, Ok(false)) {
+                    let logs = self.dump_logs().await;
+                    bail!("Redpanda node {i} exited before cluster became healthy:\n{logs}");
+                }
+            }
             let out = tokio::time::timeout(
                 Duration::from_secs(30),
                 self.rpk(0, &["cluster", "health"]),
@@ -324,13 +401,14 @@ impl RackCluster {
                 let healthy = text.lines().any(|l| l.contains("Healthy:") && l.contains("true"));
                 let all_up = text
                     .lines()
-                    .any(|l| l.contains("All nodes:") && ["0", "1", "2"].iter().all(|n| l.contains(n)));
+                    .any(|l| l.contains("All nodes:") && expected.iter().all(|n| l.contains(n)));
                 if healthy && all_up {
                     return Ok(());
                 }
             }
             if Instant::now() >= deadline {
-                bail!("3-broker Redpanda cluster never became healthy: {out:?}");
+                let logs = self.dump_logs().await;
+                bail!("3-broker Redpanda cluster never became healthy (expected={expected:?}): {out:?}\n{logs}");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }

@@ -585,6 +585,9 @@ async fn test_http_client_disable_keep_alives() {
 
         for _ in 0..5 {
             p.read_async().await.unwrap();
+            // Give reqwest/hyper's spawned HTTP/1.1 connection driver task a beat to return the
+            // idle socket to the pool before the next sequential request on busy multi-core runners.
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(srv.connections.load(Ordering::SeqCst), want_new_conns);
     }

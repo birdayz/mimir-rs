@@ -154,6 +154,7 @@ jobs:
       - name: Run conformance tests
         run: |
           threads=3
+          [[ "${{ matrix.shard }}" == "docker" ]] && threads=2
           [[ "${{ matrix.shard }}" == "docker-k8s" ]] && threads=1
           cargo test -p mimir-conformance ${{ steps.targets.outputs.args }} -- --nocapture --test-threads "$threads"
       - name: Remove leftover containers
